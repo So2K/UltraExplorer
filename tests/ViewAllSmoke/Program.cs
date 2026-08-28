@@ -269,6 +269,11 @@ internal static class Program
         Check("expanding a branch does not move existing nodes",
             node.Children.Select(child => child.Location).SequenceEqual(before));
 
+        // Anything caching drawn geometry has to hear about a move, otherwise a
+        // drag only shows up after the next pan or zoom.
+        var layoutSignals = 0;
+        graph.LayoutChanged += () => layoutSignals++;
+
         // Dragging a node has to carry its whole subtree, so dragging a drive
         // drags its tree.
         var beforeDrag = alpha.Children.Select(child => child.Location).ToArray();
@@ -282,6 +287,8 @@ internal static class Program
                 .All(error => error < 1e-6));
         Check("carried children keep their automatic flag",
             alpha.Children.All(child => !child.HasManualPosition));
+        Check("a drag announces a layout change for the node and everything it carried",
+            layoutSignals >= 1 + alpha.Children.Count);
         Check("siblings of the dragged node stay put",
             node.Children.Where(child => child != alpha)
                 .All(child => child.Location.Y == node.Children.First(other => other != alpha).Location.Y));

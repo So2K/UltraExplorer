@@ -40,6 +40,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private int _logicalNodeCount;
     private int _visibleNodeCount;
     private bool _isOverviewActive;
+    private bool _isOverviewStale;
     private string _statusCountText = string.Empty;
     private string _statusPathText = string.Empty;
 
@@ -50,6 +51,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         _graph = new ViewAllGraphService();
         _graph.GraphChanged += OnGraphChanged;
         _graph.NodeCreated += OnNodeCreated;
+        _graph.LayoutChanged += OnLayoutChanged;
         _marks.MarkChanged += OnMarkChanged;
 
         SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
@@ -552,8 +554,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
 
         OnPropertyChanged(nameof(ViewportLocation));
-        _renderThrottle.Stop();
-        _renderThrottle.Start();
+
+        // Restarting on every viewport event would starve the tick during a
+        // continuous pan and leave the culling on a stale viewport.
+        if (!_renderThrottle.IsEnabled)
+        {
+            _renderThrottle.Start();
+        }
+
         ScheduleSave();
     }
 
@@ -640,6 +648,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         _activeWatcher = null;
         _graph.GraphChanged -= OnGraphChanged;
         _graph.NodeCreated -= OnNodeCreated;
+        _graph.LayoutChanged -= OnLayoutChanged;
         _marks.MarkChanged -= OnMarkChanged;
         SelectedNodes.CollectionChanged -= OnSelectedNodesChanged;
         _graph.Dispose();
@@ -737,8 +746,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
 
         _visibleNodeCount = visible;
-        GraphInvalidated?.Invoke();
+        _isOverviewStale = true;
         RebuildRenderSet();
+    }
+
+    /// <summary>
+    /// A drag moves nodes without changing the tree, so the cached drawing has
+    /// to be rebuilt on movement too.  The throttle is not restarted on every
+    /// move: during a drag that would postpone the redraw until the user let go.
+    /// </summary>
+    private void OnLayoutChanged()
+    {
+        _isOverviewStale = true;
+        if (!_renderThrottle.IsEnabled)
+        {
+            _renderThrottle.Start();
+        }
     }
 
     private void OnNodeCreated(ViewAllNodeViewModel node)
@@ -836,6 +859,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         LogicalNodeCount = set.LogicalNodeCount;
         IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel);
         RequestIcons(set.Nodes, set.DetailLevel);
+
+        // Rebuilding is only worth it while the batched layer is on screen; if
+        // it is not, the flag survives until the canvas zooms back out.
+        if (_isOverviewStale && IsOverviewActive)
+        {
+            _isOverviewStale = false;
+            GraphInvalidated?.Invoke();
+        }
     }
 
     private static void Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired)

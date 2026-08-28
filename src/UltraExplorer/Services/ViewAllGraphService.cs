@@ -57,6 +57,13 @@ public sealed class ViewAllGraphService : IDisposable
     public event Action<ViewAllNodeViewModel>? NodeCreated;
 
     /// <summary>
+    /// Raised when a node moved.  Dragging changes positions without changing
+    /// structure, so anything caching geometry has to hear about it separately
+    /// from <see cref="GraphChanged"/>.
+    /// </summary>
+    public event Action? LayoutChanged;
+
+    /// <summary>
     /// Applies new enumeration options and re-reads only the branches that are
     /// already open, keeping their expansion and any manual positions.
     /// </summary>
@@ -488,6 +495,7 @@ public sealed class ViewAllGraphService : IDisposable
         if (node.HasLayoutPosition)
         {
             Index.AddOrUpdate(node);
+            LayoutChanged?.Invoke();
         }
     }
 
