@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Input;
@@ -53,6 +54,9 @@ internal static class Program
         await ViewportCulling(fixtureRoot);
         await DropTargets(fixtureRoot);
         await Persistence(fixtureRoot);
+        await DepthScale();
+        await RealFolderExpansion();
+        await Performance();
         await Marks(fixtureRoot);
     }
 
@@ -232,8 +236,16 @@ internal static class Program
         var node = (await graph.AddRootAsync(root))!;
         await graph.ExpandAsync(node);
 
-        Check("children are placed to the right of the parent",
-            node.Children.All(child => child.Location.X > node.Location.X));
+        Check("children are placed below the parent",
+            node.Children.All(child => child.Location.Y > node.Location.Y));
+        Check("siblings share a row",
+            node.Children.Select(child => child.Location.Y).Distinct().Count() == 1);
+
+        var childWidth = node.Children[0].Width;
+        var rowCentre = (node.Children.Min(child => child.Location.X)
+                         + node.Children.Max(child => child.Location.X)) / 2 + childWidth / 2;
+        Check("the row is centred on the parent",
+            Math.Abs(rowCentre - (node.Location.X + node.Width / 2)) < 1);
 
         var boxes = graph.Nodes.Where(item => item.HasLayoutPosition).Select(item => item.Bounds).ToArray();
         var overlapping = false;
@@ -257,6 +269,23 @@ internal static class Program
         Check("expanding a branch does not move existing nodes",
             node.Children.Select(child => child.Location).SequenceEqual(before));
 
+        // Dragging a node has to carry its whole subtree, so dragging a drive
+        // drags its tree.
+        var beforeDrag = alpha.Children.Select(child => child.Location).ToArray();
+        var dragDelta = new Vector(500, 300);
+        alpha.Location = alpha.Location + dragDelta;
+        // The delta is recovered by subtracting two large coordinates, so the
+        // carried positions land within rounding of the exact offset.
+        Check("dragging a node moves its children by the same delta",
+            alpha.Children
+                .Select((child, i) => (child.Location - (beforeDrag[i] + dragDelta)).Length)
+                .All(error => error < 1e-6));
+        Check("carried children keep their automatic flag",
+            alpha.Children.All(child => !child.HasManualPosition));
+        Check("siblings of the dragged node stay put",
+            node.Children.Where(child => child != alpha)
+                .All(child => child.Location.Y == node.Children.First(other => other != alpha).Location.Y));
+
         var manual = new Point(4321, 1234);
         alpha.Location = manual;
         Check("a dragged node is marked manual", alpha.HasManualPosition);
@@ -274,27 +303,219 @@ internal static class Program
         await graph.ExpandAsync(node);
 
         var viewport = new ViewAllViewportService();
+        Check("the furthest zoom aggregates into clusters",
+            viewport.GetDetailLevel(0.04) == ViewAllDetailLevel.Cluster);
         Check("far out is the dot level", viewport.GetDetailLevel(0.1) == ViewAllDetailLevel.Dot);
         Check("mid zoom is the glyph level", viewport.GetDetailLevel(0.2) == ViewAllDetailLevel.Glyph);
         Check("closer is the compact level", viewport.GetDetailLevel(0.45) == ViewAllDetailLevel.Compact);
         Check("full zoom is the detailed level", viewport.GetDetailLevel(1) == ViewAllDetailLevel.Detailed);
+        Check("batched drawing takes over below 30%",
+            ViewAllViewportService.UsesOverview(viewport.GetDetailLevel(0.2))
+            && !ViewAllViewportService.UsesOverview(viewport.GetDetailLevel(0.45)));
 
-        var everything = new Rect(-10_000, -10_000, 40_000, 40_000);
-        var all = viewport.BuildRenderSet(graph.Nodes, graph.Edges, everything, 1);
-        Check("everything visible is realized", all.Nodes.Count == graph.Nodes.Count(item => item.IsTreeVisible));
+        var visible = graph.Nodes.Count(item => item.IsTreeVisible);
+        var everything = new Rect(-10_000, -10_000, 60_000, 60_000);
+        var all = viewport.BuildRenderSet(graph.Index, graph.Edges, [], everything, 1, visible);
+        Check("everything visible is realized", all.Nodes.Count == visible);
 
         var elsewhere = new Rect(500_000, 500_000, 400, 400);
-        var none = viewport.BuildRenderSet(graph.Nodes, graph.Edges, elsewhere, 1);
+        var none = viewport.BuildRenderSet(graph.Index, graph.Edges, [], elsewhere, 1, visible);
         Check("nothing off screen is realized", none.Nodes.Count == 0);
         Check("logical count ignores culling", none.LogicalNodeCount == all.LogicalNodeCount);
 
-        node.IsSelected = true;
-        var withSelection = viewport.BuildRenderSet(graph.Nodes, graph.Edges, elsewhere, 1);
+        var withSelection = viewport.BuildRenderSet(graph.Index, graph.Edges, [node], elsewhere, 1, visible);
         Check("a selected node is always realized", withSelection.Nodes.Contains(node));
-        node.IsSelected = false;
+
+        var farOut = viewport.BuildRenderSet(graph.Index, graph.Edges, [], everything, 0.1, visible);
+        Check("the overview realizes no controls at all", farOut.Nodes.Count == 0);
 
         Check("an edge needs both ends realized",
             all.Edges.All(edge => all.Nodes.Contains(edge.Source) && all.Nodes.Contains(edge.Target)));
+    }
+
+    /// <summary>
+    /// A deeper folder has to take proportionally less canvas, halving every
+    /// eight levels rather than dropping off a cliff at some threshold.
+    /// </summary>
+    private static Task DepthScale()
+    {
+        Section("depth scale");
+
+        static double ScaleAt(int depth)
+        {
+            var entry = new ViewAllEntryDescriptor(
+                $@"C:\depth\{depth}",
+                $"depth-{depth}",
+                ViewAllEntryKind.Folder,
+                false,
+                false,
+                null,
+                DateTime.UnixEpoch);
+            return new ViewAllNodeViewModel(entry, depth).Scale;
+        }
+
+        Check("a root is full size", Math.Abs(ScaleAt(0) - 1) < 1e-9);
+        Check("depth 8 is half a root", Math.Abs(ScaleAt(8) - 0.5) < 1e-9);
+        Check("depth 16 is half of depth 8", Math.Abs(ScaleAt(16) - ScaleAt(8) / 2) < 1e-9);
+        Check("depth 24 is half of depth 16", Math.Abs(ScaleAt(24) - ScaleAt(16) / 2) < 1e-9);
+        Check("depth 32 is a sixteenth", Math.Abs(ScaleAt(32) - 0.0625) < 1e-9);
+        Check("shrinking stops past 32", Math.Abs(ScaleAt(64) - ScaleAt(32)) < 1e-9);
+        Check("the shrink is gradual, not stepped",
+            ScaleAt(0) > ScaleAt(3) && ScaleAt(3) > ScaleAt(5) && ScaleAt(5) > ScaleAt(8));
+
+        var entry = new ViewAllEntryDescriptor(
+            @"C:\depth\node",
+            "node",
+            ViewAllEntryKind.Folder,
+            false,
+            false,
+            null,
+            DateTime.UnixEpoch);
+        var deep = new ViewAllNodeViewModel(entry, 8);
+        deep.SetAutomaticLocation(new Point(0, 0));
+        Check("bounds follow the scale",
+            Math.Abs(deep.Bounds.Width - ViewAllNodeViewModel.DefaultWidth / 2) < 1e-9
+            && Math.Abs(deep.Bounds.Height - ViewAllNodeViewModel.DefaultHeight / 2) < 1e-9);
+        Check("anchors follow the scale",
+            Math.Abs(deep.InputAnchor.X - deep.Width / 2) < 1e-9
+            && Math.Abs(deep.OutputAnchor.Y - deep.Height) < 1e-9);
+
+        return Task.CompletedTask;
+    }
+
+    private static async Task RealFolderExpansion()
+    {
+        Section("large real folder");
+        var big = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "System32");
+        if (!Directory.Exists(big))
+        {
+            Check("no system folder to measure on this machine", true);
+            return;
+        }
+
+        using var graph = new ViewAllGraphService();
+        await graph.InitializeAsync();
+        var node = (await graph.AddRootAsync(big))!;
+
+        var watch = Stopwatch.StartNew();
+        await graph.ExpandAsync(node);
+        watch.Stop();
+
+        Check("a real system folder expands in one level", node.Children.Count > 1_000);
+        Report($"expanded {node.Children.Count:N0} real entries", watch.ElapsedMilliseconds, 8_000);
+        Check("no descendant was scanned", node.Children.All(child => child.Children.Count == 0));
+    }
+
+    /// <summary>
+    /// The whole point of the spatial index and the batched overview is that a
+    /// graph far larger than any real folder stays interactive, so the numbers
+    /// are asserted rather than eyeballed.
+    /// </summary>
+    private static Task Performance()
+    {
+        Section("performance");
+
+        const int nodeCount = 300_000;
+        var index = new ViewAllSpatialIndex();
+        var nodes = new List<ViewAllNodeViewModel>(nodeCount);
+
+        var build = Stopwatch.StartNew();
+        for (var i = 0; i < nodeCount; i++)
+        {
+            var entry = new ViewAllEntryDescriptor(
+                $@"C:\synthetic\{i}",
+                $"node-{i}",
+                i % 3 == 0 ? ViewAllEntryKind.Folder : ViewAllEntryKind.File,
+                IsHidden: false,
+                IsReparsePoint: false,
+                SizeBytes: 0,
+                ModifiedUtc: DateTime.UnixEpoch);
+            var node = new ViewAllNodeViewModel(entry, depth: 1);
+            node.SetAutomaticLocation(new Point(i % 800 * 214, i / 800 * 140));
+            index.AddOrUpdate(node);
+            nodes.Add(node);
+        }
+
+        build.Stop();
+        Report($"indexed {nodeCount:N0} nodes", build.ElapsedMilliseconds, 15_000);
+
+        var viewportRect = new Rect(40_000, 20_000, 1920, 1080);
+        var hits = new List<ViewAllNodeViewModel>();
+        var query = Stopwatch.StartNew();
+        for (var i = 0; i < 100; i++)
+        {
+            hits.Clear();
+            index.Query(viewportRect, hits);
+        }
+
+        query.Stop();
+        Check("a viewport query finds its nodes", hits.Count is > 0 and < 2_000);
+        Report("100 viewport queries", query.ElapsedMilliseconds, 500);
+
+        var viewport = new ViewAllViewportService();
+        var renderSet = Stopwatch.StartNew();
+        ViewAllRenderSet? last = null;
+        for (var i = 0; i < 100; i++)
+        {
+            last = viewport.BuildRenderSet(index, [], [], viewportRect, 1, nodeCount);
+        }
+
+        renderSet.Stop();
+        Check("the render set stays small", last is not null && last.Nodes.Count <= 900);
+        Report("100 render sets over 300k nodes", renderSet.ElapsedMilliseconds, 2_000);
+
+        // Moving a root drags its subtree; the index has to keep up per frame.
+        var move = Stopwatch.StartNew();
+        for (var i = 0; i < 20_000; i++)
+        {
+            nodes[i].SetAutomaticLocation(new Point(nodes[i].Location.X + 1, nodes[i].Location.Y + 1));
+        }
+
+        move.Stop();
+        Report("20k node moves reindexed", move.ElapsedMilliseconds, 3_000);
+
+        // Layout of one enormous folder: quadratic collision testing would make
+        // this minutes rather than milliseconds.
+        var layout = new ViewAllLayoutService();
+        var layoutIndex = new ViewAllSpatialIndex();
+        var parentEntry = new ViewAllEntryDescriptor(
+            @"C:\synthetic",
+            "synthetic",
+            ViewAllEntryKind.Folder,
+            false,
+            false,
+            null,
+            DateTime.UnixEpoch);
+        var parent = new ViewAllNodeViewModel(parentEntry, 0);
+        parent.SetAutomaticLocation(new Point(0, 0));
+        layoutIndex.AddOrUpdate(parent);
+
+        var children = new List<ViewAllNodeViewModel>(20_000);
+        for (var i = 0; i < 20_000; i++)
+        {
+            var entry = new ViewAllEntryDescriptor(
+                $@"C:\synthetic\child-{i}",
+                $"child-{i}",
+                ViewAllEntryKind.File,
+                false,
+                false,
+                0,
+                DateTime.UnixEpoch);
+            var child = new ViewAllNodeViewModel(entry, 1, parent)
+            {
+                LocationObserver = layoutIndex.AddOrUpdate
+            };
+            children.Add(child);
+        }
+
+        var placing = Stopwatch.StartNew();
+        layout.PlaceChildren(parent, children, layoutIndex);
+        placing.Stop();
+        Report("laid out 20k children", placing.ElapsedMilliseconds, 10_000);
+        Check("every child was placed", children.All(child => child.HasLayoutPosition));
+        Check("children share one row", children.Select(child => child.Location.Y).Distinct().Count() == 1);
+
+        return Task.CompletedTask;
     }
 
     private static async Task DropTargets(string root)
@@ -309,7 +530,10 @@ internal static class Program
         var inside = new Point(beta.Location.X + 10, beta.Location.Y + 10);
         Check("the folder under the cursor wins", graph.FindNearestDropTarget(inside, 96) == beta);
 
-        var nearby = new Point(beta.Location.X - 40, beta.Location.Y + 10);
+        // Siblings share a row, so probe below the node where nothing else sits.
+        var nearby = new Point(
+            beta.Location.X + ViewAllNodeViewModel.DefaultWidth / 2,
+            beta.Location.Y + ViewAllNodeViewModel.DefaultHeight + 20);
         Check("a nearby folder is picked up", graph.FindNearestDropTarget(nearby, 96) == beta);
 
         var faraway = new Point(beta.Location.X - 4000, beta.Location.Y);
@@ -398,6 +622,12 @@ internal static class Program
     {
         Console.WriteLine();
         Console.WriteLine($"== {title} ==");
+    }
+
+    private static void Report(string description, long elapsedMilliseconds, long budgetMilliseconds)
+    {
+        Check($"{description}: {elapsedMilliseconds} ms (budget {budgetMilliseconds} ms)",
+            elapsedMilliseconds <= budgetMilliseconds);
     }
 
     private static void Check(string description, bool condition)

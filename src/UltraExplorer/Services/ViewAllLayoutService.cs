@@ -4,49 +4,54 @@ using UltraExplorer.Models;
 namespace UltraExplorer.Services;
 
 public sealed record ViewAllLayoutOptions(
-    double OriginX = 80,
-    double OriginY = 80,
-    double HorizontalGap = 112,
-    double VerticalGap = 18,
-    double RootGap = 280,
-    double CollisionPaddingX = 30,
-    double CollisionPaddingY = 16);
+    double OriginX = 120,
+    double OriginY = 90,
+    double SiblingGap = 26,
+    double GenerationGap = 96,
+    double RootGap = 420,
+    double CollisionPaddingX = 14,
+    double CollisionPaddingY = 22);
 
 /// <summary>
-/// Stable incremental layout: expanding a branch positions only newly created
-/// nodes. Existing automatic positions and every user-dragged position remain
-/// untouched, avoiding the usual graph "jump" on expansion.
+/// Top-down tree: a parent sits above a row of its children.  Screens are wider
+/// than they are tall, so growing downwards and spreading sideways fills the
+/// viewport far better than a left-to-right tree.
+///
+/// Nodes shrink with depth (see <see cref="ViewAllNodeViewModel.Scale"/>), and
+/// the gaps shrink with them, so a deep branch stays compact instead of taking
+/// as much room as a root.
+///
+/// The layout is incremental on purpose: expanding a branch positions only the
+/// newly created nodes, so existing automatic positions and every user-dragged
+/// position stay where they are and the graph never jumps.  Collision tests go
+/// through the spatial index, which keeps placing a folder with thousands of
+/// children linear instead of quadratic.
 /// </summary>
 public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
 {
     private readonly ViewAllLayoutOptions _options = options ?? new ViewAllLayoutOptions();
 
-    public void PlaceRoots(
-        IEnumerable<ViewAllNodeViewModel> roots,
-        IEnumerable<ViewAllNodeViewModel> allNodes)
+    public void PlaceRoots(IEnumerable<ViewAllNodeViewModel> roots, ViewAllSpatialIndex index)
     {
-        var occupied = allNodes.Where(node => node.HasLayoutPosition).Select(node => node.Bounds).ToList();
-        var index = 0;
+        var slot = 0;
         foreach (var root in roots.OrderBy(node => node.FullPath, StringComparer.OrdinalIgnoreCase))
         {
             if (root.HasLayoutPosition)
             {
-                index++;
+                slot++;
                 continue;
             }
 
-            var preferred = new Point(_options.OriginX, _options.OriginY + index * _options.RootGap);
-            var location = FindFreeVerticalSlot(preferred, occupied);
-            root.SetAutomaticLocation(location);
-            occupied.Add(root.Bounds);
-            index++;
+            var preferred = new Point(_options.OriginX + slot * _options.RootGap, _options.OriginY);
+            root.SetAutomaticLocation(FindFreeHorizontalSlot(preferred, root, index));
+            slot++;
         }
     }
 
     public void PlaceChildren(
         ViewAllNodeViewModel parent,
         IEnumerable<ViewAllNodeViewModel> children,
-        IEnumerable<ViewAllNodeViewModel> allNodes)
+        ViewAllSpatialIndex index)
     {
         var unplaced = children
             .Where(child => !child.HasLayoutPosition)
@@ -58,21 +63,19 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
             return;
         }
 
-        var occupied = allNodes
-            .Where(node => node.HasLayoutPosition && !unplaced.Contains(node))
-            .Select(node => node.Bounds)
-            .ToList();
-        var step = ViewAllNodeViewModel.DefaultHeight + _options.VerticalGap;
-        var branchHeight = (unplaced.Length - 1) * step;
-        var startY = parent.Location.Y - branchHeight / 2;
-        var childX = parent.Location.X + ViewAllNodeViewModel.DefaultWidth + _options.HorizontalGap;
+        var childScale = unplaced[0].Scale;
+        var childWidth = ViewAllNodeViewModel.DefaultWidth * childScale;
+        var step = childWidth + _options.SiblingGap * childScale;
+        var rowWidth = (unplaced.Length - 1) * step;
 
-        for (var index = 0; index < unplaced.Length; index++)
+        var parentCentre = parent.Location.X + parent.Width / 2;
+        var startX = parentCentre - childWidth / 2 - rowWidth / 2;
+        var childY = parent.Location.Y + parent.Height + _options.GenerationGap * childScale;
+
+        for (var position = 0; position < unplaced.Length; position++)
         {
-            var preferred = new Point(childX, startY + index * step);
-            var location = FindFreeVerticalSlot(preferred, occupied);
-            unplaced[index].SetAutomaticLocation(location);
-            occupied.Add(unplaced[index].Bounds);
+            var preferred = new Point(startX + position * step, childY);
+            unplaced[position].SetAutomaticLocation(FindFreeHorizontalSlot(preferred, unplaced[position], index));
         }
     }
 
@@ -88,22 +91,27 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
         }
     }
 
-    private Point FindFreeVerticalSlot(Point preferred, IReadOnlyList<Rect> occupied)
+    private Point FindFreeHorizontalSlot(Point preferred, ViewAllNodeViewModel node, ViewAllSpatialIndex index)
     {
+        var size = new Size(node.Width, node.Height);
+        var step = node.Width + _options.SiblingGap * node.Scale;
+        var padX = _options.CollisionPaddingX * node.Scale;
+        var padY = _options.CollisionPaddingY * node.Scale;
+
         var candidate = preferred;
-        var step = ViewAllNodeViewModel.DefaultHeight + _options.VerticalGap;
         for (var attempt = 0; attempt < 20_000; attempt++)
         {
-            var bounds = new Rect(candidate, new Size(ViewAllNodeViewModel.DefaultWidth, ViewAllNodeViewModel.DefaultHeight));
-            bounds.Inflate(_options.CollisionPaddingX, _options.CollisionPaddingY);
-            if (occupied.All(other => !other.IntersectsWith(bounds)))
+            var bounds = new Rect(candidate, size);
+            bounds.Inflate(padX, padY);
+            if (!index.IsOccupied(bounds))
             {
                 return candidate;
             }
 
-            // Alternate above and below the preferred point before drifting down.
+            // Alternate right and left of the preferred point so a row stays
+            // centred on its parent instead of drifting in one direction.
             var ring = attempt / 2 + 1;
-            candidate.Y = preferred.Y + (attempt % 2 == 0 ? ring : -ring) * step;
+            candidate.X = preferred.X + (attempt % 2 == 0 ? ring : -ring) * step;
         }
 
         return candidate;

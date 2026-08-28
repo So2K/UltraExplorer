@@ -2,57 +2,28 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
 using Microsoft.VisualBasic.FileIO;
-using Vanara.PInvoke;
-using Vanara.Windows.Shell;
-using static Vanara.PInvoke.Shell32;
 
 namespace UltraExplorer.Services;
 
 public sealed class NativeShellService
 {
-    public static void ShowNativeContextMenu(IReadOnlyList<string> paths, Point screenPoint, IntPtr ownerHandle, bool extended)
-    {
-        var existingPaths = paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        if (existingPaths.Length == 0)
-        {
-            return;
-        }
-
-        var options = extended ? CMF.CMF_NORMAL | CMF.CMF_EXTENDEDVERBS : CMF.CMF_NORMAL;
-        if (existingPaths.Length == 1)
-        {
-            // Let ShellItem own the context menu and its PIDL keep-alive bundle. This is
-            // Vanara's tested lifetime path and avoids double-freeing Shell resources.
-            // Construct the base ShellItem explicitly. ShellItem.Open returns a
-            // ShellFolder for directories whose ContextMenu represents the folder
-            // background ("New", view commands, etc.) instead of the selected item.
-            using var item = new ShellItem(existingPaths[0]);
-            item.ContextMenu.ShowContextMenu(
-                new POINT((int)Math.Round(screenPoint.X), (int)Math.Round(screenPoint.Y)),
-                options,
-                hWnd: new HWND(ownerHandle));
-            return;
-        }
-
-        var items = existingPaths.Select(ShellItem.Open).ToArray();
-        try
-        {
-            using var menu = ShellContextMenu.CreateFromItems(items, out var keepAlive);
-            menu.ShowContextMenu(
-                new POINT((int)Math.Round(screenPoint.X), (int)Math.Round(screenPoint.Y)),
-                options,
-                hWnd: new HWND(ownerHandle));
-            GC.KeepAlive(keepAlive);
-        }
-        finally
-        {
-            foreach (var shellItem in items)
-            {
-                shellItem.Dispose();
-            }
-        }
-    }
+    /// <summary>
+    /// Shows Explorer's own context menu.  Returns false when the Shell cannot
+    /// build one for this selection, so the caller can fall back to the app menu.
+    /// </summary>
+    public static bool TryShowNativeContextMenu(
+        IReadOnlyList<string> paths,
+        HwndSource source,
+        Point screenPoint,
+        bool extended)
+        => ShellContextMenu.TryShow(
+            paths,
+            source,
+            (int)Math.Round(screenPoint.X),
+            (int)Math.Round(screenPoint.Y),
+            extended);
 
     public static void Open(string path)
     {

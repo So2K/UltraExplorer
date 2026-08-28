@@ -1,4 +1,3 @@
-using System.Collections.ObjectModel;
 using System.Windows;
 using UltraExplorer.Models;
 
@@ -7,11 +6,19 @@ namespace UltraExplorer.Services;
 /// <summary>
 /// Owns the lazily materialized View All tree.  No method in this class scans
 /// descendants: a branch exists only after its parent has been expanded.
+///
+/// Nodes and edges are plain lists rather than observable collections: opening a
+/// folder with thousands of entries would otherwise raise one change
+/// notification per entry.  The canvas binds to the render set instead, which is
+/// rebuilt in one pass from <see cref="Index"/>.
 /// </summary>
 public sealed class ViewAllGraphService : IDisposable
 {
     private readonly ViewAllFileSystemService _fileSystem;
     private readonly ViewAllLayoutService _layout;
+    private readonly List<ViewAllNodeViewModel> _nodes = [];
+    private readonly List<ViewAllEdgeViewModel> _edges = [];
+    private readonly List<ViewAllNodeViewModel> _roots = [];
     private readonly Dictionary<string, ViewAllNodeViewModel> _nodesByPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Guid, ViewAllEdgeViewModel> _incomingEdges = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _loads = [];
@@ -30,26 +37,14 @@ public sealed class ViewAllGraphService : IDisposable
 
     public ViewAllGraphOptions Options { get; private set; }
 
-    /// <summary>
-    /// Applies new enumeration options and re-reads only the branches that are
-    /// already open, keeping their expansion and any manual positions.
-    /// </summary>
-    public async Task ApplyOptionsAsync(ViewAllGraphOptions options, CancellationToken cancellationToken = default)
-    {
-        ThrowIfDisposed();
-        Options = options;
-        foreach (var root in Roots.Where(root => root.IsExpanded).ToArray())
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            await RefreshBranchAsync(root, cancellationToken);
-        }
+    public IReadOnlyList<ViewAllNodeViewModel> Nodes => _nodes;
 
-        GraphChanged?.Invoke(this, EventArgs.Empty);
-    }
+    public IReadOnlyList<ViewAllEdgeViewModel> Edges => _edges;
 
-    public ObservableCollection<ViewAllNodeViewModel> Nodes { get; } = [];
-    public ObservableCollection<ViewAllEdgeViewModel> Edges { get; } = [];
-    public IEnumerable<ViewAllNodeViewModel> Roots => Nodes.Where(node => node.Parent is null);
+    public IReadOnlyList<ViewAllNodeViewModel> Roots => _roots;
+
+    /// <summary>Grid over placed nodes; culling and layout both query it.</summary>
+    public ViewAllSpatialIndex Index { get; } = new();
 
     /// <summary>Raised after a structural or logical visibility change.</summary>
     public event EventHandler? GraphChanged;
@@ -60,6 +55,23 @@ public sealed class ViewAllGraphService : IDisposable
     /// which keeps those concerns out of the graph itself.
     /// </summary>
     public event Action<ViewAllNodeViewModel>? NodeCreated;
+
+    /// <summary>
+    /// Applies new enumeration options and re-reads only the branches that are
+    /// already open, keeping their expansion and any manual positions.
+    /// </summary>
+    public async Task ApplyOptionsAsync(ViewAllGraphOptions options, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        Options = options;
+        foreach (var root in _roots.Where(root => root.IsExpanded).ToArray())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await RefreshBranchAsync(root, cancellationToken);
+        }
+
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
 
     public async Task InitializeAsync(
         ViewAllWorkspaceState? restoredState = null,
@@ -91,7 +103,7 @@ public sealed class ViewAllGraphService : IDisposable
             RestorePosition(root);
         }
 
-        _layout.PlaceRoots(Roots, Nodes);
+        _layout.PlaceRoots(_roots, Index);
 
         if (restoredState is null)
         {
@@ -182,7 +194,7 @@ public sealed class ViewAllGraphService : IDisposable
             node.ChildLoadLimit = Options.SafeMaximumChildren;
             node.NotifyChildrenChanged();
             RevealLoadedBranch(node);
-            _layout.PlaceChildren(node, node.Children, Nodes);
+            _layout.PlaceChildren(node, node.Children, Index);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return new ViewAllExpansionResult(node, added, WasLoaded: true, snapshot.IsTruncated);
@@ -221,6 +233,25 @@ public sealed class ViewAllGraphService : IDisposable
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    /// <summary>Collapses every expanded root branch without discarding loaded data.</summary>
+    public void CollapseAll()
+    {
+        ThrowIfDisposed();
+        foreach (var node in _nodes.Where(node => node.IsExpanded).ToArray())
+        {
+            CancelLoad(node);
+            node.IsExpanded = false;
+        }
+
+        foreach (var root in _roots)
+        {
+            HideDescendants(root);
+        }
+
+        UpdateEdgeVisibility();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     /// <summary>
     /// Explicit progressive loading for unusually large folders. It re-reads
     /// only this one directory with a larger cap and appends previously unseen
@@ -228,7 +259,7 @@ public sealed class ViewAllGraphService : IDisposable
     /// </summary>
     public async Task<ViewAllExpansionResult> LoadMoreAsync(
         ViewAllNodeViewModel node,
-        int additionalChildren = 750,
+        int additionalChildren = 5_000,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
@@ -238,7 +269,10 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         var currentLimit = Math.Max(node.ChildLoadLimit, Options.SafeMaximumChildren);
-        var nextLimit = Math.Clamp(currentLimit + Math.Max(32, additionalChildren), 32, 10_000);
+        var nextLimit = Math.Clamp(
+            currentLimit + Math.Max(32, additionalChildren),
+            32,
+            ViewAllGraphOptions.MaximumChildrenCeiling);
         var pageOptions = Options with { MaximumChildrenPerFolder = nextLimit };
         CancelLoad(node);
         var loadCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -253,7 +287,7 @@ public sealed class ViewAllGraphService : IDisposable
             node.ChildLoadLimit = nextLimit;
             node.IsTruncated = snapshot.IsTruncated;
             node.NotifyChildrenChanged();
-            _layout.PlaceChildren(node, added, Nodes);
+            _layout.PlaceChildren(node, added, Index);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return new ViewAllExpansionResult(node, added, WasLoaded: true, snapshot.IsTruncated);
@@ -343,14 +377,14 @@ public sealed class ViewAllGraphService : IDisposable
         try
         {
             var descriptor = await _fileSystem.DescribeDirectoryAsync(directoryPath, cancellationToken);
-            if (_nodesByPath.ContainsKey(descriptor.FullPath))
+            if (_nodesByPath.TryGetValue(descriptor.FullPath, out var alreadyKnown))
             {
-                return _nodesByPath[descriptor.FullPath];
+                return alreadyKnown;
             }
 
             var root = CreateNode(descriptor, depth: 0, parent: null);
             RestorePosition(root);
-            _layout.PlaceRoots([root], Nodes);
+            _layout.PlaceRoots([root], Index);
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return root;
         }
@@ -375,10 +409,23 @@ public sealed class ViewAllGraphService : IDisposable
 
     public ViewAllNodeViewModel? FindNearestDropTarget(Point graphPoint, double maximumDistance = 96)
     {
+        var probe = new Rect(
+            graphPoint.X - maximumDistance,
+            graphPoint.Y - maximumDistance,
+            maximumDistance * 2,
+            maximumDistance * 2);
+        var candidates = new List<ViewAllNodeViewModel>(32);
+        Index.Query(probe, candidates);
+
         ViewAllNodeViewModel? nearest = null;
         var nearestDistance = double.MaxValue;
-        foreach (var node in Nodes.Where(node => node.IsTreeVisible && node.IsDirectory))
+        foreach (var node in candidates)
         {
+            if (!node.IsTreeVisible || !node.IsDirectory)
+            {
+                continue;
+            }
+
             var bounds = node.Bounds;
             var dx = Math.Max(bounds.Left - graphPoint.X, Math.Max(0, graphPoint.X - bounds.Right));
             var dy = Math.Max(bounds.Top - graphPoint.Y, Math.Max(0, graphPoint.Y - bounds.Bottom));
@@ -393,14 +440,18 @@ public sealed class ViewAllGraphService : IDisposable
         return nearestDistance <= maximumDistance ? nearest : null;
     }
 
+    /// <summary>The visible node under a graph-space point, if any.</summary>
+    public ViewAllNodeViewModel? HitTest(Point graphPoint)
+        => Index.HitTest(graphPoint, node => node.IsTreeVisible);
+
     public ViewAllWorkspaceState CaptureState(ViewAllViewportState viewport)
         => new()
         {
             ViewportX = viewport.Location.X,
             ViewportY = viewport.Location.Y,
             ViewportZoom = viewport.Zoom,
-            ExtraRoots = Roots.Where(node => !node.IsDrive).Select(node => node.FullPath).ToList(),
-            Nodes = Nodes.Select(node => new ViewAllNodeState(
+            ExtraRoots = _roots.Where(node => !node.IsDrive).Select(node => node.FullPath).ToList(),
+            Nodes = _nodes.Select(node => new ViewAllNodeState(
                     node.FullPath,
                     node.Location.X,
                     node.Location.Y,
@@ -414,30 +465,30 @@ public sealed class ViewAllGraphService : IDisposable
         int depth,
         ViewAllNodeViewModel? parent)
     {
-        var node = new ViewAllNodeViewModel(entry, depth, parent);
-        Nodes.Add(node);
+        var node = new ViewAllNodeViewModel(entry, depth, parent)
+        {
+            LocationObserver = OnNodeMoved
+        };
+
+        _nodes.Add(node);
         _nodesByPath[entry.FullPath] = node;
+        if (parent is null)
+        {
+            _roots.Add(node);
+        }
+
         NodeCreated?.Invoke(node);
         return node;
     }
 
-    /// <summary>Collapses every expanded root branch without discarding loaded data.</summary>
-    public void CollapseAll()
+    private void OnNodeMoved(ViewAllNodeViewModel node)
     {
-        ThrowIfDisposed();
-        foreach (var node in Nodes.Where(node => node.IsExpanded).ToArray())
+        // A node without a layout position has not been placed yet; indexing it
+        // at the origin would make the origin look occupied to the layout.
+        if (node.HasLayoutPosition)
         {
-            CancelLoad(node);
-            node.IsExpanded = false;
+            Index.AddOrUpdate(node);
         }
-
-        foreach (var root in Roots)
-        {
-            HideDescendants(root);
-        }
-
-        UpdateEdgeVisibility();
-        GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private void ApplySnapshot(
@@ -460,7 +511,7 @@ public sealed class ViewAllGraphService : IDisposable
             RestorePosition(child);
             parent.Children.Add(child);
             var edge = new ViewAllEdgeViewModel(parent, child);
-            Edges.Add(edge);
+            _edges.Add(edge);
             _incomingEdges[child.Id] = edge;
             added.Add(child);
         }
@@ -501,7 +552,7 @@ public sealed class ViewAllGraphService : IDisposable
 
     private void UpdateEdgeVisibility()
     {
-        foreach (var edge in Edges)
+        foreach (var edge in _edges)
         {
             edge.IsTreeVisible = edge.Source.IsTreeVisible
                 && edge.Source.IsExpanded
@@ -523,20 +574,42 @@ public sealed class ViewAllGraphService : IDisposable
 
     private void RemoveDescendants(ViewAllNodeViewModel parent)
     {
-        foreach (var child in parent.Children.ToArray())
+        var doomed = new List<ViewAllNodeViewModel>();
+        Collect(parent);
+
+        void Collect(ViewAllNodeViewModel node)
         {
-            CancelLoad(child);
-            RemoveDescendants(child);
-            if (_incomingEdges.Remove(child.Id, out var edge))
+            foreach (var child in node.Children)
             {
-                Edges.Remove(edge);
+                doomed.Add(child);
+                Collect(child);
+            }
+        }
+
+        if (doomed.Count == 0)
+        {
+            parent.Children.Clear();
+            return;
+        }
+
+        var doomedSet = new HashSet<ViewAllNodeViewModel>(doomed);
+        foreach (var node in doomed)
+        {
+            CancelLoad(node);
+            node.LocationObserver = null;
+            Index.Remove(node);
+            if (_incomingEdges.Remove(node.Id, out var edge))
+            {
                 edge.Dispose();
             }
 
-            _nodesByPath.Remove(child.FullPath);
-            Nodes.Remove(child);
+            _nodesByPath.Remove(node.FullPath);
+            node.Children.Clear();
         }
 
+        // One compacting pass instead of a removal scan per node.
+        _nodes.RemoveAll(doomedSet.Contains);
+        _edges.RemoveAll(edge => doomedSet.Contains(edge.Target) || doomedSet.Contains(edge.Source));
         parent.Children.Clear();
     }
 
@@ -559,14 +632,22 @@ public sealed class ViewAllGraphService : IDisposable
         }
         _loads.Clear();
 
-        foreach (var edge in Edges)
+        foreach (var edge in _edges)
         {
             edge.Dispose();
         }
-        Edges.Clear();
-        Nodes.Clear();
+
+        foreach (var node in _nodes)
+        {
+            node.LocationObserver = null;
+        }
+
+        _edges.Clear();
+        _nodes.Clear();
+        _roots.Clear();
         _incomingEdges.Clear();
         _nodesByPath.Clear();
+        Index.Clear();
     }
 
     private static int PathDepth(string path)

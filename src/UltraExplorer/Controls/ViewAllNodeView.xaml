@@ -10,6 +10,11 @@
              AutomationProperties.HelpText="{Binding FullPath}"
              MouseDoubleClick="Node_MouseDoubleClick"
              PreviewMouseRightButtonUp="Node_PreviewMouseRightButtonUp">
+    <!-- The node is designed at 188 x 44 and scaled by depth, so a deep branch
+         takes proportionally less canvas without a second set of templates. -->
+    <UserControl.LayoutTransform>
+        <ScaleTransform ScaleX="{Binding Scale}" ScaleY="{Binding Scale}" />
+    </UserControl.LayoutTransform>
     <UserControl.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
         <converters:NullToVisibilityConverter x:Key="NullToVisibility" />

@@ -38,6 +38,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private Size _viewportSize = new(1200, 800);
     private double _viewportZoom = 1;
     private int _logicalNodeCount;
+    private int _visibleNodeCount;
+    private bool _isOverviewActive;
     private string _statusCountText = string.Empty;
     private string _statusPathText = string.Empty;
 
@@ -108,6 +110,25 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>Raised when a message belongs on the shell toast.</summary>
     public event Action<string, bool>? MessageRequested;
+
+    /// <summary>Raised when the graph structure changed and cached drawing is stale.</summary>
+    public event Action? GraphInvalidated;
+
+    /// <summary>Grid the overview layer draws from.</summary>
+    public ViewAllSpatialIndex SpatialIndex => _graph.Index;
+
+    /// <summary>
+    /// True while the canvas is far enough out that the graph is drawn as
+    /// batched geometry rather than as one control per node.
+    /// </summary>
+    public bool IsOverviewActive
+    {
+        get => _isOverviewActive;
+        private set => SetProperty(ref _isOverviewActive, value);
+    }
+
+    /// <summary>The visible node under a graph-space point.</summary>
+    public ViewAllNodeViewModel? HitTest(Point graphPoint) => _graph.HitTest(graphPoint);
 
     public ViewAllNodeViewModel? ActiveNode
     {
@@ -536,6 +557,25 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         ScheduleSave();
     }
 
+    /// <summary>Bounds of the current selection, or empty when nothing is selected.</summary>
+    public Rect GetSelectionExtent()
+    {
+        var selected = SelectedNodes.Where(node => node.HasLayoutPosition).ToArray();
+        if (selected.Length == 0)
+        {
+            return Rect.Empty;
+        }
+
+        var extent = selected[0].Bounds;
+        foreach (var node in selected.Skip(1))
+        {
+            extent.Union(node.Bounds);
+        }
+
+        extent.Inflate(200, 200);
+        return extent;
+    }
+
     public Rect GetContentExtent()
     {
         var visible = _graph.Nodes.Where(node => node.IsTreeVisible && node.HasLayoutPosition).ToArray();
@@ -684,14 +724,61 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }, DispatcherPriority.Background);
     }
 
-    private void OnGraphChanged(object? sender, EventArgs e) => RebuildRenderSet();
+    private void OnGraphChanged(object? sender, EventArgs e)
+    {
+        // Counting once per structural change keeps it off the pan path.
+        var visible = 0;
+        foreach (var node in _graph.Nodes)
+        {
+            if (node.IsTreeVisible)
+            {
+                visible++;
+            }
+        }
+
+        _visibleNodeCount = visible;
+        GraphInvalidated?.Invoke();
+        RebuildRenderSet();
+    }
 
     private void OnNodeCreated(ViewAllNodeViewModel node)
     {
         var mark = _marks.Get(node.FullPath);
         node.AccentHex = mark.AccentHex;
         node.Note = mark.Note;
-        node.Icon = _icons.GetSmallIcon(node.FullPath, node.IsDirectory);
+
+        // Cached only. Resolving through the Shell here would add milliseconds
+        // per distinct executable to every expansion, on the UI thread.
+        node.Icon = _icons.GetCached(node.FullPath, node.IsDirectory);
+    }
+
+    /// <summary>
+    /// Icons are fetched for what is actually on screen, and only once the nodes
+    /// are large enough for an icon to be visible at all.
+    /// </summary>
+    private void RequestIcons(IReadOnlyList<ViewAllNodeViewModel> nodes, ViewAllDetailLevel detail)
+    {
+        if (detail < ViewAllDetailLevel.Compact)
+        {
+            return;
+        }
+
+        foreach (var node in nodes)
+        {
+            if (node.Icon is not null)
+            {
+                continue;
+            }
+
+            var target = node;
+            _icons.Request(target.FullPath, target.IsDirectory, icon =>
+            {
+                if (!_isDisposed && icon is not null)
+                {
+                    target.Icon = icon;
+                }
+            });
+        }
     }
 
     private void OnMarkChanged(string path, FolderMark mark)
@@ -736,11 +823,19 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
 
         var viewport = new Rect(_viewportLocation, _viewportSize);
-        var set = _viewportService.BuildRenderSet(_graph.Nodes, _graph.Edges, viewport, _viewportZoom);
+        var set = _viewportService.BuildRenderSet(
+            _graph.Index,
+            _graph.Edges,
+            SelectedNodes,
+            viewport,
+            _viewportZoom,
+            _visibleNodeCount);
         Sync(RenderNodes, set.Nodes);
         Sync(RenderEdges, set.Edges);
         DetailLevel = set.DetailLevel;
         LogicalNodeCount = set.LogicalNodeCount;
+        IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel);
+        RequestIcons(set.Nodes, set.DetailLevel);
     }
 
     private static void Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired)

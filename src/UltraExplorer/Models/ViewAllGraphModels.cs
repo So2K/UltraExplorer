@@ -19,6 +19,8 @@ public enum ViewAllEntryKind
 /// </summary>
 public enum ViewAllDetailLevel
 {
+    /// <summary>So far out that individual objects are aggregated into blocks.</summary>
+    Cluster,
     Dot,
     Glyph,
     Compact,
@@ -47,9 +49,12 @@ public sealed record ViewAllDirectorySnapshot(
 public sealed record ViewAllGraphOptions(
     bool IncludeHidden = false,
     bool FollowReparsePoints = false,
-    int MaximumChildrenPerFolder = 750)
+    int MaximumChildrenPerFolder = 5_000)
 {
-    public int SafeMaximumChildren => Math.Clamp(MaximumChildrenPerFolder, 32, 10_000);
+    /// <summary>Absolute ceiling for one folder, however often Load more is used.</summary>
+    public const int MaximumChildrenCeiling = 250_000;
+
+    public int SafeMaximumChildren => Math.Clamp(MaximumChildrenPerFolder, 32, MaximumChildrenCeiling);
 }
 
 public sealed class ViewAllWorkspaceState

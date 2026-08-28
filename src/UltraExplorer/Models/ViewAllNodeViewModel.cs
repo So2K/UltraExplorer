@@ -14,6 +14,12 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     public const double DefaultWidth = 188;
     public const double DefaultHeight = 44;
 
+    /// <summary>Every this many levels the node is half the size.</summary>
+    public const int ScaleHalvingDepth = 8;
+
+    /// <summary>Past this depth the node stops shrinking.</summary>
+    public const int MaximumScaledDepth = 32;
+
     private Point _location;
     private bool _hasLayoutPosition;
     private bool _hasManualPosition;
@@ -41,7 +47,14 @@ public sealed class ViewAllNodeViewModel : ObservableObject
         Depth = depth;
         Parent = parent;
         Id = ViewAllNodeIdentity.FromPath(entry.FullPath);
+        Scale = Math.Pow(0.5, Math.Min(depth, MaximumScaledDepth) / (double)ScaleHalvingDepth);
     }
+
+    /// <summary>
+    /// Set by the graph so a move can update the spatial index in constant time
+    /// instead of forcing a rebuild over every node.
+    /// </summary>
+    internal Action<ViewAllNodeViewModel>? LocationObserver { get; set; }
 
     public Guid Id { get; }
     public ViewAllEntryDescriptor Entry { get; }
@@ -66,12 +79,22 @@ public sealed class ViewAllNodeViewModel : ObservableObject
 
     /// <summary>
     /// Public setter intentionally treats a change from the canvas as a user
-    /// move.  Layout code uses SetAutomaticLocation instead.
+    /// move, and carries the whole subtree with it: dragging a drive drags its
+    /// tree.  Layout code uses SetAutomaticLocation instead, which moves only
+    /// the node itself.
     /// </summary>
     public Point Location
     {
         get => _location;
-        set => SetLocation(value, isManual: true, hasPosition: true);
+        set
+        {
+            var delta = value - _location;
+            SetLocation(value, isManual: true, hasPosition: true);
+            if (delta.X != 0 || delta.Y != 0)
+            {
+                OffsetDescendants(delta);
+            }
+        }
     }
 
     public bool HasLayoutPosition
@@ -233,9 +256,22 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     /// <summary>Disclosure chevron rotation: 0 collapsed, 90 expanded.</summary>
     public double ChevronAngle => IsExpanded ? 90 : 0;
 
-    public Point InputAnchor => new(Location.X, Location.Y + DefaultHeight / 2);
-    public Point OutputAnchor => new(Location.X + DefaultWidth, Location.Y + DefaultHeight / 2);
-    public Rect Bounds => new(Location, new Size(DefaultWidth, DefaultHeight));
+    /// <summary>
+    /// Size relative to a root.  A deeper folder occupies proportionally less of
+    /// the canvas: half the size every <see cref="ScaleHalvingDepth"/> levels, so
+    /// depth 8 is 50%, depth 16 is 25% and depth 32 is 6.25%.
+    /// </summary>
+    public double Scale { get; }
+
+    public double Width => DefaultWidth * Scale;
+
+    public double Height => DefaultHeight * Scale;
+
+    // Top-down tree: a branch leaves the bottom of the parent and enters the
+    // top of the child.
+    public Point InputAnchor => new(Location.X + Width / 2, Location.Y);
+    public Point OutputAnchor => new(Location.X + Width / 2, Location.Y + Height);
+    public Rect Bounds => new(Location, new Size(Width, Height));
 
     public void SetAutomaticLocation(Point location)
         => SetLocation(location, isManual: false, hasPosition: true);
@@ -265,6 +301,35 @@ public sealed class ViewAllNodeViewModel : ObservableObject
         OnPropertyChanged(nameof(HasVisibleChildren));
     }
 
+    /// <summary>
+    /// Shifts every descendant by the same delta.  A descendant that is itself
+    /// selected is skipped: the canvas is already dragging it, and its own
+    /// setter carries its subtree, so touching it here would move it twice.
+    /// </summary>
+    private void OffsetDescendants(Vector delta)
+    {
+        foreach (var child in Children)
+        {
+            if (child.IsSelected)
+            {
+                continue;
+            }
+
+            child.OffsetSelf(delta);
+        }
+    }
+
+    private void OffsetSelf(Vector delta)
+    {
+        _location = new Point(_location.X + delta.X, _location.Y + delta.Y);
+        OnPropertyChanged(nameof(Location));
+        OnPropertyChanged(nameof(InputAnchor));
+        OnPropertyChanged(nameof(OutputAnchor));
+        OnPropertyChanged(nameof(Bounds));
+        LocationObserver?.Invoke(this);
+        OffsetDescendants(delta);
+    }
+
     private void SetLocation(Point location, bool isManual, bool hasPosition)
     {
         var changed = SetProperty(ref _location, location, nameof(Location));
@@ -275,6 +340,7 @@ public sealed class ViewAllNodeViewModel : ObservableObject
             OnPropertyChanged(nameof(InputAnchor));
             OnPropertyChanged(nameof(OutputAnchor));
             OnPropertyChanged(nameof(Bounds));
+            LocationObserver?.Invoke(this);
         }
     }
 }

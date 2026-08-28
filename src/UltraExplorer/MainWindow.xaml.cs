@@ -33,16 +33,17 @@ public partial class MainWindow : Window
     private bool _maximizeHover;
     private bool _sidebarCollapsed;
     private double _restoredSidebarWidth = 240;
+    private bool _isSpaceHeld;
+    private bool _isSpacePanning;
+    private Point _panPointerAnchor;
+    private Point _panViewportAnchor;
 
     public MainWindow()
     {
         InitializeComponent();
         DataContext = _viewModel;
 
-        EditorGestures.Mappings.Editor.ZoomModifierKey = ModifierKeys.Control;
-        EditorGestures.Mappings.Editor.PanWithMouseWheel = true;
-        EditorGestures.Mappings.Editor.PanVerticalModifierKey = ModifierKeys.None;
-        EditorGestures.Mappings.Editor.PanHorizontalModifierKey = ModifierKeys.Shift;
+        ConfigureFigmaGestures();
 
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
@@ -50,6 +51,13 @@ public partial class MainWindow : Window
         _viewModel.ConfirmRequested += ShowConfirmDialog;
         _viewModel.ContextMenuRequested += ShowContextMenu;
         _viewModel.Tree.FocusNodeRequested += FocusNode;
+        _viewModel.Tree.GraphInvalidated += OnGraphInvalidated;
+
+        Overview.Index = _viewModel.Tree.SpatialIndex;
+        if (TryFindResource("EdgeColor") is Color edgeColor)
+        {
+            Overview.SetEdgeColor(edgeColor);
+        }
 
         StateChanged += (_, _) => MaximizeGlyph.Text = WindowState == WindowState.Maximized ? "\uE923" : "\uE922";
     }
@@ -57,6 +65,13 @@ public partial class MainWindow : Window
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
+
+        // ViewportUpdated only fires for zoom and resize, so panning would leave
+        // both the culling and the batched overview showing a stale viewport.
+        DependencyPropertyDescriptor
+            .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
+            .AddValueChanged(Editor, OnViewportLocationChanged);
+
         var handle = new WindowInteropHelper(this).Handle;
         var darkMode = 1;
         var cornerPreference = 2;
@@ -92,12 +107,17 @@ public partial class MainWindow : Window
 
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
+
+        Editor.Focus();
     }
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
         if (_allowClose)
         {
+            DependencyPropertyDescriptor
+                .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
+                .RemoveValueChanged(Editor, OnViewportLocationChanged);
             _capture?.Dispose();
             _viewModel.Dispose();
             return;
@@ -110,12 +130,138 @@ public partial class MainWindow : Window
         Close();
     }
 
+    /// <summary>
+    /// Canvas navigation matched to Figma: wheel scrolls, Shift+wheel scrolls
+    /// sideways, Ctrl+wheel zooms at the pointer, the middle button drags the
+    /// canvas whatever modifier is held, space turns the left button into a
+    /// grab hand, and the right button is a context menu rather than a pan.
+    /// </summary>
+    private static void ConfigureFigmaGestures()
+    {
+        var editor = EditorGestures.Mappings.Editor;
+        editor.ZoomModifierKey = ModifierKeys.Control;
+        editor.PanWithMouseWheel = true;
+        editor.PanVerticalModifierKey = ModifierKeys.None;
+        editor.PanHorizontalModifierKey = ModifierKeys.Shift;
+
+        // A MouseGesture matches one exact modifier combination, so holding
+        // Ctrl to zoom used to cancel the middle-button pan. Bind them all.
+        ModifierKeys[] everyModifier =
+        [
+            ModifierKeys.None,
+            ModifierKeys.Control,
+            ModifierKeys.Shift,
+            ModifierKeys.Alt,
+            ModifierKeys.Control | ModifierKeys.Shift,
+            ModifierKeys.Control | ModifierKeys.Alt,
+            ModifierKeys.Shift | ModifierKeys.Alt,
+            ModifierKeys.Control | ModifierKeys.Shift | ModifierKeys.Alt
+        ];
+
+        // Nodify's own MouseGesture is used, not WPF's: it can ignore the modifier
+        // state on release, so letting go of Ctrl mid-drag cannot strand the pan.
+        var middleDrag = everyModifier
+            .Select(modifier => (InputGesture)new Nodify.Interactivity.MouseGesture(
+                MouseAction.MiddleClick,
+                modifier,
+                ignoreModifierKeysOnRelease: true))
+            .ToArray();
+        editor.Pan.Value = new MultiGesture(MultiGesture.Match.Any, middleDrag);
+    }
+
+    private void SetSpacePanArmed(bool armed)
+    {
+        if (_isSpaceHeld == armed)
+        {
+            return;
+        }
+
+        _isSpaceHeld = armed;
+        Editor.Cursor = armed ? Cursors.Hand : null;
+    }
+
+    private void Editor_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (!_isSpaceHeld)
+        {
+            return;
+        }
+
+        _isSpacePanning = true;
+        _panPointerAnchor = e.GetPosition(Editor);
+        _panViewportAnchor = Editor.ViewportLocation;
+        Editor.Cursor = Cursors.SizeAll;
+        Editor.CaptureMouse();
+        e.Handled = true;
+    }
+
+    private void Editor_PreviewMouseMove(object sender, MouseEventArgs e)
+    {
+        if (!_isSpacePanning)
+        {
+            return;
+        }
+
+        var moved = e.GetPosition(Editor) - _panPointerAnchor;
+        Editor.ViewportLocation = _panViewportAnchor - moved / Math.Max(Editor.ViewportZoom, 0.001);
+        PushViewport();
+        e.Handled = true;
+    }
+
+    private void Editor_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (!_isSpacePanning)
+        {
+            return;
+        }
+
+        _isSpacePanning = false;
+        Editor.ReleaseMouseCapture();
+        Editor.Cursor = _isSpaceHeld ? Cursors.Hand : null;
+        e.Handled = true;
+    }
+
+    private void ZoomToSelection()
+    {
+        var extent = _viewModel.Tree.GetSelectionExtent();
+        if (extent.IsEmpty)
+        {
+            FitAll();
+            return;
+        }
+
+        Editor.FitToScreen(extent);
+        PushViewport();
+    }
+
     // ---- Canvas wiring -----------------------------------------------------
 
     private void Editor_ViewportUpdated(object sender, RoutedEventArgs e) => PushViewport();
 
+    private void OnViewportLocationChanged(object? sender, EventArgs e) => PushViewport();
+
     private void PushViewport()
-        => _viewModel.Tree.UpdateViewport(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+    {
+        _viewModel.Tree.UpdateViewport(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+
+        // Cheap unless the viewport left the window the geometry was built for:
+        // normally this just moves an already uploaded visual.
+        Overview.Update(
+            Editor.ViewportLocation,
+            Editor.ViewportSize,
+            Editor.ViewportZoom,
+            _viewModel.Tree.DetailLevel);
+    }
+
+    private void OnGraphInvalidated()
+    {
+        Overview.InvalidateGeometry();
+        Overview.Update(
+            Editor.ViewportLocation,
+            Editor.ViewportSize,
+            Editor.ViewportZoom,
+            _viewModel.Tree.DetailLevel);
+    }
 
     private void FitAll()
     {
@@ -152,8 +298,8 @@ public partial class MainWindow : Window
         Dispatcher.InvokeAsync(() =>
         {
             var center = new Point(
-                node.Location.X + ViewAllNodeViewModel.DefaultWidth / 2,
-                node.Location.Y + ViewAllNodeViewModel.DefaultHeight / 2);
+                node.Location.X + node.Width / 2,
+                node.Location.Y + node.Height / 2);
             Editor.BringIntoView(center, animated);
             PushViewport();
         }, DispatcherPriority.Background);
@@ -167,9 +313,23 @@ public partial class MainWindow : Window
 
     private void Editor_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (e.OriginalSource == Editor)
+        if (e.OriginalSource != Editor)
         {
-            Keyboard.ClearFocus();
+            return;
+        }
+
+        // Focus moves to the canvas rather than being cleared: with no focused
+        // element WPF has nowhere to route key events, and every shortcut except
+        // the Alt ones (which go through system-key handling) stops working.
+        Editor.Focus();
+
+        // While the overview is drawing, there are no node controls to click,
+        // so hit-test the graph directly and keep selection working.
+        if (_viewModel.Tree.IsOverviewActive
+            && _viewModel.Tree.HitTest(Editor.GetLocationInsideEditor(e)) is { } node)
+        {
+            _viewModel.Tree.SelectOnly(node);
+            e.Handled = true;
         }
     }
 
@@ -279,29 +439,24 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (paths.Count == 1)
+        try
         {
-            try
-            {
-                var screenPoint = origin.PointToScreen(point);
-                var handle = new WindowInteropHelper(this).Handle;
-                NativeShellService.ShowNativeContextMenu(
+            if (PresentationSource.FromVisual(this) is HwndSource source
+                && NativeShellService.TryShowNativeContextMenu(
                     paths,
-                    screenPoint,
-                    handle,
-                    Keyboard.Modifiers.HasFlag(ModifierKeys.Shift));
-            }
-            catch (Exception ex)
+                    source,
+                    origin.PointToScreen(point),
+                    Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)))
             {
-                _viewModel.Toast.ShowError($"Windows context menu failed: {ex.Message}");
+                return;
             }
-
-            return;
+        }
+        catch (Exception ex)
+        {
+            _viewModel.Toast.ShowError($"Windows context menu failed: {ex.Message}");
         }
 
-        // The multi-item Shell menu still needs its own STA/IContextMenu3 host,
-        // so a selection of several items uses the app menu instead of risking
-        // the Shell taking the process down.
+        // Items spread across different folders have no single Shell menu.
         ShowSelectionMenu(origin);
     }
 
@@ -618,6 +773,9 @@ public partial class MainWindow : Window
             case (ModifierKeys.Alt, Key.Enter):
                 _viewModel.PropertiesCommand.Execute(null);
                 break;
+            // Figma's viewport shortcuts, plus Ctrl+0 as a familiar alias.
+            case (ModifierKeys.Shift, Key.D0):
+            case (ModifierKeys.Shift, Key.NumPad0):
             case (ModifierKeys.Control, Key.D0):
             case (ModifierKeys.Control, Key.NumPad0):
                 _viewModel.ResetZoomCommand.Execute(null);
@@ -625,6 +783,21 @@ public partial class MainWindow : Window
             case (ModifierKeys.Shift, Key.D1):
             case (ModifierKeys.Shift, Key.NumPad1):
                 _viewModel.FitAllCommand.Execute(null);
+                break;
+            case (ModifierKeys.Shift, Key.D2):
+            case (ModifierKeys.Shift, Key.NumPad2):
+                ZoomToSelection();
+                break;
+            case (ModifierKeys.Control, Key.OemPlus):
+            case (ModifierKeys.Control, Key.Add):
+                _viewModel.ZoomInCommand.Execute(null);
+                break;
+            case (ModifierKeys.Control, Key.OemMinus):
+            case (ModifierKeys.Control, Key.Subtract):
+                _viewModel.ZoomOutCommand.Execute(null);
+                break;
+            case (ModifierKeys.None, Key.Space):
+                SetSpacePanArmed(true);
                 break;
             case (ModifierKeys.Shift, Key.F10):
                 ShowContextMenuForSelection();
@@ -658,6 +831,30 @@ public partial class MainWindow : Window
         }
 
         e.Handled = true;
+    }
+
+    private void Window_Activated(object? sender, EventArgs e)
+    {
+        // Coming back from another window can leave focus nowhere.
+        if (Keyboard.FocusedElement is null)
+        {
+            Editor.Focus();
+        }
+    }
+
+    private void Window_Deactivated(object? sender, EventArgs e)
+    {
+        // Alt+Tab while space is held would otherwise leave the grab hand on.
+        _isSpacePanning = false;
+        SetSpacePanArmed(false);
+    }
+
+    private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Space)
+        {
+            SetSpacePanArmed(false);
+        }
     }
 
     private void ShowContextMenuForSelection()

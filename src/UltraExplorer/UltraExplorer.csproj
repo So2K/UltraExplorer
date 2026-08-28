@@ -21,10 +21,14 @@
 
   <ItemGroup>
     <PackageReference Include="Nodify" Version="7.3.0" />
-    <PackageReference Include="Vanara.Windows.Shell" Version="5.0.7" />
   </ItemGroup>
 
   <ItemGroup>
     <Resource Include="Assets\UltraExplorer.ico" />
+  </ItemGroup>
+
+  <!-- The headless harness exercises the graph internals directly. -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="ViewAllSmoke" />
   </ItemGroup>
 </Project>

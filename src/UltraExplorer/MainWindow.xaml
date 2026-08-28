@@ -23,7 +23,10 @@
         Background="{StaticResource WindowBrush}"
         Loaded="Window_Loaded"
         Closing="Window_Closing"
-        PreviewKeyDown="Window_PreviewKeyDown">
+        PreviewKeyDown="Window_PreviewKeyDown"
+        PreviewKeyUp="Window_PreviewKeyUp"
+        Activated="Window_Activated"
+        Deactivated="Window_Deactivated">
     <shell:WindowChrome.WindowChrome>
         <shell:WindowChrome CaptionHeight="40"
                             ResizeBorderThickness="6"
@@ -393,6 +396,7 @@
 
             <Grid Grid.Column="2" Background="{StaticResource CanvasBrush}" ClipToBounds="True">
                 <nodify:NodifyEditor x:Name="Editor"
+                                     Focusable="True"
                                      ItemsSource="{Binding Tree.RenderNodes}"
                                      Connections="{Binding Tree.RenderEdges}"
                                      SelectedItems="{Binding Tree.SelectedNodes}"
@@ -408,6 +412,9 @@
                                      PreviewDragLeave="Editor_PreviewDragLeave"
                                      PreviewDrop="Editor_PreviewDrop"
                                      MouseLeftButtonDown="Editor_MouseLeftButtonDown"
+                                     PreviewMouseLeftButtonDown="Editor_PreviewMouseLeftButtonDown"
+                                     PreviewMouseMove="Editor_PreviewMouseMove"
+                                     PreviewMouseLeftButtonUp="Editor_PreviewMouseLeftButtonUp"
                                      PreviewMouseRightButtonUp="Editor_PreviewMouseRightButtonUp">
                     <nodify:NodifyEditor.Background>
                         <DrawingBrush TileMode="Tile" Viewport="0,0,26,26" ViewportUnits="Absolute" Viewbox="0,0,26,26" ViewboxUnits="Absolute">
@@ -435,8 +442,8 @@
                         <DataTemplate DataType="{x:Type models:ViewAllEdgeViewModel}">
                             <nodify:StepConnection Source="{Binding SourceAnchor}"
                                                    Target="{Binding TargetAnchor}"
-                                                   SourcePosition="Right"
-                                                   TargetPosition="Left"
+                                                   SourcePosition="Bottom"
+                                                   TargetPosition="Top"
                                                    Stroke="{StaticResource EdgeBrush}"
                                                    StrokeThickness="1.2"
                                                    CornerRadius="7"
@@ -446,6 +453,11 @@
                         </DataTemplate>
                     </nodify:NodifyEditor.ConnectionTemplate>
                 </nodify:NodifyEditor>
+
+                <!-- Batched drawing of the whole graph, used instead of node
+                     controls once the canvas is zoomed far enough out. -->
+                <controls:ViewAllOverviewLayer x:Name="Overview"
+                                               Visibility="{Binding Tree.IsOverviewActive, Converter={StaticResource BoolToVisibility}}" />
 
                 <!-- Search results -->
                 <Border Width="420"
@@ -566,8 +578,8 @@
                         <nodify:Minimap.ItemContainerStyle>
                             <Style TargetType="{x:Type nodify:MinimapItem}">
                                 <Setter Property="Location" Value="{Binding Location}" />
-                                <Setter Property="Width" Value="188" />
-                                <Setter Property="Height" Value="44" />
+                                <Setter Property="Width" Value="{Binding Width}" />
+                                <Setter Property="Height" Value="{Binding Height}" />
                             </Style>
                         </nodify:Minimap.ItemContainerStyle>
                         <nodify:Minimap.ViewportStyle>
@@ -590,16 +602,16 @@
                         BorderBrush="{StaticResource BorderStrongBrush}"
                         BorderThickness="1">
                     <StackPanel Orientation="Horizontal">
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomOutCommand}" ToolTip="Zoom out" AutomationProperties.Name="Zoom out">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomOutCommand}" ToolTip="Zoom out (Ctrl+-, Ctrl+wheel)" AutomationProperties.Name="Zoom out">
                             <TextBlock Text="&#xE949;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button Width="54" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100%" AutomationProperties.Name="Reset to 100%">
+                        <Button Width="54" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100% (Shift+0)" AutomationProperties.Name="Reset to 100%">
                             <TextBlock Text="{Binding Tree.ZoomLabel}" FontSize="10.5" />
                         </Button>
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in" AutomationProperties.Name="Zoom in">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in (Ctrl++, Ctrl+wheel)" AutomationProperties.Name="Zoom in">
                             <TextBlock Text="&#xE948;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all (Shift+1)" AutomationProperties.Name="Fit all">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all (Shift+1) — Shift+2 fits the selection" AutomationProperties.Name="Fit all">
                             <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
                         <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ToggleMinimapCommand}" ToolTip="Toggle minimap" AutomationProperties.Name="Toggle minimap">
