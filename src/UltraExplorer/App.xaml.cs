@@ -16,6 +16,12 @@ public partial class App : Application
 
         NodifyEditor.EnableDraggingContainersOptimizations = true;
         NodifyEditor.EnableSnappingCorrection = true;
+
+        // Between the batched overview and full zoom the editor still renders
+        // real containers; let it simplify them once they get small.
+        NodifyEditor.EnableRenderingContainersOptimizations = true;
+        NodifyEditor.OptimizeRenderingMinimumContainers = 200;
+        NodifyEditor.OptimizeRenderingZoomOutPercent = 0.6;
         base.OnStartup(e);
     }
 }

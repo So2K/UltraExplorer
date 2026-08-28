@@ -27,9 +27,16 @@ tests/ViewAllSmoke/bin/Debug/net10.0-windows/win-x64/ViewAllSmoke.exe
 ```
 
 `ViewAllSmoke` is a headless harness over the View All engine: lazy expansion,
-incremental layout, viewport culling, branch refresh, truncation, drop-target
-selection, drag rules and persistence. It builds a throwaway fixture under
-`%TEMP%`, prints one line per check and exits non-zero on the first failure.
+incremental layout, viewport culling and mip levels, depth scaling, branch
+refresh, truncation, drop-target selection, drag rules and persistence. It
+builds a throwaway fixture under `%TEMP%`, prints one line per check and exits
+non-zero on the first failure.
+
+Its `performance` section asserts wall-clock budgets rather than describing them
+— a spatial-index build over 300k nodes, viewport queries and render sets over
+that graph, reindexing 20k node moves, laying out 20k children of one folder —
+and `large real folder` expands `C:\Windows\System32` for real. Run it after any
+change to the graph, layout, index or viewport services.
 
 ## Publish
 

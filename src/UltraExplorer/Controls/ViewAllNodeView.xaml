@@ -194,16 +194,16 @@
                                Visibility="{Binding HasVisibleChildren, Converter={StaticResource BoolToVisibility}}" />
                 </StackPanel>
 
-                <ProgressBar Grid.Column="0"
-                             Grid.ColumnSpan="5"
-                             Height="2"
-                             VerticalAlignment="Bottom"
-                             Margin="6,0"
-                             IsIndeterminate="True"
-                             Background="Transparent"
-                             BorderThickness="0"
-                             Foreground="{StaticResource AccentBrush}"
-                             Visibility="{Binding IsLoading, Converter={StaticResource BoolToVisibility}}" />
+                <!-- A plain bar, not a ProgressBar: its template would add half a
+                     dozen visuals to every one of the hundreds of realized nodes. -->
+                <Border Grid.Column="0"
+                        Grid.ColumnSpan="5"
+                        Height="2"
+                        VerticalAlignment="Bottom"
+                        Margin="6,0"
+                        CornerRadius="1"
+                        Background="{StaticResource AccentBrush}"
+                        Visibility="{Binding IsLoading, Converter={StaticResource BoolToVisibility}}" />
             </Grid>
         </Border>
 
