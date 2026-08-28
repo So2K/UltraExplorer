@@ -1,23 +1,24 @@
 namespace UltraExplorer.Models;
 
+/// <summary>
+/// Shell-level state only.  Graph layout and viewport live in the separate
+/// View All workspace file.
+/// </summary>
 public sealed class WorkspaceState
 {
-    public List<NodeState> Nodes { get; set; } = [];
-    public List<ConnectionState> Connections { get; set; } = [];
+    public int SchemaVersion { get; set; } = 2;
     public List<FavoriteState> Favorites { get; set; } = [];
-    public double ViewportX { get; set; }
-    public double ViewportY { get; set; }
-    public double ViewportZoom { get; set; } = 1;
+    public double SidebarWidth { get; set; } = 240;
+    public bool IsMinimapVisible { get; set; }
+
+    /// <summary>
+    /// Version 1 stored a colour label and a note per canvas node.  They are
+    /// migrated into the path-keyed folder mark store on first load and then
+    /// stop being written.
+    /// </summary>
+    public List<LegacyNodeState> Nodes { get; set; } = [];
 }
 
-public sealed record NodeState(
-    Guid Id,
-    string Path,
-    double X,
-    double Y,
-    string AccentHex,
-    string Note);
-
-public sealed record ConnectionState(Guid SourceId, Guid TargetId);
-
 public sealed record FavoriteState(string Name, string Path, string Glyph, string AccentHex);
+
+public sealed record LegacyNodeState(string Path, string AccentHex, string Note);

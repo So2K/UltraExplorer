@@ -14,17 +14,18 @@
         Icon="Assets/UltraExplorer.ico"
         Width="1520"
         Height="900"
-        MinWidth="1050"
-        MinHeight="650"
+        MinWidth="960"
+        MinHeight="620"
         WindowStartupLocation="CenterScreen"
         WindowStyle="None"
         ResizeMode="CanResize"
         AllowsTransparency="False"
+        Background="{StaticResource WindowBrush}"
         Loaded="Window_Loaded"
         Closing="Window_Closing"
         PreviewKeyDown="Window_PreviewKeyDown">
     <shell:WindowChrome.WindowChrome>
-        <shell:WindowChrome CaptionHeight="0"
+        <shell:WindowChrome CaptionHeight="40"
                             ResizeBorderThickness="6"
                             CornerRadius="0"
                             GlassFrameThickness="0"
@@ -34,404 +35,640 @@
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
         <converters:StringToVisibilityConverter x:Key="StringToVisibility" />
-        <converters:CountToVisibilityConverter x:Key="CountToVisibility" />
-        <infra:BindingProxy x:Key="ViewModelProxy" Data="{Binding}" />
+        <converters:NullToVisibilityConverter x:Key="NullToVisibility" />
+        <converters:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVisibility" />
+        <converters:ZeroCountToVisibilityConverter x:Key="ZeroCountToVisibility" />
+        <infra:BindingProxy x:Key="Shell" Data="{Binding}" />
 
-        <Style x:Key="SidebarButton" TargetType="Button" BasedOn="{StaticResource FlatButton}">
-            <Setter Property="Height" Value="34" />
-            <Setter Property="Padding" Value="8,0" />
-            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-            <Setter Property="Margin" Value="7,1" />
-        </Style>
-
-        <Style x:Key="CommandButton" TargetType="Button" BasedOn="{StaticResource FlatButton}">
-            <Setter Property="Height" Value="32" />
-            <Setter Property="Padding" Value="9,0" />
-            <Setter Property="Margin" Value="1,0" />
-        </Style>
-
-        <DataTemplate x:Key="FavoriteTemplate" DataType="{x:Type models:FavoriteItemViewModel}">
-            <Button Style="{StaticResource SidebarButton}" Click="FavoriteButton_Click" Tag="{Binding}">
+        <DataTemplate x:Key="SidebarItemTemplate" DataType="{x:Type models:FavoriteItemViewModel}">
+            <Button Style="{StaticResource SidebarItem}"
+                    Tag="{Binding StateTag}"
+                    ToolTip="{Binding ToolTipText}"
+                    AutomationProperties.Name="{Binding Name}"
+                    Command="{Binding Data.OpenSidebarItemCommand, Source={StaticResource Shell}}"
+                    CommandParameter="{Binding}">
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="27" />
+                        <ColumnDefinition Width="24" />
                         <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="20" />
                     </Grid.ColumnDefinitions>
-                    <TextBlock Text="{Binding Glyph}" Style="{StaticResource IconText}" Foreground="{Binding AccentHex}" FontSize="14" />
-                    <TextBlock Grid.Column="1" Text="{Binding Name}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" FontSize="12" />
-                    <TextBlock Grid.Column="2" Text="&#xE76C;" Style="{StaticResource IconText}" FontSize="8" Foreground="{StaticResource TextDimBrush}" Opacity="0.45" />
+                    <Grid Width="16" Height="16" HorizontalAlignment="Left">
+                        <Image Source="{Binding Icon}" Width="16" Height="16" RenderOptions.BitmapScalingMode="HighQuality" />
+                        <TextBlock Text="{Binding Glyph}"
+                                   Style="{StaticResource IconText}"
+                                   FontSize="14"
+                                   Foreground="{StaticResource TextMutedBrush}"
+                                   Visibility="{Binding Icon, Converter={StaticResource NullToVisibility}, ConverterParameter=Invert}" />
+                    </Grid>
+                    <TextBlock Grid.Column="1"
+                               Text="{Binding Name}"
+                               VerticalAlignment="Center"
+                               FontSize="12"
+                               TextTrimming="CharacterEllipsis" />
                 </Grid>
+                <Button.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="Unpin from Home"
+                                  Command="{Binding Data.RemoveFavoriteCommand, Source={StaticResource Shell}}"
+                                  CommandParameter="{Binding}" />
+                    </ContextMenu>
+                </Button.ContextMenu>
             </Button>
         </DataTemplate>
     </Window.Resources>
 
-    <Grid Background="{StaticResource WindowBrush}">
+    <Grid>
         <Grid.RowDefinitions>
-            <RowDefinition Height="34" />
+            <RowDefinition Height="40" />
+            <RowDefinition Height="48" />
+            <RowDefinition Height="44" />
             <RowDefinition Height="*" />
+            <RowDefinition Height="24" />
         </Grid.RowDefinitions>
 
-        <!-- Native-feeling custom title bar; the resize/snap frame remains Win32. -->
-        <Border Grid.Row="0" Background="#0A0C10" BorderBrush="#222733" BorderThickness="0,0,0,1" MouseLeftButtonDown="TitleBar_MouseLeftButtonDown">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="46" />
-                    <ColumnDefinition Width="46" />
-                    <ColumnDefinition Width="46" />
-                </Grid.ColumnDefinitions>
-                <StackPanel Orientation="Horizontal" Margin="11,0,0,0" VerticalAlignment="Center">
-                    <Image Source="Assets/UltraExplorer.ico" Width="17" Height="17" />
-                    <TextBlock Text="UltraExplorer" Margin="8,0,0,0" VerticalAlignment="Center" FontSize="12" FontWeight="SemiBold" />
-                    <Border Margin="9,0,0,0" Padding="6,2" CornerRadius="4" Background="#1826447E">
-                        <TextBlock Text="ZUI" FontSize="9" Foreground="{StaticResource AccentBrightBrush}" FontWeight="SemiBold" />
-                    </Border>
-                </StackPanel>
-                <TextBlock Grid.Column="1" Text="{Binding ActiveNode.DisplayName}" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{StaticResource TextDimBrush}" FontSize="11" />
-                <Button Grid.Column="2" Style="{StaticResource FlatButton}" Padding="0" Click="MinimizeButton_Click" ToolTip="Minimize">
+        <!-- Title / tab strip -->
+        <Grid Grid.Row="0" Background="{StaticResource WindowBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal" VerticalAlignment="Bottom" Margin="8,0,0,0">
+                <Border Height="34"
+                        MinWidth="220"
+                        MaxWidth="260"
+                        CornerRadius="7,7,0,0"
+                        Background="{StaticResource SurfaceRaisedBrush}"
+                        shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                    <Grid Margin="10,0,4,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="22" />
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="28" />
+                        </Grid.ColumnDefinitions>
+                        <Image Source="Assets/UltraExplorer.ico" Width="16" Height="16" HorizontalAlignment="Left" />
+                        <TextBlock Grid.Column="1"
+                                   Text="{Binding TabTitle}"
+                                   VerticalAlignment="Center"
+                                   FontSize="12"
+                                   TextTrimming="CharacterEllipsis" />
+                        <Button Grid.Column="2"
+                                Width="28"
+                                Height="28"
+                                Padding="0"
+                                Style="{StaticResource FlatButton}"
+                                Click="CloseWindowButton_Click"
+                                ToolTip="Close tab" AutomationProperties.Name="Close tab">
+                            <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
+                        </Button>
+                    </Grid>
+                </Border>
+                <Button Width="32"
+                        Height="32"
+                        Padding="0"
+                        Margin="4,0,0,1"
+                        VerticalAlignment="Bottom"
+                        Style="{StaticResource FlatButton}"
+                        Click="NewTabButton_Click"
+                        ToolTip="Reset the canvas view" AutomationProperties.Name="Reset the canvas view"
+                        shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                    <TextBlock Text="&#xE710;" Style="{StaticResource IconText}" FontSize="11" />
+                </Button>
+            </StackPanel>
+
+            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top" shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                <Button Style="{StaticResource CaptionButton}" Click="MinimizeButton_Click" ToolTip="Minimize" AutomationProperties.Name="Minimize">
                     <TextBlock Text="&#xE921;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>
-                <Button Grid.Column="3" Style="{StaticResource FlatButton}" Padding="0" Click="MaximizeButton_Click" ToolTip="Maximize">
+                <Button x:Name="MaximizeButton" Style="{StaticResource CaptionButton}" Click="MaximizeButton_Click" ToolTip="Maximize" AutomationProperties.Name="Maximize">
                     <TextBlock x:Name="MaximizeGlyph" Text="&#xE922;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>
-                <Button Grid.Column="4" Style="{StaticResource FlatButton}" Padding="0" Click="CloseWindowButton_Click" ToolTip="Close">
-                    <Button.Template>
-                        <ControlTemplate TargetType="Button">
-                            <Border x:Name="Chrome" Background="Transparent">
-                                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
-                            </Border>
-                            <ControlTemplate.Triggers>
-                                <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="Chrome" Property="Background" Value="#C42B1C" />
-                                    <Setter Property="Foreground" Value="White" />
-                                </Trigger>
-                            </ControlTemplate.Triggers>
-                        </ControlTemplate>
-                    </Button.Template>
+                <Button Style="{StaticResource CloseCaptionButton}" Click="CloseWindowButton_Click" ToolTip="Close" AutomationProperties.Name="Close">
                     <TextBlock Text="&#xE8BB;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>
+            </StackPanel>
+        </Grid>
+
+        <!-- Navigation / address / search -->
+        <Grid Grid.Row="1" Background="{StaticResource WindowBrush}">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Orientation="Horizontal" Margin="8,0,0,0" VerticalAlignment="Center">
+                <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding BackCommand}" ToolTip="Back (Alt+Left)" AutomationProperties.Name="Back">
+                    <TextBlock Text="&#xE72B;" Style="{StaticResource IconText}" FontSize="14" />
+                </Button>
+                <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ForwardCommand}" ToolTip="Forward (Alt+Right)" AutomationProperties.Name="Forward">
+                    <TextBlock Text="&#xE72A;" Style="{StaticResource IconText}" FontSize="14" />
+                </Button>
+                <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding UpCommand}" ToolTip="Up (Alt+Up)" AutomationProperties.Name="Up">
+                    <TextBlock Text="&#xE74A;" Style="{StaticResource IconText}" FontSize="14" />
+                </Button>
+            </StackPanel>
+
+            <Border Grid.Column="1"
+                    Height="32"
+                    Margin="8,0,8,0"
+                    VerticalAlignment="Center"
+                    CornerRadius="4"
+                    Background="{StaticResource SurfaceRaisedBrush}"
+                    BorderBrush="{StaticResource BorderStrongBrush}"
+                    BorderThickness="1"
+                    MouseLeftButtonDown="AddressArea_MouseLeftButtonDown">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="26" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="30" />
+                    </Grid.ColumnDefinitions>
+
+                    <TextBlock Text="&#xE8B7;"
+                               Style="{StaticResource IconText}"
+                               FontSize="13"
+                               Foreground="{StaticResource FolderBrush}"
+                               IsHitTestVisible="False" />
+
+                    <ScrollViewer Grid.Column="1"
+                                  HorizontalScrollBarVisibility="Hidden"
+                                  VerticalScrollBarVisibility="Disabled"
+                                  Visibility="{Binding IsAddressEditing, Converter={StaticResource InverseBoolToVisibility}}">
+                        <ItemsControl ItemsSource="{Binding Breadcrumbs}" VerticalAlignment="Center">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate DataType="{x:Type models:BreadcrumbSegment}">
+                                    <StackPanel Orientation="Horizontal">
+                                        <Button Style="{StaticResource FlatButton}"
+                                                Height="24"
+                                                Padding="6,0"
+                                                Command="{Binding Data.OpenBreadcrumbCommand, Source={StaticResource Shell}}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip="{Binding FullPath}">
+                                            <TextBlock Text="{Binding Name}" FontSize="12" VerticalAlignment="Center" />
+                                        </Button>
+                                        <TextBlock Text="&#xE76C;"
+                                                   Style="{StaticResource IconText}"
+                                                   FontSize="7"
+                                                   Margin="1,0"
+                                                   Foreground="{StaticResource TextDimBrush}"
+                                                   Visibility="{Binding IsLast, Converter={StaticResource InverseBoolToVisibility}}" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </ScrollViewer>
+
+                    <TextBox x:Name="AddressBox"
+                             Grid.Column="1"
+                             Text="{Binding AddressText, UpdateSourceTrigger=PropertyChanged}"
+                             Background="Transparent"
+                             BorderThickness="0"
+                             Height="26"
+                             Padding="4,0"
+                             VerticalContentAlignment="Center"
+                             FontSize="12"
+                             KeyDown="AddressBox_KeyDown"
+                             LostKeyboardFocus="AddressBox_LostKeyboardFocus"
+                             Visibility="{Binding IsAddressEditing, Converter={StaticResource BoolToVisibility}}" />
+
+                    <Button Grid.Column="2"
+                            Width="28"
+                            Height="26"
+                            Padding="0"
+                            Style="{StaticResource FlatButton}"
+                            Command="{Binding RefreshCommand}"
+                            ToolTip="Refresh (F5)" AutomationProperties.Name="Refresh">
+                        <TextBlock Text="&#xE72C;" Style="{StaticResource IconText}" FontSize="12" />
+                    </Button>
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="2"
+                    Width="300"
+                    MinWidth="220"
+                    MaxWidth="360"
+                    Height="32"
+                    Margin="0,0,8,0"
+                    VerticalAlignment="Center"
+                    CornerRadius="4"
+                    Background="{StaticResource SurfaceRaisedBrush}"
+                    BorderBrush="{StaticResource BorderStrongBrush}"
+                    BorderThickness="1">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="30" />
+                    </Grid.ColumnDefinitions>
+                    <Grid>
+                        <TextBox x:Name="SearchBox"
+                                 Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+                                 Background="Transparent"
+                                 BorderThickness="0"
+                                 Height="26"
+                                 Padding="8,0"
+                                 VerticalContentAlignment="Center"
+                                 FontSize="12"
+                                 KeyDown="SearchBox_KeyDown" />
+                        <TextBlock Text="{Binding SearchPlaceholder}"
+                                   Margin="10,0,0,0"
+                                   VerticalAlignment="Center"
+                                   FontSize="12"
+                                   Foreground="{StaticResource TextDimBrush}"
+                                   IsHitTestVisible="False"
+                                   Visibility="{Binding SearchText, Converter={StaticResource StringToVisibility}, ConverterParameter=Invert}" />
+                    </Grid>
+                    <Button Grid.Column="1"
+                            Width="28"
+                            Height="26"
+                            Padding="0"
+                            Style="{StaticResource FlatButton}"
+                            Command="{Binding SearchCommand}"
+                            ToolTip="Search (Ctrl+F)" AutomationProperties.Name="Search">
+                        <TextBlock Text="&#xE721;" Style="{StaticResource IconText}" FontSize="12" />
+                    </Button>
+                </Grid>
+            </Border>
+        </Grid>
+
+        <!-- Command bar -->
+        <Border Grid.Row="2" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
+            <Grid Margin="8,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Style="{StaticResource CommandBarButton}" Click="OrganizeButton_Click" AutomationProperties.Name="Organize">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Organize" VerticalAlignment="Center" FontSize="12" />
+                            <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="8" Margin="7,2,0,0" />
+                        </StackPanel>
+                    </Button>
+                    <Button Style="{StaticResource CommandBarButton}" Click="GiveAccessButton_Click" AutomationProperties.Name="Give access to">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="Give access to" VerticalAlignment="Center" FontSize="12" />
+                            <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="8" Margin="7,2,0,0" />
+                        </StackPanel>
+                    </Button>
+                    <Button Style="{StaticResource CommandBarButton}" Command="{Binding NewFolderCommand}" ToolTip="New folder (Ctrl+Shift+N)" AutomationProperties.Name="New folder">
+                        <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="&#xE8F4;" Style="{StaticResource IconText}" FontSize="13" Margin="0,0,7,0" />
+                            <TextBlock Text="New folder" VerticalAlignment="Center" FontSize="12" />
+                        </StackPanel>
+                    </Button>
+
+                    <Border Width="1" Height="20" Margin="10,0" Background="{StaticResource BorderStrongBrush}" />
+
+                    <Border CornerRadius="4" Padding="2" Background="{StaticResource SurfaceRaisedBrush}" BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1">
+                        <StackPanel Orientation="Horizontal">
+                            <ToggleButton Style="{StaticResource SegmentButton}"
+                                          Content="View all"
+                                          IsChecked="{Binding IsViewAll, Mode=TwoWay}"
+                                          AutomationProperties.Name="View all"
+                                          ToolTip="Every drive is a root; folders expand into their direct children" />
+                            <ToggleButton Style="{StaticResource SegmentButton}"
+                                          Content="View select"
+                                          IsEnabled="False"
+                                          IsChecked="{Binding IsViewSelect, Mode=TwoWay}"
+                                          AutomationProperties.Name="View select"
+                                          ToolTip="Behaviour is not defined yet" />
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding CollapseAllCommand}" ToolTip="Collapse every branch" AutomationProperties.Name="Collapse every branch">
+                        <TextBlock Text="&#xE70E;" Style="{StaticResource IconText}" FontSize="13" />
+                    </Button>
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="LayoutButton_Click" ToolTip="Canvas options" AutomationProperties.Name="Canvas options">
+                        <TextBlock Text="&#xE8A9;" Style="{StaticResource IconText}" FontSize="13" />
+                    </Button>
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="PaneToggleButton_Click" ToolTip="Toggle the navigation pane" AutomationProperties.Name="Toggle the navigation pane">
+                        <TextBlock Text="&#xE8A4;" Style="{StaticResource IconText}" FontSize="13" />
+                    </Button>
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="OverflowButton_Click" ToolTip="More" AutomationProperties.Name="More">
+                        <TextBlock Text="&#xE712;" Style="{StaticResource IconText}" FontSize="13" />
+                    </Button>
+                </StackPanel>
             </Grid>
         </Border>
 
-        <Grid Grid.Row="1">
+        <!-- Navigation pane + canvas -->
+        <Grid Grid.Row="3">
             <Grid.ColumnDefinitions>
-                <ColumnDefinition x:Name="SidebarColumn" Width="224" MinWidth="184" MaxWidth="320" />
+                <ColumnDefinition x:Name="SidebarColumn" Width="240" MinWidth="190" MaxWidth="340" />
                 <ColumnDefinition Width="1" />
                 <ColumnDefinition Width="*" />
             </Grid.ColumnDefinitions>
 
-            <Border Grid.Column="0" Background="#11141B" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
-                <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="52" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-                    <Button Margin="8,8,8,6" Style="{StaticResource AccentButton}" Command="{Binding BrowseCommand}" HorizontalContentAlignment="Left">
-                        <StackPanel Orientation="Horizontal">
-                            <TextBlock Text="&#xE8B7;" Style="{StaticResource IconText}" Foreground="White" Margin="0,0,9,0" />
-                            <TextBlock Text="Add folder to canvas" VerticalAlignment="Center" />
-                        </StackPanel>
-                    </Button>
-
-                    <StackPanel Grid.Row="1" Margin="0,10,0,4">
-                        <TextBlock Text="FAVORITES" Margin="16,0,0,6" FontSize="9.5" FontWeight="SemiBold" Foreground="{StaticResource TextDimBrush}" />
-                        <ItemsControl ItemsSource="{Binding Favorites}" ItemTemplate="{StaticResource FavoriteTemplate}" />
+            <Border Grid.Column="0" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
+                <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <StackPanel Margin="0,8,0,12">
+                        <ItemsControl ItemsSource="{Binding HomeItems}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
+                        <Separator Margin="12,8" />
+                        <ItemsControl ItemsSource="{Binding QuickAccess}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
+                        <Separator Margin="12,8" />
+                        <TextBlock Text="This PC" Margin="16,2,0,4" FontSize="11" Foreground="{StaticResource TextDimBrush}" />
+                        <ItemsControl ItemsSource="{Binding Drives}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
+                        <Separator Margin="12,8" />
+                        <ItemsControl ItemsSource="{Binding NetworkLocations}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
                     </StackPanel>
-
-                    <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                        <StackPanel Margin="0,10,0,12">
-                            <Separator Margin="12,0,12,12" />
-                            <TextBlock Text="THIS PC" Margin="16,0,0,6" FontSize="9.5" FontWeight="SemiBold" Foreground="{StaticResource TextDimBrush}" />
-                            <ItemsControl ItemsSource="{Binding Drives}" ItemTemplate="{StaticResource FavoriteTemplate}" />
-                        </StackPanel>
-                    </ScrollViewer>
-
-                    <Border Grid.Row="3" Margin="10" Padding="10,8" CornerRadius="7" Background="#171B24">
-                        <StackPanel>
-                            <TextBlock Text="Canvas controls" FontSize="10.5" Foreground="{StaticResource TextMutedBrush}" />
-                            <TextBlock Margin="0,4,0,0" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextWrapping="Wrap"
-                                       Text="Middle/right drag: pan  •  Ctrl+wheel: zoom  •  Double-click a folder: expand" />
-                        </StackPanel>
-                    </Border>
-                </Grid>
+                </ScrollViewer>
             </Border>
 
-            <GridSplitter Grid.Column="1" Width="5" HorizontalAlignment="Center" Background="Transparent" ResizeDirection="Columns" ResizeBehavior="PreviousAndNext" />
+            <GridSplitter Grid.Column="1"
+                          Width="5"
+                          HorizontalAlignment="Center"
+                          Background="Transparent"
+                          ResizeDirection="Columns"
+                          ResizeBehavior="PreviousAndNext" />
 
-            <Grid Grid.Column="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="50" />
-                    <RowDefinition Height="42" />
-                    <RowDefinition Height="*" />
-                    <RowDefinition Height="29" />
-                </Grid.RowDefinitions>
+            <Grid Grid.Column="2" Background="{StaticResource CanvasBrush}" ClipToBounds="True">
+                <nodify:NodifyEditor x:Name="Editor"
+                                     ItemsSource="{Binding Tree.RenderNodes}"
+                                     Connections="{Binding Tree.RenderEdges}"
+                                     SelectedItems="{Binding Tree.SelectedNodes}"
+                                     MinViewportZoom="0.06"
+                                     MaxViewportZoom="3"
+                                     GridCellSize="16"
+                                     BringIntoViewSpeed="2200"
+                                     BringIntoViewMaxDuration="0.32"
+                                     DisplayConnectionsOnTop="False"
+                                     AllowDrop="True"
+                                     ViewportUpdated="Editor_ViewportUpdated"
+                                     PreviewDragOver="Editor_PreviewDragOver"
+                                     PreviewDragLeave="Editor_PreviewDragLeave"
+                                     PreviewDrop="Editor_PreviewDrop"
+                                     MouseLeftButtonDown="Editor_MouseLeftButtonDown"
+                                     PreviewMouseRightButtonUp="Editor_PreviewMouseRightButtonUp">
+                    <nodify:NodifyEditor.Background>
+                        <DrawingBrush TileMode="Tile" Viewport="0,0,26,26" ViewportUnits="Absolute" Viewbox="0,0,26,26" ViewboxUnits="Absolute">
+                            <DrawingBrush.Drawing>
+                                <GeometryDrawing Brush="#242424">
+                                    <GeometryDrawing.Geometry>
+                                        <EllipseGeometry Center="1,1" RadiusX="0.8" RadiusY="0.8" />
+                                    </GeometryDrawing.Geometry>
+                                </GeometryDrawing>
+                            </DrawingBrush.Drawing>
+                        </DrawingBrush>
+                    </nodify:NodifyEditor.Background>
+                    <nodify:NodifyEditor.ItemTemplate>
+                        <DataTemplate DataType="{x:Type models:ViewAllNodeViewModel}">
+                            <controls:ViewAllNodeView />
+                        </DataTemplate>
+                    </nodify:NodifyEditor.ItemTemplate>
+                    <nodify:NodifyEditor.ItemContainerStyle>
+                        <Style TargetType="{x:Type nodify:ItemContainer}" BasedOn="{StaticResource {x:Type nodify:ItemContainer}}">
+                            <Setter Property="Location" Value="{Binding Location, Mode=TwoWay}" />
+                            <Setter Property="BorderBrush" Value="Transparent" />
+                        </Style>
+                    </nodify:NodifyEditor.ItemContainerStyle>
+                    <nodify:NodifyEditor.ConnectionTemplate>
+                        <DataTemplate DataType="{x:Type models:ViewAllEdgeViewModel}">
+                            <nodify:StepConnection Source="{Binding SourceAnchor}"
+                                                   Target="{Binding TargetAnchor}"
+                                                   SourcePosition="Right"
+                                                   TargetPosition="Left"
+                                                   Stroke="{StaticResource EdgeBrush}"
+                                                   StrokeThickness="1.2"
+                                                   CornerRadius="7"
+                                                   Spacing="14"
+                                                   ArrowEnds="None"
+                                                   IsHitTestVisible="False" />
+                        </DataTemplate>
+                    </nodify:NodifyEditor.ConnectionTemplate>
+                </nodify:NodifyEditor>
 
-                <Border Grid.Row="0" Background="#0F1218" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
-                    <Grid Margin="8,7">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="260" />
-                        </Grid.ColumnDefinitions>
-                        <StackPanel Orientation="Horizontal">
-                            <Button Style="{StaticResource IconButton}" Command="{Binding BackCommand}" ToolTip="Back (Alt+Left)"><TextBlock Text="&#xE72B;" Style="{StaticResource IconText}" /></Button>
-                            <Button Style="{StaticResource IconButton}" Command="{Binding ForwardCommand}" ToolTip="Forward (Alt+Right)"><TextBlock Text="&#xE72A;" Style="{StaticResource IconText}" /></Button>
-                            <Button Style="{StaticResource IconButton}" Command="{Binding UpCommand}" ToolTip="Up (Alt+Up)"><TextBlock Text="&#xE74A;" Style="{StaticResource IconText}" /></Button>
-                            <Button Style="{StaticResource IconButton}" Command="{Binding HomeCommand}" ToolTip="Home"><TextBlock Text="&#xE80F;" Style="{StaticResource IconText}" /></Button>
-                        </StackPanel>
-
-                        <Grid Grid.Column="1" Margin="8,0,8,0">
-                            <TextBox x:Name="AddressBox"
-                                     Text="{Binding AddressText, UpdateSourceTrigger=PropertyChanged}"
-                                     VerticalContentAlignment="Center"
-                                     Padding="31,5,36,5"
-                                     KeyDown="AddressBox_KeyDown" />
-                            <TextBlock Text="&#xE8B7;" Style="{StaticResource IconText}" Foreground="{StaticResource FolderBrush}" HorizontalAlignment="Left" Margin="10,0,0,0" IsHitTestVisible="False" />
-                            <Button HorizontalAlignment="Right" Style="{StaticResource IconButton}" Width="30" Command="{Binding RefreshCommand}" ToolTip="Refresh (F5)">
-                                <TextBlock Text="&#xE72C;" Style="{StaticResource IconText}" FontSize="12" />
-                            </Button>
-                        </Grid>
-
-                        <Grid Grid.Column="2">
-                            <TextBox x:Name="SearchBox"
-                                     Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
-                                     Padding="31,5,30,5"
-                                     VerticalContentAlignment="Center"
-                                     KeyDown="SearchBox_KeyDown"
-                                     ToolTip="Search recursively in the focused folder (Ctrl+F)" />
-                            <TextBlock Text="&#xE721;" Style="{StaticResource IconText}" HorizontalAlignment="Left" Margin="10,0,0,0" Foreground="{StaticResource TextMutedBrush}" IsHitTestVisible="False" />
-                            <Button HorizontalAlignment="Right" Width="28" Height="28" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding CloseSearchCommand}" Visibility="{Binding IsSearchOpen, Converter={StaticResource BoolToVisibility}}">
+                <!-- Search results -->
+                <Border Width="420"
+                        MaxHeight="520"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Top"
+                        Margin="14"
+                        Padding="8"
+                        CornerRadius="8"
+                        Background="#F2242424"
+                        BorderBrush="{StaticResource BorderStrongBrush}"
+                        BorderThickness="1"
+                        Visibility="{Binding IsSearchOpen, Converter={StaticResource BoolToVisibility}}">
+                    <Border.Effect>
+                        <DropShadowEffect BlurRadius="20" ShadowDepth="6" Opacity="0.45" Color="#000000" />
+                    </Border.Effect>
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="40" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+                        <Grid Margin="6,0">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <StackPanel VerticalAlignment="Center">
+                                <TextBlock Text="{Binding SearchResults.Count, StringFormat=Search results ({0})}" FontWeight="SemiBold" FontSize="12.5" />
+                                <TextBlock Text="{Binding Tree.ActivePath}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                            <ProgressBar Grid.Column="1" Width="60" MaxWidth="60" Height="3" Margin="8,0" VerticalAlignment="Center" IsIndeterminate="True"
+                                         Visibility="{Binding IsSearchBusy, Converter={StaticResource BoolToVisibility}}" />
+                            <Button Grid.Column="2" Width="26" Height="26" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding CloseSearchCommand}">
                                 <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
                             </Button>
                         </Grid>
+                        <TextBlock Grid.Row="1"
+                                   Margin="8,10,8,14"
+                                   FontSize="11.5"
+                                   Foreground="{StaticResource TextDimBrush}"
+                                   TextWrapping="Wrap"
+                                   Text="Walking the folder tree — matches appear as they are found."
+                                   Visibility="{Binding SearchResults.Count, Converter={StaticResource ZeroCountToVisibility}}" />
+                        <ListBox Grid.Row="1"
+                                 ItemsSource="{Binding SearchResults}"
+                                 Background="Transparent"
+                                 BorderThickness="0"
+                                 MaxHeight="450"
+                                 MouseDoubleClick="SearchResults_MouseDoubleClick">
+                            <ListBox.ItemContainerStyle>
+                                <Style TargetType="ListBoxItem">
+                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                    <Setter Property="Padding" Value="0" />
+                                    <Setter Property="Margin" Value="0,1" />
+                                    <Setter Property="Background" Value="Transparent" />
+                                    <Setter Property="Template">
+                                        <Setter.Value>
+                                            <ControlTemplate TargetType="ListBoxItem">
+                                                <Border x:Name="Chrome" CornerRadius="4" Background="{TemplateBinding Background}" Padding="8,6">
+                                                    <ContentPresenter />
+                                                </Border>
+                                                <ControlTemplate.Triggers>
+                                                    <Trigger Property="IsMouseOver" Value="True">
+                                                        <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                                                    </Trigger>
+                                                    <Trigger Property="IsSelected" Value="True">
+                                                        <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentSoftBrush}" />
+                                                    </Trigger>
+                                                </ControlTemplate.Triggers>
+                                            </ControlTemplate>
+                                        </Setter.Value>
+                                    </Setter>
+                                </Style>
+                            </ListBox.ItemContainerStyle>
+                            <ListBox.ItemTemplate>
+                                <DataTemplate DataType="{x:Type models:SearchResultViewModel}">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="26" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Text="{Binding Glyph}" Style="{StaticResource IconText}" FontSize="13" Foreground="{StaticResource FolderBrush}" />
+                                        <StackPanel Grid.Column="1">
+                                            <TextBlock Text="{Binding Name}" FontSize="12" TextTrimming="CharacterEllipsis" />
+                                            <TextBlock Text="{Binding ParentPath}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                    </Grid>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
                     </Grid>
                 </Border>
 
-                <Border Grid.Row="1" Background="#12151C" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,0,1">
-                    <StackPanel Orientation="Horizontal" Margin="9,5" VerticalAlignment="Center">
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding NewFolderCommand}" ToolTip="New folder (Ctrl+Shift+N)">
-                            <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE8F4;" Style="{StaticResource IconText}" Margin="0,0,7,0" /><TextBlock Text="New" VerticalAlignment="Center" /></StackPanel>
+                <!-- Minimap -->
+                <Border x:Name="MinimapPanel"
+                        Width="200"
+                        Height="124"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Bottom"
+                        Margin="14,14,14,56"
+                        CornerRadius="6"
+                        BorderBrush="{StaticResource BorderStrongBrush}"
+                        BorderThickness="1"
+                        Background="#E6202020"
+                        Visibility="{Binding IsMinimapVisible, Converter={StaticResource BoolToVisibility}}">
+                    <nodify:Minimap ItemsSource="{Binding Tree.RenderNodes}"
+                                    ViewportLocation="{Binding ViewportLocation, ElementName=Editor}"
+                                    ViewportSize="{Binding ViewportSize, ElementName=Editor}"
+                                    ResizeToViewport="True"
+                                    Zoom="Minimap_Zoom"
+                                    Background="Transparent">
+                        <nodify:Minimap.ItemTemplate>
+                            <DataTemplate DataType="{x:Type models:ViewAllNodeViewModel}">
+                                <Border Background="{Binding AccentBrush}" CornerRadius="1" Opacity="0.8" />
+                            </DataTemplate>
+                        </nodify:Minimap.ItemTemplate>
+                        <nodify:Minimap.ItemContainerStyle>
+                            <Style TargetType="{x:Type nodify:MinimapItem}">
+                                <Setter Property="Location" Value="{Binding Location}" />
+                                <Setter Property="Width" Value="188" />
+                                <Setter Property="Height" Value="44" />
+                            </Style>
+                        </nodify:Minimap.ItemContainerStyle>
+                        <nodify:Minimap.ViewportStyle>
+                            <Style TargetType="Rectangle">
+                                <Setter Property="Stroke" Value="{StaticResource AccentBrush}" />
+                                <Setter Property="StrokeThickness" Value="1.5" />
+                                <Setter Property="Fill" Value="#1460CDFF" />
+                            </Style>
+                        </nodify:Minimap.ViewportStyle>
+                    </nodify:Minimap>
+                </Border>
+
+                <!-- Canvas controls -->
+                <Border HorizontalAlignment="Right"
+                        VerticalAlignment="Bottom"
+                        Margin="14"
+                        Padding="3"
+                        CornerRadius="6"
+                        Background="#EB242424"
+                        BorderBrush="{StaticResource BorderStrongBrush}"
+                        BorderThickness="1">
+                    <StackPanel Orientation="Horizontal">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomOutCommand}" ToolTip="Zoom out" AutomationProperties.Name="Zoom out">
+                            <TextBlock Text="&#xE949;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding CutCommand}" ToolTip="Cut (Ctrl+X)"><TextBlock Text="&#xE8C6;" Style="{StaticResource IconText}" /></Button>
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding CopyCommand}" ToolTip="Copy (Ctrl+C)"><TextBlock Text="&#xE8C8;" Style="{StaticResource IconText}" /></Button>
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding PasteCommand}" ToolTip="Paste (Ctrl+V)"><TextBlock Text="&#xE77F;" Style="{StaticResource IconText}" /></Button>
-                        <Separator Width="1" Height="23" Margin="7,0" />
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding RenameCommand}" ToolTip="Rename (F2)"><TextBlock Text="&#xE8AC;" Style="{StaticResource IconText}" /></Button>
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding DuplicateCommand}" ToolTip="Duplicate (Ctrl+Shift+D)"><TextBlock Text="&#xE8B0;" Style="{StaticResource IconText}" /></Button>
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding DeleteCommand}" ToolTip="Delete to Recycle Bin"><TextBlock Text="&#xE74D;" Style="{StaticResource IconText}" /></Button>
-                        <Separator Width="1" Height="23" Margin="7,0" />
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding BrowseCommand}" ToolTip="Place another folder on the canvas">
-                            <StackPanel Orientation="Horizontal"><TextBlock Text="&#xECC8;" Style="{StaticResource IconText}" Margin="0,0,7,0" /><TextBlock Text="Place folder" VerticalAlignment="Center" /></StackPanel>
+                        <Button Width="54" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100%" AutomationProperties.Name="Reset to 100%">
+                            <TextBlock Text="{Binding Tree.ZoomLabel}" FontSize="10.5" />
                         </Button>
-                        <Button Style="{StaticResource CommandButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all nodes (Shift+1)">
-                            <StackPanel Orientation="Horizontal"><TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" Margin="0,0,7,0" /><TextBlock Text="Fit all" VerticalAlignment="Center" /></StackPanel>
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in" AutomationProperties.Name="Zoom in">
+                            <TextBlock Text="&#xE948;" Style="{StaticResource IconText}" FontSize="12" />
+                        </Button>
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all (Shift+1)" AutomationProperties.Name="Fit all">
+                            <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="12" />
+                        </Button>
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ToggleMinimapCommand}" ToolTip="Toggle minimap" AutomationProperties.Name="Toggle minimap">
+                            <TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
                     </StackPanel>
                 </Border>
 
-                <Grid Grid.Row="2" Background="{StaticResource CanvasBrush}" ClipToBounds="True">
-                    <nodify:NodifyEditor x:Name="Editor"
-                                         ItemsSource="{Binding Nodes}"
-                                         Connections="{Binding Connections}"
-                                         SelectedItems="{Binding SelectedNodes}"
-                                         ViewportLocation="{Binding ViewportLocation, Mode=TwoWay}"
-                                         ViewportZoom="{Binding ViewportZoom, Mode=TwoWay}"
-                                         MinViewportZoom="0.1"
-                                         MaxViewportZoom="4"
-                                         BringIntoViewSpeed="1700"
-                                         BringIntoViewMaxDuration="0.28"
-                                         GridCellSize="12"
-                                         AllowDrop="True"
-                                         PreviewDragOver="Editor_PreviewDragOver"
-                                         PreviewDragLeave="Editor_PreviewDragLeave"
-                                         PreviewDrop="Editor_PreviewDrop"
-                                         MouseLeftButtonDown="Editor_MouseLeftButtonDown">
-                        <nodify:NodifyEditor.Background>
-                            <DrawingBrush TileMode="Tile" Viewport="0,0,24,24" ViewportUnits="Absolute" Viewbox="0,0,24,24" ViewboxUnits="Absolute">
-                                <DrawingBrush.Drawing>
-                                    <GeometryDrawing Brush="#2A3342">
-                                        <GeometryDrawing.Geometry>
-                                            <EllipseGeometry Center="1,1" RadiusX="0.85" RadiusY="0.85" />
-                                        </GeometryDrawing.Geometry>
-                                    </GeometryDrawing>
-                                </DrawingBrush.Drawing>
-                            </DrawingBrush>
-                        </nodify:NodifyEditor.Background>
-                        <nodify:NodifyEditor.ItemTemplate>
-                            <DataTemplate DataType="{x:Type models:FolderNodeViewModel}">
-                                <controls:FolderNodeView />
-                            </DataTemplate>
-                        </nodify:NodifyEditor.ItemTemplate>
-                        <nodify:NodifyEditor.ItemContainerStyle>
-                            <Style TargetType="{x:Type nodify:ItemContainer}" BasedOn="{StaticResource {x:Type nodify:ItemContainer}}">
-                                <Setter Property="Location" Value="{Binding Location, Mode=TwoWay}" />
-                                <Setter Property="ActualSize" Value="{Binding ActualSize, Mode=OneWayToSource}" />
-                                <Setter Property="BorderBrush" Value="Transparent" />
-                            </Style>
-                        </nodify:NodifyEditor.ItemContainerStyle>
-                        <nodify:NodifyEditor.ConnectionTemplate>
-                            <DataTemplate DataType="{x:Type models:FolderConnectionViewModel}">
-                                <nodify:StepConnection Source="{Binding Source.OutputAnchor}"
-                                                       Target="{Binding Target.InputAnchor}"
-                                                       SourcePosition="Right"
-                                                       TargetPosition="Left"
-                                                       StrokeThickness="2"
-                                                       CornerRadius="10"
-                                                       Spacing="0"
-                                                       IsHitTestVisible="False">
-                                    <nodify:StepConnection.Stroke>
-                                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
-                                            <GradientStop Color="#8A4F7FFF" Offset="0" />
-                                            <GradientStop Color="#505F6D82" Offset="1" />
-                                        </LinearGradientBrush>
-                                    </nodify:StepConnection.Stroke>
-                                </nodify:StepConnection>
-                            </DataTemplate>
-                        </nodify:NodifyEditor.ConnectionTemplate>
-                    </nodify:NodifyEditor>
+                <!-- Toast -->
+                <Border HorizontalAlignment="Center"
+                        VerticalAlignment="Bottom"
+                        Margin="0,0,0,16"
+                        Padding="12,8"
+                        CornerRadius="6"
+                        Background="#F22B2B2B"
+                        BorderBrush="{StaticResource BorderStrongBrush}"
+                        BorderThickness="1"
+                        Visibility="{Binding Toast.IsVisible, Converter={StaticResource BoolToVisibility}}">
+                    <StackPanel Orientation="Horizontal">
+                        <ProgressBar Width="44" Height="3" IsIndeterminate="True" Margin="0,0,10,0"
+                                     Visibility="{Binding Toast.IsBusy, Converter={StaticResource BoolToVisibility}}" />
+                        <TextBlock Text="{Binding Toast.Message}" VerticalAlignment="Center" FontSize="11.5" />
+                        <Button Width="24" Height="24" Padding="0" Margin="9,0,0,0" Style="{StaticResource FlatButton}" Command="{Binding Toast.HideCommand}">
+                            <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
+                        </Button>
+                    </StackPanel>
+                </Border>
 
-                    <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="16" Padding="10,7" CornerRadius="7" Background="#CC151922" BorderBrush="{StaticResource BorderBrush}" BorderThickness="1" IsHitTestVisible="False">
-                        <StackPanel Orientation="Horizontal">
-                            <TextBlock Text="&#xE7C2;" Style="{StaticResource IconText}" Foreground="{StaticResource AccentBrightBrush}" Margin="0,0,7,0" />
-                            <TextBlock Text="Infinite folder canvas" FontSize="10.5" Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center" />
-                        </StackPanel>
-                    </Border>
-
-                    <!-- Recursive search results are a temporary overlay node, leaving the canvas intact. -->
-                    <Border Width="430"
-                            MaxHeight="520"
-                            HorizontalAlignment="Right"
-                            VerticalAlignment="Top"
-                            Margin="16"
-                            Padding="8"
-                            CornerRadius="10"
-                            Background="#F2151922"
-                            BorderBrush="{StaticResource BorderStrongBrush}"
-                            BorderThickness="1"
-                            Visibility="{Binding IsSearchOpen, Converter={StaticResource BoolToVisibility}}">
-                        <Border.Effect>
-                            <DropShadowEffect BlurRadius="22" ShadowDepth="7" Opacity="0.48" Color="#000000" />
-                        </Border.Effect>
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="42" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-                            <Grid Margin="7,0">
-                                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                                <StackPanel VerticalAlignment="Center">
-                                    <TextBlock Text="Search results" FontWeight="SemiBold" FontSize="13" />
-                                    <TextBlock Text="{Binding ActiveNode.FullPath}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" />
-                                </StackPanel>
-                                <ProgressBar Grid.Column="1" Width="70" Height="3" IsIndeterminate="True" Visibility="{Binding IsSearchBusy, Converter={StaticResource BoolToVisibility}}" />
-                            </Grid>
-                            <ListBox Grid.Row="1" ItemsSource="{Binding SearchResults}" Background="Transparent" BorderThickness="0" MaxHeight="450" MouseDoubleClick="SearchResults_MouseDoubleClick">
-                                <ListBox.ItemContainerStyle>
-                                    <Style TargetType="ListBoxItem">
-                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                                        <Setter Property="Padding" Value="0" />
-                                        <Setter Property="Margin" Value="0,1" />
-                                        <Setter Property="Background" Value="Transparent" />
-                                        <Setter Property="BorderThickness" Value="0" />
-                                        <Setter Property="Template">
-                                            <Setter.Value>
-                                                <ControlTemplate TargetType="ListBoxItem">
-                                                    <Border x:Name="Chrome" CornerRadius="6" Background="{TemplateBinding Background}" Padding="8,7">
-                                                        <ContentPresenter />
-                                                    </Border>
-                                                    <ControlTemplate.Triggers>
-                                                        <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" /></Trigger>
-                                                        <Trigger Property="IsSelected" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentSoftBrush}" /></Trigger>
-                                                    </ControlTemplate.Triggers>
-                                                </ControlTemplate>
-                                            </Setter.Value>
-                                        </Setter>
-                                    </Style>
-                                </ListBox.ItemContainerStyle>
-                                <ListBox.ItemTemplate>
-                                    <DataTemplate DataType="{x:Type models:SearchResultViewModel}">
-                                        <Grid>
-                                            <Grid.ColumnDefinitions><ColumnDefinition Width="28" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
-                                            <TextBlock Text="{Binding Glyph}" Style="{StaticResource IconText}" Foreground="{StaticResource FolderBrush}" />
-                                            <StackPanel Grid.Column="1">
-                                                <TextBlock Text="{Binding Name}" FontSize="11.5" TextTrimming="CharacterEllipsis" />
-                                                <TextBlock Text="{Binding ParentPath}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" />
-                                            </StackPanel>
-                                        </Grid>
-                                    </DataTemplate>
-                                </ListBox.ItemTemplate>
-                            </ListBox>
-                        </Grid>
-                    </Border>
-
-                    <Border x:Name="MinimapPanel" Width="190" Height="118" HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="14,14,14,58" CornerRadius="8" BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1" Background="#E6151922" Visibility="Collapsed">
-                        <nodify:Minimap ItemsSource="{Binding Nodes}"
-                                        ViewportLocation="{Binding ViewportLocation, ElementName=Editor}"
-                                        ViewportSize="{Binding ViewportSize, ElementName=Editor}"
-                                        ResizeToViewport="True"
-                                        Zoom="Minimap_Zoom"
-                                        Background="Transparent">
-                            <nodify:Minimap.ItemTemplate>
-                                <DataTemplate DataType="{x:Type models:FolderNodeViewModel}">
-                                    <Border Background="{Binding AccentBrush}" CornerRadius="2" Opacity="0.72" />
-                                </DataTemplate>
-                            </nodify:Minimap.ItemTemplate>
-                            <nodify:Minimap.ItemContainerStyle>
-                                <Style TargetType="{x:Type nodify:MinimapItem}">
-                                    <Setter Property="Location" Value="{Binding Location}" />
-                                    <Setter Property="Width" Value="420" />
-                                    <Setter Property="Height" Value="440" />
-                                </Style>
-                            </nodify:Minimap.ItemContainerStyle>
-                            <nodify:Minimap.ViewportStyle>
-                                <Style TargetType="Rectangle">
-                                    <Setter Property="Stroke" Value="{StaticResource AccentBrightBrush}" />
-                                    <Setter Property="StrokeThickness" Value="2" />
-                                    <Setter Property="Fill" Value="#164F7FFF" />
-                                </Style>
-                            </nodify:Minimap.ViewportStyle>
-                        </nodify:Minimap>
-                    </Border>
-
-                    <Border HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="14" Padding="4" CornerRadius="8" Background="#EB151922" BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1">
-                        <StackPanel Orientation="Horizontal">
-                            <Button Style="{StaticResource IconButton}" Command="{Binding ZoomOutCommand}" ToolTip="Zoom out"><TextBlock Text="&#xE949;" Style="{StaticResource IconText}" /></Button>
-                            <Button Style="{StaticResource FlatButton}" Width="58" Height="32" Padding="0" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100%"><TextBlock Text="{Binding ZoomLabel}" FontSize="10.5" /></Button>
-                            <Button Style="{StaticResource IconButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in"><TextBlock Text="&#xE948;" Style="{StaticResource IconText}" /></Button>
-                            <Button Style="{StaticResource IconButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all"><TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" /></Button>
-                            <Button Style="{StaticResource IconButton}" Click="MinimapButton_Click" ToolTip="Toggle minimap"><TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" /></Button>
-                        </StackPanel>
-                    </Border>
-
-                    <Border HorizontalAlignment="Center" VerticalAlignment="Bottom" Margin="0,0,0,16" Padding="13,9" CornerRadius="8" Background="#F21B202B" BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1" Visibility="{Binding Toast.IsVisible, Converter={StaticResource BoolToVisibility}}">
-                        <StackPanel Orientation="Horizontal">
-                            <ProgressBar Width="46" Height="3" IsIndeterminate="True" Margin="0,0,10,0" Visibility="{Binding Toast.IsBusy, Converter={StaticResource BoolToVisibility}}" />
-                            <TextBlock Text="{Binding Toast.Message}" VerticalAlignment="Center" FontSize="11.5" />
-                            <Button Style="{StaticResource IconButton}" Width="25" Height="25" Margin="9,0,0,0" Command="{Binding Toast.HideCommand}"><TextBlock Text="&#xE711;" Style="{StaticResource IconText}" /></Button>
-                        </StackPanel>
-                    </Border>
-                </Grid>
-
-                <Border Grid.Row="3" Background="#0D1016" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
-                    <Grid Margin="10,0">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="Auto" />
-                        </Grid.ColumnDefinitions>
-                        <TextBlock Text="{Binding StatusText}" VerticalAlignment="Center" FontSize="10.5" Foreground="{StaticResource TextMutedBrush}" TextTrimming="CharacterEllipsis" />
-                        <TextBlock Grid.Column="1" Text="{Binding StatusDetail}" Margin="18,0" VerticalAlignment="Center" FontSize="10.5" Foreground="{StaticResource TextDimBrush}" />
-                        <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                            <Ellipse Width="6" Height="6" Fill="{StaticResource SuccessBrush}" Margin="0,0,6,0" />
-                            <TextBlock Text="Live" FontSize="10" Foreground="{StaticResource TextDimBrush}" />
-                        </StackPanel>
-                    </Grid>
+                <Border HorizontalAlignment="Center"
+                        VerticalAlignment="Center"
+                        Padding="16,12"
+                        CornerRadius="6"
+                        Background="#CC2B2B2B"
+                        Visibility="{Binding Tree.IsBusy, Converter={StaticResource BoolToVisibility}}">
+                    <StackPanel>
+                        <ProgressBar Width="140" Height="3" IsIndeterminate="True" />
+                        <TextBlock Text="Reading drives…" Margin="0,10,0,0" FontSize="11.5" Foreground="{StaticResource TextMutedBrush}" HorizontalAlignment="Center" />
+                    </StackPanel>
                 </Border>
             </Grid>
         </Grid>
+
+        <!-- Status bar -->
+        <Border Grid.Row="4" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+            <Grid Margin="10,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding StatusCountText}" VerticalAlignment="Center" FontSize="11" Foreground="{StaticResource TextMutedBrush}" />
+                <TextBlock Grid.Column="1"
+                           Text="{Binding StatusPathText}"
+                           ToolTip="{Binding StatusPathText}"
+                           Margin="18,0"
+                           VerticalAlignment="Center"
+                           HorizontalAlignment="Center"
+                           FontSize="11"
+                           Foreground="{StaticResource TextDimBrush}"
+                           TextTrimming="CharacterEllipsis" />
+                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                    <Button Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all" AutomationProperties.Name="Fit all">
+                        <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="10" />
+                    </Button>
+                    <Button Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ToggleMinimapCommand}" ToolTip="Minimap" AutomationProperties.Name="Minimap">
+                        <TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" FontSize="10" />
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
     </Grid>
 </Window>

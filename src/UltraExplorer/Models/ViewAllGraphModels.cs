@@ -59,6 +59,15 @@ public sealed class ViewAllWorkspaceState
     public double ViewportX { get; set; }
     public double ViewportY { get; set; }
     public double ViewportZoom { get; set; } = 1;
+
+    /// <summary>Reselected on load so the address and status bars are never blank.</summary>
+    public string ActivePath { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Roots that are not local drives — a WSL distribution or a UNC share.
+    /// They have to be re-added explicitly because only drives are discovered.
+    /// </summary>
+    public List<string> ExtraRoots { get; set; } = [];
 }
 
 public sealed record ViewAllNodeState(

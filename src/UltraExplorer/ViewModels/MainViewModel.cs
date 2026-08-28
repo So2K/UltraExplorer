@@ -1,124 +1,196 @@
 using System.Collections.ObjectModel;
-using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Input;
-using System.Windows.Threading;
-using Microsoft.Win32;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
 
 namespace UltraExplorer.ViewModels;
 
+public enum CanvasMode
+{
+    ViewAll,
+    ViewSelect
+}
+
+/// <summary>
+/// The Explorer-like shell around the canvas: navigation pane, address bar,
+/// command bar, search and status bar.  Everything that concerns the graph
+/// itself is delegated to <see cref="ViewAllViewModel"/>.
+/// </summary>
 public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly ShellIconService _iconService = new();
     private readonly NativeShellService _shellService = new();
     private readonly WorkspaceStore _workspaceStore = new();
+    private readonly FolderMarkService _marks = new();
     private readonly FileSystemService _fileSystemService;
-    private readonly Dictionary<string, FolderNodeViewModel> _nodesByPath = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<Guid, CancellationTokenSource> _nodeLoads = [];
     private readonly List<string> _navigationHistory = [];
+
     private CancellationTokenSource? _searchCancellation;
-    private CancellationTokenSource? _saveDebounce;
     private int _navigationIndex = -1;
-    private FolderNodeViewModel? _activeNode;
-    private Point _viewportLocation;
-    private double _viewportZoom = 1;
+    private bool _isInitialized;
+    private bool _isDisposed;
+    private bool _isNavigating;
     private string _addressText = string.Empty;
     private string _searchText = string.Empty;
-    private string _statusText = "Ready";
-    private string _statusDetail = string.Empty;
+    private bool _isAddressEditing;
     private bool _isSearchOpen;
     private bool _isSearchBusy;
-    private bool _isInitialized;
-    private bool _showHiddenItems = true;
+    private bool _isMinimapVisible;
+    private double _sidebarWidth = 240;
+    private CanvasMode _mode = CanvasMode.ViewAll;
 
     public MainViewModel()
     {
         _fileSystemService = new FileSystemService(_iconService);
-        SelectedNodes.CollectionChanged += SelectedNodesOnCollectionChanged;
+        Tree = new ViewAllViewModel(_marks, _iconService);
+        Tree.PropertyChanged += OnTreePropertyChanged;
+        Tree.MessageRequested += OnTreeMessage;
 
-        BrowseCommand = new AsyncRelayCommand(BrowseAsync);
-        GoToAddressCommand = new AsyncRelayCommand(GoToAddressAsync);
         BackCommand = new RelayCommand(GoBack);
         ForwardCommand = new RelayCommand(GoForward);
         UpCommand = new AsyncRelayCommand(GoUpAsync);
         HomeCommand = new AsyncRelayCommand(GoHomeAsync);
         RefreshCommand = new AsyncRelayCommand(RefreshActiveAsync);
-        FitAllCommand = new RelayCommand(() => FitAllRequested?.Invoke());
-        ZoomInCommand = new RelayCommand(() => ZoomRequested?.Invoke(1.2));
-        ZoomOutCommand = new RelayCommand(() => ZoomRequested?.Invoke(1 / 1.2));
-        ResetZoomCommand = new RelayCommand(() => ViewportZoom = 1);
-        CopyCommand = new RelayCommand(() => CopySelection(false));
+        GoToAddressCommand = new AsyncRelayCommand(GoToAddressAsync);
+        OpenBreadcrumbCommand = new AsyncRelayCommand<BreadcrumbSegment>(OpenBreadcrumbAsync);
+        OpenSidebarItemCommand = new AsyncRelayCommand<FavoriteItemViewModel>(OpenSidebarItemAsync);
+
+        NewFolderCommand = new AsyncRelayCommand(CreateFolderAsync);
+        NewTextFileCommand = new AsyncRelayCommand(CreateTextFileAsync);
         CutCommand = new RelayCommand(() => CopySelection(true));
+        CopyCommand = new RelayCommand(() => CopySelection(false));
+        CopyPathCommand = new RelayCommand(CopySelectionPath);
         PasteCommand = new AsyncRelayCommand(PasteAsync);
+        RenameCommand = new AsyncRelayCommand(RenameSelectionAsync);
+        DuplicateCommand = new AsyncRelayCommand(DuplicateSelectionAsync);
         DeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(false));
         PermanentDeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(true));
-        DuplicateCommand = new AsyncRelayCommand(DuplicateSelectionAsync);
-        RenameCommand = new AsyncRelayCommand(RenameSelectionAsync);
-        NewFolderCommand = new AsyncRelayCommand(CreateFolderAsync);
-        NewNoteFileCommand = new AsyncRelayCommand(CreateNoteFileAsync);
+        PropertiesCommand = new RelayCommand(ShowProperties);
+        OpenCommand = new RelayCommand(OpenSelection);
+        ShowInExplorerCommand = new RelayCommand(ShowSelectionInExplorer);
+        AddToFavoritesCommand = new RelayCommand(AddSelectionToFavorites);
+        RemoveFavoriteCommand = new RelayCommand<FavoriteItemViewModel>(RemoveFavorite);
+
         SearchCommand = new AsyncRelayCommand(SearchAsync);
         CloseSearchCommand = new RelayCommand(CloseSearch);
+        OpenSearchResultCommand = new AsyncRelayCommand<SearchResultViewModel>(OpenSearchResultAsync);
+
+        FitAllCommand = new RelayCommand(() => FitAllRequested?.Invoke());
+        ZoomInCommand = new RelayCommand(() => ZoomRequested?.Invoke(1.25));
+        ZoomOutCommand = new RelayCommand(() => ZoomRequested?.Invoke(1 / 1.25));
+        ResetZoomCommand = new RelayCommand(() => ZoomRequested?.Invoke(0));
+        ToggleMinimapCommand = new RelayCommand(() => IsMinimapVisible = !IsMinimapVisible);
+        CollapseAllCommand = new RelayCommand(() => Tree.CollapseAll());
+        SetAccentCommand = new RelayCommand<string>(SetSelectionAccent);
+        EditNoteCommand = new AsyncRelayCommand(EditSelectionNoteAsync);
     }
 
-    public ObservableCollection<FolderNodeViewModel> Nodes { get; } = [];
-    public ObservableCollection<FolderConnectionViewModel> Connections { get; } = [];
-    public ObservableCollection<FolderNodeViewModel> SelectedNodes { get; } = [];
-    public ObservableCollection<FavoriteItemViewModel> Favorites { get; } = [];
-    public ObservableCollection<FavoriteItemViewModel> Drives { get; } = [];
-    public ObservableCollection<SearchResultViewModel> SearchResults { get; } = [];
+    public ViewAllViewModel Tree { get; }
     public OperationToastService Toast { get; } = new();
 
-    public FolderNodeViewModel? ActiveNode
-    {
-        get => _activeNode;
-        private set
-        {
-            if (SetProperty(ref _activeNode, value))
-            {
-                AddressText = value?.FullPath ?? string.Empty;
-                UpdateStatus();
-                OnPropertyChanged(nameof(HasActiveNode));
-            }
-        }
-    }
+    /// <summary>Home sits alone above the first divider, as in Explorer.</summary>
+    public ObservableCollection<FavoriteItemViewModel> HomeItems { get; } = [];
 
-    public bool HasActiveNode => ActiveNode is not null;
+    public ObservableCollection<FavoriteItemViewModel> QuickAccess { get; } = [];
+    public ObservableCollection<FavoriteItemViewModel> Drives { get; } = [];
+    public ObservableCollection<FavoriteItemViewModel> NetworkLocations { get; } = [];
+    public ObservableCollection<BreadcrumbSegment> Breadcrumbs { get; } = [];
+    public ObservableCollection<SearchResultViewModel> SearchResults { get; } = [];
 
-    public Point ViewportLocation
+    public ICommand BackCommand { get; }
+    public ICommand ForwardCommand { get; }
+    public ICommand UpCommand { get; }
+    public ICommand HomeCommand { get; }
+    public ICommand RefreshCommand { get; }
+    public ICommand GoToAddressCommand { get; }
+    public ICommand OpenBreadcrumbCommand { get; }
+    public ICommand OpenSidebarItemCommand { get; }
+    public ICommand NewFolderCommand { get; }
+    public ICommand NewTextFileCommand { get; }
+    public ICommand CutCommand { get; }
+    public ICommand CopyCommand { get; }
+    public ICommand CopyPathCommand { get; }
+    public ICommand PasteCommand { get; }
+    public ICommand RenameCommand { get; }
+    public ICommand DuplicateCommand { get; }
+    public ICommand DeleteCommand { get; }
+    public ICommand PermanentDeleteCommand { get; }
+    public ICommand PropertiesCommand { get; }
+    public ICommand OpenCommand { get; }
+    public ICommand ShowInExplorerCommand { get; }
+    public ICommand AddToFavoritesCommand { get; }
+    public ICommand RemoveFavoriteCommand { get; }
+    public ICommand SearchCommand { get; }
+    public ICommand CloseSearchCommand { get; }
+    public ICommand OpenSearchResultCommand { get; }
+    public ICommand FitAllCommand { get; }
+    public ICommand ZoomInCommand { get; }
+    public ICommand ZoomOutCommand { get; }
+    public ICommand ResetZoomCommand { get; }
+    public ICommand ToggleMinimapCommand { get; }
+    public ICommand CollapseAllCommand { get; }
+    public ICommand SetAccentCommand { get; }
+    public ICommand EditNoteCommand { get; }
+
+    public event Action? FitAllRequested;
+
+    /// <summary>Zoom factor, or 0 to reset the canvas to 100%.</summary>
+    public event Action<double>? ZoomRequested;
+
+    public event Func<string, string, string, string?>? PromptRequested;
+    public event Func<string, string, bool>? ConfirmRequested;
+    public event Action<IReadOnlyList<string>, FrameworkElement, Point>? ContextMenuRequested;
+
+    public CanvasMode Mode
     {
-        get => _viewportLocation;
+        get => _mode;
         set
         {
-            if (SetProperty(ref _viewportLocation, value))
+            if (SetProperty(ref _mode, value))
             {
-                ScheduleSave();
+                OnPropertyChanged(nameof(IsViewAll));
+                OnPropertyChanged(nameof(IsViewSelect));
             }
         }
     }
 
-    public double ViewportZoom
+    public bool IsViewAll
     {
-        get => _viewportZoom;
+        get => _mode == CanvasMode.ViewAll;
         set
         {
-            if (SetProperty(ref _viewportZoom, value))
+            if (value)
             {
-                OnPropertyChanged(nameof(ZoomLabel));
-                ScheduleSave();
+                Mode = CanvasMode.ViewAll;
             }
         }
     }
 
-    public string ZoomLabel => $"{ViewportZoom:P0}";
+    public bool IsViewSelect
+    {
+        get => _mode == CanvasMode.ViewSelect;
+        set
+        {
+            if (value)
+            {
+                Mode = CanvasMode.ViewSelect;
+            }
+        }
+    }
 
     public string AddressText
     {
         get => _addressText;
         set => SetProperty(ref _addressText, value);
+    }
+
+    public bool IsAddressEditing
+    {
+        get => _isAddressEditing;
+        set => SetProperty(ref _isAddressEditing, value);
     }
 
     public string SearchText
@@ -127,17 +199,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         set => SetProperty(ref _searchText, value);
     }
 
-    public string StatusText
-    {
-        get => _statusText;
-        private set => SetProperty(ref _statusText, value);
-    }
-
-    public string StatusDetail
-    {
-        get => _statusDetail;
-        private set => SetProperty(ref _statusDetail, value);
-    }
+    public string SearchPlaceholder
+        => Tree.ActiveNode is { } node ? $"Search {node.DisplayName}" : "Search this PC";
 
     public bool IsSearchOpen
     {
@@ -151,48 +214,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         private set => SetProperty(ref _isSearchBusy, value);
     }
 
-    public bool ShowHiddenItems
+    public bool IsMinimapVisible
     {
-        get => _showHiddenItems;
-        set
-        {
-            if (SetProperty(ref _showHiddenItems, value))
-            {
-                OnPropertyChanged(nameof(VisibleNodes));
-            }
-        }
+        get => _isMinimapVisible;
+        set => SetProperty(ref _isMinimapVisible, value);
     }
 
-    public IEnumerable<FolderNodeViewModel> VisibleNodes => Nodes;
+    public double SidebarWidth
+    {
+        get => _sidebarWidth;
+        set => SetProperty(ref _sidebarWidth, value);
+    }
 
-    public ICommand BrowseCommand { get; }
-    public ICommand GoToAddressCommand { get; }
-    public ICommand BackCommand { get; }
-    public ICommand ForwardCommand { get; }
-    public ICommand UpCommand { get; }
-    public ICommand HomeCommand { get; }
-    public ICommand RefreshCommand { get; }
-    public ICommand FitAllCommand { get; }
-    public ICommand ZoomInCommand { get; }
-    public ICommand ZoomOutCommand { get; }
-    public ICommand ResetZoomCommand { get; }
-    public ICommand CopyCommand { get; }
-    public ICommand CutCommand { get; }
-    public ICommand PasteCommand { get; }
-    public ICommand DeleteCommand { get; }
-    public ICommand PermanentDeleteCommand { get; }
-    public ICommand DuplicateCommand { get; }
-    public ICommand RenameCommand { get; }
-    public ICommand NewFolderCommand { get; }
-    public ICommand NewNoteFileCommand { get; }
-    public ICommand SearchCommand { get; }
-    public ICommand CloseSearchCommand { get; }
+    public string TabTitle => Tree.ActiveNode?.DisplayName is { Length: > 0 } name ? name : "This PC";
 
-    public event Action<FolderNodeViewModel, bool>? FocusNodeRequested;
-    public event Action? FitAllRequested;
-    public event Action<double>? ZoomRequested;
-    public event Func<string, string, string, string?>? PromptRequested;
-    public event Func<string, string, bool>? ConfirmRequested;
+    public string StatusCountText => Tree.StatusCountText;
+
+    public string StatusPathText => Tree.StatusPathText;
 
     public async Task InitializeAsync()
     {
@@ -202,27 +240,39 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         _isInitialized = true;
-        foreach (var favorite in FileSystemService.GetSystemFavorites())
-        {
-            Favorites.Add(favorite);
-        }
 
-        foreach (var drive in FileSystemService.GetDrives())
-        {
-            Drives.Add(drive);
-        }
-
+        await _marks.LoadAsync();
         var state = await _workspaceStore.LoadAsync();
         if (state is not null)
         {
-            ViewportLocation = new Point(state.ViewportX, state.ViewportY);
-            ViewportZoom = Math.Clamp(state.ViewportZoom, 0.1, 4);
+            SidebarWidth = Math.Clamp(state.SidebarWidth <= 0 ? 240 : state.SidebarWidth, 190, 340);
+            IsMinimapVisible = state.IsMinimapVisible;
+            foreach (var legacy in state.Nodes)
+            {
+                _marks.Seed(legacy.Path, legacy.AccentHex, legacy.Note);
+            }
+        }
 
+        var quickAccess = _fileSystemService.GetQuickAccess();
+        foreach (var item in quickAccess)
+        {
+            if (item.Name == "Home")
+            {
+                HomeItems.Add(item);
+            }
+            else
+            {
+                QuickAccess.Add(item);
+            }
+        }
+
+        if (state is not null)
+        {
             foreach (var favorite in state.Favorites.Where(favorite => Directory.Exists(favorite.Path)))
             {
-                if (Favorites.All(existing => !PathsEqual(existing.Path, favorite.Path)))
+                if (HomeItems.Concat(QuickAccess).All(existing => !ViewAllPath.Equals(existing.Path, favorite.Path)))
                 {
-                    Favorites.Add(new FavoriteItemViewModel
+                    QuickAccess.Add(new FavoriteItemViewModel
                     {
                         Name = favorite.Name,
                         Path = favorite.Path,
@@ -232,334 +282,61 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     });
                 }
             }
-
-            var restored = new Dictionary<Guid, FolderNodeViewModel>();
-            foreach (var savedNode in state.Nodes.Where(node => Directory.Exists(node.Path)).Take(80))
-            {
-                var node = CreateNode(savedNode.Path, new Point(savedNode.X, savedNode.Y), savedNode.Id);
-                node.AccentHex = savedNode.AccentHex;
-                node.Note = savedNode.Note;
-                restored[node.Id] = node;
-            }
-
-            foreach (var savedConnection in state.Connections)
-            {
-                if (restored.TryGetValue(savedConnection.SourceId, out var source)
-                    && restored.TryGetValue(savedConnection.TargetId, out var target))
-                {
-                    Connections.Add(new FolderConnectionViewModel(source, target));
-                }
-            }
-
-            await Task.WhenAll(restored.Values.Select(node => LoadNodeAsync(node)));
-            ActiveNode = Nodes.FirstOrDefault();
         }
 
-        if (Nodes.Count == 0)
+        _fileSystemService.AttachIcons(HomeItems.Concat(QuickAccess).ToArray());
+
+        foreach (var drive in _fileSystemService.GetDrives())
         {
-            var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            var node = CreateNode(home, new Point(90, 80));
-            await LoadNodeAsync(node);
-            ActivateNode(node, true, false);
+            Drives.Add(drive);
         }
 
-        UpdateStatus();
+        foreach (var location in _fileSystemService.GetNetworkLocations())
+        {
+            NetworkLocations.Add(location);
+        }
+
+        await Tree.InitializeAsync();
+        UpdateBreadcrumbs();
+        UpdateSidebarSelection();
     }
 
-    public async Task<FolderNodeViewModel?> OpenFolderAsync(
-        string path,
-        FolderNodeViewModel? parent = null,
-        bool focus = true,
-        bool animated = true)
-    {
-        string normalized;
-        try
-        {
-            normalized = NormalizePath(path);
-        }
-        catch (Exception ex)
-        {
-            Toast.ShowError(ex.Message);
-            return null;
-        }
+    public void ShowContextMenuFor(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
+        => ContextMenuRequested?.Invoke(paths, origin, point);
 
-        if (!Directory.Exists(normalized))
-        {
-            Toast.ShowError("This folder is unavailable or no longer exists.");
-            return null;
-        }
-
-        if (_nodesByPath.TryGetValue(normalized, out var existing))
-        {
-            if (parent is not null && Connections.All(connection => connection.Source != parent || connection.Target != existing))
-            {
-                Connections.Add(new FolderConnectionViewModel(parent, existing));
-            }
-
-            if (focus)
-            {
-                ActivateNode(existing, true, animated);
-            }
-
-            return existing;
-        }
-
-        var location = parent is null
-            ? GetViewportSpawnLocation()
-            : GetChildLocation(parent);
-        var node = CreateNode(normalized, location);
-        if (parent is not null)
-        {
-            Connections.Add(new FolderConnectionViewModel(parent, node));
-        }
-
-        await LoadNodeAsync(node);
-        if (focus)
-        {
-            ActivateNode(node, true, animated);
-        }
-
-        ScheduleSave();
-        return node;
-    }
-
-    public async Task ExpandItemAsync(FolderNodeViewModel parent, FileItemViewModel item, bool focus)
-    {
-        ActivateNode(parent, false, false);
-        if (item.IsDirectory)
-        {
-            await OpenFolderAsync(item.FullPath, parent, focus);
-            return;
-        }
-
-        try
-        {
-            NativeShellService.Open(item.FullPath);
-        }
-        catch (Exception ex)
-        {
-            Toast.ShowError($"Could not open {item.Name}: {ex.Message}");
-        }
-    }
-
-    public void ActivateNode(FolderNodeViewModel node, bool recordHistory = true, bool animated = false)
-    {
-        ActiveNode = node;
-        if (recordHistory)
-        {
-            RecordNavigation(node.FullPath);
-        }
-
-        FocusNodeRequested?.Invoke(node, animated);
-    }
-
-    public async Task OpenFavoriteAsync(FavoriteItemViewModel favorite)
-        => await OpenFolderAsync(favorite.Path, focus: true, animated: true);
-
-    public void AddFavorite(string path)
-    {
-        if (!Directory.Exists(path) || Favorites.Any(item => PathsEqual(item.Path, path)))
-        {
-            return;
-        }
-
-        Favorites.Add(new FavoriteItemViewModel
-        {
-            Name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } name ? name : path,
-            Path = path,
-            Glyph = "\uE8B7",
-            AccentHex = "#F1B84B",
-            IsCustom = true
-        });
-        ScheduleSave();
-    }
-
-    public void RemoveFavorite(FavoriteItemViewModel favorite)
-    {
-        if (favorite.IsCustom)
-        {
-            Favorites.Remove(favorite);
-            ScheduleSave();
-        }
-    }
-
-    public async Task RefreshNodeAsync(FolderNodeViewModel node)
-        => await LoadNodeAsync(node);
-
-    public void CloseNode(FolderNodeViewModel node)
-    {
-        var descendants = new HashSet<FolderNodeViewModel>();
-        CollectExclusiveDescendants(node, descendants);
-        descendants.Add(node);
-
-        foreach (var connection in Connections.Where(connection => descendants.Contains(connection.Source) || descendants.Contains(connection.Target)).ToArray())
-        {
-            Connections.Remove(connection);
-        }
-
-        foreach (var remove in descendants)
-        {
-            _nodeLoads.Remove(remove.Id, out var load);
-            load?.Cancel();
-            load?.Dispose();
-            remove.Dispose();
-            Nodes.Remove(remove);
-            _nodesByPath.Remove(NormalizePath(remove.FullPath));
-        }
-
-        if (ActiveNode is not null && descendants.Contains(ActiveNode))
-        {
-            ActiveNode = Nodes.FirstOrDefault();
-        }
-
-        ScheduleSave();
-    }
-
-    public void SetNodeAccent(FolderNodeViewModel node, string accentHex)
-    {
-        node.AccentHex = accentHex;
-        ScheduleSave();
-    }
-
-    public void ToggleNodeNote(FolderNodeViewModel node)
-    {
-        node.IsNoteVisible = !node.IsNoteVisible;
-        ScheduleSave();
-    }
-
-    public void UpdateSelection()
-    {
-        UpdateStatus();
-    }
-
-    public IReadOnlyList<FileItemViewModel> GetSelectedFileItems()
-        => Nodes.SelectMany(node => node.Items).Where(item => item.IsSelected).ToArray();
-
-    public IReadOnlyList<string> GetSelectedPaths()
-    {
-        var items = GetSelectedFileItems();
-        if (items.Count > 0)
-        {
-            return items.Select(item => item.FullPath).ToArray();
-        }
-
-        if (SelectedNodes.Count > 0)
-        {
-            return SelectedNodes.Select(node => node.FullPath).ToArray();
-        }
-
-        return ActiveNode is null ? [] : [ActiveNode.FullPath];
-    }
-
-    public void ClearFileSelectionExcept(FolderNodeViewModel owner)
-    {
-        foreach (var node in Nodes.Where(node => node != owner))
-        {
-            foreach (var item in node.Items.Where(item => item.IsSelected))
-            {
-                item.IsSelected = false;
-            }
-        }
-
-        UpdateStatus();
-    }
-
-    public void CopySelection(bool cut)
-    {
-        var paths = GetSelectedPaths();
-        if (paths.Count == 0)
-        {
-            return;
-        }
-
-        NativeShellService.CopyPathsToClipboard(paths, cut);
-        foreach (var item in Nodes.SelectMany(node => node.Items))
-        {
-            item.IsCut = cut && paths.Any(path => PathsEqual(path, item.FullPath));
-        }
-
-        _ = Toast.ShowSuccessAsync(cut ? $"Cut {paths.Count} item(s)" : $"Copied {paths.Count} item(s)");
-    }
-
-    public async Task PasteIntoAsync(string targetDirectory)
-    {
-        var payload = NativeShellService.GetClipboardPayload();
-        if (payload is null || payload.Paths.Length == 0)
-        {
-            Toast.ShowError("The clipboard does not contain files or folders.");
-            return;
-        }
-
-        await TransferAsync(payload.Paths, targetDirectory, payload.Cut, payload.Cut ? "Moving" : "Copying");
-        if (payload.Cut)
-        {
-            foreach (var item in Nodes.SelectMany(node => node.Items))
-            {
-                item.IsCut = false;
-            }
-        }
-    }
-
-    public async Task DropAsync(IReadOnlyList<string> paths, FolderNodeViewModel targetNode, bool internalDrag, ModifierKeys modifiers)
-        => await DropIntoPathAsync(paths, targetNode.FullPath, internalDrag, modifiers);
-
-    public async Task DropIntoPathAsync(IReadOnlyList<string> paths, string targetDirectory, bool internalDrag, ModifierKeys modifiers)
+    public async Task DropIntoPathAsync(
+        IReadOnlyList<string> paths,
+        string targetDirectory,
+        bool internalDrag,
+        ModifierKeys modifiers)
     {
         if (paths.Count == 0)
         {
             return;
         }
 
-        var forceCopy = modifiers.HasFlag(ModifierKeys.Control);
-        var forceMove = modifiers.HasFlag(ModifierKeys.Shift);
-        var move = forceMove || (!forceCopy && internalDrag && paths.All(path => NativeShellService.IsSameVolume(path, targetDirectory)));
+        var move = ShouldMove(paths, targetDirectory, modifiers);
         await TransferAsync(paths, targetDirectory, move, move ? "Moving" : "Copying");
     }
 
-    public FolderNodeViewModel? FindNearestDropTarget(Point graphPoint, double maxDistance = 128)
+    /// <summary>
+    /// Explorer's rule, used both for the drag cursor and for the operation that
+    /// actually runs, so the two can never disagree: Ctrl copies, Shift moves,
+    /// otherwise same volume moves and a different volume copies.
+    /// </summary>
+    public static bool ShouldMove(IReadOnlyList<string> paths, string targetDirectory, ModifierKeys modifiers)
     {
-        FolderNodeViewModel? nearest = null;
-        var nearestDistance = double.MaxValue;
-        foreach (var node in Nodes)
+        if (modifiers.HasFlag(ModifierKeys.Shift))
         {
-            var width = node.ActualSize.Width > 1 ? node.ActualSize.Width : 420;
-            var height = node.ActualSize.Height > 1 ? node.ActualSize.Height : 420;
-            var bounds = new Rect(node.Location, new Size(width, height));
-            var dx = Math.Max(bounds.Left - graphPoint.X, Math.Max(0, graphPoint.X - bounds.Right));
-            var dy = Math.Max(bounds.Top - graphPoint.Y, Math.Max(0, graphPoint.Y - bounds.Bottom));
-            var distance = Math.Sqrt(dx * dx + dy * dy);
-            if (distance < nearestDistance)
-            {
-                nearestDistance = distance;
-                nearest = node;
-            }
+            return true;
         }
 
-        return nearestDistance <= maxDistance ? nearest : null;
-    }
-
-    public void SetDropTarget(FolderNodeViewModel? target)
-    {
-        foreach (var node in Nodes.Where(node => node.IsDropTarget != (node == target)))
+        if (modifiers.HasFlag(ModifierKeys.Control))
         {
-            node.IsDropTarget = node == target;
-        }
-    }
-
-    public async Task OpenSearchResultAsync(SearchResultViewModel result)
-    {
-        var parent = await OpenFolderAsync(result.IsDirectory ? result.FullPath : result.ParentPath, focus: true, animated: true);
-        if (parent is not null && !result.IsDirectory)
-        {
-            var match = parent.Items.FirstOrDefault(item => PathsEqual(item.FullPath, result.FullPath));
-            if (match is not null)
-            {
-                match.IsSelected = true;
-                UpdateStatus();
-            }
+            return false;
         }
 
-        CloseSearch();
+        return paths.All(path => NativeShellService.IsSameVolume(path, targetDirectory));
     }
 
     public async Task SaveNowAsync()
@@ -569,139 +346,373 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _saveDebounce?.Cancel();
         var state = new WorkspaceState
         {
-            ViewportX = ViewportLocation.X,
-            ViewportY = ViewportLocation.Y,
-            ViewportZoom = ViewportZoom,
-            Nodes = Nodes.Select(node => new NodeState(
-                node.Id,
-                node.FullPath,
-                node.Location.X,
-                node.Location.Y,
-                node.AccentHex,
-                node.Note)).ToList(),
-            Connections = Connections.Select(connection => new ConnectionState(connection.Source.Id, connection.Target.Id)).ToList(),
-            Favorites = Favorites.Where(favorite => favorite.IsCustom).Select(favorite => new FavoriteState(
-                favorite.Name,
-                favorite.Path,
-                favorite.Glyph,
-                favorite.AccentHex)).ToList()
+            SidebarWidth = SidebarWidth,
+            IsMinimapVisible = IsMinimapVisible,
+            Favorites = QuickAccess
+                .Where(favorite => favorite.IsCustom)
+                .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))
+                .ToList()
         };
 
         try
         {
             await _workspaceStore.SaveAsync(state);
         }
-        catch
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Workspace persistence must never break file navigation.
         }
+
+        await Tree.SaveAsync();
     }
 
     public void Dispose()
     {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
         _searchCancellation?.Cancel();
         _searchCancellation?.Dispose();
-        _saveDebounce?.Cancel();
-        _saveDebounce?.Dispose();
-        foreach (var load in _nodeLoads.Values)
-        {
-            load.Cancel();
-            load.Dispose();
-        }
+        Tree.PropertyChanged -= OnTreePropertyChanged;
+        Tree.MessageRequested -= OnTreeMessage;
+        Tree.Dispose();
+    }
 
-        foreach (var node in Nodes)
+    private void OnTreePropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        switch (e.PropertyName)
         {
-            node.Dispose();
+            case nameof(ViewAllViewModel.StatusCountText):
+                OnPropertyChanged(nameof(StatusCountText));
+                break;
+            case nameof(ViewAllViewModel.StatusPathText):
+                OnPropertyChanged(nameof(StatusPathText));
+                break;
+            case nameof(ViewAllViewModel.ActivePath):
+                OnPropertyChanged(nameof(TabTitle));
+                OnPropertyChanged(nameof(SearchPlaceholder));
+                AddressText = Tree.ActivePath;
+                UpdateBreadcrumbs();
+                UpdateSidebarSelection();
+                RecordNavigation(Tree.ActivePath);
+                break;
         }
     }
 
-    private FolderNodeViewModel CreateNode(string path, Point location, Guid? id = null)
+    private void OnTreeMessage(string message, bool isError)
     {
-        var normalized = NormalizePath(path);
-        var node = new FolderNodeViewModel(normalized, location, id);
-        node.PropertyChanged += NodeOnPropertyChanged;
-        Nodes.Add(node);
-        _nodesByPath[normalized] = node;
-        AttachWatcher(node);
-        return node;
+        if (isError)
+        {
+            Toast.ShowError(message);
+        }
+        else
+        {
+            _ = Toast.ShowSuccessAsync(message);
+        }
     }
 
-    private async Task LoadNodeAsync(FolderNodeViewModel node)
+    private void UpdateBreadcrumbs()
     {
-        if (_nodeLoads.Remove(node.Id, out var previous))
+        Breadcrumbs.Clear();
+        var path = Tree.ActivePath;
+        if (string.IsNullOrWhiteSpace(path))
         {
-            previous.Cancel();
-            previous.Dispose();
+            return;
         }
 
-        var cancellation = new CancellationTokenSource();
-        _nodeLoads[node.Id] = cancellation;
-        node.IsBusy = true;
-        node.ErrorMessage = string.Empty;
-
+        IReadOnlyList<string> chain;
         try
         {
-            var selectedPaths = node.Items.Where(item => item.IsSelected).Select(item => item.FullPath).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var items = await _fileSystemService.GetDirectoryItemsAsync(node.FullPath, cancellation.Token);
-            if (cancellation.IsCancellationRequested)
+            chain = ViewAllPath.AncestorChain(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return;
+        }
+
+        for (var index = 0; index < chain.Count; index++)
+        {
+            var segment = chain[index];
+            var name = Path.GetFileName(segment.TrimEnd(Path.DirectorySeparatorChar));
+            if (string.IsNullOrEmpty(name))
             {
-                return;
+                name = segment;
             }
 
-            await Application.Current.Dispatcher.InvokeAsync(() =>
-            {
-                node.Items.Clear();
-                foreach (var item in items)
-                {
-                    if (!ShowHiddenItems && item.IsHidden)
-                    {
-                        continue;
-                    }
-
-                    item.IsSelected = selectedPaths.Contains(item.FullPath);
-                    node.Items.Add(item);
-                }
-
-                node.NotifyItemsChanged();
-                UpdateStatus();
-            }, DispatcherPriority.Background);
+            Breadcrumbs.Add(new BreadcrumbSegment(name, segment, index == chain.Count - 1));
         }
-        catch (OperationCanceledException)
+    }
+
+    private void UpdateSidebarSelection()
+    {
+        var active = Tree.ActivePath;
+        foreach (var item in HomeItems.Concat(QuickAccess).Concat(Drives).Concat(NetworkLocations))
         {
+            item.IsActive = !item.OpensInShell
+                && !string.IsNullOrEmpty(active)
+                && ViewAllPath.Equals(item.Path, active);
         }
-        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or DirectoryNotFoundException)
+    }
+
+    private void RecordNavigation(string path)
+    {
+        if (_isNavigating || string.IsNullOrWhiteSpace(path))
         {
-            node.ErrorMessage = ex is UnauthorizedAccessException ? "Access denied" : ex.Message;
+            return;
+        }
+
+        if (_navigationIndex >= 0
+            && _navigationIndex < _navigationHistory.Count
+            && ViewAllPath.Equals(_navigationHistory[_navigationIndex], path))
+        {
+            return;
+        }
+
+        if (_navigationIndex < _navigationHistory.Count - 1)
+        {
+            _navigationHistory.RemoveRange(_navigationIndex + 1, _navigationHistory.Count - _navigationIndex - 1);
+        }
+
+        _navigationHistory.Add(path);
+        if (_navigationHistory.Count > 100)
+        {
+            _navigationHistory.RemoveAt(0);
+        }
+
+        _navigationIndex = _navigationHistory.Count - 1;
+    }
+
+    private void GoBack()
+    {
+        if (_navigationIndex <= 0)
+        {
+            return;
+        }
+
+        _navigationIndex--;
+        _ = NavigateHistoryAsync(_navigationHistory[_navigationIndex]);
+    }
+
+    private void GoForward()
+    {
+        if (_navigationIndex >= _navigationHistory.Count - 1)
+        {
+            return;
+        }
+
+        _navigationIndex++;
+        _ = NavigateHistoryAsync(_navigationHistory[_navigationIndex]);
+    }
+
+    private async Task NavigateHistoryAsync(string path)
+    {
+        _isNavigating = true;
+        try
+        {
+            await Tree.RevealPathAsync(path);
         }
         finally
         {
-            node.IsBusy = false;
-            if (_nodeLoads.TryGetValue(node.Id, out var current) && current == cancellation)
-            {
-                _nodeLoads.Remove(node.Id);
-                cancellation.Dispose();
-            }
+            _isNavigating = false;
         }
     }
 
-    private void AttachWatcher(FolderNodeViewModel node)
+    private async Task GoUpAsync()
     {
+        var current = Tree.ActivePath;
+        if (string.IsNullOrWhiteSpace(current))
+        {
+            return;
+        }
+
+        var parent = Path.GetDirectoryName(current);
+        if (!string.IsNullOrEmpty(parent))
+        {
+            await Tree.RevealPathAsync(parent);
+        }
+    }
+
+    private async Task GoHomeAsync()
+        => await Tree.RevealPathAsync(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile));
+
+    private async Task RefreshActiveAsync()
+    {
+        if (Tree.ActiveNode is { } node)
+        {
+            await Tree.RefreshAsync(node.IsDirectory ? node : node.Parent ?? node);
+        }
+    }
+
+    private async Task GoToAddressAsync()
+    {
+        var expanded = Environment.ExpandEnvironmentVariables(AddressText.Trim().Trim('"'));
+        if (string.IsNullOrWhiteSpace(expanded))
+        {
+            return;
+        }
+
+        if (File.Exists(expanded))
+        {
+            await Tree.RevealPathAsync(expanded);
+            return;
+        }
+
+        if (!Directory.Exists(expanded))
+        {
+            Toast.ShowError("That location does not exist.");
+            return;
+        }
+
+        IsAddressEditing = false;
+        await Tree.RevealPathAsync(expanded);
+    }
+
+    private async Task OpenBreadcrumbAsync(BreadcrumbSegment? segment)
+    {
+        if (segment is not null)
+        {
+            await Tree.RevealPathAsync(segment.FullPath);
+        }
+    }
+
+    private async Task OpenSidebarItemAsync(FavoriteItemViewModel? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        if (item.OpensInShell)
+        {
+            try
+            {
+                NativeShellService.Open(item.Path);
+            }
+            catch (Exception ex)
+            {
+                Toast.ShowError(ex.Message);
+            }
+
+            return;
+        }
+
+        if (item.Kind == SidebarItemKind.Network)
+        {
+            await Tree.AddRootAsync(item.Path);
+            return;
+        }
+
+        await Tree.RevealPathAsync(item.Path);
+    }
+
+    private async Task CreateFolderAsync()
+    {
+        if (Tree.TargetDirectory is not { } target)
+        {
+            Toast.ShowError("Select a folder on the canvas first.");
+            return;
+        }
+
+        var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder");
+        if (name is null)
+        {
+            return;
+        }
+
         try
         {
-            var watcher = FileSystemService.CreateWatcher(node.FullPath, () =>
-            {
-                _ = Application.Current.Dispatcher.InvokeAsync(async () =>
-                    await node.DebounceReloadAsync(() => LoadNodeAsync(node)));
-            });
-            node.AttachWatcher(watcher);
+            var path = NativeShellService.CreateFolder(target, name);
+            await Tree.RefreshPathAsync(target);
+            await Toast.ShowSuccessAsync($"Created {Path.GetFileName(path)}");
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex)
         {
-            node.ErrorMessage = "Live updates unavailable";
+            Toast.ShowError(ex.Message);
         }
+    }
+
+    private async Task CreateTextFileAsync()
+    {
+        if (Tree.TargetDirectory is not { } target)
+        {
+            Toast.ShowError("Select a folder on the canvas first.");
+            return;
+        }
+
+        var name = PromptRequested?.Invoke("New text file", "File name", "New note.txt");
+        if (name is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var path = NativeShellService.CreateNoteFile(target, name);
+            await Tree.RefreshPathAsync(target);
+            NativeShellService.Open(path);
+        }
+        catch (Exception ex)
+        {
+            Toast.ShowError(ex.Message);
+        }
+    }
+
+    private void CopySelection(bool cut)
+    {
+        var paths = Tree.SelectedPaths;
+        if (paths.Count == 0)
+        {
+            return;
+        }
+
+        if (!NativeShellService.CopyPathsToClipboard(paths, cut))
+        {
+            Toast.ShowError("Another application is holding the clipboard — try again.");
+            return;
+        }
+
+        _ = Toast.ShowSuccessAsync(cut ? $"Cut {paths.Count} item(s)" : $"Copied {paths.Count} item(s)");
+    }
+
+    private void CopySelectionPath()
+    {
+        var quoted = string.Join(Environment.NewLine, Tree.SelectedOrActivePaths.Select(path => $"\"{path}\""));
+        if (string.IsNullOrWhiteSpace(quoted))
+        {
+            return;
+        }
+
+        try
+        {
+            Clipboard.SetText(quoted);
+            _ = Toast.ShowSuccessAsync("Path copied");
+        }
+        catch (Exception ex)
+        {
+            Toast.ShowError(ex.Message);
+        }
+    }
+
+    private async Task PasteAsync()
+    {
+        if (Tree.TargetDirectory is not { } target)
+        {
+            Toast.ShowError("Select a folder on the canvas first.");
+            return;
+        }
+
+        var payload = NativeShellService.GetClipboardPayload();
+        if (payload is null || payload.Paths.Length == 0)
+        {
+            Toast.ShowError("The clipboard does not contain files or folders.");
+            return;
+        }
+
+        await TransferAsync(payload.Paths, target, payload.Cut, payload.Cut ? "Moving" : "Copying");
     }
 
     private async Task TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
@@ -716,15 +727,33 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        var sourceDirectories = safePaths
+            .Select(Path.GetDirectoryName)
+            .Where(directory => !string.IsNullOrEmpty(directory))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
         try
         {
             Toast.ShowBusy($"{verb} {safePaths.Length} item(s)…");
             await _shellService.CopyOrMoveAsync(safePaths, targetDirectory, move);
-            await Toast.ShowSuccessAsync($"{(move ? "Moved" : "Copied")} {safePaths.Length} item(s) to {Path.GetFileName(targetDirectory.TrimEnd(Path.DirectorySeparatorChar))}");
-            if (_nodesByPath.TryGetValue(NormalizePath(targetDirectory), out var targetNode))
+            await Tree.RefreshPathAsync(targetDirectory);
+            if (move)
             {
-                await LoadNodeAsync(targetNode);
+                foreach (var directory in sourceDirectories)
+                {
+                    await Tree.RefreshPathAsync(directory!);
+                }
             }
+
+            var targetName = Path.GetFileName(targetDirectory.TrimEnd(Path.DirectorySeparatorChar));
+            await Toast.ShowSuccessAsync(
+                $"{(move ? "Moved" : "Copied")} {safePaths.Length} item(s) to {(string.IsNullOrEmpty(targetName) ? targetDirectory : targetName)}");
+        }
+        catch (OperationCanceledException)
+        {
+            await RefreshAfterOperationAsync(targetDirectory, sourceDirectories);
+            await Toast.ShowSuccessAsync($"{(move ? "Move" : "Copy")} cancelled");
         }
         catch (Exception ex)
         {
@@ -732,154 +761,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task BrowseAsync()
+    private async Task RefreshAfterOperationAsync(string? targetDirectory, IEnumerable<string?> sourceDirectories)
     {
-        var dialog = new OpenFolderDialog
+        if (!string.IsNullOrEmpty(targetDirectory))
         {
-            Title = "Choose a folder to place on the canvas",
-            Multiselect = false,
-            InitialDirectory = ActiveNode?.FullPath
-        };
-
-        if (dialog.ShowDialog() == true)
-        {
-            await OpenFolderAsync(dialog.FolderName, focus: true, animated: true);
-        }
-    }
-
-    private async Task GoToAddressAsync()
-    {
-        var expanded = Environment.ExpandEnvironmentVariables(AddressText.Trim().Trim('"'));
-        if (File.Exists(expanded))
-        {
-            NativeShellService.Open(expanded);
-            return;
+            await Tree.RefreshPathAsync(targetDirectory);
         }
 
-        await OpenFolderAsync(expanded, focus: true, animated: true);
-    }
-
-    private async Task GoHomeAsync()
-    {
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        await OpenFolderAsync(home, focus: true, animated: true);
-    }
-
-    private async Task GoUpAsync()
-    {
-        if (ActiveNode is null)
+        foreach (var directory in sourceDirectories.Where(directory => !string.IsNullOrEmpty(directory)))
         {
-            return;
-        }
-
-        var parent = Directory.GetParent(ActiveNode.FullPath)?.FullName;
-        if (parent is not null)
-        {
-            await OpenFolderAsync(parent, focus: true, animated: true);
-        }
-    }
-
-    private void GoBack()
-    {
-        if (_navigationIndex <= 0)
-        {
-            return;
-        }
-
-        _navigationIndex--;
-        NavigateHistoryEntry(_navigationHistory[_navigationIndex]);
-    }
-
-    private void GoForward()
-    {
-        if (_navigationIndex >= _navigationHistory.Count - 1)
-        {
-            return;
-        }
-
-        _navigationIndex++;
-        NavigateHistoryEntry(_navigationHistory[_navigationIndex]);
-    }
-
-    private void NavigateHistoryEntry(string path)
-    {
-        if (_nodesByPath.TryGetValue(NormalizePath(path), out var node))
-        {
-            ActivateNode(node, false, true);
-        }
-        else
-        {
-            _ = OpenFolderAsync(path, focus: true, animated: true);
-        }
-    }
-
-    private async Task RefreshActiveAsync()
-    {
-        if (ActiveNode is not null)
-        {
-            await LoadNodeAsync(ActiveNode);
-        }
-    }
-
-    private async Task PasteAsync()
-    {
-        if (ActiveNode is not null)
-        {
-            await PasteIntoAsync(ActiveNode.FullPath);
-        }
-    }
-
-    private async Task DeleteSelectionAsync(bool permanently)
-    {
-        var paths = GetSelectedPaths();
-        if (paths.Count == 0)
-        {
-            return;
-        }
-
-        if (permanently && ConfirmRequested?.Invoke("Permanently delete", $"Permanently delete {paths.Count} item(s)? This cannot be undone.") != true)
-        {
-            return;
-        }
-
-        try
-        {
-            Toast.ShowBusy(permanently ? "Deleting permanently…" : "Moving to Recycle Bin…");
-            await _shellService.DeleteAsync(paths, permanently);
-            await Toast.ShowSuccessAsync(permanently ? "Deleted" : "Moved to Recycle Bin");
-        }
-        catch (Exception ex)
-        {
-            Toast.ShowError(ex.Message);
-        }
-    }
-
-    private async Task DuplicateSelectionAsync()
-    {
-        var items = GetSelectedPaths();
-        if (items.Count == 0)
-        {
-            return;
-        }
-
-        try
-        {
-            Toast.ShowBusy($"Duplicating {items.Count} item(s)…");
-            foreach (var path in items)
-            {
-                await _shellService.DuplicateAsync(path);
-            }
-            await Toast.ShowSuccessAsync($"Duplicated {items.Count} item(s)");
-        }
-        catch (Exception ex)
-        {
-            Toast.ShowError(ex.Message);
+            await Tree.RefreshPathAsync(directory!);
         }
     }
 
     private async Task RenameSelectionAsync()
     {
-        var paths = GetSelectedPaths();
+        var paths = Tree.SelectedPaths;
         if (paths.Count != 1)
         {
             Toast.ShowError("Select exactly one item to rename.");
@@ -896,8 +793,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            NativeShellService.Rename(path, newName);
-            await Toast.ShowSuccessAsync($"Renamed to {newName}");
+            var renamed = NativeShellService.Rename(path, newName);
+            var parent = Path.GetDirectoryName(renamed);
+            if (!string.IsNullOrEmpty(parent))
+            {
+                await Tree.RefreshPathAsync(parent);
+                await Tree.RevealPathAsync(renamed, focus: false);
+            }
+
+            await Toast.ShowSuccessAsync($"Renamed to {Path.GetFileName(renamed)}");
         }
         catch (Exception ex)
         {
@@ -905,24 +809,36 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task CreateFolderAsync()
+    private async Task DuplicateSelectionAsync()
     {
-        if (ActiveNode is null)
-        {
-            return;
-        }
-
-        var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder");
-        if (name is null)
+        var paths = Tree.SelectedPaths;
+        if (paths.Count == 0)
         {
             return;
         }
 
         try
         {
-            var path = NativeShellService.CreateFolder(ActiveNode.FullPath, name);
-            await Toast.ShowSuccessAsync($"Created {Path.GetFileName(path)}");
-            await LoadNodeAsync(ActiveNode);
+            Toast.ShowBusy($"Duplicating {paths.Count} item(s)…");
+            foreach (var path in paths)
+            {
+                await _shellService.DuplicateAsync(path);
+            }
+
+            foreach (var directory in paths.Select(Path.GetDirectoryName).Distinct(StringComparer.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    await Tree.RefreshPathAsync(directory);
+                }
+            }
+
+            await Toast.ShowSuccessAsync($"Duplicated {paths.Count} item(s)");
+        }
+        catch (OperationCanceledException)
+        {
+            await RefreshAfterOperationAsync(null, paths.Select(Path.GetDirectoryName));
+            await Toast.ShowSuccessAsync("Duplicate cancelled");
         }
         catch (Exception ex)
         {
@@ -930,61 +846,206 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private async Task CreateNoteFileAsync()
+    private async Task DeleteSelectionAsync(bool permanently)
     {
-        if (ActiveNode is null)
+        var paths = Tree.SelectedPaths;
+        if (paths.Count == 0)
         {
             return;
         }
 
-        var name = PromptRequested?.Invoke("New text file", "File name", "New note.txt");
-        if (name is null)
+        if (permanently
+            && ConfirmRequested?.Invoke("Permanently delete", $"Permanently delete {paths.Count} item(s)? This cannot be undone.") != true)
         {
             return;
         }
+
+        var parents = paths
+            .Select(Path.GetDirectoryName)
+            .Where(directory => !string.IsNullOrEmpty(directory))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         try
         {
-            var path = NativeShellService.CreateNoteFile(ActiveNode.FullPath, name);
-            await LoadNodeAsync(ActiveNode);
-            NativeShellService.Open(path);
+            Toast.ShowBusy(permanently ? "Deleting permanently…" : "Moving to Recycle Bin…");
+            await _shellService.DeleteAsync(paths, permanently);
+            foreach (var parent in parents)
+            {
+                await Tree.RefreshPathAsync(parent!);
+            }
+
+            await Toast.ShowSuccessAsync(permanently ? "Deleted" : "Moved to Recycle Bin");
+        }
+        catch (OperationCanceledException)
+        {
+            await RefreshAfterOperationAsync(null, parents);
+            await Toast.ShowSuccessAsync("Delete cancelled");
         }
         catch (Exception ex)
         {
             Toast.ShowError(ex.Message);
         }
+    }
+
+    private void ShowProperties()
+    {
+        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path)
+        {
+            try
+            {
+                NativeShellService.ShowProperties(path);
+            }
+            catch (Exception ex)
+            {
+                Toast.ShowError(ex.Message);
+            }
+        }
+    }
+
+    private void OpenSelection()
+    {
+        if (Tree.ActiveNode is { } node)
+        {
+            if (node.IsDirectory)
+            {
+                _ = Tree.ToggleAsync(node);
+            }
+            else
+            {
+                Tree.OpenInDefaultApplication(node);
+            }
+        }
+    }
+
+    private void ShowSelectionInExplorer()
+    {
+        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path)
+        {
+            try
+            {
+                NativeShellService.ShowInExplorer(path);
+            }
+            catch (Exception ex)
+            {
+                Toast.ShowError(ex.Message);
+            }
+        }
+    }
+
+    private void AddSelectionToFavorites()
+    {
+        foreach (var path in Tree.SelectedOrActivePaths.Where(Directory.Exists))
+        {
+            if (QuickAccess.Any(item => ViewAllPath.Equals(item.Path, path)))
+            {
+                continue;
+            }
+
+            var name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
+            var item = new FavoriteItemViewModel
+            {
+                Name = string.IsNullOrEmpty(name) ? path : name,
+                Path = path,
+                Glyph = "\uE8B7",
+                AccentHex = "#E3B341",
+                IsCustom = true
+            };
+            _fileSystemService.AttachIcons([item]);
+            QuickAccess.Add(item);
+        }
+
+        _ = SaveNowAsync();
+    }
+
+    private void RemoveFavorite(FavoriteItemViewModel? favorite)
+    {
+        if (favorite is { IsCustom: true })
+        {
+            QuickAccess.Remove(favorite);
+            _ = SaveNowAsync();
+        }
+    }
+
+    private void SetSelectionAccent(string? accentHex)
+    {
+        var nodes = Tree.SelectedNodes.Count > 0
+            ? Tree.SelectedNodes.ToArray()
+            : Tree.ActiveNode is null ? [] : [Tree.ActiveNode];
+        if (nodes.Length == 0)
+        {
+            return;
+        }
+
+        Tree.ApplyAccent(nodes, string.IsNullOrEmpty(accentHex) ? null : accentHex);
+    }
+
+    private Task EditSelectionNoteAsync()
+    {
+        if (Tree.ActiveNode is not { } node)
+        {
+            return Task.CompletedTask;
+        }
+
+        var note = PromptRequested?.Invoke("Note", $"Note for {node.DisplayName}", node.Note);
+        if (note is not null)
+        {
+            Tree.ApplyNote(node, note);
+        }
+
+        return Task.CompletedTask;
     }
 
     private async Task SearchAsync()
     {
         var query = SearchText.Trim();
-        if (string.IsNullOrWhiteSpace(query) || ActiveNode is null)
+        if (string.IsNullOrWhiteSpace(query))
         {
             CloseSearch();
+            return;
+        }
+
+        var root = Tree.ActiveNode is { IsDirectory: true } node
+            ? node.FullPath
+            : Path.GetDirectoryName(Tree.ActivePath);
+        if (string.IsNullOrWhiteSpace(root))
+        {
+            Toast.ShowError("Select a folder to search in.");
             return;
         }
 
         _searchCancellation?.Cancel();
         _searchCancellation?.Dispose();
         _searchCancellation = new CancellationTokenSource();
+        var token = _searchCancellation.Token;
+
         IsSearchOpen = true;
         IsSearchBusy = true;
         SearchResults.Clear();
 
-        try
+        // Progress<T> marshals back to the UI thread, so matches appear while the
+        // walk is still running instead of all at once at the end.
+        var progress = new Progress<SearchResultViewModel>(result =>
         {
-            var results = await _fileSystemService.SearchAsync(ActiveNode.FullPath, query, 200, _searchCancellation.Token);
-            foreach (var result in results)
+            if (!token.IsCancellationRequested)
             {
                 SearchResults.Add(result);
             }
+        });
+
+        try
+        {
+            await _fileSystemService.SearchAsync(root, query, 200, progress, token);
         }
         catch (OperationCanceledException)
         {
         }
         finally
         {
-            IsSearchBusy = false;
+            if (!token.IsCancellationRequested)
+            {
+                IsSearchBusy = false;
+            }
         }
     }
 
@@ -992,186 +1053,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         _searchCancellation?.Cancel();
         IsSearchOpen = false;
+        IsSearchBusy = false;
         SearchResults.Clear();
     }
 
-    private void SelectedNodesOnCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    private async Task OpenSearchResultAsync(SearchResultViewModel? result)
     {
-        if (SelectedNodes.LastOrDefault() is { } selected)
-        {
-            ActiveNode = selected;
-        }
-
-        UpdateStatus();
-    }
-
-    private void NodeOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (e.PropertyName is nameof(FolderNodeViewModel.Location)
-            or nameof(FolderNodeViewModel.Note)
-            or nameof(FolderNodeViewModel.AccentHex))
-        {
-            ScheduleSave();
-        }
-    }
-
-    private void RecordNavigation(string path)
-    {
-        if (_navigationIndex >= 0 && _navigationIndex < _navigationHistory.Count && PathsEqual(_navigationHistory[_navigationIndex], path))
+        if (result is null)
         {
             return;
         }
 
-        if (_navigationIndex < _navigationHistory.Count - 1)
-        {
-            _navigationHistory.RemoveRange(_navigationIndex + 1, _navigationHistory.Count - _navigationIndex - 1);
-        }
-
-        _navigationHistory.Add(path);
-        if (_navigationHistory.Count > 100)
-        {
-            _navigationHistory.RemoveAt(0);
-        }
-        _navigationIndex = _navigationHistory.Count - 1;
-    }
-
-    private Point GetViewportSpawnLocation()
-    {
-        var basePoint = ViewportLocation + new Vector(120, 90);
-        return FindFreeLocation(basePoint);
-    }
-
-    private Point GetChildLocation(FolderNodeViewModel parent)
-    {
-        var width = parent.ActualSize.Width > 1 ? parent.ActualSize.Width : 420;
-        var outgoing = Connections.Count(connection => connection.Source == parent);
-        var basePoint = new Point(parent.Location.X + width + 140, parent.Location.Y + outgoing * 96);
-        return FindFreeLocation(basePoint);
-    }
-
-    private Point FindFreeLocation(Point initial)
-    {
-        var candidate = initial;
-        const double width = 420;
-        const double height = 440;
-        for (var attempt = 0; attempt < 80; attempt++)
-        {
-            var bounds = new Rect(candidate, new Size(width, height));
-            if (Nodes.All(node =>
-            {
-                var nodeWidth = node.ActualSize.Width > 1 ? node.ActualSize.Width : width;
-                var nodeHeight = node.ActualSize.Height > 1 ? node.ActualSize.Height : height;
-                var nodeBounds = new Rect(node.Location, new Size(nodeWidth, nodeHeight));
-                nodeBounds.Inflate(28, 22);
-                return !nodeBounds.IntersectsWith(bounds);
-            }))
-            {
-                return candidate;
-            }
-
-            candidate.Y += 112;
-            if (attempt % 5 == 4)
-            {
-                candidate.X += 92;
-                candidate.Y = initial.Y;
-            }
-        }
-
-        return candidate;
-    }
-
-    private void CollectExclusiveDescendants(FolderNodeViewModel node, HashSet<FolderNodeViewModel> result)
-    {
-        foreach (var child in Connections.Where(connection => connection.Source == node).Select(connection => connection.Target).ToArray())
-        {
-            var incomingFromOutside = Connections.Any(connection => connection.Target == child && connection.Source != node);
-            if (incomingFromOutside || !result.Add(child))
-            {
-                continue;
-            }
-
-            CollectExclusiveDescendants(child, result);
-        }
-    }
-
-    private void UpdateStatus()
-    {
-        var selectedItems = GetSelectedFileItems();
-        if (selectedItems.Count == 1)
-        {
-            var item = selectedItems[0];
-            StatusText = item.FullPath;
-            StatusDetail = item.IsDirectory
-                ? "Folder"
-                : $"{item.TypeDescription} • {item.SizeDisplay} • {item.ModifiedDisplay}";
-            return;
-        }
-
-        if (selectedItems.Count > 1)
-        {
-            var folders = selectedItems.Count(item => item.IsDirectory);
-            var size = selectedItems.Where(item => item.SizeBytes.HasValue).Sum(item => item.SizeBytes ?? 0);
-            var nodes = Nodes.Count(node => node.Items.Any(item => item.IsSelected));
-            StatusText = $"{selectedItems.Count:N0} selected in {nodes:N0} folder node(s)";
-            StatusDetail = $"{folders:N0} folder(s) • {FileSystemService.FormatSize(size)}";
-            return;
-        }
-
-        if (SelectedNodes.Count > 1)
-        {
-            StatusText = $"{SelectedNodes.Count:N0} folder nodes selected";
-            StatusDetail = string.Empty;
-            return;
-        }
-
-        if (ActiveNode is not null)
-        {
-            StatusText = ActiveNode.FullPath;
-            StatusDetail = ActiveNode.ItemCountLabel;
-            return;
-        }
-
-        StatusText = "Ready";
-        StatusDetail = string.Empty;
-    }
-
-    private void ScheduleSave()
-    {
-        if (!_isInitialized)
-        {
-            return;
-        }
-
-        _saveDebounce?.Cancel();
-        _saveDebounce?.Dispose();
-        _saveDebounce = new CancellationTokenSource();
-        var token = _saveDebounce.Token;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await Task.Delay(700, token);
-                await Application.Current.Dispatcher.InvokeAsync(SaveNowAsync);
-            }
-            catch (OperationCanceledException)
-            {
-            }
-        }, token);
-    }
-
-    private static string NormalizePath(string path)
-        => Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim().Trim('"')))
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-
-    private static bool PathsEqual(string left, string right)
-    {
-        try
-        {
-            return string.Equals(NormalizePath(left), NormalizePath(right), StringComparison.OrdinalIgnoreCase);
-        }
-        catch
-        {
-            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
-        }
+        await Tree.RevealPathAsync(result.FullPath);
+        CloseSearch();
     }
 }

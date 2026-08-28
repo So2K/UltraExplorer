@@ -1,0 +1,770 @@
+using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Threading;
+using UltraExplorer.Infrastructure;
+using UltraExplorer.Models;
+using UltraExplorer.Services;
+
+namespace UltraExplorer.ViewModels;
+
+/// <summary>
+/// The View All canvas: every drive is an independent root and one graph node
+/// is exactly one file-system object.  Expansion is lazy, layout is incremental
+/// and only the nodes inside the viewport are handed to the editor.
+/// </summary>
+public sealed class ViewAllViewModel : ObservableObject, IDisposable
+{
+    private readonly ViewAllGraphService _graph;
+    private readonly ViewAllViewportService _viewportService = new();
+    private readonly ViewAllWorkspaceStore _store = new();
+    private readonly FolderMarkService _marks;
+    private readonly ShellIconService _icons;
+    private readonly DispatcherTimer _renderThrottle;
+    private readonly DispatcherTimer _saveDebounce;
+    private readonly DispatcherTimer _watcherDebounce;
+    private FileSystemWatcher? _activeWatcher;
+    private string _watchedPath = string.Empty;
+
+    private bool _isInitialized;
+    private bool _isDisposed;
+    private bool _isBusy;
+    private bool _isSyncingSelection;
+    private ViewAllNodeViewModel? _activeNode;
+    private ViewAllNodeViewModel? _dropTarget;
+    private ViewAllDetailLevel _detailLevel = ViewAllDetailLevel.Detailed;
+    private Point _viewportLocation;
+    private Size _viewportSize = new(1200, 800);
+    private double _viewportZoom = 1;
+    private int _logicalNodeCount;
+    private string _statusCountText = string.Empty;
+    private string _statusPathText = string.Empty;
+
+    public ViewAllViewModel(FolderMarkService marks, ShellIconService icons)
+    {
+        _marks = marks;
+        _icons = icons;
+        _graph = new ViewAllGraphService();
+        _graph.GraphChanged += OnGraphChanged;
+        _graph.NodeCreated += OnNodeCreated;
+        _marks.MarkChanged += OnMarkChanged;
+
+        SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
+
+        _renderThrottle = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(35)
+        };
+        _renderThrottle.Tick += (_, _) =>
+        {
+            _renderThrottle.Stop();
+            RebuildRenderSet();
+        };
+
+        _saveDebounce = new DispatcherTimer(DispatcherPriority.ApplicationIdle)
+        {
+            Interval = TimeSpan.FromMilliseconds(900)
+        };
+        _saveDebounce.Tick += async (_, _) =>
+        {
+            _saveDebounce.Stop();
+            await SaveAsync();
+        };
+
+        _watcherDebounce = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(450)
+        };
+        _watcherDebounce.Tick += async (_, _) =>
+        {
+            _watcherDebounce.Stop();
+            if (!string.IsNullOrEmpty(_watchedPath))
+            {
+                await RefreshPathAsync(_watchedPath);
+            }
+        };
+
+        ToggleSelectedCommand = new AsyncRelayCommand(ToggleSelectedAsync);
+        CollapseAllCommand = new RelayCommand(CollapseAll);
+        RefreshSelectedCommand = new AsyncRelayCommand(RefreshSelectedAsync);
+        LoadMoreCommand = new AsyncRelayCommand(LoadMoreForSelectionAsync);
+    }
+
+    /// <summary>Nodes and edges the editor should actually realize right now.</summary>
+    public ObservableCollection<ViewAllNodeViewModel> RenderNodes { get; } = [];
+
+    public ObservableCollection<ViewAllEdgeViewModel> RenderEdges { get; } = [];
+
+    public ObservableCollection<ViewAllNodeViewModel> SelectedNodes { get; } = [];
+
+    public ICommand ToggleSelectedCommand { get; }
+    public ICommand CollapseAllCommand { get; }
+    public ICommand RefreshSelectedCommand { get; }
+    public ICommand LoadMoreCommand { get; }
+
+    /// <summary>Raised when the canvas should fly to a node.</summary>
+    public event Action<ViewAllNodeViewModel, bool>? FocusNodeRequested;
+
+    /// <summary>Raised when a message belongs on the shell toast.</summary>
+    public event Action<string, bool>? MessageRequested;
+
+    public ViewAllNodeViewModel? ActiveNode
+    {
+        get => _activeNode;
+        private set
+        {
+            if (SetProperty(ref _activeNode, value))
+            {
+                OnPropertyChanged(nameof(ActivePath));
+                UpdateStatus();
+                AttachWatcher(value);
+            }
+        }
+    }
+
+    public string ActivePath => _activeNode?.FullPath ?? string.Empty;
+
+    public bool IsBusy
+    {
+        get => _isBusy;
+        private set => SetProperty(ref _isBusy, value);
+    }
+
+    public ViewAllDetailLevel DetailLevel
+    {
+        get => _detailLevel;
+        private set => SetProperty(ref _detailLevel, value);
+    }
+
+    public int LogicalNodeCount
+    {
+        get => _logicalNodeCount;
+        private set
+        {
+            if (SetProperty(ref _logicalNodeCount, value))
+            {
+                UpdateStatus();
+            }
+        }
+    }
+
+    public string StatusCountText
+    {
+        get => _statusCountText;
+        private set => SetProperty(ref _statusCountText, value);
+    }
+
+    public string StatusPathText
+    {
+        get => _statusPathText;
+        private set => SetProperty(ref _statusPathText, value);
+    }
+
+    public Point ViewportLocation => _viewportLocation;
+
+    public double ViewportZoom => _viewportZoom;
+
+    public string ZoomLabel => $"{_viewportZoom:P0}";
+
+    /// <summary>Viewport restored from the saved workspace, applied once on load.</summary>
+    public Point RestoredViewportLocation { get; private set; }
+
+    public double RestoredViewportZoom { get; private set; } = 1;
+
+    public bool HasRestoredViewport { get; private set; }
+
+    public async Task InitializeAsync()
+    {
+        if (_isInitialized)
+        {
+            return;
+        }
+
+        _isInitialized = true;
+        IsBusy = true;
+        try
+        {
+            var state = await _store.LoadAsync();
+            await _graph.InitializeAsync(state);
+
+            if (state is { Nodes.Count: > 0 })
+            {
+                RestoredViewportLocation = new Point(state.ViewportX, state.ViewportY);
+                RestoredViewportZoom = Math.Clamp(state.ViewportZoom, 0.05, 4);
+                HasRestoredViewport = true;
+
+                if (!string.IsNullOrWhiteSpace(state.ActivePath) && _graph.TryGetNode(state.ActivePath, out var active))
+                {
+                    SelectOnly(active);
+                }
+                else if (_graph.Roots.FirstOrDefault() is { } firstRoot)
+                {
+                    SelectOnly(firstRoot);
+                }
+            }
+            else
+            {
+                // First run: open the profile branch so the canvas is never empty.
+                await RevealPathAsync(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), focus: false);
+            }
+
+            RebuildRenderSet();
+        }
+        catch (Exception ex)
+        {
+            MessageRequested?.Invoke($"Could not build the drive graph: {ex.Message}", true);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    public bool TryGetNode(string path, out ViewAllNodeViewModel node)
+        => _graph.TryGetNode(path, out node);
+
+    /// <summary>Adds a non-drive location (WSL, UNC share) as its own root.</summary>
+    public async Task<ViewAllNodeViewModel?> AddRootAsync(string path)
+    {
+        var node = await _graph.AddRootAsync(path);
+        if (node is null)
+        {
+            MessageRequested?.Invoke($"Could not open {path}", true);
+            return null;
+        }
+
+        await _graph.ExpandAsync(node);
+        SelectOnly(node);
+        RebuildRenderSet();
+        FocusNodeRequested?.Invoke(node, true);
+        ScheduleSave();
+        return node;
+    }
+
+    public async Task ToggleAsync(ViewAllNodeViewModel node)
+    {
+        if (!node.IsDirectory)
+        {
+            OpenInDefaultApplication(node);
+            return;
+        }
+
+        var result = await _graph.ToggleAsync(node);
+        if (result.IsTruncated)
+        {
+            MessageRequested?.Invoke(
+                $"{node.DisplayName} has more than {node.ChildLoadLimit:N0} items — use Load more to continue.",
+                false);
+        }
+
+        ScheduleSave();
+    }
+
+    public async Task<ViewAllNodeViewModel?> ExpandAsync(ViewAllNodeViewModel node)
+    {
+        if (!node.IsDirectory)
+        {
+            return node;
+        }
+
+        await _graph.ExpandAsync(node);
+        ScheduleSave();
+        return node;
+    }
+
+    public void CollapseAll()
+    {
+        _graph.CollapseAll();
+        ScheduleSave();
+    }
+
+    public async Task RefreshAsync(ViewAllNodeViewModel node)
+    {
+        if (!node.IsDirectory)
+        {
+            return;
+        }
+
+        await _graph.RefreshBranchAsync(node);
+        ScheduleSave();
+    }
+
+    /// <summary>Re-reads a directory if it is currently part of the graph.</summary>
+    public async Task RefreshPathAsync(string path)
+    {
+        if (_graph.TryGetNode(path, out var node) && node.AreChildrenLoaded)
+        {
+            await _graph.RefreshBranchAsync(node);
+            ScheduleSave();
+        }
+    }
+
+    public async Task LoadMoreAsync(ViewAllNodeViewModel node)
+    {
+        var result = await _graph.LoadMoreAsync(node);
+        if (result.WasLoaded)
+        {
+            MessageRequested?.Invoke($"Loaded {node.LoadedChildCount:N0} items in {node.DisplayName}", false);
+        }
+
+        ScheduleSave();
+    }
+
+    /// <summary>
+    /// Expands every ancestor of <paramref name="path"/> and selects it.  Only
+    /// the folders on the way are read, never their siblings' subtrees.
+    /// </summary>
+    public async Task<ViewAllNodeViewModel?> RevealPathAsync(string path, bool focus = true)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        IReadOnlyList<string> chain;
+        string normalized;
+        try
+        {
+            normalized = ViewAllPath.Normalize(path);
+            chain = ViewAllPath.AncestorChain(normalized);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            MessageRequested?.Invoke($"That path cannot be opened: {ex.Message}", true);
+            return null;
+        }
+
+        // A UNC share or a WSL distribution is not a DriveInfo root, so it only
+        // enters the graph when it is explicitly added.
+        if (chain.Count > 0 && !_graph.TryGetNode(chain[0], out _))
+        {
+            await _graph.AddRootAsync(chain[0]);
+        }
+
+        ViewAllNodeViewModel? node = null;
+        foreach (var step in chain)
+        {
+            if (!_graph.TryGetNode(step, out var found))
+            {
+                MessageRequested?.Invoke(
+                    node is null
+                        ? "That drive is not available on this machine."
+                        : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
+                    true);
+                break;
+            }
+
+            node = found;
+            var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
+            if (!isDestination && node.IsDirectory)
+            {
+                await _graph.ExpandAsync(node);
+            }
+        }
+
+        if (node is null)
+        {
+            return null;
+        }
+
+        SelectOnly(node);
+        RebuildRenderSet();
+        if (focus)
+        {
+            FocusNodeRequested?.Invoke(node, true);
+        }
+
+        ScheduleSave();
+        return node;
+    }
+
+    public void SelectOnly(ViewAllNodeViewModel node)
+    {
+        _isSyncingSelection = true;
+        try
+        {
+            foreach (var selected in SelectedNodes.Where(item => item != node).ToArray())
+            {
+                selected.IsSelected = false;
+            }
+
+            SelectedNodes.Clear();
+            SelectedNodes.Add(node);
+            node.IsSelected = true;
+        }
+        finally
+        {
+            _isSyncingSelection = false;
+        }
+
+        ActiveNode = node;
+    }
+
+    public void Activate(ViewAllNodeViewModel node)
+    {
+        ActiveNode = node;
+        UpdateStatus();
+    }
+
+    public void OpenInDefaultApplication(ViewAllNodeViewModel node)
+    {
+        try
+        {
+            NativeShellService.Open(node.FullPath);
+        }
+        catch (Exception ex)
+        {
+            MessageRequested?.Invoke($"Could not open {node.DisplayName}: {ex.Message}", true);
+        }
+    }
+
+    /// <summary>
+    /// Strictly what the user selected.  Destructive commands use this, so an
+    /// empty canvas selection can never be turned into "delete the folder I am
+    /// merely looking at".
+    /// </summary>
+    public IReadOnlyList<string> SelectedPaths
+        => SelectedNodes.Count > 0
+            ? SelectedNodes.Select(node => node.FullPath).ToArray()
+            : [];
+
+    /// <summary>Selection, falling back to the focused node for read-only commands.</summary>
+    public IReadOnlyList<string> SelectedOrActivePaths
+        => SelectedPaths.Count > 0
+            ? SelectedPaths
+            : ActiveNode is null ? [] : [ActiveNode.FullPath];
+
+    /// <summary>The folder that a new item or a paste should land in.</summary>
+    public string? TargetDirectory
+    {
+        get
+        {
+            var node = SelectedNodes.LastOrDefault() ?? ActiveNode;
+            if (node is null)
+            {
+                return null;
+            }
+
+            return node.IsDirectory ? node.FullPath : Path.GetDirectoryName(node.FullPath);
+        }
+    }
+
+    public ViewAllNodeViewModel? FindNearestDropTarget(Point graphPoint, double maximumDistance)
+        => _graph.FindNearestDropTarget(graphPoint, maximumDistance);
+
+    public void SetDropTarget(ViewAllNodeViewModel? target)
+    {
+        if (ReferenceEquals(_dropTarget, target))
+        {
+            return;
+        }
+
+        if (_dropTarget is not null)
+        {
+            _dropTarget.IsDropTarget = false;
+        }
+
+        _dropTarget = target;
+        if (_dropTarget is not null)
+        {
+            _dropTarget.IsDropTarget = true;
+        }
+    }
+
+    public void ApplyAccent(IEnumerable<ViewAllNodeViewModel> nodes, string? accentHex)
+    {
+        foreach (var node in nodes)
+        {
+            _marks.SetAccent(node.FullPath, accentHex);
+        }
+
+        ScheduleSave();
+    }
+
+    public void ApplyNote(ViewAllNodeViewModel node, string? note)
+    {
+        _marks.SetNote(node.FullPath, note);
+        ScheduleSave();
+    }
+
+    /// <summary>Called by the editor whenever the viewport moved, zoomed or resized.</summary>
+    public void UpdateViewport(Point location, Size size, double zoom)
+    {
+        var zoomChanged = Math.Abs(_viewportZoom - zoom) > double.Epsilon;
+        _viewportLocation = location;
+        _viewportSize = size.Width > 0 && size.Height > 0 ? size : _viewportSize;
+        _viewportZoom = zoom;
+
+        if (zoomChanged)
+        {
+            OnPropertyChanged(nameof(ViewportZoom));
+            OnPropertyChanged(nameof(ZoomLabel));
+        }
+
+        OnPropertyChanged(nameof(ViewportLocation));
+        _renderThrottle.Stop();
+        _renderThrottle.Start();
+        ScheduleSave();
+    }
+
+    public Rect GetContentExtent()
+    {
+        var visible = _graph.Nodes.Where(node => node.IsTreeVisible && node.HasLayoutPosition).ToArray();
+        if (visible.Length == 0)
+        {
+            return new Rect(0, 0, ViewAllNodeViewModel.DefaultWidth, ViewAllNodeViewModel.DefaultHeight);
+        }
+
+        var extent = visible[0].Bounds;
+        foreach (var node in visible.Skip(1))
+        {
+            extent.Union(node.Bounds);
+        }
+
+        extent.Inflate(80, 80);
+        return extent;
+    }
+
+    public async Task SaveAsync()
+    {
+        if (!_isInitialized || _isDisposed)
+        {
+            return;
+        }
+
+        try
+        {
+            var state = _graph.CaptureState(new ViewAllViewportState(_viewportLocation, _viewportZoom));
+            state.ActivePath = ActiveNode?.FullPath ?? string.Empty;
+            await _store.SaveAsync(state);
+            await _marks.SaveAsync();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Losing a layout snapshot must never interrupt file navigation.
+        }
+    }
+
+    public void ScheduleSave()
+    {
+        if (!_isInitialized || _isDisposed)
+        {
+            return;
+        }
+
+        _saveDebounce.Stop();
+        _saveDebounce.Start();
+    }
+
+    public void Dispose()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        _isDisposed = true;
+        _renderThrottle.Stop();
+        _saveDebounce.Stop();
+        _watcherDebounce.Stop();
+        _activeWatcher?.Dispose();
+        _activeWatcher = null;
+        _graph.GraphChanged -= OnGraphChanged;
+        _graph.NodeCreated -= OnNodeCreated;
+        _marks.MarkChanged -= OnMarkChanged;
+        SelectedNodes.CollectionChanged -= OnSelectedNodesChanged;
+        _graph.Dispose();
+    }
+
+    private async Task ToggleSelectedAsync()
+    {
+        var target = SelectedNodes.LastOrDefault() ?? ActiveNode;
+        if (target is not null)
+        {
+            await ToggleAsync(target);
+        }
+    }
+
+    private async Task RefreshSelectedAsync()
+    {
+        var target = SelectedNodes.LastOrDefault() ?? ActiveNode;
+        if (target is not null)
+        {
+            await RefreshAsync(target.IsDirectory ? target : target.Parent ?? target);
+        }
+    }
+
+    private async Task LoadMoreForSelectionAsync()
+    {
+        var target = SelectedNodes.LastOrDefault(node => node.IsTruncated) ?? ActiveNode;
+        if (target is { IsTruncated: true })
+        {
+            await LoadMoreAsync(target);
+        }
+    }
+
+    /// <summary>
+    /// Only the branch the user is looking at is watched.  One watcher keeps the
+    /// open folder current without the cost of watching a whole drive.
+    /// </summary>
+    private void AttachWatcher(ViewAllNodeViewModel? node)
+    {
+        var path = node is { IsDirectory: true, AreChildrenLoaded: true } ? node.FullPath : string.Empty;
+        if (string.Equals(path, _watchedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _watcherDebounce.Stop();
+        _activeWatcher?.Dispose();
+        _activeWatcher = null;
+        _watchedPath = path;
+
+        if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
+        {
+            return;
+        }
+
+        try
+        {
+            _activeWatcher = FileSystemService.CreateWatcher(path, OnWatchedPathChanged);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            _watchedPath = string.Empty;
+        }
+    }
+
+    private void OnWatchedPathChanged()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || _isDisposed)
+        {
+            return;
+        }
+
+        _ = dispatcher.InvokeAsync(() =>
+        {
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            _watcherDebounce.Stop();
+            _watcherDebounce.Start();
+        }, DispatcherPriority.Background);
+    }
+
+    private void OnGraphChanged(object? sender, EventArgs e) => RebuildRenderSet();
+
+    private void OnNodeCreated(ViewAllNodeViewModel node)
+    {
+        var mark = _marks.Get(node.FullPath);
+        node.AccentHex = mark.AccentHex;
+        node.Note = mark.Note;
+        node.Icon = _icons.GetSmallIcon(node.FullPath, node.IsDirectory);
+    }
+
+    private void OnMarkChanged(string path, FolderMark mark)
+    {
+        if (_graph.TryGetNode(path, out var node))
+        {
+            node.AccentHex = mark.AccentHex;
+            node.Note = mark.Note;
+        }
+    }
+
+    private void OnSelectedNodesChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        if (_isSyncingSelection)
+        {
+            return;
+        }
+
+        foreach (var removed in e.OldItems?.OfType<ViewAllNodeViewModel>() ?? [])
+        {
+            removed.IsSelected = false;
+        }
+
+        foreach (var added in e.NewItems?.OfType<ViewAllNodeViewModel>() ?? [])
+        {
+            added.IsSelected = true;
+        }
+
+        if (SelectedNodes.LastOrDefault() is { } last)
+        {
+            ActiveNode = last;
+        }
+
+        UpdateStatus();
+    }
+
+    private void RebuildRenderSet()
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        var viewport = new Rect(_viewportLocation, _viewportSize);
+        var set = _viewportService.BuildRenderSet(_graph.Nodes, _graph.Edges, viewport, _viewportZoom);
+        Sync(RenderNodes, set.Nodes);
+        Sync(RenderEdges, set.Edges);
+        DetailLevel = set.DetailLevel;
+        LogicalNodeCount = set.LogicalNodeCount;
+    }
+
+    private static void Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired)
+        where T : class
+    {
+        var wanted = new HashSet<T>(desired);
+        for (var index = target.Count - 1; index >= 0; index--)
+        {
+            if (!wanted.Contains(target[index]))
+            {
+                target.RemoveAt(index);
+            }
+        }
+
+        var present = new HashSet<T>(target);
+        foreach (var item in desired)
+        {
+            if (present.Add(item))
+            {
+                target.Add(item);
+            }
+        }
+    }
+
+    private void UpdateStatus()
+    {
+        var selected = SelectedNodes.Count;
+        if (selected > 1)
+        {
+            var folders = SelectedNodes.Count(node => node.IsDirectory);
+            var bytes = SelectedNodes.Where(node => node.IsFile && node.Entry.SizeBytes.HasValue)
+                .Sum(node => node.Entry.SizeBytes ?? 0);
+            StatusCountText = folders > 0
+                ? $"{selected:N0} items selected  ·  {folders:N0} folders  ·  {FileSystemService.FormatSize(bytes)}"
+                : $"{selected:N0} items selected  ·  {FileSystemService.FormatSize(bytes)}";
+            StatusPathText = ActiveNode?.FullPath ?? string.Empty;
+            return;
+        }
+
+        var node = SelectedNodes.FirstOrDefault() ?? ActiveNode;
+        if (node is null)
+        {
+            StatusCountText = $"{LogicalNodeCount:N0} nodes";
+            StatusPathText = string.Empty;
+            return;
+        }
+
+        StatusCountText = node.IsDirectory
+            ? node.AreChildrenLoaded
+                ? $"{node.LoadedChildCount:N0} items{(node.IsTruncated ? "+" : string.Empty)}"
+                : "Folder"
+            : node.SecondaryText;
+        StatusPathText = node.FullPath;
+    }
+}

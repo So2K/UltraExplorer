@@ -6,12 +6,12 @@ using UltraExplorer.Infrastructure;
 namespace UltraExplorer.Models;
 
 /// <summary>
-/// A deliberately small graph node.  Unlike FolderNodeViewModel it represents
-/// exactly one file-system object and never owns a file-list view.
+/// A deliberately small graph node: exactly one file-system object, never a
+/// window with an embedded file list.
 /// </summary>
 public sealed class ViewAllNodeViewModel : ObservableObject
 {
-    public const double DefaultWidth = 184;
+    public const double DefaultWidth = 188;
     public const double DefaultHeight = 44;
 
     private Point _location;
@@ -29,6 +29,7 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     private string _errorMessage = string.Empty;
     private string _accentHex = string.Empty;
     private string _note = string.Empty;
+    private ImageSource? _icon;
     private ViewAllDetailLevel _detailLevel = ViewAllDetailLevel.Detailed;
 
     public ViewAllNodeViewModel(
@@ -93,6 +94,8 @@ public sealed class ViewAllNodeViewModel : ObservableObject
             if (SetProperty(ref _isExpanded, value))
             {
                 OnPropertyChanged(nameof(HasVisibleChildren));
+                OnPropertyChanged(nameof(Glyph));
+                OnPropertyChanged(nameof(ChevronAngle));
             }
         }
     }
@@ -156,13 +159,28 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     public string ErrorMessage
     {
         get => _errorMessage;
-        internal set => SetProperty(ref _errorMessage, value);
+        internal set
+        {
+            if (SetProperty(ref _errorMessage, value))
+            {
+                OnPropertyChanged(nameof(HasError));
+            }
+        }
     }
+
+    public bool HasError => !string.IsNullOrEmpty(_errorMessage);
 
     public ViewAllDetailLevel DetailLevel
     {
         get => _detailLevel;
         internal set => SetProperty(ref _detailLevel, value);
+    }
+
+    /// <summary>The real Shell icon; resolved once per extension by the graph.</summary>
+    public ImageSource? Icon
+    {
+        get => _icon;
+        set => SetProperty(ref _icon, value);
     }
 
     /// <summary>Empty means "use the colour that belongs to this object kind".</summary>
@@ -185,9 +203,9 @@ public sealed class ViewAllNodeViewModel : ObservableObject
 
     public string DefaultAccentHex => Kind switch
     {
-        ViewAllEntryKind.Drive => "#98A2B3",
-        ViewAllEntryKind.Folder => "#FFD66B",
-        _ => "#6E7A8C"
+        ViewAllEntryKind.Drive => "#9AA4B2",
+        ViewAllEntryKind.Folder => "#E3B341",
+        _ => "#5C6675"
     };
 
     public string Note
@@ -204,12 +222,16 @@ public sealed class ViewAllNodeViewModel : ObservableObject
 
     public bool HasNote => !string.IsNullOrWhiteSpace(_note);
 
+    /// <summary>Fallback Segoe Fluent glyph used until the Shell icon arrives.</summary>
     public string Glyph => Kind switch
     {
-        ViewAllEntryKind.Drive => "",
-        ViewAllEntryKind.Folder => IsExpanded ? "" : "",
-        _ => ""
+        ViewAllEntryKind.Drive => "\uEDA2",
+        ViewAllEntryKind.Folder => IsExpanded ? "\uE838" : "\uE8B7",
+        _ => "\uE8A5"
     };
+
+    /// <summary>Disclosure chevron rotation: 0 collapsed, 90 expanded.</summary>
+    public double ChevronAngle => IsExpanded ? 90 : 0;
 
     public Point InputAnchor => new(Location.X, Location.Y + DefaultHeight / 2);
     public Point OutputAnchor => new(Location.X + DefaultWidth, Location.Y + DefaultHeight / 2);
@@ -299,5 +321,32 @@ public static class ViewAllPath
         {
             return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
         }
+    }
+
+    /// <summary>Root-first chain of every ancestor path including <paramref name="path"/>.</summary>
+    public static IReadOnlyList<string> AncestorChain(string path)
+    {
+        var chain = new List<string>();
+        var current = Normalize(path);
+        while (true)
+        {
+            chain.Add(current);
+            var parent = Path.GetDirectoryName(current);
+            if (string.IsNullOrEmpty(parent))
+            {
+                break;
+            }
+
+            var normalizedParent = Normalize(parent);
+            if (string.Equals(normalizedParent, current, StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
+
+            current = normalizedParent;
+        }
+
+        chain.Reverse();
+        return chain;
     }
 }

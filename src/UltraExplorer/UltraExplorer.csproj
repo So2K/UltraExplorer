@@ -10,13 +10,14 @@
     <RootNamespace>UltraExplorer</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\UltraExplorer.ico</ApplicationIcon>
-    <PublishSingleFile>true</PublishSingleFile>
-    <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <PublishReadyToRun>true</PublishReadyToRun>
     <SatelliteResourceLanguages>en;ru</SatelliteResourceLanguages>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
+
+  <!-- Self-contained single file is a publish-time decision passed on the
+       command line, so ordinary builds stay framework-dependent and the test
+       harness can reference this project. See BUILD.md for the publish command. -->
 
   <ItemGroup>
     <PackageReference Include="Nodify" Version="7.3.0" />

@@ -47,6 +47,35 @@ public sealed class ViewAllFileSystemService
             return roots;
         }, cancellationToken);
 
+    /// <summary>
+    /// Describes a single directory so it can be added as an extra root, which
+    /// is how WSL and UNC shares join the graph alongside the local drives.
+    /// </summary>
+    public Task<ViewAllEntryDescriptor> DescribeDirectoryAsync(
+        string directoryPath,
+        CancellationToken cancellationToken = default)
+        => Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var normalized = ViewAllPath.Normalize(directoryPath);
+            var directory = new DirectoryInfo(normalized);
+            if (!directory.Exists)
+            {
+                throw new DirectoryNotFoundException($"Folder no longer exists: {directoryPath}");
+            }
+
+            var attributes = directory.Attributes;
+            return new ViewAllEntryDescriptor(
+                normalized,
+                string.IsNullOrEmpty(directory.Name) ? normalized : directory.Name,
+                ViewAllEntryKind.Folder,
+                attributes.HasFlag(FileAttributes.Hidden),
+                attributes.HasFlag(FileAttributes.ReparsePoint),
+                SizeBytes: null,
+                directory.LastWriteTimeUtc,
+                normalized);
+        }, cancellationToken);
+
     public Task<ViewAllDirectorySnapshot> GetChildrenAsync(
         string directoryPath,
         ViewAllGraphOptions options,

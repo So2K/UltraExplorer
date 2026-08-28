@@ -1,123 +1,82 @@
-using System.Globalization;
 using System.IO;
 using UltraExplorer.Models;
 
 namespace UltraExplorer.Services;
 
+/// <summary>
+/// Shell-level helpers: navigation pane content, recursive search and the
+/// watcher used to keep an open branch current.  Directory enumeration for the
+/// graph itself lives in <see cref="ViewAllFileSystemService"/>.
+/// </summary>
 public sealed class FileSystemService(ShellIconService iconService)
 {
-    private static readonly EnumerationOptions EnumerationOptions = new()
-    {
-        IgnoreInaccessible = true,
-        RecurseSubdirectories = false,
-        ReturnSpecialDirectories = false,
-        AttributesToSkip = 0,
-        MatchCasing = MatchCasing.CaseInsensitive
-    };
+    private const string WslRoot = @"\\wsl$";
 
-    public Task<IReadOnlyList<FileItemViewModel>> GetDirectoryItemsAsync(string path, CancellationToken cancellationToken)
-        => Task.Run<IReadOnlyList<FileItemViewModel>>(() =>
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var directory = new DirectoryInfo(path);
-            if (!directory.Exists)
-            {
-                throw new DirectoryNotFoundException($"Folder no longer exists: {path}");
-            }
-
-            var items = new List<FileItemViewModel>();
-            foreach (var info in directory.EnumerateFileSystemInfos("*", EnumerationOptions))
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                try
-                {
-                    var isDirectory = info.Attributes.HasFlag(FileAttributes.Directory);
-                    long? size = isDirectory ? null : ((FileInfo)info).Length;
-                    items.Add(new FileItemViewModel
-                    {
-                        FullPath = info.FullName,
-                        Name = info.Name,
-                        IsDirectory = isDirectory,
-                        TypeDescription = isDirectory ? "Folder" : GetTypeDescription(info.Extension),
-                        SizeBytes = size,
-                        SizeDisplay = size is null ? string.Empty : FormatSize(size.Value),
-                        ModifiedUtc = info.LastWriteTimeUtc,
-                        ModifiedDisplay = info.LastWriteTime.ToString("g", CultureInfo.CurrentCulture),
-                        IsHidden = info.Attributes.HasFlag(FileAttributes.Hidden),
-                        Icon = iconService.GetSmallIcon(info.FullName, isDirectory)
-                    });
-                }
-                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
-                {
-                    // The Shell also skips entries that disappear during enumeration.
-                }
-            }
-
-            return items
-                .OrderByDescending(item => item.IsDirectory)
-                .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase)
-                .ToArray();
-        }, cancellationToken);
-
+    /// <summary>
+    /// Breadth-first so the shallowest — and usually most relevant — matches
+    /// arrive first, and streamed through <paramref name="progress"/> so the
+    /// results list fills in while the walk is still running.
+    /// </summary>
     public Task<IReadOnlyList<SearchResultViewModel>> SearchAsync(
         string rootPath,
         string query,
         int maxResults,
+        IProgress<SearchResultViewModel>? progress,
         CancellationToken cancellationToken)
         => Task.Run<IReadOnlyList<SearchResultViewModel>>(() =>
         {
             var results = new List<SearchResultViewModel>(Math.Min(maxResults, 128));
-            var pending = new Stack<string>();
-            pending.Push(rootPath);
+            var pending = new Queue<string>();
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            pending.Enqueue(rootPath);
 
             while (pending.Count > 0 && results.Count < maxResults)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                var current = pending.Pop();
+                var current = pending.Dequeue();
+                if (!visited.Add(current))
+                {
+                    continue;
+                }
 
                 try
                 {
                     foreach (var entry in Directory.EnumerateFileSystemEntries(current))
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        bool isDirectory;
+                        FileAttributes attributes;
                         try
                         {
-                            isDirectory = File.GetAttributes(entry).HasFlag(FileAttributes.Directory);
+                            attributes = File.GetAttributes(entry);
                         }
-                        catch
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                         {
                             continue;
                         }
 
+                        var isDirectory = attributes.HasFlag(FileAttributes.Directory);
                         var name = Path.GetFileName(entry);
                         if (name.Contains(query, StringComparison.OrdinalIgnoreCase))
                         {
-                            results.Add(new SearchResultViewModel(
+                            var result = new SearchResultViewModel(
                                 name,
                                 entry,
                                 current,
                                 isDirectory,
-                                isDirectory ? "\uE8B7" : "\uE8A5"));
+                                isDirectory ? "\uE8B7" : "\uE8A5");
+                            results.Add(result);
+                            progress?.Report(result);
                             if (results.Count >= maxResults)
                             {
                                 break;
                             }
                         }
 
-                        if (isDirectory)
+                        // Reparse points are skipped: following them turns the
+                        // search into an unbounded walk over the same folders.
+                        if (isDirectory && !attributes.HasFlag(FileAttributes.ReparsePoint))
                         {
-                            try
-                            {
-                                var attributes = File.GetAttributes(entry);
-                                if (!attributes.HasFlag(FileAttributes.ReparsePoint))
-                                {
-                                    pending.Push(entry);
-                                }
-                            }
-                            catch
-                            {
-                            }
+                            pending.Enqueue(entry);
                         }
                     }
                 }
@@ -129,34 +88,91 @@ public sealed class FileSystemService(ShellIconService iconService)
             return results;
         }, cancellationToken);
 
-    public static IReadOnlyList<FavoriteItemViewModel> GetSystemFavorites()
+    public IReadOnlyList<FavoriteItemViewModel> GetQuickAccess()
     {
         var profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
         var candidates = new[]
         {
-            new FavoriteItemViewModel { Name = "Home", Path = profile, Glyph = "\uE80F", AccentHex = "#70A0FF" },
-            new FavoriteItemViewModel { Name = "Desktop", Path = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), Glyph = "\uE7F4" },
-            new FavoriteItemViewModel { Name = "Downloads", Path = Path.Combine(profile, "Downloads"), Glyph = "\uE896" },
-            new FavoriteItemViewModel { Name = "Documents", Path = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), Glyph = "\uE8A5" },
-            new FavoriteItemViewModel { Name = "Pictures", Path = Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), Glyph = "\uEB9F" },
-            new FavoriteItemViewModel { Name = "Music", Path = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), Glyph = "\uE8D6" },
-            new FavoriteItemViewModel { Name = "Videos", Path = Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), Glyph = "\uE8B2" }
+            Create("Home", profile, "\uE80F", "#60CDFF"),
+            Create("Desktop", Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "\uE7F4"),
+            Create("Downloads", Path.Combine(profile, "Downloads"), "\uE896"),
+            Create("Documents", Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "\uE8A5"),
+            Create("Pictures", Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "\uEB9F"),
+            Create("Music", Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "\uE8D6"),
+            Create("Videos", Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "\uE8B2")
         };
 
         return candidates.Where(item => Directory.Exists(item.Path)).ToArray();
     }
 
-    public static IReadOnlyList<FavoriteItemViewModel> GetDrives()
+    public IReadOnlyList<FavoriteItemViewModel> GetDrives()
         => DriveInfo.GetDrives()
             .Where(drive => drive.IsReady)
-            .Select(drive => new FavoriteItemViewModel
+            .Select(drive =>
             {
-                Name = string.IsNullOrWhiteSpace(drive.VolumeLabel) ? $"Local Disk ({drive.Name.TrimEnd('\\')})" : $"{drive.VolumeLabel} ({drive.Name.TrimEnd('\\')})",
-                Path = drive.RootDirectory.FullName,
-                Glyph = "\uEDA2",
-                AccentHex = "#98A2B3"
+                var label = SafeVolumeLabel(drive);
+                var item = new FavoriteItemViewModel
+                {
+                    Name = $"{label} ({drive.Name.TrimEnd('\\')})",
+                    Path = drive.RootDirectory.FullName,
+                    Glyph = drive.DriveType == DriveType.Network ? "\uE968" : "\uEDA2",
+                    AccentHex = "#9AA4B2",
+                    Kind = SidebarItemKind.Drive
+                };
+                item.Icon = iconService.GetSmallIcon(item.Path, isDirectory: true);
+                return item;
             })
             .ToArray();
+
+    /// <summary>WSL distributions and the Explorer network view, when present.</summary>
+    public IReadOnlyList<FavoriteItemViewModel> GetNetworkLocations()
+    {
+        var items = new List<FavoriteItemViewModel>();
+
+        try
+        {
+            if (Directory.Exists(WslRoot))
+            {
+                foreach (var distribution in Directory.EnumerateDirectories(WslRoot).Take(8))
+                {
+                    var item = new FavoriteItemViewModel
+                    {
+                        Name = Path.GetFileName(distribution),
+                        Path = distribution,
+                        Glyph = "\uEC7A",
+                        AccentHex = "#E3B341",
+                        Kind = SidebarItemKind.Network
+                    };
+                    item.Icon = iconService.GetSmallIcon(distribution, isDirectory: true);
+                    items.Add(item);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // A stopped WSL service simply means there is nothing to list.
+        }
+
+        items.Add(new FavoriteItemViewModel
+        {
+            Name = "Network",
+            Path = "shell:NetworkPlacesFolder",
+            Glyph = "\uE968",
+            AccentHex = "#9AA4B2",
+            Kind = SidebarItemKind.Network,
+            OpensInShell = true
+        });
+
+        return items;
+    }
+
+    public void AttachIcons(IEnumerable<FavoriteItemViewModel> items)
+    {
+        foreach (var item in items.Where(item => item.Icon is null && !item.OpensInShell))
+        {
+            item.Icon = iconService.GetSmallIcon(item.Path, isDirectory: true);
+        }
+    }
 
     public static FileSystemWatcher CreateWatcher(string path, Action changed)
     {
@@ -169,12 +185,10 @@ public sealed class FileSystemService(ShellIconService iconService)
 
         FileSystemEventHandler onChange = (_, _) => changed();
         RenamedEventHandler onRename = (_, _) => changed();
-        ErrorEventHandler onError = (_, _) => changed();
         watcher.Created += onChange;
         watcher.Changed += onChange;
         watcher.Deleted += onChange;
         watcher.Renamed += onRename;
-        watcher.Error += onError;
         return watcher;
     }
 
@@ -192,13 +206,41 @@ public sealed class FileSystemService(ShellIconService iconService)
         return suffix == 0 ? $"{bytes:N0} B" : $"{value:0.#} {suffixes[suffix]}";
     }
 
-    private static string GetTypeDescription(string extension)
+    private FavoriteItemViewModel Create(string name, string path, string glyph, string accentHex = "#C8C8C8")
     {
-        if (string.IsNullOrWhiteSpace(extension))
+        var item = new FavoriteItemViewModel
         {
-            return "File";
+            Name = name,
+            Path = path,
+            Glyph = glyph,
+            AccentHex = accentHex
+        };
+
+        if (Directory.Exists(path))
+        {
+            item.Icon = iconService.GetSmallIcon(path, isDirectory: true);
         }
 
-        return $"{extension.TrimStart('.').ToUpperInvariant()} file";
+        return item;
+    }
+
+    private static string SafeVolumeLabel(DriveInfo drive)
+    {
+        try
+        {
+            return string.IsNullOrWhiteSpace(drive.VolumeLabel)
+                ? drive.DriveType switch
+                {
+                    DriveType.Removable => "Removable Disk",
+                    DriveType.Network => "Network Drive",
+                    DriveType.CDRom => "DVD Drive",
+                    _ => "Local Disk"
+                }
+                : drive.VolumeLabel;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return "Disk";
+        }
     }
 }

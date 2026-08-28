@@ -73,57 +73,92 @@ public sealed class NativeShellService
     public static void ShowProperties(string path)
         => ExecuteShellVerb(path, "properties", ShellExecuteMask.InvokeIdList);
 
-    public static void CopyPathsToClipboard(IEnumerable<string> paths, bool cut)
+    /// <summary>
+    /// Writes the selection in the exact shape Explorer uses: CF_HDROP plus the
+    /// "Preferred DropEffect" flag.  No proprietary format is written, because
+    /// object serialization on the clipboard no longer exists on modern .NET and
+    /// the standard formats already round-trip with Explorer.
+    /// </summary>
+    public static bool CopyPathsToClipboard(IEnumerable<string> paths, bool cut)
     {
         var pathArray = paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
         if (pathArray.Length == 0)
         {
-            return;
+            return false;
         }
 
         var collection = new StringCollection();
         collection.AddRange(pathArray);
         var data = new DataObject();
         data.SetFileDropList(collection);
-        data.SetData("Preferred DropEffect", new MemoryStream([(byte)(cut ? 2 : 1), 0, 0, 0]));
-        data.SetData(InternalClipboardFormat, new ClipboardPayload(pathArray, cut));
-        Clipboard.SetDataObject(data, true);
+        data.SetData(PreferredDropEffectFormat, new MemoryStream([(byte)(cut ? DropEffectMove : DropEffectCopy), 0, 0, 0]));
+
+        // The clipboard is a shared, contended resource; another process can own
+        // it for a moment right when the user presses Ctrl+C.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                Clipboard.SetDataObject(data, copy: true);
+                return true;
+            }
+            catch (ExternalException)
+            {
+                Thread.Sleep(60);
+            }
+        }
+
+        return false;
     }
 
     public static ClipboardPayload? GetClipboardPayload()
     {
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                if (Clipboard.GetDataObject() is not IDataObject data)
+                {
+                    return null;
+                }
+
+                if (!data.GetDataPresent(DataFormats.FileDrop)
+                    || data.GetData(DataFormats.FileDrop) is not string[] paths
+                    || paths.Length == 0)
+                {
+                    return null;
+                }
+
+                return new ClipboardPayload(paths, ReadPreferredDropEffect(data) == DropEffectMove);
+            }
+            catch (ExternalException)
+            {
+                Thread.Sleep(60);
+            }
+        }
+
+        return null;
+    }
+
+    private static byte ReadPreferredDropEffect(IDataObject data)
+    {
         try
         {
-            if (Clipboard.GetDataObject() is not IDataObject data)
+            if (data.GetDataPresent(PreferredDropEffectFormat)
+                && data.GetData(PreferredDropEffectFormat) is MemoryStream stream)
             {
-                return null;
-            }
-
-            if (data.GetDataPresent(InternalClipboardFormat)
-                && data.GetData(InternalClipboardFormat) is ClipboardPayload internalPayload)
-            {
-                return internalPayload;
-            }
-
-            if (!data.GetDataPresent(DataFormats.FileDrop)
-                || data.GetData(DataFormats.FileDrop) is not string[] paths)
-            {
-                return null;
-            }
-
-            var cut = false;
-            if (data.GetDataPresent("Preferred DropEffect") && data.GetData("Preferred DropEffect") is MemoryStream stream)
-            {
-                cut = stream.ReadByte() == 2;
+                var position = stream.Position;
                 stream.Position = 0;
+                var first = stream.ReadByte();
+                stream.Position = position;
+                return first < 0 ? DropEffectCopy : (byte)first;
             }
-
-            return new ClipboardPayload(paths, cut);
         }
-        catch (ExternalException)
+        catch (Exception ex) when (ex is ExternalException or ObjectDisposedException or NotSupportedException)
         {
-            return null;
         }
+
+        return DropEffectCopy;
     }
 
     public Task CopyOrMoveAsync(IEnumerable<string> sources, string targetDirectory, bool move)
@@ -149,22 +184,22 @@ public sealed class NativeShellService
                 {
                     if (move)
                     {
-                        FileSystem.MoveDirectory(source, target, UIOption.AllDialogs, UICancelOption.DoNothing);
+                        FileSystem.MoveDirectory(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
                     }
                     else
                     {
-                        FileSystem.CopyDirectory(source, target, UIOption.AllDialogs, UICancelOption.DoNothing);
+                        FileSystem.CopyDirectory(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
                     }
                 }
                 else if (File.Exists(source))
                 {
                     if (move)
                     {
-                        FileSystem.MoveFile(source, target, UIOption.AllDialogs, UICancelOption.DoNothing);
+                        FileSystem.MoveFile(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
                     }
                     else
                     {
-                        FileSystem.CopyFile(source, target, UIOption.AllDialogs, UICancelOption.DoNothing);
+                        FileSystem.CopyFile(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
                     }
                 }
             }
@@ -181,11 +216,11 @@ public sealed class NativeShellService
                 var recycle = permanently ? RecycleOption.DeletePermanently : RecycleOption.SendToRecycleBin;
                 if (Directory.Exists(path))
                 {
-                    FileSystem.DeleteDirectory(path, UIOption.AllDialogs, recycle, UICancelOption.DoNothing);
+                    FileSystem.DeleteDirectory(path, UIOption.AllDialogs, recycle, UICancelOption.ThrowException);
                 }
                 else if (File.Exists(path))
                 {
-                    FileSystem.DeleteFile(path, UIOption.AllDialogs, recycle, UICancelOption.DoNothing);
+                    FileSystem.DeleteFile(path, UIOption.AllDialogs, recycle, UICancelOption.ThrowException);
                 }
             }
         });
@@ -197,11 +232,11 @@ public sealed class NativeShellService
             var target = GetDuplicatePath(path);
             if (Directory.Exists(path))
             {
-                FileSystem.CopyDirectory(path, target, UIOption.AllDialogs, UICancelOption.DoNothing);
+                FileSystem.CopyDirectory(path, target, UIOption.AllDialogs, UICancelOption.ThrowException);
             }
             else
             {
-                FileSystem.CopyFile(path, target, UIOption.AllDialogs, UICancelOption.DoNothing);
+                FileSystem.CopyFile(path, target, UIOption.AllDialogs, UICancelOption.ThrowException);
             }
 
             return target;
@@ -288,10 +323,12 @@ public sealed class NativeShellService
         return targetWithSeparator.StartsWith(sourceWithSeparator, StringComparison.OrdinalIgnoreCase);
     }
 
-    public const string InternalClipboardFormat = "UltraExplorer.FileClipboard.v1";
     public const string InternalDragFormat = "UltraExplorer.InternalFileDrag.v1";
 
-    [Serializable]
+    private const string PreferredDropEffectFormat = "Preferred DropEffect";
+    private const byte DropEffectCopy = 1;
+    private const byte DropEffectMove = 2;
+
     public sealed record ClipboardPayload(string[] Paths, bool Cut);
 
     private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
@@ -328,7 +365,9 @@ public sealed class NativeShellService
             {
                 completion.SetException(ex);
             }
-        }) { IsBackground = true, Name = "UltraExplorer Shell operation" };
+            // Foreground on purpose: killing this thread half-way through a copy
+            // would leave a truncated file behind.
+        }) { IsBackground = false, Name = "UltraExplorer Shell operation" };
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         return completion.Task;
@@ -347,7 +386,9 @@ public sealed class NativeShellService
             {
                 completion.SetException(ex);
             }
-        }) { IsBackground = true, Name = "UltraExplorer Shell operation" };
+            // Foreground on purpose: killing this thread half-way through a copy
+            // would leave a truncated file behind.
+        }) { IsBackground = false, Name = "UltraExplorer Shell operation" };
         thread.SetApartmentState(ApartmentState.STA);
         thread.Start();
         return completion.Task;

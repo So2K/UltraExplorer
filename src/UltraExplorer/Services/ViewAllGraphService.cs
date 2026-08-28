@@ -36,6 +36,13 @@ public sealed class ViewAllGraphService : IDisposable
     /// <summary>Raised after a structural or logical visibility change.</summary>
     public event EventHandler? GraphChanged;
 
+    /// <summary>
+    /// Raised once per node, right after it is created.  The view model uses it
+    /// to attach the Shell icon and any colour label / note stored for the path,
+    /// which keeps those concerns out of the graph itself.
+    /// </summary>
+    public event Action<ViewAllNodeViewModel>? NodeCreated;
+
     public async Task InitializeAsync(
         ViewAllWorkspaceState? restoredState = null,
         CancellationToken cancellationToken = default)
@@ -67,12 +74,22 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         _layout.PlaceRoots(Roots, Nodes);
-        GraphChanged?.Invoke(this, EventArgs.Empty);
 
         if (restoredState is null)
         {
+            GraphChanged?.Invoke(this, EventArgs.Empty);
             return;
         }
+
+        // WSL distributions and UNC shares are not drives, so nothing would
+        // rediscover them; the workspace lists them explicitly.
+        foreach (var extraRoot in restoredState.ExtraRoots)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await AddRootAsync(extraRoot, cancellationToken);
+        }
+
+        GraphChanged?.Invoke(this, EventArgs.Empty);
 
         // Parents sort before descendants. Each expansion therefore creates the
         // node needed by the following saved path without a recursive scan.
@@ -244,14 +261,16 @@ public sealed class ViewAllGraphService : IDisposable
     }
 
     /// <summary>
-    /// Re-enumerates only this folder. Saved child coordinates are retained and
-    /// are reapplied if the same object still exists.
+    /// Re-enumerates only this folder. Saved child coordinates and the
+    /// expansion state of every descendant are retained, so refreshing a branch
+    /// never silently collapses the tree the user had opened.
     /// </summary>
     public async Task<ViewAllExpansionResult> RefreshBranchAsync(
         ViewAllNodeViewModel node,
         CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
+        var previouslyExpanded = new List<string>();
         foreach (var descendant in EnumerateDescendants(node))
         {
             _restoredStates[descendant.FullPath] = new ViewAllNodeState(
@@ -260,6 +279,10 @@ public sealed class ViewAllGraphService : IDisposable
                 descendant.Location.Y,
                 descendant.HasManualPosition,
                 descendant.IsExpanded);
+            if (descendant.IsExpanded)
+            {
+                previouslyExpanded.Add(descendant.FullPath);
+            }
         }
 
         RemoveDescendants(node);
@@ -267,7 +290,56 @@ public sealed class ViewAllGraphService : IDisposable
         node.IsExpanded = false;
         node.IsTruncated = false;
         node.NotifyChildrenChanged();
-        return await ExpandAsync(node, cancellationToken);
+        var result = await ExpandAsync(node, cancellationToken);
+
+        // Parents sort before descendants, so each re-expansion has already
+        // created the node the next path needs.
+        foreach (var path in previouslyExpanded
+                     .OrderBy(PathDepth)
+                     .ThenBy(path => path, StringComparer.OrdinalIgnoreCase))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (TryGetNode(path, out var restored) && !restored.IsExpanded)
+            {
+                await ExpandAsync(restored, cancellationToken);
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Adds an extra top-level root for a directory that is not a local drive
+    /// (a WSL distribution or a UNC share).  Existing roots are left alone.
+    /// </summary>
+    public async Task<ViewAllNodeViewModel?> AddRootAsync(
+        string directoryPath,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (TryGetNode(directoryPath, out var existing))
+        {
+            return existing;
+        }
+
+        try
+        {
+            var descriptor = await _fileSystem.DescribeDirectoryAsync(directoryPath, cancellationToken);
+            if (_nodesByPath.ContainsKey(descriptor.FullPath))
+            {
+                return _nodesByPath[descriptor.FullPath];
+            }
+
+            var root = CreateNode(descriptor, depth: 0, parent: null);
+            RestorePosition(root);
+            _layout.PlaceRoots([root], Nodes);
+            GraphChanged?.Invoke(this, EventArgs.Empty);
+            return root;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or DirectoryNotFoundException)
+        {
+            return null;
+        }
     }
 
     public bool TryGetNode(string path, out ViewAllNodeViewModel node)
@@ -309,6 +381,7 @@ public sealed class ViewAllGraphService : IDisposable
             ViewportX = viewport.Location.X,
             ViewportY = viewport.Location.Y,
             ViewportZoom = viewport.Zoom,
+            ExtraRoots = Roots.Where(node => !node.IsDrive).Select(node => node.FullPath).ToList(),
             Nodes = Nodes.Select(node => new ViewAllNodeState(
                     node.FullPath,
                     node.Location.X,
@@ -326,7 +399,27 @@ public sealed class ViewAllGraphService : IDisposable
         var node = new ViewAllNodeViewModel(entry, depth, parent);
         Nodes.Add(node);
         _nodesByPath[entry.FullPath] = node;
+        NodeCreated?.Invoke(node);
         return node;
+    }
+
+    /// <summary>Collapses every expanded root branch without discarding loaded data.</summary>
+    public void CollapseAll()
+    {
+        ThrowIfDisposed();
+        foreach (var node in Nodes.Where(node => node.IsExpanded).ToArray())
+        {
+            CancelLoad(node);
+            node.IsExpanded = false;
+        }
+
+        foreach (var root in Roots)
+        {
+            HideDescendants(root);
+        }
+
+        UpdateEdgeVisibility();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 
     private void ApplySnapshot(

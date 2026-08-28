@@ -19,9 +19,11 @@ public sealed class ViewAllViewportService(ViewAllViewportOptions? options = nul
 
     public ViewAllDetailLevel GetDetailLevel(double zoom) => zoom switch
     {
-        < 0.18 => ViewAllDetailLevel.Dot,
-        < 0.34 => ViewAllDetailLevel.Glyph,
-        < 0.68 => ViewAllDetailLevel.Compact,
+        // Below ~15% a 188 x 44 node is under 30 px wide, so text and icons stop
+        // carrying information and only the coloured slab is worth drawing.
+        < 0.15 => ViewAllDetailLevel.Dot,
+        < 0.30 => ViewAllDetailLevel.Glyph,
+        < 0.62 => ViewAllDetailLevel.Compact,
         _ => ViewAllDetailLevel.Detailed
     };
 

@@ -5,11 +5,12 @@ namespace UltraExplorer.Dialogs;
 
 public partial class ConfirmDialog : Window
 {
-    public ConfirmDialog(string title, string message)
+    public ConfirmDialog(string title, string message, string confirmLabel = "Delete")
     {
         InitializeComponent();
         TitleText.Text = title;
         MessageText.Text = message;
+        ConfirmButton.Content = confirmLabel;
     }
 
     private void Confirm_Click(object sender, RoutedEventArgs e)
