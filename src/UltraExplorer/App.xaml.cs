@@ -69,8 +69,14 @@ public partial class App : Application
         window.Show();
     }
 
+    /// <summary>
+    /// Where this build lives, for the COM registration to point at.  A
+    /// single-file app has no assembly location to fall back on, so the app
+    /// directory is the answer when the process path is unavailable.
+    /// </summary>
     private static string ExecutablePath =>
-        Environment.ProcessPath ?? System.Reflection.Assembly.GetExecutingAssembly().Location;
+        Environment.ProcessPath
+        ?? Path.Combine(AppContext.BaseDirectory, "UltraExplorer.exe");
 
     private static bool HasSwitch(IReadOnlyList<string> args, string name)
     {
