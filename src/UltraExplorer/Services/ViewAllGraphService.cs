@@ -28,7 +28,25 @@ public sealed class ViewAllGraphService : IDisposable
         _layout = layout ?? new ViewAllLayoutService();
     }
 
-    public ViewAllGraphOptions Options { get; }
+    public ViewAllGraphOptions Options { get; private set; }
+
+    /// <summary>
+    /// Applies new enumeration options and re-reads only the branches that are
+    /// already open, keeping their expansion and any manual positions.
+    /// </summary>
+    public async Task ApplyOptionsAsync(ViewAllGraphOptions options, CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        Options = options;
+        foreach (var root in Roots.Where(root => root.IsExpanded).ToArray())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            await RefreshBranchAsync(root, cancellationToken);
+        }
+
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
+
     public ObservableCollection<ViewAllNodeViewModel> Nodes { get; } = [];
     public ObservableCollection<ViewAllEdgeViewModel> Edges { get; } = [];
     public IEnumerable<ViewAllNodeViewModel> Roots => Nodes.Where(node => node.Parent is null);

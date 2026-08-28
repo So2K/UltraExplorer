@@ -70,6 +70,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         PermanentDeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(true));
         PropertiesCommand = new RelayCommand(ShowProperties);
         OpenCommand = new RelayCommand(OpenSelection);
+        OpenWithCommand = new RelayCommand(OpenSelectionWith);
+        ToggleHiddenItemsCommand = new AsyncRelayCommand(ToggleHiddenItemsAsync);
         ShowInExplorerCommand = new RelayCommand(ShowSelectionInExplorer);
         AddToFavoritesCommand = new RelayCommand(AddSelectionToFavorites);
         RemoveFavoriteCommand = new RelayCommand<FavoriteItemViewModel>(RemoveFavorite);
@@ -120,6 +122,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ICommand PermanentDeleteCommand { get; }
     public ICommand PropertiesCommand { get; }
     public ICommand OpenCommand { get; }
+    public ICommand OpenWithCommand { get; }
+    public ICommand ToggleHiddenItemsCommand { get; }
     public ICommand ShowInExplorerCommand { get; }
     public ICommand AddToFavoritesCommand { get; }
     public ICommand RemoveFavoriteCommand { get; }
@@ -307,7 +311,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public async Task DropIntoPathAsync(
         IReadOnlyList<string> paths,
         string targetDirectory,
-        bool internalDrag,
         ModifierKeys modifiers)
     {
         if (paths.Count == 0)
@@ -917,6 +920,28 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
         }
     }
+
+    private void OpenSelectionWith()
+    {
+        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path && File.Exists(path))
+        {
+            try
+            {
+                NativeShellService.OpenWith(path);
+            }
+            catch (Exception ex)
+            {
+                Toast.ShowError(ex.Message);
+            }
+        }
+        else
+        {
+            Toast.ShowError("Select a file first.");
+        }
+    }
+
+    private async Task ToggleHiddenItemsAsync()
+        => await Tree.SetShowHiddenItemsAsync(!Tree.ShowHiddenItems);
 
     private void ShowSelectionInExplorer()
     {

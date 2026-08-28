@@ -273,6 +273,34 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         return node;
     }
 
+    /// <summary>Explorer's View / Hidden items toggle.</summary>
+    public bool ShowHiddenItems
+    {
+        get => _graph.Options.IncludeHidden;
+    }
+
+    public async Task SetShowHiddenItemsAsync(bool include)
+    {
+        if (_graph.Options.IncludeHidden == include)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            await _graph.ApplyOptionsAsync(_graph.Options with { IncludeHidden = include });
+            OnPropertyChanged(nameof(ShowHiddenItems));
+            MessageRequested?.Invoke(include ? "Hidden items shown" : "Hidden items hidden", false);
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+
+        ScheduleSave();
+    }
+
     public void CollapseAll()
     {
         _graph.CollapseAll();

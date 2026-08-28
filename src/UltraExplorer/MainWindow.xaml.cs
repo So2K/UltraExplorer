@@ -229,8 +229,7 @@ public partial class MainWindow : Window
         }
 
         e.Handled = true;
-        var internalDrag = e.Data.GetDataPresent(NativeShellService.InternalDragFormat);
-        await _viewModel.DropIntoPathAsync(paths, target.FullPath, internalDrag, Keyboard.Modifiers);
+        await _viewModel.DropIntoPathAsync(paths, target.FullPath, Keyboard.Modifiers);
     }
 
     /// <summary>
@@ -310,6 +309,7 @@ public partial class MainWindow : Window
     {
         var menu = new ContextMenu { PlacementTarget = placementTarget };
         AddCommandItem(menu, "Open", "\uE8E5", _viewModel.OpenCommand);
+        AddCommandItem(menu, "Open with\u2026", "\uE7AC", _viewModel.OpenWithCommand);
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Cut", "\uE8C6", _viewModel.CutCommand, "Ctrl+X");
         AddCommandItem(menu, "Copy", "\uE8C8", _viewModel.CopyCommand, "Ctrl+C");
@@ -373,6 +373,7 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
+        AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
         menu.Items.Add(new Separator());
         AddColourItems(menu);
         AddCommandItem(menu, "Note…", "\uE70B", _viewModel.EditNoteCommand);
@@ -425,6 +426,19 @@ public partial class MainWindow : Window
         }
 
         menu.Items.Add(parent);
+    }
+
+    private static void AddCheckableItem(ItemsControl menu, string header, bool isChecked, ICommand command)
+    {
+        var item = new MenuItem
+        {
+            Header = header,
+            IsCheckable = true,
+            IsChecked = isChecked,
+            Command = command
+        };
+
+        menu.Items.Add(item);
     }
 
     private static void AddCommandItem(ItemsControl menu, string header, string glyph, ICommand command, string gesture = "")

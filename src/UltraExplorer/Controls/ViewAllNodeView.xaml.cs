@@ -2,7 +2,6 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using UltraExplorer.Models;
-using UltraExplorer.Services;
 using UltraExplorer.ViewModels;
 
 namespace UltraExplorer.Controls;
@@ -122,7 +121,6 @@ public partial class ViewAllNodeView : UserControl
 
         var data = new DataObject();
         data.SetData(DataFormats.FileDrop, paths);
-        data.SetData(NativeShellService.InternalDragFormat, true);
         DragDrop.DoDragDrop(this, data, DragDropEffects.Copy | DragDropEffects.Move);
     }
 }

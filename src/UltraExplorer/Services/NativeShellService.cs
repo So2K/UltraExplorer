@@ -323,8 +323,6 @@ public sealed class NativeShellService
         return targetWithSeparator.StartsWith(sourceWithSeparator, StringComparison.OrdinalIgnoreCase);
     }
 
-    public const string InternalDragFormat = "UltraExplorer.InternalFileDrag.v1";
-
     private const string PreferredDropEffectFormat = "Preferred DropEffect";
     private const byte DropEffectCopy = 1;
     private const byte DropEffectMove = 2;

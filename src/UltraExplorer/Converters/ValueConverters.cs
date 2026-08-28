@@ -30,20 +30,6 @@ public sealed class NullToVisibilityConverter : IValueConverter
         => Binding.DoNothing;
 }
 
-public sealed class ZoomDetailVisibilityConverter : IValueConverter
-{
-    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
-    {
-        var threshold = parameter is string text && double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)
-            ? parsed
-            : 0.58;
-        return value is double zoom && zoom >= threshold ? Visibility.Visible : Visibility.Collapsed;
-    }
-
-    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
-        => Binding.DoNothing;
-}
-
 public sealed class InverseBooleanToVisibilityConverter : IValueConverter
 {
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
@@ -57,15 +43,6 @@ public sealed class ZeroCountToVisibilityConverter : IValueConverter
 {
     public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
         => value is int count && count == 0 ? Visibility.Visible : Visibility.Collapsed;
-
-    public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
-        => Binding.DoNothing;
-}
-
-public sealed class CountToVisibilityConverter : IValueConverter
-{
-    public object Convert(object? value, Type targetType, object? parameter, CultureInfo culture)
-        => value is int count && count > 0 ? Visibility.Visible : Visibility.Collapsed;
 
     public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
         => Binding.DoNothing;
