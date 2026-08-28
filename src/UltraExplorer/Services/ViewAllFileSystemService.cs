@@ -107,10 +107,31 @@ public sealed class ViewAllFileSystemService
                 try
                 {
                     var attributes = info.Attributes;
-                    var isHidden = attributes.HasFlag(FileAttributes.Hidden);
+
+                    // A system file is hidden for the same reason a hidden one
+                    // is, and the dialog flag that reveals either reveals both,
+                    // so they are one concept here.
+                    var isHidden = attributes.HasFlag(FileAttributes.Hidden)
+                        || attributes.HasFlag(FileAttributes.System);
                     if (isHidden && !options.IncludeHidden)
                     {
                         continue;
+                    }
+
+                    var isDirectory = attributes.HasFlag(FileAttributes.Directory);
+                    if (!isDirectory)
+                    {
+                        // Folders are never filtered: they are how the user gets
+                        // to the files that do match.
+                        if (!options.ShowFiles)
+                        {
+                            continue;
+                        }
+
+                        if (options.FileFilter is { } filter && !filter.Matches(info.Name))
+                        {
+                            continue;
+                        }
                     }
 
                     if (entries.Count >= maximum)
@@ -119,7 +140,6 @@ public sealed class ViewAllFileSystemService
                         break;
                     }
 
-                    var isDirectory = attributes.HasFlag(FileAttributes.Directory);
                     long? size = null;
                     if (!isDirectory && info is FileInfo file)
                     {

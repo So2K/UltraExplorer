@@ -41,11 +41,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
+    private string? _dialogTitle;
 
-    public MainViewModel()
+    /// <param name="treeStatePath">
+    /// Overrides where the canvas layout is saved; a picker session keeps its
+    /// own so it cannot rearrange the user's workspace.
+    /// </param>
+    public MainViewModel(string? treeStatePath = null)
     {
         _fileSystemService = new FileSystemService(_iconService);
-        Tree = new ViewAllViewModel(_marks, _iconService);
+        Tree = new ViewAllViewModel(_marks, _iconService, treeStatePath);
         Tree.PropertyChanged += OnTreePropertyChanged;
         Tree.MessageRequested += OnTreeMessage;
 
@@ -97,6 +102,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<FavoriteItemViewModel> HomeItems { get; } = [];
 
     public ObservableCollection<FavoriteItemViewModel> QuickAccess { get; } = [];
+
+    /// <summary>
+    /// Folders the calling program pinned with <c>IFileDialog::AddPlace</c>.
+    /// Empty, and the section hidden, outside a picker session.
+    /// </summary>
+    public ObservableCollection<FavoriteItemViewModel> PickerPlaces { get; } = [];
     public ObservableCollection<FavoriteItemViewModel> Drives { get; } = [];
     public ObservableCollection<FavoriteItemViewModel> NetworkLocations { get; } = [];
     public ObservableCollection<BreadcrumbSegment> Breadcrumbs { get; } = [];
@@ -230,13 +241,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         set => SetProperty(ref _sidebarWidth, value);
     }
 
-    public string TabTitle => Tree.ActiveNode?.DisplayName is { Length: > 0 } name ? name : "This PC";
+    /// <summary>
+    /// Set while acting as somebody else's file dialog, so the tab says what is
+    /// being asked for rather than which folder happens to be open.
+    /// </summary>
+    public string? DialogTitle
+    {
+        get => _dialogTitle;
+        set
+        {
+            if (SetProperty(ref _dialogTitle, value))
+            {
+                OnPropertyChanged(nameof(TabTitle));
+            }
+        }
+    }
+
+    public string TabTitle => DialogTitle is { Length: > 0 } dialog
+        ? dialog
+        : Tree.ActiveNode?.DisplayName is { Length: > 0 } name ? name : "This PC";
 
     public string StatusCountText => Tree.StatusCountText;
 
     public string StatusPathText => Tree.StatusPathText;
 
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(string? initialPath = null)
     {
         if (_isInitialized)
         {
@@ -300,7 +329,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             NetworkLocations.Add(location);
         }
 
-        await Tree.InitializeAsync();
+        await Tree.InitializeAsync(initialPath);
         UpdateBreadcrumbs();
         UpdateSidebarSelection();
     }

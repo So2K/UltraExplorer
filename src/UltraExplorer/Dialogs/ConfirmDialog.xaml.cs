@@ -13,6 +13,17 @@ public partial class ConfirmDialog : Window
         ConfirmButton.Content = confirmLabel;
     }
 
+    /// <summary>
+    /// A message with nothing to decide: one button, and Escape closes it.  The
+    /// file dialog needs this for the refusals the validator produces.
+    /// </summary>
+    public static void Alert(Window? owner, string title, string message)
+    {
+        var dialog = new ConfirmDialog(title, message, "OK") { Owner = owner };
+        dialog.CancelButton.Visibility = Visibility.Collapsed;
+        dialog.ShowDialog();
+    }
+
     private void Confirm_Click(object sender, RoutedEventArgs e)
     {
         DialogResult = true;

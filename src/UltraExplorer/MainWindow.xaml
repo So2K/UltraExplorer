@@ -86,6 +86,7 @@
             <RowDefinition Height="48" />
             <RowDefinition Height="44" />
             <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="24" />
         </Grid.RowDefinitions>
 
@@ -321,7 +322,7 @@
                             <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="8" Margin="7,2,0,0" />
                         </StackPanel>
                     </Button>
-                    <Button Style="{StaticResource CommandBarButton}" Command="{Binding NewFolderCommand}" ToolTip="New folder (Ctrl+Shift+N)" AutomationProperties.Name="New folder">
+                    <Button x:Name="NewFolderButton" Style="{StaticResource CommandBarButton}" Command="{Binding NewFolderCommand}" ToolTip="New folder (Ctrl+Shift+N)" AutomationProperties.Name="New folder">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="&#xE8F4;" Style="{StaticResource IconText}" FontSize="13" Margin="0,0,7,0" />
                             <TextBlock Text="New folder" VerticalAlignment="Center" FontSize="12" />
@@ -375,9 +376,14 @@
             <Border Grid.Column="0" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,0,1,0">
                 <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
                     <StackPanel Margin="0,8,0,12">
+                        <ItemsControl x:Name="PlacesItems"
+                                      ItemsSource="{Binding PickerPlaces}"
+                                      ItemTemplate="{StaticResource SidebarItemTemplate}"
+                                      Visibility="Collapsed" />
+                        <Separator x:Name="PlacesSeparator" Margin="12,8" Visibility="Collapsed" />
                         <ItemsControl ItemsSource="{Binding HomeItems}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
-                        <Separator Margin="12,8" />
-                        <ItemsControl ItemsSource="{Binding QuickAccess}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
+                        <Separator x:Name="QuickAccessSeparator" Margin="12,8" />
+                        <ItemsControl x:Name="QuickAccessItems" ItemsSource="{Binding QuickAccess}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
                         <Separator Margin="12,8" />
                         <TextBlock Text="This PC" Margin="16,2,0,4" FontSize="11" Foreground="{StaticResource TextDimBrush}" />
                         <ItemsControl ItemsSource="{Binding Drives}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
@@ -654,8 +660,76 @@
             </Grid>
         </Grid>
 
+        <!-- File dialog footer: only ever visible when another program asked
+             UltraExplorer to pick something for it. -->
+        <Border x:Name="PickerFooter"
+                Grid.Row="4"
+                Visibility="Collapsed"
+                Padding="14,10"
+                Background="{StaticResource WindowBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,1,0,0">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" MinWidth="88" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <TextBlock Text="{Binding FileNameLabel}"
+                           VerticalAlignment="Center"
+                           Margin="0,0,12,0"
+                           FontSize="12"
+                           Foreground="{StaticResource TextMutedBrush}" />
+
+                <ComboBox x:Name="PickerNameBox"
+                          Grid.Column="1"
+                          IsEditable="True"
+                          Margin="0,0,12,0"
+                          ItemsSource="{Binding RecentNames}"
+                          Text="{Binding FileNameText, UpdateSourceTrigger=PropertyChanged, Mode=TwoWay}"
+                          AutomationProperties.Name="File name"
+                          PreviewKeyDown="PickerNameBox_PreviewKeyDown" />
+
+                <Button x:Name="PickerAcceptButton"
+                        Grid.Column="2"
+                        Style="{StaticResource DialogPrimaryButton}"
+                        Content="{Binding OkLabel}"
+                        IsEnabled="{Binding CanAccept}"
+                        Click="PickerAccept_Click" />
+
+                <TextBlock x:Name="PickerTypeLabel"
+                           Grid.Row="1"
+                           Text="Files of type:"
+                           VerticalAlignment="Center"
+                           Margin="0,9,12,0"
+                           FontSize="12"
+                           Foreground="{StaticResource TextMutedBrush}" />
+
+                <ComboBox x:Name="PickerTypeBox"
+                          Grid.Row="1"
+                          Grid.Column="1"
+                          Margin="0,9,12,0"
+                          ItemsSource="{Binding Filters}"
+                          DisplayMemberPath="DisplayText"
+                          SelectedIndex="{Binding SelectedFilterIndex, Mode=TwoWay}"
+                          AutomationProperties.Name="Files of type" />
+
+                <Button Grid.Row="1"
+                        Grid.Column="2"
+                        Margin="0,9,0,0"
+                        Style="{StaticResource DialogButton}"
+                        Content="Cancel"
+                        Click="PickerCancel_Click" />
+            </Grid>
+        </Border>
+
         <!-- Status bar -->
-        <Border Grid.Row="4" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
+        <Border Grid.Row="5" Background="{StaticResource WindowBrush}" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0">
             <Grid Margin="10,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />

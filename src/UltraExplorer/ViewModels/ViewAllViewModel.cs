@@ -18,7 +18,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 {
     private readonly ViewAllGraphService _graph;
     private readonly ViewAllViewportService _viewportService = new();
-    private readonly ViewAllWorkspaceStore _store = new();
+    private readonly ViewAllWorkspaceStore _store;
     private readonly FolderMarkService _marks;
     private readonly ShellIconService _icons;
     private readonly DispatcherTimer _renderThrottle;
@@ -44,10 +44,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private string _statusCountText = string.Empty;
     private string _statusPathText = string.Empty;
 
-    public ViewAllViewModel(FolderMarkService marks, ShellIconService icons)
+    /// <param name="statePath">
+    /// Where the canvas layout is persisted.  Picker sessions pass their own
+    /// file so that being a file dialog for somebody else never disturbs the
+    /// workspace the user arranged for themselves.
+    /// </param>
+    public ViewAllViewModel(FolderMarkService marks, ShellIconService icons, string? statePath = null)
     {
         _marks = marks;
         _icons = icons;
+        _store = new ViewAllWorkspaceStore(statePath);
         _graph = new ViewAllGraphService();
         _graph.GraphChanged += OnGraphChanged;
         _graph.NodeCreated += OnNodeCreated;
@@ -197,7 +203,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     public bool HasRestoredViewport { get; private set; }
 
-    public async Task InitializeAsync()
+    /// <param name="initialPath">
+    /// Opened instead of the profile folder on a first run, which is how a file
+    /// dialog lands on the folder its caller asked for.
+    /// </param>
+    public async Task InitializeAsync(string? initialPath = null)
     {
         if (_isInitialized)
         {
@@ -228,8 +238,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             }
             else
             {
-                // First run: open the profile branch so the canvas is never empty.
-                await RevealPathAsync(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), focus: false);
+                // First run: open a branch so the canvas is never empty.
+                await RevealPathAsync(
+                    string.IsNullOrWhiteSpace(initialPath)
+                        ? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)
+                        : initialPath,
+                    focus: false);
             }
 
             RebuildRenderSet();
@@ -267,6 +281,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     public async Task ToggleAsync(ViewAllNodeViewModel node)
     {
+        if (ActivationOverride is { } activate && activate(node))
+        {
+            return;
+        }
+
         if (!node.IsDirectory)
         {
             OpenInDefaultApplication(node);
@@ -323,6 +342,43 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         ScheduleSave();
     }
+
+    /// <summary>
+    /// Applies the entry rules a file dialog imposes: whether files are listed
+    /// at all, and which names survive the selected file type.  Branches that
+    /// are already open are re-read so the change is visible immediately.
+    /// </summary>
+    public async Task ApplyEntryRulesAsync(bool showFiles, IEntryNameFilter? fileFilter, bool? includeHidden = null)
+    {
+        var options = _graph.Options with
+        {
+            ShowFiles = showFiles,
+            FileFilter = fileFilter,
+            IncludeHidden = includeHidden ?? _graph.Options.IncludeHidden
+        };
+
+        if (options == _graph.Options)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        try
+        {
+            await _graph.ApplyOptionsAsync(options);
+            OnPropertyChanged(nameof(ShowHiddenItems));
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>
+    /// Replaces what double-clicking a node does.  A picker returns the file to
+    /// its caller instead of launching it.
+    /// </summary>
+    public Func<ViewAllNodeViewModel, bool>? ActivationOverride { get; set; }
 
     public void CollapseAll()
     {

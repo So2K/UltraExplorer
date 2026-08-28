@@ -12,6 +12,7 @@ using Nodify.Interactivity;
 using UltraExplorer.Controls;
 using UltraExplorer.Dialogs;
 using UltraExplorer.Models;
+using UltraExplorer.Picker;
 using UltraExplorer.Services;
 using UltraExplorer.ViewModels;
 
@@ -27,7 +28,7 @@ public partial class MainWindow : Window
 
     private static readonly Brush CaptionHoverBrush = CreateFrozenBrush(0x2D, 0x2D, 0x2D);
 
-    private readonly MainViewModel _viewModel = new();
+    private readonly MainViewModel _viewModel;
     private WindowCaptureService? _capture;
     private bool _allowClose;
     private bool _maximizeHover;
@@ -42,7 +43,19 @@ public partial class MainWindow : Window
     private Point _overviewDragNodeOrigin;
 
     public MainWindow()
+        : this(null)
     {
+    }
+
+    /// <param name="picker">
+    /// Set when another program asked UltraExplorer to pick a file or folder
+    /// for it.  The window is the same one either way; only the footer, the
+    /// entry rules and what activating an item does differ.
+    /// </param>
+    public MainWindow(FileDialogSession? picker)
+    {
+        _viewModel = new MainViewModel(picker is null ? null : FileDialogHost.WorkspacePath);
+
         InitializeComponent();
         DataContext = _viewModel;
 
@@ -63,6 +76,11 @@ public partial class MainWindow : Window
         }
 
         StateChanged += (_, _) => MaximizeGlyph.Text = WindowState == WindowState.Maximized ? "\uE923" : "\uE922";
+
+        if (picker is not null)
+        {
+            AttachPicker(picker);
+        }
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -85,7 +103,10 @@ public partial class MainWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        await _viewModel.InitializeAsync();
+        // The dialog's entry rules go in before the first read, so the folder
+        // the caller asked for is already filtered when it appears.
+        await ApplyPickerRulesAsync();
+        await _viewModel.InitializeAsync(_picker?.CurrentFolder);
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
         SidebarColumn.Width = new GridLength(_restoredSidebarWidth);
@@ -111,11 +132,21 @@ public partial class MainWindow : Window
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
 
+        if (_picker is { } session)
+        {
+            await _viewModel.Tree.RevealPathAsync(session.CurrentFolder);
+            PickerNameBox.Focus();
+            return;
+        }
+
         Editor.Focus();
     }
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        // However the window goes away, the caller gets an answer.
+        CompletePickerOnClose();
+
         if (_allowClose)
         {
             DependencyPropertyDescriptor

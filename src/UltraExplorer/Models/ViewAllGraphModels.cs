@@ -43,13 +43,24 @@ public sealed record ViewAllDirectorySnapshot(
     int LoadedCount);
 
 /// <summary>
+/// Decides which names survive enumeration.  The picker implements it over the
+/// selected "Files of type" entry; the graph knows nothing about dialogs.
+/// </summary>
+public interface IEntryNameFilter
+{
+    bool Matches(string fileName);
+}
+
+/// <summary>
 /// Caps a single expansion without ever walking descendants.  Increasing the
 /// cap and refreshing the branch is an explicit user action.
 /// </summary>
 public sealed record ViewAllGraphOptions(
     bool IncludeHidden = false,
     bool FollowReparsePoints = false,
-    int MaximumChildrenPerFolder = 5_000)
+    int MaximumChildrenPerFolder = 5_000,
+    bool ShowFiles = true,
+    IEntryNameFilter? FileFilter = null)
 {
     /// <summary>Absolute ceiling for one folder, however often Load more is used.</summary>
     public const int MaximumChildrenCeiling = 250_000;

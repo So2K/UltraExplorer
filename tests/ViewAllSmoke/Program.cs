@@ -13,7 +13,7 @@ namespace ViewAllSmoke;
 /// viewport culling, branch refresh and persistence.  These are the parts that
 /// cannot be judged from a screenshot.
 /// </summary>
-internal static class Program
+internal static partial class Program
 {
     private static int _failures;
     private static int _checks;
@@ -58,6 +58,12 @@ internal static class Program
         await RealFolderExpansion();
         await Performance();
         await Marks(fixtureRoot);
+        await PickerFilters();
+        await PickerCommandLine();
+        await PickerNames();
+        await PickerSessionRules(fixtureRoot);
+        await PickerValidation(fixtureRoot);
+        await PickerGraphRules(fixtureRoot);
     }
 
     // ---- fixture -----------------------------------------------------------
