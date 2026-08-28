@@ -1,0 +1,46 @@
+using System.ComponentModel;
+using System.Windows;
+using UltraExplorer.Infrastructure;
+
+namespace UltraExplorer.Models;
+
+public sealed class ViewAllEdgeViewModel : ObservableObject, IDisposable
+{
+    private bool _isTreeVisible = true;
+
+    public ViewAllEdgeViewModel(ViewAllNodeViewModel source, ViewAllNodeViewModel target)
+    {
+        Source = source;
+        Target = target;
+        Source.PropertyChanged += EndpointOnPropertyChanged;
+        Target.PropertyChanged += EndpointOnPropertyChanged;
+    }
+
+    public ViewAllNodeViewModel Source { get; }
+    public ViewAllNodeViewModel Target { get; }
+    public Point SourceAnchor => Source.OutputAnchor;
+    public Point TargetAnchor => Target.InputAnchor;
+
+    public bool IsTreeVisible
+    {
+        get => _isTreeVisible;
+        internal set => SetProperty(ref _isTreeVisible, value);
+    }
+
+    private void EndpointOnPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(ViewAllNodeViewModel.Location)
+            or nameof(ViewAllNodeViewModel.InputAnchor)
+            or nameof(ViewAllNodeViewModel.OutputAnchor))
+        {
+            OnPropertyChanged(nameof(SourceAnchor));
+            OnPropertyChanged(nameof(TargetAnchor));
+        }
+    }
+
+    public void Dispose()
+    {
+        Source.PropertyChanged -= EndpointOnPropertyChanged;
+        Target.PropertyChanged -= EndpointOnPropertyChanged;
+    }
+}
