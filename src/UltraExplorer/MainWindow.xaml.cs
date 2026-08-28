@@ -37,6 +37,9 @@ public partial class MainWindow : Window
     private bool _isSpacePanning;
     private Point _panPointerAnchor;
     private Point _panViewportAnchor;
+    private ViewAllNodeViewModel? _overviewDragNode;
+    private Point _overviewDragPointerAnchor;
+    private Point _overviewDragNodeOrigin;
 
     public MainWindow()
     {
@@ -197,6 +200,22 @@ public partial class MainWindow : Window
 
     private void Editor_PreviewMouseMove(object sender, MouseEventArgs e)
     {
+        if (_overviewDragNode is not null)
+        {
+            if (e.LeftButton != MouseButtonState.Pressed)
+            {
+                EndOverviewDrag();
+                return;
+            }
+
+            // Setting Location goes through the same path a container drag uses,
+            // so the subtree is carried and the batched canvas follows.
+            var dragged = Editor.GetLocationInsideEditor(e) - _overviewDragPointerAnchor;
+            _overviewDragNode.Location = _overviewDragNodeOrigin + dragged;
+            e.Handled = true;
+            return;
+        }
+
         if (!_isSpacePanning)
         {
             return;
@@ -210,6 +229,13 @@ public partial class MainWindow : Window
 
     private void Editor_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
+        if (_overviewDragNode is not null)
+        {
+            EndOverviewDrag();
+            e.Handled = true;
+            return;
+        }
+
         if (!_isSpacePanning)
         {
             return;
@@ -219,6 +245,18 @@ public partial class MainWindow : Window
         Editor.ReleaseMouseCapture();
         Editor.Cursor = _isSpaceHeld ? Cursors.Hand : null;
         e.Handled = true;
+    }
+
+    private void EndOverviewDrag()
+    {
+        if (_overviewDragNode is null)
+        {
+            return;
+        }
+
+        _overviewDragNode = null;
+        Editor.ReleaseMouseCapture();
+        _viewModel.Tree.ScheduleSave();
     }
 
     private void ZoomToSelection()
@@ -323,14 +361,26 @@ public partial class MainWindow : Window
         // the Alt ones (which go through system-key handling) stops working.
         Editor.Focus();
 
-        // While the overview is drawing, there are no node controls to click,
-        // so hit-test the graph directly and keep selection working.
-        if (_viewModel.Tree.IsOverviewActive
-            && _viewModel.Tree.HitTest(Editor.GetLocationInsideEditor(e)) is { } node)
+        // While the overview is drawing there are no node controls to hit, so the
+        // graph is hit-tested directly: selecting and dragging keep working at
+        // any zoom rather than only where a container happens to exist.
+        if (!_viewModel.Tree.IsOverviewActive)
         {
-            _viewModel.Tree.SelectOnly(node);
-            e.Handled = true;
+            return;
         }
+
+        var graphPoint = Editor.GetLocationInsideEditor(e);
+        if (_viewModel.Tree.HitTest(graphPoint) is not { } node)
+        {
+            return;
+        }
+
+        _viewModel.Tree.SelectOnly(node);
+        _overviewDragNode = node;
+        _overviewDragPointerAnchor = graphPoint;
+        _overviewDragNodeOrigin = node.Location;
+        Editor.CaptureMouse();
+        e.Handled = true;
     }
 
     private void Editor_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)

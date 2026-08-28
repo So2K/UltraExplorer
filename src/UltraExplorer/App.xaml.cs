@@ -14,7 +14,11 @@ public partial class App : Application
             typeof(Timeline),
             new FrameworkPropertyMetadata(60));
 
-        NodifyEditor.EnableDraggingContainersOptimizations = true;
+        // Deliberately off: this defers committing a dragged container's position
+        // until the drag ends, so while dragging nothing downstream of the view
+        // model moves - not the carried subtree, not the spatial index, and not
+        // the batched canvas. Committing live is what makes a drag look live.
+        NodifyEditor.EnableDraggingContainersOptimizations = false;
         NodifyEditor.EnableSnappingCorrection = true;
 
         // Between the batched overview and full zoom the editor still renders
