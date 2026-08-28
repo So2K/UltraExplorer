@@ -454,12 +454,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         {
             if (!_graph.TryGetNode(step, out var found))
             {
-                MessageRequested?.Invoke(
-                    node is null
-                        ? "That drive is not available on this machine."
-                        : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
-                    true);
-                break;
+                // The step may simply be filtered out of its parent - hidden,
+                // or not of the file type on offer.  Asking for it by name
+                // outranks that.
+                var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
+                if (adopted is null)
+                {
+                    MessageRequested?.Invoke(
+                        node is null
+                            ? "That drive is not available on this machine."
+                            : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
+                        true);
+                    break;
+                }
+
+                found = adopted;
             }
 
             node = found;

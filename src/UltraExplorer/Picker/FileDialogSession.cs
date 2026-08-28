@@ -93,6 +93,25 @@ public sealed class FileDialogSession : ObservableObject
     /// <summary>Raised when the set of entries the graph should show changes.</summary>
     public event Action? FilterChanged;
 
+    /// <summary>Raised when the canvas moves to another folder.</summary>
+    public event Action? FolderChanged;
+
+    /// <summary>Raised when what is highlighted on the canvas changes.</summary>
+    public event Action? SelectionChanged;
+
+    /// <summary>
+    /// A caller's last word on what it is about to be handed.  Returning false
+    /// leaves the dialog open, which is what <c>IFileDialogEvents::OnFileOk</c>
+    /// is for.
+    /// </summary>
+    public Func<IReadOnlyList<string>, bool>? AcceptGuard { get; set; }
+
+    /// <summary>
+    /// A caller's answer to replacing a file: true to allow, false to refuse,
+    /// null to ask the user.  <c>IFileDialogEvents::OnOverwrite</c>.
+    /// </summary>
+    public Func<string, bool?>? OverwriteGuard { get; set; }
+
     /// <summary>Zero-based for the combo box; the caller's index is one-based.</summary>
     public int SelectedFilterIndex
     {
@@ -177,7 +196,13 @@ public sealed class FileDialogSession : ObservableObject
     public string CurrentFolder
     {
         get => _currentFolder;
-        set => SetProperty(ref _currentFolder, value ?? string.Empty);
+        set
+        {
+            if (SetProperty(ref _currentFolder, value ?? string.Empty))
+            {
+                FolderChanged?.Invoke();
+            }
+        }
     }
 
     public string Title => Request.EffectiveTitle;
@@ -231,12 +256,20 @@ public sealed class FileDialogSession : ObservableObject
     /// </summary>
     public FileDialogFilter GraphFilter => PicksFolders ? FileDialogFilter.MatchAll : CurrentFilter;
 
+    /// <summary>
+    /// The last usable selection, kept as a plain snapshot so a caller on
+    /// another thread can read it without touching the canvas.
+    /// </summary>
+    public IReadOnlyList<string> LastSelection { get; private set; } = [];
+
     /// <summary>Reflects a canvas selection in the name box.</summary>
     public void ReportSelection(IReadOnlyList<string> paths)
     {
         var usable = paths
             .Where(path => PicksFolders ? Directory.Exists(path) : !Directory.Exists(path))
             .ToArray();
+
+        LastSelection = usable;
 
         if (usable.Length == 0)
         {
@@ -246,6 +279,7 @@ public sealed class FileDialogSession : ObservableObject
         MarkInteraction();
         FileNameText = FileDialogNaming.Describe(
             AllowsMultipleSelection ? usable : [usable[0]]);
+        SelectionChanged?.Invoke();
     }
 
     /// <summary>Decides what pressing OK, or double-clicking, should do now.</summary>

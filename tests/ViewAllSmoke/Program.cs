@@ -19,8 +19,15 @@ internal static partial class Program
     private static int _checks;
 
     [STAThread]
-    private static int Main()
+    private static int Main(string[] args)
     {
+        // The COM client is a separate job: it talks to a running UltraExplorer
+        // through the dialog interfaces rather than exercising them in-process.
+        if (args.Any(argument => argument.Equals("--com-client", StringComparison.OrdinalIgnoreCase)))
+        {
+            return PickerComClient.Run(args);
+        }
+
         var fixtureRoot = Path.Combine(Path.GetTempPath(), "UltraExplorerSmoke", Guid.NewGuid().ToString("N"));
         try
         {

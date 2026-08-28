@@ -3,6 +3,7 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Nodify;
 using UltraExplorer.Picker;
+using UltraExplorer.Picker.Com;
 
 namespace UltraExplorer;
 
@@ -30,6 +31,33 @@ public partial class App : Application
 
         base.OnStartup(e);
 
+        if (HasSwitch(e.Args, "register-picker"))
+        {
+            FileDialogHost.WriteConsole(ComServerRegistration.Register(ExecutablePath));
+            Shutdown(FileDialogCommandLine.ExitAccepted);
+            return;
+        }
+
+        if (HasSwitch(e.Args, "unregister-picker"))
+        {
+            FileDialogHost.WriteConsole(ComServerRegistration.Unregister());
+            Shutdown(FileDialogCommandLine.ExitAccepted);
+            return;
+        }
+
+        // COM starts the server with -Embedding; a person testing it uses the
+        // long switch.  Neither shows a window until a client asks for one.
+        if (HasSwitch(e.Args, "com-server") || HasSwitch(e.Args, "embedding"))
+        {
+            if (!ComServerHost.Start(this))
+            {
+                FileDialogHost.WriteConsole("Could not register the dialog classes with COM.");
+                Shutdown(FileDialogCommandLine.ExitError);
+            }
+
+            return;
+        }
+
         if (FileDialogCommandLine.IsPickerInvocation(e.Args))
         {
             StartPicker(e.Args);
@@ -39,6 +67,22 @@ public partial class App : Application
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
+    }
+
+    private static string ExecutablePath =>
+        Environment.ProcessPath ?? System.Reflection.Assembly.GetExecutingAssembly().Location;
+
+    private static bool HasSwitch(IReadOnlyList<string> args, string name)
+    {
+        foreach (var argument in args)
+        {
+            if (argument.TrimStart('-', '/').Equals(name, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>

@@ -106,7 +106,7 @@ public partial class MainWindow : Window
         // The dialog's entry rules go in before the first read, so the folder
         // the caller asked for is already filtered when it appears.
         await ApplyPickerRulesAsync();
-        await _viewModel.InitializeAsync(_picker?.CurrentFolder);
+        await _viewModel.InitializeAsync(_pickerStartFolder);
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
         SidebarColumn.Width = new GridLength(_restoredSidebarWidth);
@@ -132,9 +132,9 @@ public partial class MainWindow : Window
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
 
-        if (_picker is { } session)
+        if (_picker is not null)
         {
-            await _viewModel.Tree.RevealPathAsync(session.CurrentFolder);
+            await _viewModel.Tree.RevealPathAsync(_pickerStartFolder);
             PickerNameBox.Focus();
             return;
         }

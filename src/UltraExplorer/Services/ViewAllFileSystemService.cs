@@ -76,6 +76,52 @@ public sealed class ViewAllFileSystemService
                 normalized);
         }, cancellationToken);
 
+    /// <summary>
+    /// Describes one object by name, folder or file, without regard to any of
+    /// the rules that govern enumeration.  Something asked for by name is not
+    /// something a display filter gets a say over.
+    /// </summary>
+    public Task<ViewAllEntryDescriptor> DescribeEntryAsync(
+        string path,
+        CancellationToken cancellationToken = default)
+        => Task.Run(() =>
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var normalized = ViewAllPath.Normalize(path);
+
+            if (Directory.Exists(normalized))
+            {
+                var directory = new DirectoryInfo(normalized);
+                var attributes = directory.Attributes;
+                return new ViewAllEntryDescriptor(
+                    normalized,
+                    string.IsNullOrEmpty(directory.Name) ? normalized : directory.Name,
+                    ViewAllEntryKind.Folder,
+                    attributes.HasFlag(FileAttributes.Hidden) || attributes.HasFlag(FileAttributes.System),
+                    attributes.HasFlag(FileAttributes.ReparsePoint),
+                    SizeBytes: null,
+                    directory.LastWriteTimeUtc,
+                    BuildSecondaryText(directory, isDirectory: true, size: null));
+            }
+
+            var file = new FileInfo(normalized);
+            if (!file.Exists)
+            {
+                throw new FileNotFoundException($"No longer exists: {path}", path);
+            }
+
+            var fileAttributes = file.Attributes;
+            return new ViewAllEntryDescriptor(
+                normalized,
+                file.Name,
+                ViewAllEntryKind.File,
+                fileAttributes.HasFlag(FileAttributes.Hidden) || fileAttributes.HasFlag(FileAttributes.System),
+                fileAttributes.HasFlag(FileAttributes.ReparsePoint),
+                file.Length,
+                file.LastWriteTimeUtc,
+                BuildSecondaryText(file, isDirectory: false, file.Length));
+        }, cancellationToken);
+
     public Task<ViewAllDirectorySnapshot> GetChildrenAsync(
         string directoryPath,
         ViewAllGraphOptions options,

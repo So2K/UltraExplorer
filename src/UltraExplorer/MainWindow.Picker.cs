@@ -21,11 +21,34 @@ public partial class MainWindow
     private TaskCompletionSource<FileDialogResult>? _pickerCompletion;
     private bool _pickerFinished;
 
+    /// <summary>
+    /// The folder the caller asked for, kept from before the canvas is built:
+    /// restoring the saved workspace selects whatever was open last time, which
+    /// moves the session's idea of where it is.  The caller's choice wins.
+    /// </summary>
+    private string _pickerStartFolder = string.Empty;
+
     public bool IsPickerMode => _picker is not null;
 
     /// <summary>Completes once the user accepts, cancels or closes the window.</summary>
     public Task<FileDialogResult> PickerResult =>
         _pickerCompletion?.Task ?? Task.FromResult(FileDialogResult.Cancelled());
+
+    /// <summary>What is highlighted right now, for a caller that is watching.</summary>
+    public IReadOnlyList<string> PickerSelection =>
+        _picker is null ? [] : _viewModel.Tree.SelectedPaths;
+
+    /// <summary>The caller dismissing its own dialog through <c>IFileDialog::Close</c>.</summary>
+    public void CloseFromCaller()
+    {
+        if (_picker is { } session)
+        {
+            FinishPicker(session.Cancelled());
+        }
+    }
+
+    /// <summary>The caller moving the view with <c>IFileDialog::SetFolder</c>.</summary>
+    public Task NavigateFromCallerAsync(string folder) => NavigatePickerAsync(folder);
 
     private void AttachPicker(FileDialogSession session)
     {
@@ -33,6 +56,7 @@ public partial class MainWindow
         _pickerCompletion = new TaskCompletionSource<FileDialogResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
+        _pickerStartFolder = session.CurrentFolder;
         Title = session.Title;
         _viewModel.DialogTitle = session.Title;
         PickerFooter.DataContext = session;
@@ -308,6 +332,12 @@ public partial class MainWindow
 
             if (verdict.IsAccept)
             {
+                // The caller gets the last word on what it is handed.
+                if (session.AcceptGuard is { } guard && !guard(verdict.Paths))
+                {
+                    return;
+                }
+
                 foreach (var path in verdict.Paths)
                 {
                     session.RememberName(Path.GetFileName(path));
@@ -322,6 +352,22 @@ public partial class MainWindow
             {
                 ConfirmDialog.Alert(this, verdict.Caption, verdict.Message);
                 return;
+            }
+
+            // A caller watching the dialog may answer the overwrite question
+            // itself, in which case the user is never asked.
+            if (verdict.Kind == FileDialogVerdictKind.ConfirmOverwrite
+                && session.OverwriteGuard is { } overwrite
+                && verdict.Paths.Count > 0
+                && overwrite(verdict.Paths[0]) is { } decided)
+            {
+                if (!decided)
+                {
+                    return;
+                }
+
+                session.Allow(FileDialogGate.Overwrite);
+                continue;
             }
 
             if (!AskPicker(verdict))

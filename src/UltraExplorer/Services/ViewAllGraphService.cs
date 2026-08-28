@@ -368,6 +368,67 @@ public sealed class ViewAllGraphService : IDisposable
     }
 
     /// <summary>
+    /// Materializes one child that enumeration left out: a hidden folder on a
+    /// path that was typed or asked for by a caller, or a file the current file
+    /// type filters away.  Naming something is a stronger statement than any
+    /// display rule, which is how the address bar has always behaved.
+    /// </summary>
+    public async Task<ViewAllNodeViewModel?> AdoptChildAsync(
+        ViewAllNodeViewModel parent,
+        string childPath,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (!parent.IsDirectory)
+        {
+            return null;
+        }
+
+        string normalized;
+        try
+        {
+            normalized = ViewAllPath.Normalize(childPath);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+
+        if (_nodesByPath.TryGetValue(normalized, out var existing))
+        {
+            return existing;
+        }
+
+        if (!ViewAllPath.Equals(Path.GetDirectoryName(normalized) ?? string.Empty, parent.FullPath))
+        {
+            return null;
+        }
+
+        ViewAllEntryDescriptor descriptor;
+        try
+        {
+            descriptor = await _fileSystem.DescribeEntryAsync(normalized, cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or DirectoryNotFoundException or FileNotFoundException)
+        {
+            return null;
+        }
+
+        var child = CreateNode(descriptor, parent.Depth + 1, parent);
+        RestorePosition(child);
+        parent.Children.Add(child);
+        var edge = new ViewAllEdgeViewModel(parent, child);
+        _edges.Add(edge);
+        _incomingEdges[child.Id] = edge;
+        parent.NotifyChildrenChanged();
+        _layout.PlaceChildren(parent, [child], Index);
+        UpdateEdgeVisibility();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+        return child;
+    }
+
+    /// <summary>
     /// Adds an extra top-level root for a directory that is not a local drive
     /// (a WSL distribution or a UNC share).  Existing roots are left alone.
     /// </summary>
