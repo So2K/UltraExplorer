@@ -20,7 +20,16 @@ namespace UltraExplorer.Services;
 public sealed class ShellIconService : IDisposable
 {
     private readonly ConcurrentDictionary<string, ImageSource?> _cache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, byte> _pending = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>
+    /// Who is waiting for an icon that is being resolved, by cache key.  It used
+    /// to be a set, and a second caller asking for an icon already in flight was
+    /// simply dropped - which is how a file could have its icon on the canvas and
+    /// a blank glyph in the folder list, for ever, because nothing ever asked
+    /// again.
+    /// </summary>
+    private readonly Dictionary<string, List<Action<ImageSource?>>> _pending = new(StringComparer.OrdinalIgnoreCase);
+
+    private readonly object _gate = new();
     private readonly BlockingCollection<IconRequest> _queue = new(new ConcurrentQueue<IconRequest>());
     private readonly Thread _worker;
     private bool _disposed;
@@ -44,7 +53,8 @@ public sealed class ShellIconService : IDisposable
     /// <summary>
     /// Resolves in the background and calls back on the UI thread.  Returns true
     /// when the icon was already cached and <paramref name="completed"/> has
-    /// been invoked synchronously.
+    /// been invoked synchronously.  Several callers may wait on the same icon;
+    /// the Shell is asked once and all of them are told.
     /// </summary>
     public bool Request(string path, bool isDirectory, Action<ImageSource?> completed)
     {
@@ -55,12 +65,31 @@ public sealed class ShellIconService : IDisposable
             return true;
         }
 
-        if (_disposed || !_pending.TryAdd(key, 0))
+        if (_disposed)
         {
             return false;
         }
 
-        _queue.Add(new IconRequest(key, path, isDirectory, completed));
+        lock (_gate)
+        {
+            // Checked again inside the lock: the worker may have finished between
+            // the first look and here, and then nobody would ever call back.
+            if (_cache.TryGetValue(key, out cached))
+            {
+                completed(cached);
+                return true;
+            }
+
+            if (_pending.TryGetValue(key, out var waiting))
+            {
+                waiting.Add(completed);
+                return false;
+            }
+
+            _pending[key] = [completed];
+        }
+
+        _queue.Add(new IconRequest(key, path, isDirectory));
         return false;
     }
 
@@ -97,19 +126,28 @@ public sealed class ShellIconService : IDisposable
                 {
                     _cache.TryAdd(request.Key, null);
                 }
-                finally
+                List<Action<ImageSource?>>? waiting;
+                lock (_gate)
                 {
-                    _pending.TryRemove(request.Key, out _);
+                    _pending.Remove(request.Key, out waiting);
                 }
 
                 var dispatcher = Application.Current?.Dispatcher;
-                if (dispatcher is null || dispatcher.HasShutdownStarted)
+                if (waiting is null || dispatcher is null || dispatcher.HasShutdownStarted)
                 {
                     continue;
                 }
 
                 var resolved = icon;
-                _ = dispatcher.InvokeAsync(() => request.Completed(resolved), DispatcherPriority.Background);
+                _ = dispatcher.InvokeAsync(
+                    () =>
+                    {
+                        foreach (var completed in waiting)
+                        {
+                            completed(resolved);
+                        }
+                    },
+                    DispatcherPriority.Background);
             }
         }
         catch (ObjectDisposedException)
@@ -169,7 +207,7 @@ public sealed class ShellIconService : IDisposable
         }
     }
 
-    private readonly record struct IconRequest(string Key, string Path, bool IsDirectory, Action<ImageSource?> Completed);
+    private readonly record struct IconRequest(string Key, string Path, bool IsDirectory);
 
     [Flags]
     private enum Shgfi : uint

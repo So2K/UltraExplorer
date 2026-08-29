@@ -92,6 +92,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ZoomOutCommand = new RelayCommand(() => ZoomRequested?.Invoke(1 / 1.25));
         ResetZoomCommand = new RelayCommand(() => ZoomRequested?.Invoke(0));
         ToggleMinimapCommand = new RelayCommand(() => IsMinimapVisible = !IsMinimapVisible);
+        ToggleFolderListCommand = new RelayCommand(
+            () => Tree.FolderList.IsVisible = !Tree.FolderList.IsVisible);
         CollapseAllCommand = new RelayCommand(() => Tree.CollapseAll());
         RelayoutCommand = new RelayCommand(() => Tree.RelayoutCanvas());
         HideSelectedCommand = new RelayCommand(() => Tree.HideSelected());
@@ -159,6 +161,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ICommand ZoomOutCommand { get; }
     public ICommand ResetZoomCommand { get; }
     public ICommand ToggleMinimapCommand { get; }
+    public ICommand ToggleFolderListCommand { get; }
     public ICommand CollapseAllCommand { get; }
     public ICommand RelayoutCommand { get; }
     public ICommand HideSelectedCommand { get; }
@@ -313,6 +316,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             SidebarWidth = Math.Clamp(state.SidebarWidth <= 0 ? 240 : state.SidebarWidth, 190, 340);
             IsMinimapVisible = state.IsMinimapVisible;
+            Tree.FolderList.IsVisible = state.IsFolderListVisible;
             foreach (var legacy in state.Nodes)
             {
                 _marks.Seed(legacy.Path, legacy.AccentHex, legacy.Note);
@@ -415,6 +419,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             SidebarWidth = SidebarWidth,
             IsMinimapVisible = IsMinimapVisible,
+            IsFolderListVisible = Tree.FolderList.IsVisible,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))

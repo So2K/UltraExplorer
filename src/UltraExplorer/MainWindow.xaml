@@ -21,6 +21,8 @@
         ResizeMode="CanResize"
         AllowsTransparency="False"
         Background="{StaticResource WindowBrush}"
+        Foreground="{StaticResource TextBrush}"
+        Style="{StaticResource AppWindow}"
         Loaded="Window_Loaded"
         Closing="Window_Closing"
         PreviewKeyDown="Window_PreviewKeyDown"
@@ -114,6 +116,7 @@
                         <Image Source="Assets/UltraExplorer.ico" Width="16" Height="16" HorizontalAlignment="Left" />
                         <TextBlock Grid.Column="1"
                                    Text="{Binding TabTitle}"
+                                   Foreground="{StaticResource TextBrush}"
                                    VerticalAlignment="Center"
                                    FontSize="12"
                                    TextTrimming="CharacterEllipsis" />
@@ -215,7 +218,10 @@
                                                 Command="{Binding Data.OpenBreadcrumbCommand, Source={StaticResource Shell}}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip="{Binding FullPath}">
-                                            <TextBlock Text="{Binding Name}" FontSize="12" VerticalAlignment="Center" />
+                                            <TextBlock Text="{Binding Name}"
+                                                       Foreground="{StaticResource TextBrush}"
+                                                       FontSize="12"
+                                                       VerticalAlignment="Center" />
                                         </Button>
                                         <TextBlock Text="&#xE76C;"
                                                    Style="{StaticResource IconText}"
@@ -233,6 +239,9 @@
                              Grid.Column="1"
                              Text="{Binding AddressText, UpdateSourceTrigger=PropertyChanged}"
                              Background="Transparent"
+                             Foreground="{StaticResource TextBrush}"
+                             CaretBrush="{StaticResource TextBrush}"
+                             SelectionBrush="{StaticResource AccentBrush}"
                              BorderThickness="0"
                              Height="26"
                              Padding="4,0"
@@ -274,6 +283,9 @@
                         <TextBox x:Name="SearchBox"
                                  Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
                                  Background="Transparent"
+                                 Foreground="{StaticResource TextBrush}"
+                                 CaretBrush="{StaticResource TextBrush}"
+                                 SelectionBrush="{StaticResource AccentBrush}"
                                  BorderThickness="0"
                                  Height="26"
                                  Padding="8,0"
@@ -501,6 +513,213 @@
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
                     </ItemsControl>
+                </Border>
+
+                <!-- The current folder as a plain list.  The canvas answers
+                     "what is where"; this answers "where is the one called X",
+                     which is the half a canvas is bad at. -->
+                <Border x:Name="FolderListPanel"
+                        Width="320"
+                        Height="380"
+                        HorizontalAlignment="Left"
+                        VerticalAlignment="Bottom"
+                        Margin="14"
+                        CornerRadius="8"
+                        Background="#F21C1C1C"
+                        BorderBrush="{StaticResource BorderStrongBrush}"
+                        BorderThickness="1"
+                        Visibility="{Binding Tree.FolderList.IsVisible, Converter={StaticResource BoolToVisibility}}">
+                    <Border.Effect>
+                        <DropShadowEffect BlurRadius="18" ShadowDepth="5" Opacity="0.40" Color="#000000" />
+                    </Border.Effect>
+                    <Grid Margin="8">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                        </Grid.RowDefinitions>
+
+                        <!-- Header: which folder, how many, and a way out. -->
+                        <Grid Grid.Row="0" Margin="0,0,0,6">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <!-- One arrow, not two: walking up and stepping back
+                                 land in the same place nearly every time, and a
+                                 button that duplicates its neighbour is worse
+                                 than no button.  Back is still on Alt+Left. -->
+                            <Button Grid.Column="0"
+                                    Width="22"
+                                    Height="22"
+                                    Padding="0"
+                                    Margin="0,0,4,0"
+                                    Style="{StaticResource FlatButton}"
+                                    Command="{Binding Tree.FolderList.UpCommand}"
+                                    ToolTip="Up one folder (Alt+Up)"
+                                    AutomationProperties.Name="Up one folder">
+                                <TextBlock Text="&#xE74A;" Style="{StaticResource IconText}" FontSize="11" />
+                            </Button>
+                            <TextBlock Grid.Column="1"
+                                       Text="&#xE8B7;"
+                                       Style="{StaticResource IconText}"
+                                       Foreground="{StaticResource FolderBrush}"
+                                       VerticalAlignment="Center"
+                                       Margin="0,0,6,0" />
+                            <TextBlock Grid.Column="2"
+                                       Text="{Binding Tree.FolderList.Title}"
+                                       ToolTip="{Binding Tree.FolderList.FolderPath}"
+                                       Foreground="{StaticResource TextBrush}"
+                                       FontSize="12"
+                                       FontWeight="SemiBold"
+                                       TextTrimming="CharacterEllipsis"
+                                       VerticalAlignment="Center" />
+                            <TextBlock Grid.Column="3"
+                                       Text="{Binding Tree.FolderList.CountText}"
+                                       Foreground="{StaticResource TextMutedBrush}"
+                                       FontSize="11"
+                                       VerticalAlignment="Center"
+                                       Margin="6,0,4,0" />
+                            <Button Grid.Column="4"
+                                    Width="22"
+                                    Height="22"
+                                    Padding="0"
+                                    Style="{StaticResource FlatButton}"
+                                    Command="{Binding Tree.FolderList.HideCommand}"
+                                    ToolTip="Hide the folder list"
+                                    AutomationProperties.Name="Hide the folder list">
+                                <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="11" />
+                            </Button>
+                        </Grid>
+
+                        <!-- Type to narrow it down; Enter opens the best match. -->
+                        <Border Grid.Row="1"
+                                CornerRadius="5"
+                                Background="{StaticResource SurfaceRaisedBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                Padding="7,4"
+                                Margin="0,0,0,6">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0"
+                                           Text="&#xE721;"
+                                           Style="{StaticResource IconText}"
+                                           FontSize="11"
+                                           Foreground="{StaticResource TextMutedBrush}"
+                                           VerticalAlignment="Center"
+                                           Margin="0,0,6,0" />
+                                <Grid Grid.Column="1">
+                                    <TextBlock Text="Find in this folder"
+                                               Foreground="{StaticResource TextMutedBrush}"
+                                               FontSize="12"
+                                               IsHitTestVisible="False"
+                                               VerticalAlignment="Center"
+                                               Visibility="{Binding Tree.FolderList.Filter, Converter={StaticResource StringToVisibility}, ConverterParameter=Invert}" />
+                                    <TextBox x:Name="FolderListFilterBox"
+                                             Text="{Binding Tree.FolderList.Filter, UpdateSourceTrigger=PropertyChanged}"
+                                             Background="Transparent"
+                                             BorderThickness="0"
+                                             Foreground="{StaticResource TextBrush}"
+                                             CaretBrush="{StaticResource TextBrush}"
+                                             FontSize="12"
+                                             VerticalContentAlignment="Center"
+                                             KeyDown="FolderListFilter_KeyDown" />
+                                </Grid>
+                            </Grid>
+                        </Border>
+
+                        <Grid Grid.Row="2">
+                            <ListBox x:Name="FolderListItems"
+                                     ItemsSource="{Binding Tree.FolderList.Items}"
+                                     SelectedItem="{Binding Tree.FolderList.Selected, Mode=TwoWay}"
+                                     Background="Transparent"
+                                     BorderThickness="0"
+                                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                     VirtualizingPanel.IsVirtualizing="True"
+                                     VirtualizingPanel.VirtualizationMode="Recycling"
+                                     MouseDoubleClick="FolderListItems_MouseDoubleClick"
+                                     PreviewMouseLeftButtonUp="FolderListItems_PreviewMouseLeftButtonUp"
+                                     PreviewMouseRightButtonUp="FolderListItems_PreviewMouseRightButtonUp">
+                                <ListBox.ItemContainerStyle>
+                                    <Style TargetType="ListBoxItem">
+                                        <Setter Property="Padding" Value="0" />
+                                        <Setter Property="Background" Value="Transparent" />
+                                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                        <Setter Property="Template">
+                                            <Setter.Value>
+                                                <ControlTemplate TargetType="ListBoxItem">
+                                                    <Border x:Name="Chrome" CornerRadius="4" Background="{TemplateBinding Background}" Padding="6,4">
+                                                        <ContentPresenter />
+                                                    </Border>
+                                                    <ControlTemplate.Triggers>
+                                                        <Trigger Property="IsMouseOver" Value="True">
+                                                            <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                                                        </Trigger>
+                                                        <Trigger Property="IsSelected" Value="True">
+                                                            <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentSoftBrush}" />
+                                                        </Trigger>
+                                                    </ControlTemplate.Triggers>
+                                                </ControlTemplate>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Style>
+                                </ListBox.ItemContainerStyle>
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate>
+                                        <Grid>
+                                            <Grid.ColumnDefinitions>
+                                                <ColumnDefinition Width="20" />
+                                                <ColumnDefinition Width="*" />
+                                                <ColumnDefinition Width="Auto" />
+                                            </Grid.ColumnDefinitions>
+                                            <Grid Grid.Column="0" Width="16" Height="16" HorizontalAlignment="Left">
+                                                <Image Source="{Binding Icon}"
+                                                       Width="16"
+                                                       Height="16"
+                                                       RenderOptions.BitmapScalingMode="HighQuality" />
+                                                <TextBlock Text="{Binding Glyph}"
+                                                           Style="{StaticResource IconText}"
+                                                           FontSize="12"
+                                                           Foreground="{Binding Tint}"
+                                                           HorizontalAlignment="Center"
+                                                           VerticalAlignment="Center"
+                                                           Visibility="{Binding Icon, Converter={StaticResource NullToVisibility}, ConverterParameter=Invert}" />
+                                            </Grid>
+                                            <TextBlock Grid.Column="1"
+                                                       Text="{Binding DisplayName}"
+                                                       ToolTip="{Binding FullPath}"
+                                                       FontSize="12"
+                                                       TextTrimming="CharacterEllipsis"
+                                                       VerticalAlignment="Center"
+                                                       Margin="4,0,6,0" />
+                                            <TextBlock Grid.Column="2"
+                                                       Text="{Binding SecondaryText}"
+                                                       Foreground="{StaticResource TextMutedBrush}"
+                                                       FontSize="10"
+                                                       VerticalAlignment="Center" />
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+
+                            <TextBlock Text="{Binding Tree.FolderList.EmptyText}"
+                                       Foreground="{StaticResource TextMutedBrush}"
+                                       FontSize="12"
+                                       TextWrapping="Wrap"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       Margin="12"
+                                       Visibility="{Binding Tree.FolderList.EmptyText, Converter={StaticResource StringToVisibility}}" />
+                        </Grid>
+                    </Grid>
                 </Border>
 
                 <!-- Search results -->

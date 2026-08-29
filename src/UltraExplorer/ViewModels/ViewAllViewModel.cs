@@ -42,6 +42,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private int _visibleNodeCount;
     private bool _isOverviewActive;
     private bool _isOverviewStale;
+
+    /// <summary>
+    /// Node containers added per pass.  Measured: a container costs about a
+    /// millisecond and a half to inflate, so four of them plus the edges that
+    /// come with them is comfortably inside one frame at sixty a second.  The
+    /// rest arrive on the next tick, eight milliseconds later.
+    /// </summary>
+    private const int FillBudget = 4;
+
+    private readonly DispatcherTimer _fillTimer;
     private IReadOnlyList<ViewAllTrailStep> _trail = [];
     private readonly List<ViewAllNodeViewModel> _trailProbe = [];
     private string _statusCountText = string.Empty;
@@ -66,10 +76,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
 
+        FolderList = new FolderListViewModel(
+            (path, cancellation) => _graph.ReadDirectoryAsync(path, cancellation),
+            ActivateListItemAsync,
+            path => _graph.TryGetNode(path, out _),
+            icons);
+
         _renderThrottle = new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromMilliseconds(35)
         };
+        _fillTimer = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromMilliseconds(8)
+        };
+        _fillTimer.Tick += (_, _) => RebuildRenderSet();
+
         _renderThrottle.Tick += (_, _) =>
         {
             _renderThrottle.Stop();
@@ -133,6 +155,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// </summary>
     public event Action<Vector>? ViewShiftRequested;
 
+    /// <summary>The current folder as a list, beside the canvas.</summary>
+    public FolderListViewModel FolderList { get; }
+
     /// <summary>Grid the overview layer draws from.</summary>
     public ViewAllSpatialIndex SpatialIndex => _graph.Index;
 
@@ -170,6 +195,41 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     public ViewAllNodeViewModel? HitTest(Point graphPoint, Predicate<ViewAllNodeViewModel> exclude)
         => _graph.HitTest(graphPoint, exclude);
 
+    /// <summary>
+    /// What a row in the folder list does.  Picking one takes the canvas to it,
+    /// which is why the list is worth having at all; opening one is the ordinary
+    /// double-click, and for a folder that means the list goes in as well.
+    /// </summary>
+    private async Task ActivateListItemAsync(string path, bool open)
+    {
+        var node = await RevealPathAsync(path);
+        if (node is null)
+        {
+            if (open)
+            {
+                MessageRequested?.Invoke($"{Path.GetFileName(path)} could not be shown", true);
+            }
+
+            return;
+        }
+
+        SelectOnly(node);
+
+        if (!open)
+        {
+            return;
+        }
+
+        if (node.IsDirectory)
+        {
+            await ExpandAsync(node);
+            ActiveNode = node;
+            return;
+        }
+
+        OpenInDefaultApplication(node);
+    }
+
     public ViewAllNodeViewModel? ActiveNode
     {
         get => _activeNode;
@@ -178,6 +238,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             if (SetProperty(ref _activeNode, value))
             {
                 OnPropertyChanged(nameof(ActivePath));
+                FolderList.SetTarget(_activeNode);
                 UpdateStatus();
                 AttachWatcher(value);
             }
@@ -871,6 +932,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         _activeWatcher = null;
         _graph.GraphChanged -= OnGraphChanged;
         _graph.NodeCreated -= OnNodeCreated;
+        _fillTimer.Stop();
         _graph.LayoutChanged -= OnLayoutChanged;
         _marks.MarkChanged -= OnMarkChanged;
         SelectedNodes.CollectionChanged -= OnSelectedNodesChanged;
@@ -1153,6 +1215,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return;
         }
 
+        using var frame = PerfLog.Measure("renderset");
         var viewport = new Rect(_viewportLocation, _viewportSize);
         var set = _viewportService.BuildRenderSet(
             _graph.Index,
@@ -1161,13 +1224,41 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             viewport,
             _viewportZoom,
             _visibleNodeCount);
-        Sync(RenderNodes, set.Nodes);
-        Sync(RenderEdges, set.Edges);
+        PerfLog.Value("renderset.nodes", set.Nodes.Count);
+        bool filling;
+        using (PerfLog.Measure("renderset.sync"))
+        {
+            var budget = FillBudget;
+            filling = Sync(RenderNodes, set.Nodes, ref budget);
+            filling |= Sync(RenderEdges, set.Edges, ref budget);
+        }
+
+        // While the containers are still arriving the batched picture stays up.
+        // It is drawn over the editor and is a complete picture of the same tree,
+        // so the canvas goes from one finished image to the other rather than
+        // filling in visibly - and never blocks.
+        if (filling)
+        {
+            _fillTimer.Start();
+        }
+        else
+        {
+            _fillTimer.Stop();
+        }
+
         DetailLevel = set.DetailLevel;
         LogicalNodeCount = set.LogicalNodeCount;
-        IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel);
-        RequestIcons(set.Nodes, set.DetailLevel);
-        UpdateTrail(viewport);
+        IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel) || filling;
+        using (PerfLog.Measure("renderset.icons"))
+        {
+            RequestIcons(set.Nodes, set.DetailLevel);
+        }
+
+        using (PerfLog.Measure("renderset.trail"))
+        {
+            UpdateTrail(viewport);
+        }
+
 
         // Raised at every zoom, not only while the batched slab layer is on
         // screen: the links are drawn by a layer of their own that is always
@@ -1179,7 +1270,18 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
     }
 
-    private static void Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired)
+    /// <summary>
+    /// Brings <paramref name="target"/> towards <paramref name="desired"/>, adding
+    /// at most <paramref name="budget"/> items and reporting whether more are
+    /// waiting.
+    ///
+    /// Removals are not budgeted - tearing a container down is cheap.  Adding one
+    /// is not: the editor inflates a whole node control per item, about a
+    /// millisecond and a half each, and the canvas crossing out of the batched
+    /// view wanted a hundred of them in a single frame.  That was a third of a
+    /// second of nothing moving, measured, every time the zoom came back in.
+    /// </summary>
+    private static bool Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired, ref int budget)
         where T : class
     {
         var wanted = new HashSet<T>(desired);
@@ -1194,11 +1296,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         var present = new HashSet<T>(target);
         foreach (var item in desired)
         {
-            if (present.Add(item))
+            if (!present.Add(item))
             {
-                target.Add(item);
+                continue;
             }
+
+            if (budget <= 0)
+            {
+                return true;
+            }
+
+            target.Add(item);
+            budget--;
         }
+
+        return false;
     }
 
     private void UpdateStatus()

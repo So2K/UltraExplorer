@@ -630,6 +630,16 @@ public sealed class ViewAllGraphService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Reads a directory without touching the canvas, under the same enumeration
+    /// options the graph uses - so the folder list hides what the canvas hides
+    /// and the picker's file filter applies to both.
+    /// </summary>
+    public Task<ViewAllDirectorySnapshot> ReadDirectoryAsync(
+        string directoryPath,
+        CancellationToken cancellationToken = default)
+        => _fileSystem.GetChildrenAsync(directoryPath, Options, cancellationToken);
+
     public bool TryGetNode(string path, out ViewAllNodeViewModel node)
     {
         try

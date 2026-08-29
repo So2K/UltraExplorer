@@ -108,6 +108,8 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
 
     private void Rebuild(Rect window, OverviewMode mode)
     {
+        using var frame = PerfLog.Measure("overview.rebuild");
+        PerfLog.Value("overview.window", window.Width * window.Height / (640.0 * 640.0));
         _builtMode = mode;
         if (mode == OverviewMode.Density)
         {

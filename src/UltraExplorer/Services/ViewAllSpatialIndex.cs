@@ -74,6 +74,7 @@ public sealed class ViewAllSpatialIndex
 
         // A node straddling a cell border is registered in each cell it touches,
         // so the same node can be visited more than once.
+        PerfLog.Value("index.querycells", (maxX - minX + 1) * (double)(maxY - minY + 1));
         var seen = new HashSet<ViewAllNodeViewModel>();
         for (var x = minX; x <= maxX; x++)
         {

@@ -5,6 +5,8 @@ using Nodify;
 using UltraExplorer.Picker;
 using UltraExplorer.Picker.Com;
 
+using UltraExplorer.Services;
+
 namespace UltraExplorer;
 
 public partial class App : Application
@@ -31,6 +33,7 @@ public partial class App : Application
         // turned the canvas black mid-drag.  Culling and the batched overview
         // layer already do this job, better and at every zoom.
         NodifyEditor.EnableRenderingContainersOptimizations = false;
+        PerfLog.Configure(Environment.GetCommandLineArgs());
 
         base.OnStartup(e);
 

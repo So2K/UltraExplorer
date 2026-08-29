@@ -11,6 +11,9 @@ public sealed class WorkspaceState
     public double SidebarWidth { get; set; } = 240;
     public bool IsMinimapVisible { get; set; }
 
+    /// <summary>Whether the current folder is also shown as a list.</summary>
+    public bool IsFolderListVisible { get; set; } = true;
+
     /// <summary>
     /// Version 1 stored a colour label and a note per canvas node.  They are
     /// migrated into the path-keyed folder mark store on first load and then

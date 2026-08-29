@@ -82,7 +82,16 @@
     <FontFamily x:Key="AppFont">Segoe UI Variable Text, Segoe UI</FontFamily>
     <FontFamily x:Key="IconFont">Segoe Fluent Icons, Segoe MDL2 Assets</FontFamily>
 
-    <Style TargetType="Window">
+    <!--
+        Keyed on purpose.  As an implicit style this was dead: WPF matches implicit
+        styles on the element's exact runtime type, so a style keyed on Window
+        never reaches MainWindow or a dialog, and every setter below - the font,
+        the text rendering, and above all Foreground - silently did nothing.  That
+        left the inherited foreground at the system default, which is black, and
+        any text that did not name its own colour came out black on a dark panel.
+        Windows now ask for it by name.
+    -->
+    <Style x:Key="AppWindow" TargetType="Window">
         <Setter Property="FontFamily" Value="{StaticResource AppFont}" />
         <Setter Property="Background" Value="{StaticResource WindowBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />

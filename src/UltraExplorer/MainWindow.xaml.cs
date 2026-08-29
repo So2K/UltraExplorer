@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
@@ -140,6 +141,26 @@ public partial class MainWindow : Window
 
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
+
+        if (PerfLog.IsEnabled)
+        {
+            // A watchdog on the render loop: whatever stalls the UI thread shows
+            // up here as a gap between frames, including the work no stopwatch of
+            // ours wraps - WPF's own measure, arrange and container realisation.
+            var lastFrame = Stopwatch.GetTimestamp();
+            CompositionTarget.Rendering += (_, _) =>
+            {
+                var now = Stopwatch.GetTimestamp();
+                var gap = Stopwatch.GetElapsedTime(lastFrame, now).TotalMilliseconds;
+                lastFrame = now;
+                if (gap > 40)
+                {
+                    PerfLog.Value("frame.gap", gap);
+                    PerfLog.Value("frame.gap.zoom", Editor.ViewportZoom);
+                    PerfLog.Value("frame.gap.containers", Editor.Items.Count);
+                }
+            };
+        }
 
         if (_picker is not null)
         {
@@ -390,12 +411,23 @@ public partial class MainWindow : Window
 
     private void PushViewport()
     {
-        _viewModel.Tree.UpdateViewport(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+        using var frame = PerfLog.Measure("viewport");
 
-        Harness.Update(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+        using (PerfLog.Measure("viewport.model"))
+        {
+            _viewModel.Tree.UpdateViewport(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+        }
+
+        using (PerfLog.Measure("viewport.harness"))
+        {
+            Harness.Update(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+        }
+
+        PerfLog.Value("viewport.zoom", Editor.ViewportZoom);
 
         // Cheap unless the viewport left the window the geometry was built for:
         // normally this just moves an already uploaded visual.
+        using var overview = PerfLog.Measure("viewport.overview");
         Overview.Update(
             Editor.ViewportLocation,
             Editor.ViewportSize,
@@ -421,6 +453,112 @@ public partial class MainWindow : Window
             Editor.ViewportLocation.Y + delta.Y);
         PushViewport();
     }
+
+    /// <summary>
+    /// Enter in the folder-list filter opens the best match, which is what makes
+    /// the list a way of getting somewhere rather than only of looking.
+    /// </summary>
+    private void FolderListFilter_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Enter)
+        {
+            _viewModel.Tree.FolderList.OpenFirstMatchCommand.Execute(null);
+            e.Handled = true;
+            return;
+        }
+
+        if (e.Key == Key.Escape)
+        {
+            _viewModel.Tree.FolderList.ClearFilterCommand.Execute(null);
+            e.Handled = true;
+            return;
+        }
+
+        // Down arrow moves into the list, so typing and picking is one gesture.
+        if (e.Key == Key.Down && Keyboard.Modifiers == ModifierKeys.None && FolderListItems.Items.Count > 0)
+        {
+            FolderListItems.SelectedIndex = 0;
+            (FolderListItems.ItemContainerGenerator.ContainerFromIndex(0) as ListBoxItem)?.Focus();
+            e.Handled = true;
+            return;
+        }
+
+        // Explorer's own shortcuts, so the muscle memory carries over.  Backspace
+        // is deliberately not one of them: it belongs to the text being typed.
+        if (Keyboard.Modifiers == ModifierKeys.Alt && e.Key == Key.Up)
+        {
+            _viewModel.Tree.FolderList.UpCommand.Execute(null);
+            e.Handled = true;
+            return;
+        }
+
+        if (Keyboard.Modifiers == ModifierKeys.Alt && e.Key == Key.Left)
+        {
+            _viewModel.Tree.FolderList.BackCommand.Execute(null);
+            e.Handled = true;
+        }
+    }
+
+    private void FolderListItems_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (RowUnder(e) is { } item)
+        {
+            _viewModel.Tree.FolderList.ActivateCommand.Execute(item);
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// A plain click takes the canvas to the row.  This is on button-up rather
+    /// than on the selection changing, so walking the list with the arrow keys
+    /// stays a way of reading it rather than a hundred flights across the canvas.
+    /// </summary>
+    private void FolderListItems_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (e.ClickCount == 1 && RowUnder(e) is { } item)
+        {
+            _viewModel.Tree.FolderList.RevealCommand.Execute(item);
+        }
+    }
+
+    /// <summary>
+    /// Right-click gets the real Windows menu for that file - open, open with,
+    /// copy, rename, delete, properties - which is what makes the list a file
+    /// manager rather than a picture of one.
+    ///
+    /// On the button going up, not down: the Shell menu runs its own modal
+    /// message loop, and opened on the press it swallows the matching release -
+    /// which with TPM_RIGHTBUTTON can count as a click on whatever item the menu
+    /// happened to draw under the cursor.  The canvas opens its menus the same
+    /// way, and so does Explorer.
+    ///
+    /// The canvas half of the menu is deliberately left out.  Those entries act
+    /// on the canvas selection, and making the row the canvas selection first
+    /// would move the viewport, expand a branch, and - for a folder - re-point
+    /// this very list into it, all while the menu was opening.
+    /// </summary>
+    private void FolderListItems_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (RowUnder(e) is not { } item)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        _viewModel.Tree.FolderList.Highlight(item);
+        ShowContextMenu(
+            [item.FullPath],
+            FolderListItems,
+            e.GetPosition(FolderListItems),
+            includeCanvasCommands: false);
+    }
+
+    /// <summary>The folder-list row the mouse is over, or null between rows.</summary>
+    private FolderListItem? RowUnder(MouseButtonEventArgs e)
+        => ItemsControl.ContainerFromElement(FolderListItems, e.OriginalSource as DependencyObject)
+            is ListBoxItem container && container.DataContext is FolderListItem item
+            ? item
+            : null;
 
     private void OnGraphInvalidated()
     {
@@ -639,6 +777,13 @@ public partial class MainWindow : Window
     }
 
     private void ShowContextMenu(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
+        => ShowContextMenu(paths, origin, point, includeCanvasCommands: true);
+
+    private void ShowContextMenu(
+        IReadOnlyList<string> paths,
+        FrameworkElement origin,
+        Point point,
+        bool includeCanvasCommands)
     {
         if (paths.Count == 0)
         {
@@ -646,8 +791,10 @@ public partial class MainWindow : Window
         }
 
         // The Shell menu is the whole menu for a node, so anything of ours has to
-        // live inside it or it would be unreachable.
-        var appCommands = BuildNodeMenuEntries();
+        // live inside it or it would be unreachable.  The canvas entries are left
+        // out when the thing clicked has no node on the canvas: hiding or
+        // recolouring a branch that is not there would act on the wrong item.
+        var appCommands = includeCanvasCommands ? BuildNodeMenuEntries() : [];
 
         try
         {
@@ -748,6 +895,7 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
         AddHiddenFolderItems(menu);
+        AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         menu.IsOpen = true;
     }
@@ -787,6 +935,7 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
         AddHiddenFolderItems(menu);
+        AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
         menu.Items.Add(new Separator());
@@ -862,6 +1011,9 @@ public partial class MainWindow : Window
         menu.Items.Add(item);
     }
 
+    private static Brush MenuGlyphBrush =>
+        Application.Current?.TryFindResource("TextBrush") as Brush ?? Brushes.White;
+
     private static void AddCommandItem(ItemsControl menu, string header, string glyph, ICommand command, string gesture = "")
     {
         var item = new MenuItem
@@ -874,6 +1026,11 @@ public partial class MainWindow : Window
                 Text = glyph,
                 FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"),
                 FontSize = 13,
+
+                // A menu lives in a popup, which is its own visual tree: nothing
+                // inherits from the window into it, so a colour left unsaid here
+                // is the system default - black text on a dark menu.
+                Foreground = MenuGlyphBrush,
                 HorizontalAlignment = HorizontalAlignment.Center,
                 VerticalAlignment = VerticalAlignment.Center
             }

@@ -151,6 +151,7 @@ public sealed class ViewAllHarnessLayer : FrameworkElement
 
     private void Rebuild(Rect window)
     {
+        using var frame = PerfLog.Measure("harness.rebuild");
         _scratch.Clear();
         _parents.Clear();
         _links.Clear();
