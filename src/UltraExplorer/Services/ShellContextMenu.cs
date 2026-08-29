@@ -11,6 +11,12 @@ namespace UltraExplorer.Services;
 /// on screen.  A wrapper that owns these lifetimes implicitly was the source of
 /// a 0xC0000374 heap corruption, so the interop is deliberately explicit.
 /// </summary>
+/// <summary>
+/// One item the app adds to the Shell's menu.  A non-empty
+/// <see cref="Children"/> makes it a submenu and the id is ignored.
+/// </summary>
+public sealed record ShellMenuEntry(uint Id, string Label, IReadOnlyList<ShellMenuEntry>? Children = null);
+
 internal static class ShellContextMenu
 {
     private const uint CmdFirst = 0x0001;
@@ -25,6 +31,7 @@ internal static class ShellContextMenu
 
     private const uint MfString = 0x00000000;
     private const uint MfSeparator = 0x00000800;
+    private const uint MfPopup = 0x00000010;
 
     private const int WmInitMenuPopup = 0x0117;
     private const int WmDrawItem = 0x002B;
@@ -65,7 +72,7 @@ internal static class ShellContextMenu
         int screenX,
         int screenY,
         bool extended,
-        IReadOnlyList<(uint Id, string Label)>? appCommands,
+        IReadOnlyList<ShellMenuEntry>? appCommands,
         out uint chosenAppCommand)
     {
         chosenAppCommand = 0;
@@ -148,10 +155,7 @@ internal static class ShellContextMenu
             if (appCommands is { Count: > 0 })
             {
                 AppendMenuW(menuHandle, MfSeparator, UIntPtr.Zero, null);
-                foreach (var (id, label) in appCommands)
-                {
-                    AppendMenuW(menuHandle, MfString, (UIntPtr)id, label);
-                }
+                AppendEntries(menuHandle, appCommands);
             }
 
             contextMenu2 = contextMenu as IContextMenu2;
@@ -384,6 +388,32 @@ internal static class ShellContextMenu
 
     [DllImport("user32.dll")]
     private static extern IntPtr CreatePopupMenu();
+
+    /// <summary>
+    /// Adds the app's items to a menu handle this class already owns.  A submenu
+    /// attached with MF_POPUP belongs to its parent, so the single DestroyMenu in
+    /// the cleanup path frees it too.
+    /// </summary>
+    private static void AppendEntries(IntPtr menu, IReadOnlyList<ShellMenuEntry> entries)
+    {
+        foreach (var entry in entries)
+        {
+            if (entry.Children is { Count: > 0 } children)
+            {
+                var submenu = CreatePopupMenu();
+                if (submenu == IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                AppendEntries(submenu, children);
+                AppendMenuW(menu, MfPopup, (UIntPtr)(ulong)submenu, entry.Label);
+                continue;
+            }
+
+            AppendMenuW(menu, MfString, (UIntPtr)entry.Id, entry.Label);
+        }
+    }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]

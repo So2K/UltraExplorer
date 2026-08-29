@@ -556,6 +556,49 @@ public partial class MainWindow : Window
     // ---- Context menus -----------------------------------------------------
 
     private const uint HideFromCanvasCommandId = ShellContextMenu.AppCommandFirst + 1;
+    private const uint ColourCommandFirst = ShellContextMenu.AppCommandFirst + 0x10;
+
+    /// <summary>
+    /// What the app adds to the Shell's menu for a node: the colour palette, and
+    /// hiding the branch when the selection is a folder.
+    /// </summary>
+    private IReadOnlyList<ShellMenuEntry> BuildNodeMenuEntries()
+    {
+        var colours = new List<ShellMenuEntry>(CanvasColours.Length);
+        for (var index = 0; index < CanvasColours.Length; index++)
+        {
+            colours.Add(new ShellMenuEntry(
+                ColourCommandFirst + (uint)index,
+                CanvasColours[index].Name));
+        }
+
+        var entries = new List<ShellMenuEntry>
+        {
+            new(0, "Colour", colours)
+        };
+
+        if (_viewModel.Tree.SelectedNodes.Any(node => node.IsDirectory))
+        {
+            entries.Add(new ShellMenuEntry(HideFromCanvasCommandId, "Hide from canvas"));
+        }
+
+        return entries;
+    }
+
+    private void InvokeAppCommand(uint command)
+    {
+        if (command == HideFromCanvasCommandId)
+        {
+            _viewModel.HideSelectedCommand.Execute(null);
+            return;
+        }
+
+        var colour = (int)(command - ColourCommandFirst);
+        if (colour >= 0 && colour < CanvasColours.Length)
+        {
+            _viewModel.SetAccentCommand.Execute(CanvasColours[colour].Hex);
+        }
+    }
 
     private void ShowContextMenu(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
     {
@@ -564,11 +607,9 @@ public partial class MainWindow : Window
             return;
         }
 
-        // The Shell menu is the whole menu for a node, so the one command that is
-        // ours has to live inside it or it would be unreachable.
-        var appCommands = _viewModel.Tree.SelectedNodes.Any(node => node.IsDirectory)
-            ? new[] { (HideFromCanvasCommandId, "Hide from canvas") }
-            : null;
+        // The Shell menu is the whole menu for a node, so anything of ours has to
+        // live inside it or it would be unreachable.
+        var appCommands = BuildNodeMenuEntries();
 
         try
         {
@@ -581,11 +622,7 @@ public partial class MainWindow : Window
                     appCommands,
                     out var chosen))
             {
-                if (chosen == HideFromCanvasCommandId)
-                {
-                    _viewModel.HideSelectedCommand.Execute(null);
-                }
-
+                InvokeAppCommand(chosen);
                 return;
             }
         }
@@ -724,21 +761,27 @@ public partial class MainWindow : Window
         menu.IsOpen = true;
     }
 
+    /// <summary>
+    /// The palette offered for a folder's colour.  One list, used by the app menu
+    /// and by the items added to the Shell's own menu, so the two can never drift.
+    /// </summary>
+    private static readonly (string Name, string Hex)[] CanvasColours =
+    [
+        ("Default", ""),
+        ("Red", "#EF5A68"),
+        ("Orange", "#F28A4B"),
+        ("Yellow", "#E3B341"),
+        ("Green", "#4ED6A0"),
+        ("Cyan", "#4CC9D8"),
+        ("Blue", "#60CDFF"),
+        ("Violet", "#A979FF")
+    ];
+
     private void AddColourItems(ItemsControl menu)
     {
-        var colours = new (string Name, string Hex)[]
-        {
-            ("Default", string.Empty),
-            ("Red", "#EF5A68"),
-            ("Orange", "#F28A4B"),
-            ("Yellow", "#E3B341"),
-            ("Green", "#4ED6A0"),
-            ("Cyan", "#4CC9D8"),
-            ("Blue", "#60CDFF"),
-            ("Violet", "#A979FF")
-        };
+        var colours = CanvasColours;
 
-        var parent = new MenuItem { Header = "Colour label" };
+        var parent = new MenuItem { Header = "Colour" };
         foreach (var colour in colours)
         {
             var swatch = new Border

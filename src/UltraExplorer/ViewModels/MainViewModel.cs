@@ -26,6 +26,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly WorkspaceStore _workspaceStore = new();
     private readonly FolderMarkService _marks = new();
     private readonly FileSystemService _fileSystemService;
+    private readonly EverythingSearchService _everything = new();
     private readonly List<string> _navigationHistory = [];
 
     private CancellationTokenSource? _searchCancellation;
@@ -38,6 +39,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isAddressEditing;
     private bool _isSearchOpen;
     private bool _isSearchBusy;
+    private string _searchStatusText = string.Empty;
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
@@ -242,6 +244,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get => _isSearchBusy;
         private set => SetProperty(ref _isSearchBusy, value);
     }
+
+    /// <summary>Which engine answered, so a slow search is never a mystery.</summary>
+    public string SearchStatusText
+    {
+        get => _searchStatusText;
+        private set => SetProperty(ref _searchStatusText, value);
+    }
+
+    /// <summary>True when Everything is installed and running.</summary>
+    public bool IsEverythingAvailable => _everything.IsAvailable;
 
     public bool IsMinimapVisible
     {
@@ -1102,6 +1114,45 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IsSearchBusy = true;
         SearchResults.Clear();
 
+        // Everything has already read the file table of every volume, so it
+        // answers a query outright.  Walking the tree is the fallback, and the
+        // difference on a folder like C:\Windows is seconds against nothing.
+        if (_everything.IsAvailable)
+        {
+            SearchStatusText = "Asking Everything…";
+            try
+            {
+                var found = await _everything.SearchAsync(query, root, 1_000, token);
+                if (!token.IsCancellationRequested)
+                {
+                    foreach (var result in found)
+                    {
+                        SearchResults.Add(result);
+                    }
+
+                    SearchStatusText = found.Count > 0
+                        ? $"Everything · {found.Count} result(s) under {Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar))}"
+                        : $"Everything found nothing under {Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar))}";
+                    IsSearchBusy = false;
+                    return;
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+            catch (Exception exception)
+            {
+                // A broken index or a version mismatch is a reason to fall back,
+                // not a reason to fail the search.
+                SearchStatusText = $"Everything failed ({exception.Message}) — walking the folder tree instead.";
+            }
+        }
+        else
+        {
+            SearchStatusText = $"Walking the folder tree. {_everything.UnavailableReason}";
+        }
+
         // Progress<T> marshals back to the UI thread, so matches appear while the
         // walk is still running instead of all at once at the end.
         var progress = new Progress<SearchResultViewModel>(result =>
@@ -1124,6 +1175,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (!token.IsCancellationRequested)
             {
                 IsSearchBusy = false;
+                if (!_everything.IsAvailable)
+                {
+                    SearchStatusText = $"{SearchResults.Count} result(s) — walked the folder tree. {_everything.UnavailableReason}";
+                }
             }
         }
     }

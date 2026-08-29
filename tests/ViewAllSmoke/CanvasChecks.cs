@@ -138,6 +138,90 @@ internal static partial class Program
         Check("and nothing overlaps afterwards", !overlapping);
     }
 
+    private static async Task FolderColours(string root)
+    {
+        Section("folder colours");
+
+        using var graph = new ViewAllGraphService();
+        await graph.InitializeAsync();
+        var node = (await graph.AddRootAsync(root))!;
+        await graph.ExpandAsync(node);
+        var alpha = node.Children.First(child => child.DisplayName == "alpha");
+        await graph.ExpandAsync(alpha);
+
+        var beta = node.Children.First(child => child.DisplayName == "beta");
+        Check("two folders get two colours", alpha.BranchColor != beta.BranchColor);
+
+        // The hue has to come from the path, not from a per-process hash, or the
+        // whole canvas would be repainted differently on every launch.
+        var twin = new ViewAllGraphService();
+        await twin.InitializeAsync();
+        var twinRoot = (await twin.AddRootAsync(root))!;
+        await twin.ExpandAsync(twinRoot);
+        var twinAlpha = twinRoot.Children.First(child => child.DisplayName == "alpha");
+        Check("the same folder is the same colour every run", twinAlpha.BranchColor == alpha.BranchColor);
+        twin.Dispose();
+
+        var before = alpha.BranchColor;
+        var childBrush = alpha.Children[0].FamilyBrush;
+        var edge = graph.Edges.First(item => ReferenceEquals(item.Source, alpha));
+        Check("a child wears its parent colour", ReferenceEquals(childBrush, alpha.BranchBrush));
+        Check("so does the line to it", ReferenceEquals(edge.Stroke, alpha.BranchBrush));
+
+        var notified = new List<string>();
+        edge.PropertyChanged += (_, e) => notified.Add(e.PropertyName ?? string.Empty);
+
+        alpha.AccentHex = "#4ED6A0";
+
+        Check("a chosen colour takes over the branch", alpha.BranchColor != before);
+        Check("the line follows it", ReferenceEquals(edge.Stroke, alpha.BranchBrush));
+        Check("and says so, or the canvas would not repaint", notified.Contains("Stroke"));
+        Check("the children follow it too",
+            ReferenceEquals(alpha.Children[0].FamilyBrush, alpha.BranchBrush));
+        Check("a sibling is untouched", beta.BranchColor != alpha.BranchColor);
+
+        alpha.AccentHex = string.Empty;
+        Check("clearing it goes back to the colour of the path", alpha.BranchColor == before);
+    }
+
+    private static Task EverythingSearch()
+    {
+        Section("Everything search");
+
+        var everything = new EverythingSearchService();
+        Check($"the SDK is looked for and reported ({everything.LibraryPath ?? "not found"})",
+            everything.LibraryPath is null || File.Exists(everything.LibraryPath));
+        Check("availability implies a library",
+            !everything.IsAvailable || everything.LibraryPath is not null);
+        Check("an unavailable engine says why",
+            everything.IsAvailable || everything.UnavailableReason.Length > 0);
+
+        // Everything restricts a search to a subtree with a path term; getting
+        // this wrong silently searches the whole disk instead of the folder.
+        Check("an unscoped search is the query itself",
+            EverythingSearchService.BuildSearch("  report  ", null) == "report");
+        Check("a scoped search becomes a path term",
+            EverythingSearchService.BuildSearch("report", @"D:\Games")
+                == @"path:""D:\Games"" report");
+        Check("a trailing separator is trimmed off the scope",
+            EverythingSearchService.BuildSearch("report", @"D:\Games\")
+                == @"path:""D:\Games"" report");
+        Check("a drive root keeps its letter",
+            EverythingSearchService.BuildSearch("report", @"D:\")
+                .StartsWith(@"path:""D:""", StringComparison.Ordinal));
+
+        Check("IPC failure is explained in words", EverythingSearchService.DescribeError(2).Contains("not running"));
+        Check("an unknown code still says something", EverythingSearchService.DescribeError(99).Contains("99"));
+
+        // Asking an unavailable engine must be harmless, not an exception.
+        var empty = everything.IsAvailable
+            ? []
+            : everything.SearchAsync("anything", null, 10, CancellationToken.None).GetAwaiter().GetResult();
+        Check("an unavailable engine returns nothing rather than throwing", empty.Count == 0);
+
+        return Task.CompletedTask;
+    }
+
     private static Task ProgramTargets()
     {
         Section("dropping onto a program");

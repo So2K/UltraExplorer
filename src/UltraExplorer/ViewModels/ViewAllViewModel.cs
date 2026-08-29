@@ -975,11 +975,17 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     private void OnMarkChanged(string path, FolderMark mark)
     {
-        if (_graph.TryGetNode(path, out var node))
+        if (!_graph.TryGetNode(path, out var node))
         {
-            node.AccentHex = mark.AccentHex;
-            node.Note = mark.Note;
+            return;
         }
+
+        node.AccentHex = mark.AccentHex;
+        node.Note = mark.Note;
+
+        // Zoomed out the canvas is one cached geometry per colour, so a recolour
+        // is not visible until it is rebuilt.
+        GraphInvalidated?.Invoke();
     }
 
     private void OnSelectedNodesChanged(object? sender, NotifyCollectionChangedEventArgs e)

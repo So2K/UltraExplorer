@@ -493,7 +493,7 @@
                             </Grid.ColumnDefinitions>
                             <StackPanel VerticalAlignment="Center">
                                 <TextBlock Text="{Binding SearchResults.Count, StringFormat=Search results ({0})}" FontWeight="SemiBold" FontSize="12.5" />
-                                <TextBlock Text="{Binding Tree.ActivePath}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" />
+                                <TextBlock Text="{Binding SearchStatusText}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" ToolTip="{Binding SearchStatusText}" />
                             </StackPanel>
                             <ProgressBar Grid.Column="1" Width="60" MaxWidth="60" Height="3" Margin="8,0" VerticalAlignment="Center" IsIndeterminate="True"
                                          Visibility="{Binding IsSearchBusy, Converter={StaticResource BoolToVisibility}}" />
@@ -506,7 +506,7 @@
                                    FontSize="11.5"
                                    Foreground="{StaticResource TextDimBrush}"
                                    TextWrapping="Wrap"
-                                   Text="Walking the folder tree — matches appear as they are found."
+                                   Text="{Binding SearchStatusText}"
                                    Visibility="{Binding SearchResults.Count, Converter={StaticResource ZeroCountToVisibility}}" />
                         <ListBox Grid.Row="1"
                                  ItemsSource="{Binding SearchResults}"

@@ -42,6 +42,12 @@ public sealed class ViewAllEdgeViewModel : ObservableObject, IDisposable
         {
             OnPropertyChanged(nameof(SourceAnchor));
             OnPropertyChanged(nameof(TargetAnchor));
+            return;
+        }
+
+        if (e.PropertyName == nameof(ViewAllNodeViewModel.BranchBrush))
+        {
+            OnPropertyChanged(nameof(Stroke));
         }
     }
 

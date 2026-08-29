@@ -18,7 +18,7 @@ public sealed class NativeShellService
         HwndSource source,
         Point screenPoint,
         bool extended,
-        IReadOnlyList<(uint Id, string Label)>? appCommands,
+        IReadOnlyList<ShellMenuEntry>? appCommands,
         out uint chosenAppCommand)
         => ShellContextMenu.TryShow(
             paths,

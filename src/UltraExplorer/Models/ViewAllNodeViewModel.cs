@@ -32,6 +32,9 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     private bool _isDropTarget;
     private bool _isRunTarget;
     private bool _isUserHidden;
+
+    private readonly Color _pathColor;
+    private readonly Brush _pathBrush;
     private bool _isTruncated;
     private int _childLoadLimit;
     private string _errorMessage = string.Empty;
@@ -50,8 +53,8 @@ public sealed class ViewAllNodeViewModel : ObservableObject
         Parent = parent;
         Id = ViewAllNodeIdentity.FromPath(entry.FullPath);
         Scale = Math.Pow(0.5, Math.Min(depth, MaximumScaledDepth) / (double)ScaleHalvingDepth);
-        BranchColor = BranchColorFor(entry.FullPath, depth);
-        BranchBrush = FrozenBrush(BranchColor);
+        _pathColor = BranchColorFor(entry.FullPath, depth);
+        _pathBrush = FrozenBrush(_pathColor);
     }
 
     /// <summary>
@@ -237,13 +240,28 @@ public sealed class ViewAllNodeViewModel : ObservableObject
         get => _accentHex;
         set
         {
-            if (SetProperty(ref _accentHex, value ?? string.Empty))
+            if (!SetProperty(ref _accentHex, value ?? string.Empty))
             {
-                OnPropertyChanged(nameof(HasCustomAccent));
-                OnPropertyChanged(nameof(AccentBrush));
+                return;
+            }
+
+            OnPropertyChanged(nameof(HasCustomAccent));
+            OnPropertyChanged(nameof(AccentBrush));
+
+            // A colour picked for a folder is the whole point of picking it: it
+            // takes over the folder's branch, so every line out of it and the
+            // stripe on every child it holds change with it.
+            OnPropertyChanged(nameof(BranchColor));
+            OnPropertyChanged(nameof(BranchBrush));
+            OnPropertyChanged(nameof(FamilyBrush));
+            foreach (var child in Children)
+            {
+                child.NotifyFamilyBrushChanged();
             }
         }
     }
+
+    internal void NotifyFamilyBrushChanged() => OnPropertyChanged(nameof(FamilyBrush));
 
     public bool HasCustomAccent => !string.IsNullOrEmpty(_accentHex);
 
@@ -257,9 +275,11 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     /// the path, so it is the same colour every session and two folders side by
     /// side are almost never the same.
     /// </summary>
-    public Color BranchColor { get; }
+    public Color BranchColor => HasCustomAccent && AccentBrush is SolidColorBrush accent
+        ? accent.Color
+        : _pathColor;
 
-    public Brush BranchBrush { get; }
+    public Brush BranchBrush => HasCustomAccent ? AccentBrush : _pathBrush;
 
     /// <summary>
     /// What the stripe down the left of the node shows: the colour the user
