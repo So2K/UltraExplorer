@@ -71,6 +71,9 @@ internal static partial class Program
         await PickerSessionRules(fixtureRoot);
         await PickerValidation(fixtureRoot);
         await PickerGraphRules(fixtureRoot);
+        await HiddenBranches(fixtureRoot);
+        await TidyLayout(fixtureRoot);
+        await ProgramTargets();
     }
 
     // ---- fixture -----------------------------------------------------------
@@ -251,7 +254,7 @@ internal static partial class Program
 
         Check("children are placed below the parent",
             node.Children.All(child => child.Location.Y > node.Location.Y));
-        Check("siblings share a row",
+        Check("a small folder stays on one row",
             node.Children.Select(child => child.Location.Y).Distinct().Count() == 1);
 
         var childWidth = node.Children[0].Width;
@@ -275,6 +278,23 @@ internal static partial class Program
         }
 
         Check("no two nodes overlap", !overlapping);
+
+        // Sixty entries is past the point where one line stops being readable.
+        var wide = node.Children.First(child => child.DisplayName == "wide");
+        await graph.ExpandAsync(wide);
+        var wideRows = wide.Children.Select(child => child.Location.Y).Distinct().Count();
+        Check("a large folder wraps into rows", wideRows > 1);
+        Check("its rows are full before the next one starts",
+            wide.Children.GroupBy(child => child.Location.Y).Count() == wideRows
+            && wide.Children.GroupBy(child => child.Location.Y).Max(row => row.Count())
+               <= (wide.Children.Count + wideRows - 1) / wideRows);
+        Check("the block is centred on the parent",
+            Math.Abs((wide.Children.Min(child => child.Location.X)
+                      + wide.Children.Max(child => child.Location.X)) / 2
+                     + wide.Children[0].Width / 2
+                     - (wide.Location.X + wide.Width / 2)) < 1);
+        Check("the block sits below its parent",
+            wide.Children.All(child => child.Location.Y > wide.Location.Y));
 
         var before = node.Children.Select(child => child.Location).ToArray();
         var alpha = node.Children.First(child => child.DisplayName == "alpha");
@@ -531,9 +551,23 @@ internal static partial class Program
         var placing = Stopwatch.StartNew();
         layout.PlaceChildren(parent, children, layoutIndex);
         placing.Stop();
-        Report("laid out 20k children", placing.ElapsedMilliseconds, 10_000);
+        Report("laid out 20k children", placing.ElapsedMilliseconds, 4_000);
         Check("every child was placed", children.All(child => child.HasLayoutPosition));
-        Check("children share one row", children.Select(child => child.Location.Y).Distinct().Count() == 1);
+
+        // A row grows with the child count; a block grows with its square root.
+        // Neither side of twenty thousand children may be twenty thousand long.
+        var columns = children.Select(child => child.Location.X).Distinct().Count();
+        var rows = children.Select(child => child.Location.Y).Distinct().Count();
+        Check("children wrap into a block", columns > 1 && rows > 1);
+        Check("neither side grows with the child count",
+            columns < 4 * Math.Sqrt(children.Count) && rows < 4 * Math.Sqrt(children.Count));
+
+        var blockWidth = children.Max(child => child.Location.X) - children.Min(child => child.Location.X);
+        var blockHeight = children.Max(child => child.Location.Y) - children.Min(child => child.Location.Y);
+        Check("the block is wider than tall, but not a line",
+            blockWidth > blockHeight && blockWidth < blockHeight * 8);
+        Check("no child of the block overlaps another",
+            children.All(child => !layoutIndex.IsOccupied(child.Bounds, child)));
 
         return Task.CompletedTask;
     }

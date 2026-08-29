@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
@@ -20,6 +21,7 @@ namespace UltraExplorer;
 
 public partial class MainWindow : Window
 {
+    private const int WmGetMinMaxInfo = 0x0024;
     private const int WmNcHitTest = 0x0084;
     private const int WmNcLeftButtonDown = 0x00A1;
     private const int WmNcLeftButtonUp = 0x00A2;
@@ -41,6 +43,7 @@ public partial class MainWindow : Window
     private ViewAllNodeViewModel? _overviewDragNode;
     private Point _overviewDragPointerAnchor;
     private Point _overviewDragNodeOrigin;
+    private bool _overviewDragMoved;
 
     public MainWindow()
         : this(null)
@@ -69,13 +72,17 @@ public partial class MainWindow : Window
         _viewModel.Tree.FocusNodeRequested += FocusNode;
         _viewModel.Tree.GraphInvalidated += OnGraphInvalidated;
 
-        Overview.Index = _viewModel.Tree.SpatialIndex;
-        if (TryFindResource("EdgeColor") is Color edgeColor)
-        {
-            Overview.SetEdgeColor(edgeColor);
-        }
+        ConfigureNodeDrag();
 
-        StateChanged += (_, _) => MaximizeGlyph.Text = WindowState == WindowState.Maximized ? "\uE923" : "\uE922";
+        Overview.Index = _viewModel.Tree.SpatialIndex;
+
+        StateChanged += (_, _) =>
+        {
+            var maximized = WindowState == WindowState.Maximized;
+            MaximizeGlyph.Text = maximized ? "\uE923" : "\uE922";
+            AutomationProperties.SetName(MaximizeButton, maximized ? "Restore" : "Maximize");
+            SetMaximizeHover(false);
+        };
 
         if (picker is not null)
         {
@@ -152,6 +159,7 @@ public partial class MainWindow : Window
             DependencyPropertyDescriptor
                 .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
                 .RemoveValueChanged(Editor, OnViewportLocationChanged);
+            DetachNodeDrag();
             _capture?.Dispose();
             _viewModel.Dispose();
             return;
@@ -214,17 +222,50 @@ public partial class MainWindow : Window
         Editor.Cursor = armed ? Cursors.Hand : null;
     }
 
+    /// <summary>
+    /// The press has to be claimed here, in the tunnel.  By the time the
+    /// bubbling MouseLeftButtonDown is raised, Nodify has already begun its own
+    /// rubber-band selection, marked the event handled and captured the mouse,
+    /// so a handler on the bubbling event is never even called.
+    /// </summary>
     private void Editor_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (!_isSpaceHeld)
+        if (_isSpaceHeld)
+        {
+            _isSpacePanning = true;
+            _panPointerAnchor = e.GetPosition(Editor);
+            _panViewportAnchor = Editor.ViewportLocation;
+            Editor.Cursor = Cursors.SizeAll;
+            Editor.CaptureMouse();
+            e.Handled = true;
+            return;
+        }
+
+        // Below 30% zoom only the selection still has a container, so there is
+        // nothing to grab: the graph is hit-tested directly instead.  The press
+        // lands on the Border inside the editor template rather than on the
+        // editor, so the canvas is identified by what it is not - a node.
+        if (!_viewModel.Tree.IsOverviewActive
+            || FindAncestor<ViewAllNodeView>(e.OriginalSource as DependencyObject) is not null)
         {
             return;
         }
 
-        _isSpacePanning = true;
-        _panPointerAnchor = e.GetPosition(Editor);
-        _panViewportAnchor = Editor.ViewportLocation;
-        Editor.Cursor = Cursors.SizeAll;
+        Editor.Focus();
+
+        var graphPoint = Editor.GetLocationInsideEditor(e);
+        if (_viewModel.Tree.HitTest(graphPoint) is not { } node)
+        {
+            // Empty canvas: leave it to Nodify, which draws the selection box.
+            return;
+        }
+
+        _viewModel.Tree.SelectOnly(node);
+        _overviewDragNode = node;
+        _overviewDragPointerAnchor = graphPoint;
+        _overviewDragNodeOrigin = node.Location;
+        _overviewDragMoved = false;
+        BeginNodeDrag([node]);
         Editor.CaptureMouse();
         e.Handled = true;
     }
@@ -235,15 +276,38 @@ public partial class MainWindow : Window
         {
             if (e.LeftButton != MouseButtonState.Pressed)
             {
-                EndOverviewDrag();
+                EndOverviewDrag(committed: _overviewDragMoved);
                 return;
             }
 
+            var pointer = Editor.GetLocationInsideEditor(e);
+            var dragged = pointer - _overviewDragPointerAnchor;
+
+            // A click is not a drag: without this, clicking a slab would mark
+            // the node hand-placed and dirty the saved layout.
+            if (!_overviewDragMoved
+                && Math.Abs(dragged.X) * Editor.ViewportZoom < SystemParameters.MinimumHorizontalDragDistance
+                && Math.Abs(dragged.Y) * Editor.ViewportZoom < SystemParameters.MinimumVerticalDragDistance)
+            {
+                e.Handled = true;
+                return;
+            }
+
+            _overviewDragMoved = true;
+
             // Setting Location goes through the same path a container drag uses,
             // so the subtree is carried and the batched canvas follows.
-            var dragged = Editor.GetLocationInsideEditor(e) - _overviewDragPointerAnchor;
             _overviewDragNode.Location = _overviewDragNodeOrigin + dragged;
+            UpdateNodeDragHover(pointer);
             e.Handled = true;
+            return;
+        }
+
+        if (_nodeDragRoots.Length > 0 && Editor.IsDragging)
+        {
+            // A container drag: Nodify moves the node, this only watches what
+            // the pointer is over.  Handling the event would starve that drag.
+            UpdateNodeDragHover(Editor.GetLocationInsideEditor(e));
             return;
         }
 
@@ -260,25 +324,36 @@ public partial class MainWindow : Window
 
     private void Editor_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
+        // Cleared before the early return below: left latched, it would make
+        // every later move slam the viewport and the canvas would never pan again.
+        var wasPanning = _isSpacePanning;
+        _isSpacePanning = false;
+
         if (_overviewDragNode is not null)
         {
-            EndOverviewDrag();
+            EndOverviewDrag(committed: _overviewDragMoved);
             e.Handled = true;
             return;
         }
 
-        if (!_isSpacePanning)
+        if (!wasPanning)
         {
             return;
         }
 
-        _isSpacePanning = false;
         Editor.ReleaseMouseCapture();
         Editor.Cursor = _isSpaceHeld ? Cursors.Hand : null;
         e.Handled = true;
     }
 
-    private void EndOverviewDrag()
+    /// <summary>A drag that loses capture - Alt+Tab, a dialog - must still end.</summary>
+    private void Editor_LostMouseCapture(object sender, MouseEventArgs e)
+    {
+        _isSpacePanning = false;
+        EndOverviewDrag(committed: false);
+    }
+
+    private void EndOverviewDrag(bool committed)
     {
         if (_overviewDragNode is null)
         {
@@ -286,7 +361,9 @@ public partial class MainWindow : Window
         }
 
         _overviewDragNode = null;
+        _overviewDragMoved = false;
         Editor.ReleaseMouseCapture();
+        EndNodeDrag(committed);
         _viewModel.Tree.ScheduleSave();
     }
 
@@ -379,41 +456,6 @@ public partial class MainWindow : Window
         Editor.ZoomAtPosition(e.Zoom, e.Location);
         PushViewport();
     }
-
-    private void Editor_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-    {
-        if (e.OriginalSource != Editor)
-        {
-            return;
-        }
-
-        // Focus moves to the canvas rather than being cleared: with no focused
-        // element WPF has nowhere to route key events, and every shortcut except
-        // the Alt ones (which go through system-key handling) stops working.
-        Editor.Focus();
-
-        // While the overview is drawing there are no node controls to hit, so the
-        // graph is hit-tested directly: selecting and dragging keep working at
-        // any zoom rather than only where a container happens to exist.
-        if (!_viewModel.Tree.IsOverviewActive)
-        {
-            return;
-        }
-
-        var graphPoint = Editor.GetLocationInsideEditor(e);
-        if (_viewModel.Tree.HitTest(graphPoint) is not { } node)
-        {
-            return;
-        }
-
-        _viewModel.Tree.SelectOnly(node);
-        _overviewDragNode = node;
-        _overviewDragPointerAnchor = graphPoint;
-        _overviewDragNodeOrigin = node.Location;
-        Editor.CaptureMouse();
-        e.Handled = true;
-    }
-
     private void Editor_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
         if (FindAncestor<ViewAllNodeView>(e.OriginalSource as DependencyObject) is not null)
@@ -513,12 +555,20 @@ public partial class MainWindow : Window
 
     // ---- Context menus -----------------------------------------------------
 
+    private const uint HideFromCanvasCommandId = ShellContextMenu.AppCommandFirst + 1;
+
     private void ShowContextMenu(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
     {
         if (paths.Count == 0)
         {
             return;
         }
+
+        // The Shell menu is the whole menu for a node, so the one command that is
+        // ours has to live inside it or it would be unreachable.
+        var appCommands = _viewModel.Tree.SelectedNodes.Any(node => node.IsDirectory)
+            ? new[] { (HideFromCanvasCommandId, "Hide from canvas") }
+            : null;
 
         try
         {
@@ -527,8 +577,15 @@ public partial class MainWindow : Window
                     paths,
                     source,
                     origin.PointToScreen(point),
-                    Keyboard.Modifiers.HasFlag(ModifierKeys.Shift)))
+                    Keyboard.Modifiers.HasFlag(ModifierKeys.Shift),
+                    appCommands,
+                    out var chosen))
             {
+                if (chosen == HideFromCanvasCommandId)
+                {
+                    _viewModel.HideSelectedCommand.Execute(null);
+                }
+
                 return;
             }
         }
@@ -556,9 +613,47 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Delete", "\uE74D", _viewModel.DeleteCommand, "Del");
         AddCommandItem(menu, "Delete permanently", "\uE74D", _viewModel.PermanentDeleteCommand, "Shift+Del");
         menu.Items.Add(new Separator());
+        AddCommandItem(menu, "Hide from canvas", "\uED1A", _viewModel.HideSelectedCommand, "Ctrl+H");
         AddColourItems(menu);
         AddCommandItem(menu, "Show in File Explorer", "\uEC50", _viewModel.ShowInExplorerCommand);
         menu.IsOpen = true;
+    }
+
+    /// <summary>
+    /// The way back for anything hidden.  Without a list of what is hidden, a
+    /// folder put away months ago is unfindable - the classic failure of this
+    /// kind of command.
+    /// </summary>
+    private void AddHiddenFolderItems(ContextMenu menu)
+    {
+        var hidden = _viewModel.HiddenPaths;
+        if (hidden.Count == 0)
+        {
+            return;
+        }
+
+        var group = new MenuItem { Header = $"Hidden folders ({hidden.Count})" };
+        foreach (var path in hidden)
+        {
+            var item = new MenuItem
+            {
+                Header = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } name
+                    ? name
+                    : path,
+                ToolTip = path
+            };
+
+            var restored = path;
+            item.Click += (_, _) => _viewModel.Tree.ShowHidden(restored);
+            group.Items.Add(item);
+        }
+
+        group.Items.Add(new Separator());
+        var all = new MenuItem { Header = "Show all hidden" };
+        all.Click += (_, _) => _viewModel.Tree.ShowAllHidden();
+        group.Items.Add(all);
+
+        menu.Items.Add(group);
     }
 
     private void ShowCanvasMenu(Point point)
@@ -571,6 +666,8 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
+        AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
+        AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         menu.IsOpen = true;
     }
@@ -824,6 +921,14 @@ public partial class MainWindow : Window
 
         switch (modifiers, key)
         {
+            case (ModifierKeys.Control, Key.H):
+                _viewModel.HideSelectedCommand.Execute(null);
+                break;
+
+            case (ModifierKeys.Control | ModifierKeys.Shift, Key.H):
+                _viewModel.ShowAllHiddenCommand.Execute(null);
+                break;
+
             case (ModifierKeys.Control, Key.C):
                 _viewModel.CopyCommand.Execute(null);
                 break;
@@ -978,6 +1083,13 @@ public partial class MainWindow : Window
     {
         switch (msg)
         {
+            // Left to the rest of the chain: WPF applies MinWidth/MinHeight to
+            // the same structure afterwards and re-stores it whole, so what is
+            // written here survives.
+            case WmGetMinMaxInfo:
+                ClampMaximizedBounds(hwnd, lParam);
+                return IntPtr.Zero;
+
             case WmNcHitTest:
                 if (IsOverMaximizeButton(lParam))
                 {
@@ -1004,6 +1116,49 @@ public partial class MainWindow : Window
         }
 
         return IntPtr.Zero;
+    }
+
+    /// <summary>
+    /// Keeps a maximized window inside the monitor work area.
+    ///
+    /// The window keeps its sizing frame but has no caption, so Windows maximizes
+    /// it to the work area grown by the frame width on every side.  WindowChrome
+    /// then makes the client area the whole window and clips the overhang away
+    /// with a region - so the outer band of the UI, including the top of the
+    /// caption buttons and the bottom of the status bar, is laid out off-screen
+    /// and simply cut off.  Clamping the maximized rectangle is the fix; a
+    /// compensating margin would need a frame width that differs per monitor.
+    ///
+    /// Everything here is device pixels straight from the monitor, which is what
+    /// makes it correct on a second monitor at another scale.
+    /// </summary>
+    private static void ClampMaximizedBounds(IntPtr window, IntPtr lParam)
+    {
+        var monitor = MonitorFromWindow(window, MonitorDefaultToNearest);
+        if (monitor == IntPtr.Zero)
+        {
+            return;
+        }
+
+        var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+        if (!GetMonitorInfo(monitor, ref info))
+        {
+            return;
+        }
+
+        var bounds = Marshal.PtrToStructure<MinMaxInfo>(lParam);
+        bounds.MaxPosition = new PointL
+        {
+            X = info.Work.Left - info.Monitor.Left,
+            Y = info.Work.Top - info.Monitor.Top
+        };
+        bounds.MaxSize = new PointL
+        {
+            X = info.Work.Right - info.Work.Left,
+            Y = info.Work.Bottom - info.Work.Top
+        };
+
+        Marshal.StructureToPtr(bounds, lParam, false);
     }
 
     private bool IsOverMaximizeButton(IntPtr lParam)
@@ -1040,6 +1195,49 @@ public partial class MainWindow : Window
         _maximizeHover = hover;
         MaximizeButton.Background = hover ? CaptionHoverBrush : Brushes.Transparent;
     }
+
+    private const int MonitorDefaultToNearest = 0x00000002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RectL
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PointL
+    {
+        public int X;
+        public int Y;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MinMaxInfo
+    {
+        public PointL Reserved;
+        public PointL MaxSize;
+        public PointL MaxPosition;
+        public PointL MinTrackSize;
+        public PointL MaxTrackSize;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MonitorInfo
+    {
+        public int Size;
+        public RectL Monitor;
+        public RectL Work;
+        public int Flags;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr window, int flags);
+
+    [DllImport("user32.dll")]
+    private static extern bool GetMonitorInfo(IntPtr monitor, ref MonitorInfo info);
 
     private static Brush CreateFrozenBrush(byte red, byte green, byte blue)
     {

@@ -84,12 +84,15 @@
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
-                <!-- Colour label: a thin stripe, never a fill of the whole node. -->
+                <!-- Colour label: a thin stripe, never a fill of the whole node.
+                     Without a label of its own it shows the colour of the folder
+                     this node lives in, which is the same colour as the line it
+                     hangs from. -->
                 <Border Grid.Column="0"
                         Margin="1,7"
                         Width="3"
                         CornerRadius="2"
-                        Background="{Binding AccentBrush}" />
+                        Background="{Binding FamilyBrush}" />
 
                 <!-- Disclosure chevron: directories only. -->
                 <Button x:Name="Chevron"
@@ -232,6 +235,39 @@
                             </DataTrigger.EnterActions>
                             <DataTrigger.ExitActions>
                                 <StopStoryboard BeginStoryboardName="DropPulse" />
+                            </DataTrigger.ExitActions>
+                        </DataTrigger>
+                    </Style.Triggers>
+                </Style>
+            </Border.Style>
+        </Border>
+
+        <!-- Run target: dropping here hands the files to this program rather
+             than moving them, so it gets its own colour. -->
+        <Border x:Name="RunGlow"
+                IsHitTestVisible="False"
+                CornerRadius="5"
+                Margin="0,3"
+                BorderBrush="{StaticResource SuccessBrush}"
+                BorderThickness="2"
+                Background="#2632D583"
+                Opacity="0">
+            <Border.Style>
+                <Style TargetType="Border">
+                    <Style.Triggers>
+                        <DataTrigger Binding="{Binding IsRunTarget}" Value="True">
+                            <DataTrigger.EnterActions>
+                                <BeginStoryboard x:Name="RunPulse">
+                                    <Storyboard RepeatBehavior="Forever" AutoReverse="True">
+                                        <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                         From="0.45"
+                                                         To="0.95"
+                                                         Duration="0:0:0.75" />
+                                    </Storyboard>
+                                </BeginStoryboard>
+                            </DataTrigger.EnterActions>
+                            <DataTrigger.ExitActions>
+                                <StopStoryboard BeginStoryboardName="RunPulse" />
                             </DataTrigger.ExitActions>
                         </DataTrigger>
                     </Style.Triggers>

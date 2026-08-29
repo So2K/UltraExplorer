@@ -84,6 +84,13 @@ public sealed class ViewAllWorkspaceState
     /// They have to be re-added explicitly because only drives are discovered.
     /// </summary>
     public List<string> ExtraRoots { get; set; } = [];
+
+    /// <summary>
+    /// Folders the user hid from the canvas, with everything under them.  Kept
+    /// by path rather than per node, because a hidden folder inside a branch
+    /// that is refreshed loses its node and would lose the flag with it.
+    /// </summary>
+    public List<string> HiddenPaths { get; set; } = [];
 }
 
 public sealed record ViewAllNodeState(

@@ -23,11 +23,14 @@ public partial class App : Application
         NodifyEditor.EnableDraggingContainersOptimizations = false;
         NodifyEditor.EnableSnappingCorrection = true;
 
-        // Between the batched overview and full zoom the editor still renders
-        // real containers; let it simplify them once they get small.
-        NodifyEditor.EnableRenderingContainersOptimizations = true;
-        NodifyEditor.OptimizeRenderingMinimumContainers = 200;
-        NodifyEditor.OptimizeRenderingZoomOutPercent = 0.6;
+        // Deliberately off as well.  Nodify caches the whole container host into
+        // one bitmap below a zoom threshold; with this window's minimum zoom that
+        // band is 30-56%, exactly where the app still renders real containers,
+        // and the surface it asks for is the viewport divided by the zoom - large
+        // enough to exceed what the graphics stack will cache, which is what
+        // turned the canvas black mid-drag.  Culling and the batched overview
+        // layer already do this job, better and at every zoom.
+        NodifyEditor.EnableRenderingContainersOptimizations = false;
 
         base.OnStartup(e);
 

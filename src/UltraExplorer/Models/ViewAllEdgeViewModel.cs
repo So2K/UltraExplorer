@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Windows;
+using System.Windows.Media;
 using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Models;
@@ -18,6 +19,12 @@ public sealed class ViewAllEdgeViewModel : ObservableObject, IDisposable
 
     public ViewAllNodeViewModel Source { get; }
     public ViewAllNodeViewModel Target { get; }
+    /// <summary>
+    /// The colour of the folder this line leaves.  All the lines out of one
+    /// folder share it, which is what makes a block of children readable.
+    /// </summary>
+    public Brush Stroke => Source.BranchBrush;
+
     public Point SourceAnchor => Source.OutputAnchor;
     public Point TargetAnchor => Target.InputAnchor;
 

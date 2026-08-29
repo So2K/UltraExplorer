@@ -33,6 +33,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private bool _isSyncingSelection;
     private ViewAllNodeViewModel? _activeNode;
     private ViewAllNodeViewModel? _dropTarget;
+    private ViewAllNodeViewModel? _runTarget;
     private ViewAllDetailLevel _detailLevel = ViewAllDetailLevel.Detailed;
     private Point _viewportLocation;
     private Size _viewportSize = new(1200, 800);
@@ -137,6 +138,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>The visible node under a graph-space point.</summary>
     public ViewAllNodeViewModel? HitTest(Point graphPoint) => _graph.HitTest(graphPoint);
+
+    public ViewAllNodeViewModel? HitTest(Point graphPoint, Predicate<ViewAllNodeViewModel> exclude)
+        => _graph.HitTest(graphPoint, exclude);
 
     public ViewAllNodeViewModel? ActiveNode
     {
@@ -380,6 +384,86 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// </summary>
     public Func<ViewAllNodeViewModel, bool>? ActivationOverride { get; set; }
 
+    /// <summary>Folders currently hidden from the canvas, for the restore menu.</summary>
+    public IReadOnlyList<string> HiddenPaths =>
+        [.. _graph.HiddenPaths.OrderBy(path => path, StringComparer.CurrentCultureIgnoreCase)];
+
+    public int HiddenCount => _graph.HiddenPaths.Count;
+
+    /// <summary>
+    /// Takes the selected folders and everything under them off the canvas.
+    ///
+    /// The selection is cleared afterwards, and not as a courtesy: a selected
+    /// node is realized whatever the culling says, so a folder hidden while it
+    /// is still selected would stay on screen.
+    /// </summary>
+    public void HideSelected()
+    {
+        var targets = SelectedNodes.Where(node => node.IsDirectory).ToArray();
+        if (targets.Length == 0)
+        {
+            MessageRequested?.Invoke("Select a folder to hide.", false);
+            return;
+        }
+
+        SelectedNodes.Clear();
+        foreach (var node in targets)
+        {
+            _graph.Hide(node);
+        }
+
+        ActiveNode = targets[0].Parent ?? ActiveNode;
+        OnPropertyChanged(nameof(HiddenPaths));
+        OnPropertyChanged(nameof(HiddenCount));
+        MessageRequested?.Invoke(
+            targets.Length == 1
+                ? $"{targets[0].DisplayName} hidden — bring it back from the canvas menu"
+                : $"{targets.Length} folders hidden — bring them back from the canvas menu",
+            false);
+        RebuildRenderSet();
+        GraphInvalidated?.Invoke();
+        ScheduleSave();
+    }
+
+    public void ShowHidden(string path)
+    {
+        if (!_graph.Show(path))
+        {
+            return;
+        }
+
+        OnPropertyChanged(nameof(HiddenPaths));
+        OnPropertyChanged(nameof(HiddenCount));
+        RebuildRenderSet();
+        GraphInvalidated?.Invoke();
+        ScheduleSave();
+    }
+
+    public void ShowAllHidden()
+    {
+        if (!_graph.ShowAllHidden())
+        {
+            MessageRequested?.Invoke("Nothing is hidden.", false);
+            return;
+        }
+
+        OnPropertyChanged(nameof(HiddenPaths));
+        OnPropertyChanged(nameof(HiddenCount));
+        RebuildRenderSet();
+        GraphInvalidated?.Invoke();
+        ScheduleSave();
+    }
+
+    /// <summary>Throws away every hand-placed position and rebuilds the tree.</summary>
+    public void RelayoutCanvas()
+    {
+        _graph.Relayout();
+        RebuildRenderSet();
+        GraphInvalidated?.Invoke();
+        MessageRequested?.Invoke("Canvas tidied", false);
+        ScheduleSave();
+    }
+
     public void CollapseAll()
     {
         _graph.CollapseAll();
@@ -585,6 +669,26 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         if (_dropTarget is not null)
         {
             _dropTarget.IsDropTarget = true;
+        }
+    }
+
+    /// <summary>The program a dragged file would be handed to.</summary>
+    public void SetRunTarget(ViewAllNodeViewModel? target)
+    {
+        if (ReferenceEquals(_runTarget, target))
+        {
+            return;
+        }
+
+        if (_runTarget is not null)
+        {
+            _runTarget.IsRunTarget = false;
+        }
+
+        _runTarget = target;
+        if (_runTarget is not null)
+        {
+            _runTarget.IsRunTarget = true;
         }
     }
 

@@ -17,17 +17,117 @@ public sealed class NativeShellService
         IReadOnlyList<string> paths,
         HwndSource source,
         Point screenPoint,
-        bool extended)
+        bool extended,
+        IReadOnlyList<(uint Id, string Label)>? appCommands,
+        out uint chosenAppCommand)
         => ShellContextMenu.TryShow(
             paths,
             source,
             (int)Math.Round(screenPoint.X),
             (int)Math.Round(screenPoint.Y),
-            extended);
+            extended,
+            appCommands,
+            out chosenAppCommand);
 
     public static void Open(string path)
     {
         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+    }
+
+    /// <summary>
+    /// Extensions Windows will run rather than open.  PATHEXT is what the shell
+    /// itself consults, so a machine that has added to it is respected; the
+    /// literal list is the fallback and shortcuts are always included.
+    /// </summary>
+    private static readonly HashSet<string> ExecutableExtensions = BuildExecutableExtensions();
+
+    private static HashSet<string> BuildExecutableExtensions()
+    {
+        var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ".exe", ".com", ".bat", ".cmd", ".lnk"
+        };
+
+        foreach (var entry in (Environment.GetEnvironmentVariable("PATHEXT") ?? string.Empty)
+                     .Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = entry.Trim();
+            if (trimmed.StartsWith('.'))
+            {
+                extensions.Add(trimmed);
+            }
+        }
+
+        return extensions;
+    }
+
+    public static bool IsExecutable(string path)
+        => ExecutableExtensions.Contains(Path.GetExtension(path));
+
+    /// <summary>
+    /// Hands files to a program, the way dropping them on its icon does in
+    /// Explorer.  Shell execution is required: a .lnk or a .cmd cannot be
+    /// started any other way.
+    /// </summary>
+    public static void OpenWithProgram(string programPath, IReadOnlyList<string> arguments)
+    {
+        var start = new ProcessStartInfo(programPath)
+        {
+            UseShellExecute = true,
+            WorkingDirectory = Path.GetDirectoryName(programPath) ?? string.Empty,
+            Arguments = BuildCommandLine(arguments)
+        };
+
+        using var process = Process.Start(start);
+    }
+
+    /// <summary>
+    /// Quotes arguments the way the C runtime parses them back.  A naive pair of
+    /// quotes corrupts anything ending in a backslash - a folder path, most of
+    /// the time - because the backslash escapes the closing quote.
+    /// </summary>
+    internal static string BuildCommandLine(IReadOnlyList<string> arguments)
+    {
+        var line = new System.Text.StringBuilder();
+        foreach (var argument in arguments)
+        {
+            if (line.Length > 0)
+            {
+                line.Append(' ');
+            }
+
+            if (argument.Length > 0 && argument.IndexOfAny([' ', '\t', '\n', '\v', '"']) < 0)
+            {
+                line.Append(argument);
+                continue;
+            }
+
+            line.Append('"');
+            for (var index = 0; ; index++)
+            {
+                var backslashes = 0;
+                while (index < argument.Length && argument[index] == '\\')
+                {
+                    index++;
+                    backslashes++;
+                }
+
+                if (index == argument.Length)
+                {
+                    // Doubled so the run of backslashes cannot escape the quote
+                    // that closes the argument.
+                    line.Append('\\', backslashes * 2);
+                    break;
+                }
+
+                line.Append('\\', argument[index] == '"' ? backslashes * 2 + 1 : backslashes);
+                line.Append(argument[index]);
+            }
+
+            line.Append('"');
+        }
+
+        return line.ToString();
     }
 
     public static void OpenWith(string path)

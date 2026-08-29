@@ -30,6 +30,8 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     private bool _isViewportRealized = true;
     private bool _isSelected;
     private bool _isDropTarget;
+    private bool _isRunTarget;
+    private bool _isUserHidden;
     private bool _isTruncated;
     private int _childLoadLimit;
     private string _errorMessage = string.Empty;
@@ -48,6 +50,8 @@ public sealed class ViewAllNodeViewModel : ObservableObject
         Parent = parent;
         Id = ViewAllNodeIdentity.FromPath(entry.FullPath);
         Scale = Math.Pow(0.5, Math.Min(depth, MaximumScaledDepth) / (double)ScaleHalvingDepth);
+        BranchColor = BranchColorFor(entry.FullPath, depth);
+        BranchBrush = FrozenBrush(BranchColor);
     }
 
     /// <summary>
@@ -161,6 +165,27 @@ public sealed class ViewAllNodeViewModel : ObservableObject
         set => SetProperty(ref _isDropTarget, value);
     }
 
+    /// <summary>
+    /// Hidden from the canvas by an explicit user action, together with its whole
+    /// subtree.  Unlike the visibility a collapsed ancestor imposes, this one
+    /// survives expanding, refreshing and restarting: it is intent, not state.
+    /// </summary>
+    public bool IsUserHidden
+    {
+        get => _isUserHidden;
+        internal set => SetProperty(ref _isUserHidden, value);
+    }
+
+    /// <summary>
+    /// A program the dragged file would be opened with, rather than a folder it
+    /// would be moved into.  Two different outcomes need two different lights.
+    /// </summary>
+    public bool IsRunTarget
+    {
+        get => _isRunTarget;
+        set => SetProperty(ref _isRunTarget, value);
+    }
+
     public bool IsTruncated
     {
         get => _isTruncated;
@@ -224,6 +249,27 @@ public sealed class ViewAllNodeViewModel : ObservableObject
 
     public Brush AccentBrush => BrushCache.Get(HasCustomAccent ? _accentHex : DefaultAccentHex);
 
+    /// <summary>
+    /// The colour of this folder's own branch: every line leaving it, and the
+    /// stripe on every child it owns.  Once a folder holds a block of children
+    /// rather than a row, one colour for every line on the canvas is unreadable -
+    /// the eye cannot tell which run belongs to which parent.  The hue comes from
+    /// the path, so it is the same colour every session and two folders side by
+    /// side are almost never the same.
+    /// </summary>
+    public Color BranchColor { get; }
+
+    public Brush BranchBrush { get; }
+
+    /// <summary>
+    /// What the stripe down the left of the node shows: the colour the user
+    /// chose if there is one, otherwise the colour of the folder this node lives
+    /// in, so a node reads as belonging to its parent.
+    /// </summary>
+    public Brush FamilyBrush => HasCustomAccent
+        ? BrushCache.Get(_accentHex)
+        : Parent?.BranchBrush ?? BrushCache.Get(DefaultAccentHex);
+
     public string DefaultAccentHex => Kind switch
     {
         ViewAllEntryKind.Drive => "#9AA4B2",
@@ -272,6 +318,54 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     public Point InputAnchor => new(Location.X + Width / 2, Location.Y);
     public Point OutputAnchor => new(Location.X + Width / 2, Location.Y + Height);
     public Rect Bounds => new(Location, new Size(Width, Height));
+
+    /// <summary>
+    /// A stable hue per path.  FNV-1a rather than string.GetHashCode, which is
+    /// randomised per process and would repaint the graph on every launch.
+    /// Deeper branches are drawn a little darker, so the eye reads the shallow
+    /// structure first.
+    /// </summary>
+    private static Color BranchColorFor(string path, int depth)
+    {
+        var hash = 2166136261u;
+        foreach (var character in path)
+        {
+            hash = (hash ^ char.ToLowerInvariant(character)) * 16777619u;
+        }
+
+        var hue = hash % 360u;
+        var lightness = Math.Clamp(0.66 - depth * 0.022, 0.42, 0.66);
+        return FromHsl(hue, 0.52, lightness);
+    }
+
+    private static Color FromHsl(double hue, double saturation, double lightness)
+    {
+        var chroma = (1 - Math.Abs(2 * lightness - 1)) * saturation;
+        var sector = hue / 60.0;
+        var second = chroma * (1 - Math.Abs(sector % 2 - 1));
+        var (red, green, blue) = (int)sector switch
+        {
+            0 => (chroma, second, 0.0),
+            1 => (second, chroma, 0.0),
+            2 => (0.0, chroma, second),
+            3 => (0.0, second, chroma),
+            4 => (second, 0.0, chroma),
+            _ => (chroma, 0.0, second)
+        };
+
+        var offset = lightness - chroma / 2;
+        return Color.FromRgb(
+            (byte)Math.Round((red + offset) * 255),
+            (byte)Math.Round((green + offset) * 255),
+            (byte)Math.Round((blue + offset) * 255));
+    }
+
+    private static Brush FrozenBrush(Color color)
+    {
+        var brush = new SolidColorBrush(color);
+        brush.Freeze();
+        return brush;
+    }
 
     public void SetAutomaticLocation(Point location)
         => SetLocation(location, isManual: false, hasPosition: true);

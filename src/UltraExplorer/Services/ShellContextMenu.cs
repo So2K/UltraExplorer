@@ -16,6 +16,16 @@ internal static class ShellContextMenu
     private const uint CmdFirst = 0x0001;
     private const uint CmdLast = 0x7FFF;
 
+    /// <summary>
+    /// Ids at or above this belong to the app, not to the Shell.  The Shell is
+    /// only ever asked to invoke a command inside CmdFirst..CmdLast, so an id up
+    /// here comes back to the caller untouched.
+    /// </summary>
+    public const uint AppCommandFirst = 0x8000;
+
+    private const uint MfString = 0x00000000;
+    private const uint MfSeparator = 0x00000800;
+
     private const int WmInitMenuPopup = 0x0117;
     private const int WmDrawItem = 0x002B;
     private const int WmMeasureItem = 0x002C;
@@ -41,13 +51,24 @@ internal static class ShellContextMenu
     /// for example when the items do not share a parent folder — so the caller
     /// can fall back to its own menu instead of showing nothing.
     /// </summary>
+    /// <param name="appCommands">
+    /// Items of the app's own, appended below the Shell's.  They are plain
+    /// strings on the menu handle this method already owns; nothing about the
+    /// PIDL or COM lifetimes changes.
+    /// </param>
+    /// <param name="chosenAppCommand">
+    /// The app item that was picked, or zero when the Shell handled the choice.
+    /// </param>
     public static bool TryShow(
         IReadOnlyList<string> paths,
         HwndSource source,
         int screenX,
         int screenY,
-        bool extended)
+        bool extended,
+        IReadOnlyList<(uint Id, string Label)>? appCommands,
+        out uint chosenAppCommand)
     {
+        chosenAppCommand = 0;
         var existing = paths
             .Where(path => File.Exists(path) || Directory.Exists(path))
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -124,6 +145,15 @@ internal static class ShellContextMenu
                 return false;
             }
 
+            if (appCommands is { Count: > 0 })
+            {
+                AppendMenuW(menuHandle, MfSeparator, UIntPtr.Zero, null);
+                foreach (var (id, label) in appCommands)
+                {
+                    AppendMenuW(menuHandle, MfString, (UIntPtr)id, label);
+                }
+            }
+
             contextMenu2 = contextMenu as IContextMenu2;
             contextMenu3 = contextMenu as IContextMenu3;
 
@@ -172,6 +202,10 @@ internal static class ShellContextMenu
             if (command >= CmdFirst && command <= CmdLast)
             {
                 Invoke(contextMenu, source.Handle, command - CmdFirst, parentDirectory, screenX, screenY);
+            }
+            else if (command >= AppCommandFirst)
+            {
+                chosenAppCommand = command;
             }
 
             return true;
@@ -350,6 +384,10 @@ internal static class ShellContextMenu
 
     [DllImport("user32.dll")]
     private static extern IntPtr CreatePopupMenu();
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AppendMenuW(IntPtr menu, uint flags, UIntPtr id, string? item);
 
     [DllImport("user32.dll")]
     private static extern bool DestroyMenu(IntPtr menu);

@@ -23,6 +23,23 @@ public sealed class ViewAllGraphService : IDisposable
     private readonly Dictionary<Guid, ViewAllEdgeViewModel> _incomingEdges = [];
     private readonly Dictionary<Guid, CancellationTokenSource> _loads = [];
     private readonly Dictionary<string, ViewAllNodeState> _restoredStates = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Paths whose automatic coordinates came from a saved workspace.  They are
+    /// laid out afresh rather than restored, so a change to the layout reaches a
+    /// canvas that was saved before it.  Positions recorded during this session -
+    /// by a branch refresh - are not in here and are restored exactly, because
+    /// pressing F5 must not rearrange the canvas.
+    /// </summary>
+    private readonly HashSet<string> _staleAutomaticPositions = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Folders the user hid, by path.  A path outlives the node: a hidden folder
+    /// inside a branch that is refreshed is destroyed and recreated, and this is
+    /// what makes the hide stick across that, across restarts, and across a
+    /// change to the enumeration options.
+    /// </summary>
+    private readonly HashSet<string> _hiddenPaths = new(StringComparer.OrdinalIgnoreCase);
     private bool _disposed;
 
     public ViewAllGraphService(
@@ -88,13 +105,35 @@ public sealed class ViewAllGraphService : IDisposable
         ClearGraph();
 
         _restoredStates.Clear();
+        _staleAutomaticPositions.Clear();
+        _hiddenPaths.Clear();
+
+        // Seeded before the first node is created, so a hidden folder is never
+        // briefly visible and never briefly indexed.
+        foreach (var hidden in restoredState?.HiddenPaths ?? [])
+        {
+            try
+            {
+                _hiddenPaths.Add(ViewAllPath.Normalize(hidden));
+            }
+            catch
+            {
+                // Ignore obsolete or malformed paths in a saved workspace.
+            }
+        }
+
         if (restoredState?.SchemaVersion == 1)
         {
             foreach (var state in restoredState.Nodes)
             {
                 try
                 {
-                    _restoredStates[ViewAllPath.Normalize(state.Path)] = state;
+                    var path = ViewAllPath.Normalize(state.Path);
+                    _restoredStates[path] = state;
+                    if (!state.HasManualPosition)
+                    {
+                        _staleAutomaticPositions.Add(path);
+                    }
                 }
                 catch
                 {
@@ -338,6 +377,10 @@ public sealed class ViewAllGraphService : IDisposable
                 descendant.Location.Y,
                 descendant.HasManualPosition,
                 descendant.IsExpanded);
+
+            // Recorded now, from a node that is already laid out the current
+            // way, so it is restored as it is rather than reflowed.
+            _staleAutomaticPositions.Remove(descendant.FullPath);
             if (descendant.IsExpanded)
             {
                 previouslyExpanded.Add(descendant.FullPath);
@@ -509,8 +552,163 @@ public sealed class ViewAllGraphService : IDisposable
     }
 
     /// <summary>The visible node under a graph-space point, if any.</summary>
+    /// <summary>
+    /// Lays the whole canvas out again from scratch, dropping every position -
+    /// including the ones the user dragged.  A graph that has been rearranged by
+    /// hand over a long session ends up with anchors nobody remembers placing,
+    /// and every later expansion has to route around them; this is the way back
+    /// to a clean tree.
+    /// </summary>
+    public void Relayout()
+    {
+        ThrowIfDisposed();
+        Index.Clear();
+
+        foreach (var node in _nodes)
+        {
+            node.ReleaseManualPosition();
+            node.ReleaseAutomaticLocation();
+        }
+
+        _layout.PlaceRoots(_roots, Index);
+
+        // Depth order: a parent is placed before the block that hangs off it.
+        foreach (var parent in _nodes
+                     .Where(node => node.IsExpanded && !node.IsUserHidden && node.IsTreeVisible)
+                     .OrderBy(node => node.Depth))
+        {
+            _layout.PlaceChildren(parent, parent.Children, Index);
+        }
+
+        LayoutChanged?.Invoke();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>Folders the user has hidden, whether or not their node exists.</summary>
+    public IReadOnlyCollection<string> HiddenPaths => _hiddenPaths;
+
+    /// <summary>
+    /// Takes a folder and everything under it off the canvas.  The nodes are
+    /// kept - the branch is not collapsed and nothing is re-read - but they stop
+    /// being drawn and, just as importantly, stop occupying space: they leave the
+    /// spatial index, so the room they took is available to everything else.
+    /// </summary>
+    public void Hide(ViewAllNodeViewModel node)
+    {
+        ThrowIfDisposed();
+        if (node.IsUserHidden)
+        {
+            return;
+        }
+
+        _hiddenPaths.Add(node.FullPath);
+        node.IsUserHidden = true;
+        node.IsTreeVisible = false;
+        Index.Remove(node);
+
+        foreach (var descendant in EnumerateDescendants(node))
+        {
+            descendant.IsTreeVisible = false;
+            Index.Remove(descendant);
+        }
+
+        node.Parent?.NotifyChildrenChanged();
+        UpdateEdgeVisibility();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>
+    /// Puts a hidden folder back.  Its automatic position is released first: the
+    /// space it used was given away while it was gone, so it is laid out afresh
+    /// rather than dropped on top of whatever moved in.  A position the user
+    /// chose is kept, because that one was a decision.
+    /// </summary>
+    public bool Show(string path)
+    {
+        ThrowIfDisposed();
+        string normalized;
+        try
+        {
+            normalized = ViewAllPath.Normalize(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+
+        if (!_hiddenPaths.Remove(normalized))
+        {
+            return false;
+        }
+
+        if (!_nodesByPath.TryGetValue(normalized, out var node))
+        {
+            // The node is gone - the branch was refreshed away, say.  Dropping
+            // the path is enough; it will come back visible when it is next read.
+            GraphChanged?.Invoke(this, EventArgs.Empty);
+            return true;
+        }
+
+        node.IsUserHidden = false;
+        node.IsTreeVisible = node.Parent is null || (node.Parent.IsTreeVisible && node.Parent.IsExpanded);
+
+        var subtree = EnumerateDescendants(node).ToArray();
+        _layout.ReleaseAutomaticLayout([node]);
+        _layout.ReleaseAutomaticLayout(subtree);
+
+        if (node.Parent is { } parent)
+        {
+            _layout.PlaceChildren(parent, parent.Children, Index);
+        }
+        else
+        {
+            _layout.PlaceRoots([node], Index);
+        }
+
+        if (node.IsExpanded)
+        {
+            RevealLoadedBranch(node);
+        }
+
+        // Depth order, so a parent is placed before the children that hang off it.
+        foreach (var branch in subtree
+                     .Where(item => item.IsExpanded && item.IsTreeVisible)
+                     .OrderBy(item => item.Depth))
+        {
+            _layout.PlaceChildren(branch, branch.Children, Index);
+        }
+
+        UpdateEdgeVisibility();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
+    public bool ShowAllHidden()
+    {
+        ThrowIfDisposed();
+        if (_hiddenPaths.Count == 0)
+        {
+            return false;
+        }
+
+        foreach (var path in _hiddenPaths.ToArray())
+        {
+            Show(path);
+        }
+
+        _hiddenPaths.Clear();
+        return true;
+    }
+
     public ViewAllNodeViewModel? HitTest(Point graphPoint)
         => Index.HitTest(graphPoint, node => node.IsTreeVisible);
+
+    /// <summary>
+    /// The node under a point, ignoring the ones being dragged.  Without the
+    /// exclusion a drag would immediately land on itself.
+    /// </summary>
+    public ViewAllNodeViewModel? HitTest(Point graphPoint, Predicate<ViewAllNodeViewModel> exclude)
+        => Index.HitTest(graphPoint, node => node.IsTreeVisible && !exclude(node));
 
     public ViewAllWorkspaceState CaptureState(ViewAllViewportState viewport)
         => new()
@@ -519,6 +717,7 @@ public sealed class ViewAllGraphService : IDisposable
             ViewportY = viewport.Location.Y,
             ViewportZoom = viewport.Zoom,
             ExtraRoots = _roots.Where(node => !node.IsDrive).Select(node => node.FullPath).ToList(),
+            HiddenPaths = [.. _hiddenPaths],
             Nodes = _nodes.Select(node => new ViewAllNodeState(
                     node.FullPath,
                     node.Location.X,
@@ -538,6 +737,13 @@ public sealed class ViewAllGraphService : IDisposable
             LocationObserver = OnNodeMoved
         };
 
+        // A folder that was hidden comes back hidden, however it was recreated.
+        if (_hiddenPaths.Contains(entry.FullPath))
+        {
+            node.IsUserHidden = true;
+            node.IsTreeVisible = false;
+        }
+
         _nodes.Add(node);
         _nodesByPath[entry.FullPath] = node;
         if (parent is null)
@@ -551,6 +757,14 @@ public sealed class ViewAllGraphService : IDisposable
 
     private void OnNodeMoved(ViewAllNodeViewModel node)
     {
+        // A hidden node must stay out of the grid however it moves.  Dragging an
+        // ancestor offsets every descendant, hidden ones included, and would
+        // otherwise quietly put the whole hidden spread back in the way.
+        if (node.IsUserHidden)
+        {
+            return;
+        }
+
         // A node without a layout position has not been placed yet; indexing it
         // at the origin would make the origin look occupied to the layout.
         if (node.HasLayoutPosition)
@@ -588,16 +802,32 @@ public sealed class ViewAllGraphService : IDisposable
 
     private void RestorePosition(ViewAllNodeViewModel node)
     {
-        if (_restoredStates.TryGetValue(node.FullPath, out var state))
+        if (!_restoredStates.TryGetValue(node.FullPath, out var state))
         {
-            node.RestoreLocation(new Point(state.X, state.Y), state.HasManualPosition);
+            return;
         }
+
+        // An automatic position that came from a saved workspace is dropped, so
+        // the node is laid out the way this build lays things out.  A position
+        // the user chose, and one recorded during this session, are kept.
+        if (!state.HasManualPosition && _staleAutomaticPositions.Contains(node.FullPath))
+        {
+            return;
+        }
+
+        node.RestoreLocation(new Point(state.X, state.Y), state.HasManualPosition);
     }
 
     private void RevealLoadedBranch(ViewAllNodeViewModel parent)
     {
         foreach (var child in parent.Children)
         {
+            // Expanding the parent must not undo a hide.
+            if (child.IsUserHidden)
+            {
+                continue;
+            }
+
             child.IsTreeVisible = true;
             if (child.IsExpanded)
             {

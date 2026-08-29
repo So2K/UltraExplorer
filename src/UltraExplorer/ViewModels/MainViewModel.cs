@@ -91,6 +91,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ResetZoomCommand = new RelayCommand(() => ZoomRequested?.Invoke(0));
         ToggleMinimapCommand = new RelayCommand(() => IsMinimapVisible = !IsMinimapVisible);
         CollapseAllCommand = new RelayCommand(() => Tree.CollapseAll());
+        RelayoutCommand = new RelayCommand(() => Tree.RelayoutCanvas());
+        HideSelectedCommand = new RelayCommand(() => Tree.HideSelected());
+        ShowAllHiddenCommand = new RelayCommand(() => Tree.ShowAllHidden());
+        ShowHiddenCommand = new RelayCommand<string>(path =>
+        {
+            if (!string.IsNullOrEmpty(path))
+            {
+                Tree.ShowHidden(path);
+            }
+        });
         SetAccentCommand = new RelayCommand<string>(SetSelectionAccent);
         EditNoteCommand = new AsyncRelayCommand(EditSelectionNoteAsync);
     }
@@ -147,6 +157,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ICommand ResetZoomCommand { get; }
     public ICommand ToggleMinimapCommand { get; }
     public ICommand CollapseAllCommand { get; }
+    public ICommand RelayoutCommand { get; }
+    public ICommand HideSelectedCommand { get; }
+    public ICommand ShowAllHiddenCommand { get; }
+    public ICommand ShowHiddenCommand { get; }
     public ICommand SetAccentCommand { get; }
     public ICommand EditNoteCommand { get; }
 
@@ -260,6 +274,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string TabTitle => DialogTitle is { Length: > 0 } dialog
         ? dialog
         : Tree.ActiveNode?.DisplayName is { Length: > 0 } name ? name : "This PC";
+
+    /// <summary>Folders hidden from the canvas, newest last, for the restore menu.</summary>
+    public IReadOnlyList<string> HiddenPaths => Tree.HiddenPaths;
+
+    public int HiddenCount => Tree.HiddenCount;
 
     public string StatusCountText => Tree.StatusCountText;
 
@@ -423,6 +442,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 break;
             case nameof(ViewAllViewModel.StatusPathText):
                 OnPropertyChanged(nameof(StatusPathText));
+                break;
+            case nameof(ViewAllViewModel.HiddenPaths):
+                OnPropertyChanged(nameof(HiddenPaths));
+                break;
+            case nameof(ViewAllViewModel.HiddenCount):
+                OnPropertyChanged(nameof(HiddenCount));
                 break;
             case nameof(ViewAllViewModel.ActivePath):
                 OnPropertyChanged(nameof(TabTitle));
