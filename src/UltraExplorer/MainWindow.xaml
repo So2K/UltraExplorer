@@ -648,6 +648,7 @@
                                      VirtualizingPanel.IsVirtualizing="True"
                                      VirtualizingPanel.VirtualizationMode="Recycling"
                                      MouseDoubleClick="FolderListItems_MouseDoubleClick"
+                                     PreviewMouseLeftButtonDown="FolderListItems_PreviewMouseLeftButtonDown"
                                      PreviewMouseLeftButtonUp="FolderListItems_PreviewMouseLeftButtonUp"
                                      PreviewMouseRightButtonUp="FolderListItems_PreviewMouseRightButtonUp">
                                 <ListBox.ItemContainerStyle>

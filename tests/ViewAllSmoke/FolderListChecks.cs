@@ -64,6 +64,8 @@ internal static partial class Program
 
             await list.NavigateAsync(root);
             Check("the folder is read", list.Items.Count == 4);
+            Check("there is somewhere above a temp folder", list.CanGoUp);
+            Check("nowhere to go back to yet", !list.CanGoBack);
             Check("it counts what it read", list.CountText == "4");
             Check("folders and files are all there",
                 list.Items.Any(item => item.DisplayName == "alpha")
@@ -91,10 +93,32 @@ internal static partial class Program
             Check("nor does highlighting it explicitly", opened.Count == beforeHighlight);
             Check("but the highlight moved", list.Selected?.DisplayName == "alpha");
 
-            // ---- walking the tree -------------------------------------------
-            Check("there is somewhere above a temp folder", list.CanGoUp);
-            Check("nowhere to go back to yet", !list.CanGoBack);
+            // ---- a click selects; it does not open ---------------------------
+            await list.NavigateAsync(root);
+            var alphaEntry = new ViewAllEntryDescriptor(
+                Path.Combine(root, "alpha"),
+                "alpha",
+                ViewAllEntryKind.Folder,
+                false,
+                false,
+                null,
+                DateTime.UnixEpoch);
+            var alphaNode = new ViewAllNodeViewModel(alphaEntry, 1);
 
+            using (list.HoldFolder())
+            {
+                list.SetTarget(alphaNode);
+            }
+
+            Check("clicking a folder row does not take the list into it",
+                string.Equals(list.FolderPath, root, StringComparison.OrdinalIgnoreCase));
+
+            list.SetTarget(alphaNode);
+            Check("but selecting one on the canvas does",
+                string.Equals(list.FolderPath, Path.Combine(root, "alpha"), StringComparison.OrdinalIgnoreCase));
+
+            // ---- walking the tree -------------------------------------------
+            await list.NavigateAsync(root);
             await list.NavigateAsync(Path.Combine(root, "alpha"));
             Check("going in reads the new folder", list.Items.Count == 1);
             Check("the title follows", list.Title == "alpha");

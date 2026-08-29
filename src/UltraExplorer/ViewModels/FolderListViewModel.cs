@@ -41,6 +41,7 @@ public sealed class FolderListViewModel : ObservableObject
     private string _filter = string.Empty;
     private string _emptyText = string.Empty;
     private bool _isVisible;
+    private int _held;
     private bool _isLoading;
     private bool _isTruncated;
     private FolderListItem? _selected;
@@ -171,12 +172,51 @@ public sealed class FolderListViewModel : ObservableObject
     }
 
     /// <summary>
+    /// Stops the list following the canvas while something the list itself did is
+    /// still settling.  Clicking a folder row selects that folder on the canvas,
+    /// and following that selection would take the list straight into the folder
+    /// - so a single click would open it, which is not what a single click does.
+    /// </summary>
+    public IDisposable HoldFolder() => new Hold(this);
+
+    private sealed class Hold : IDisposable
+    {
+        private readonly FolderListViewModel _list;
+        private bool _released;
+
+        public Hold(FolderListViewModel list)
+        {
+            _list = list;
+            _list._held++;
+        }
+
+        public void Dispose()
+        {
+            if (_released)
+            {
+                return;
+            }
+
+            _released = true;
+            _list._held--;
+        }
+    }
+
+    /// <summary>
     /// Points the list at a folder.  A file is taken as its parent folder with
     /// the file picked out, which is what makes selecting a node on the canvas
     /// scroll the list to the matching row.
     /// </summary>
     public void SetTarget(ViewAllNodeViewModel? node)
     {
+        if (_held > 0)
+        {
+            // The list is driving the canvas, not the other way round.  The row
+            // still follows the selection; the folder does not move.
+            SelectExisting(node);
+            return;
+        }
+
         var folder = node is null
             ? string.Empty
             : node.IsDirectory

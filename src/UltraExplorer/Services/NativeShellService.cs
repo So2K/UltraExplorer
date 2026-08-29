@@ -49,6 +49,15 @@ public sealed class NativeShellService
             appCommands,
             out chosenAppCommand);
 
+    /// <summary>
+    /// How long Windows waits before two clicks stop being a double-click.  The
+    /// user set it; nothing here should second-guess it with a constant.
+    /// </summary>
+    public static int DoubleClickMilliseconds => Math.Clamp((int)GetDoubleClickTime(), 200, 1200);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDoubleClickTime();
+
     public static void Open(string path)
     {
         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });

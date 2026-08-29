@@ -203,7 +203,20 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// </summary>
     private async Task ActivateListItemAsync(string path, bool open)
     {
-        var node = await RevealPathAsync(path);
+        ViewAllNodeViewModel? node;
+
+        // Held while the canvas is being driven from a row: selecting a folder on
+        // the canvas would otherwise take the list into it, which would make a
+        // single click open the folder.  A single click selects; it does not open.
+        using (FolderList.HoldFolder())
+        {
+            node = await RevealPathAsync(path);
+            if (node is not null)
+            {
+                SelectOnly(node);
+            }
+        }
+
         if (node is null)
         {
             if (open)
@@ -214,8 +227,6 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return;
         }
 
-        SelectOnly(node);
-
         if (!open)
         {
             return;
@@ -225,6 +236,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         {
             await ExpandAsync(node);
             ActiveNode = node;
+            await FolderList.NavigateAsync(path);
             return;
         }
 

@@ -45,6 +45,11 @@ public partial class MainWindow : Window
     private Point _overviewDragPointerAnchor;
     private Point _overviewDragNodeOrigin;
     private bool _overviewDragMoved;
+    private bool _folderListClickWasOnSelection;
+    private readonly DispatcherTimer _folderListRenameTimer = new(DispatcherPriority.Input)
+    {
+        Interval = TimeSpan.FromMilliseconds(NativeShellService.DoubleClickMilliseconds + 60)
+    };
 
     public MainWindow()
         : this(null)
@@ -75,6 +80,7 @@ public partial class MainWindow : Window
         _viewModel.Tree.ViewShiftRequested += OnViewShiftRequested;
 
         ConfigureNodeDrag();
+        _folderListRenameTimer.Tick += FolderListRename_Tick;
 
         Overview.Index = _viewModel.Tree.SpatialIndex;
         Harness.Index = _viewModel.Tree.SpatialIndex;
@@ -501,6 +507,10 @@ public partial class MainWindow : Window
 
     private void FolderListItems_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
+        // The second click of a double-click was a click on the selection too, so
+        // the rename that was waiting for it is called off.
+        _folderListRenameTimer.Stop();
+
         if (RowUnder(e) is { } item)
         {
             _viewModel.Tree.FolderList.ActivateCommand.Execute(item);
@@ -509,16 +519,42 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// A plain click takes the canvas to the row.  This is on button-up rather
-    /// than on the selection changing, so walking the list with the arrow keys
-    /// stays a way of reading it rather than a hundred flights across the canvas.
+    /// Remembers whether the row was already the selected one before this click,
+    /// because the list itself selects it on the way down and by button-up the
+    /// answer is always yes.
+    /// </summary>
+    private void FolderListItems_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        => _folderListClickWasOnSelection =
+            RowUnder(e) is { } row
+            && ReferenceEquals(FolderListItems.SelectedItem, row)
+            && FolderListItems.IsKeyboardFocusWithin;
+
+    /// <summary>
+    /// A plain click takes the canvas to the row and nothing else: it does not
+    /// go into a folder, which is what opening means.  A second click on a row
+    /// that was already selected renames it, and a double-click opens it - the
+    /// same three gestures Explorer has, told apart the same way, by waiting out
+    /// the double-click time before starting a rename.
+    ///
+    /// This is on button-up rather than on the selection changing, so walking the
+    /// list with the arrow keys stays a way of reading it rather than a hundred
+    /// flights across the canvas.
     /// </summary>
     private void FolderListItems_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
-        if (e.ClickCount == 1 && RowUnder(e) is { } item)
+        if (e.ClickCount != 1 || RowUnder(e) is not { } item)
         {
-            _viewModel.Tree.FolderList.RevealCommand.Execute(item);
+            return;
         }
+
+        if (_folderListClickWasOnSelection)
+        {
+            _folderListRenameTimer.Stop();
+            _folderListRenameTimer.Start();
+            return;
+        }
+
+        _viewModel.Tree.FolderList.RevealCommand.Execute(item);
     }
 
     /// <summary>
@@ -613,6 +649,19 @@ public partial class MainWindow : Window
             is ListBoxItem container && container.DataContext is FolderListItem item
             ? item
             : null;
+
+    /// <summary>
+    /// Starts the rename only once the double-click time has passed without a
+    /// second click, so opening something never opens a rename box first.
+    /// </summary>
+    private void FolderListRename_Tick(object? sender, EventArgs e)
+    {
+        _folderListRenameTimer.Stop();
+        if (FolderListItems.SelectedItem is FolderListItem)
+        {
+            _viewModel.RenameCommand.Execute(null);
+        }
+    }
 
     private void OnGraphInvalidated()
     {
