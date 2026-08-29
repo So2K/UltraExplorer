@@ -27,9 +27,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
     private readonly List<KeyValuePair<Brush, Geometry>> _drawList = [];
     private readonly MatrixTransform _transform = new(Matrix.Identity);
 
-    private readonly List<KeyValuePair<Color, Geometry>> _edgeList = [];
-    private readonly List<KeyValuePair<Pen, Geometry>> _edgeDrawList = [];
-
     private Rect _builtWindow = Rect.Empty;
     private OverviewMode _builtMode = OverviewMode.SlabsAndBranches;
     private double _penZoom = 1;
@@ -94,7 +91,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
         if (Math.Abs(zoom - _penZoom) > _penZoom * 0.02)
         {
             _penZoom = zoom;
-            RebuildEdgePens(zoom);
             InvalidateVisual();
         }
 
@@ -104,11 +100,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
 
     protected override void OnRender(DrawingContext drawingContext)
     {
-        foreach (var edge in _edgeDrawList)
-        {
-            drawingContext.DrawGeometry(null, edge.Key, edge.Value);
-        }
-
         foreach (var entry in _drawList)
         {
             drawingContext.DrawGeometry(entry.Key, null, entry.Value);
@@ -129,8 +120,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
 
         var geometries = new Dictionary<Color, StreamGeometry>();
         var contexts = new Dictionary<Color, StreamGeometryContext>();
-        var edgeGeometries = new Dictionary<Color, StreamGeometry>();
-        var edgeContexts = new Dictionary<Color, StreamGeometryContext>();
         var drawn = 0;
 
         try
@@ -153,23 +142,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
                 }
 
                 AddSlab(context, node.Bounds, node.Scale);
-
-                if (mode == OverviewMode.SlabsAndBranches
-                    && node.Parent is { IsTreeVisible: true, IsExpanded: true } parent)
-                {
-                    // Grouped by the parent's colour, so the batched picture tells
-                    // the same story the realized one does: one hue per folder.
-                    var branchColour = parent.BranchColor;
-                    if (!edgeContexts.TryGetValue(branchColour, out var edgeContext))
-                    {
-                        var geometry = new StreamGeometry();
-                        edgeGeometries[branchColour] = geometry;
-                        edgeContext = geometry.Open();
-                        edgeContexts[branchColour] = edgeContext;
-                    }
-
-                    AddBranch(edgeContext, parent.OutputAnchor, node.InputAnchor);
-                }
             }
         }
         finally
@@ -179,20 +151,7 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
                 context.Close();
             }
 
-            foreach (var context in edgeContexts.Values)
-            {
-                context.Close();
-            }
         }
-
-        _edgeList.Clear();
-        foreach (var pair in edgeGeometries)
-        {
-            pair.Value.Freeze();
-            _edgeList.Add(new KeyValuePair<Color, Geometry>(pair.Key, pair.Value));
-        }
-
-        RebuildEdgePens(_penZoom);
 
         _drawList.Clear();
         foreach (var pair in geometries)
@@ -224,8 +183,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
             blocks[key] = blocks.TryGetValue(key, out var running) ? running + count : count;
         });
 
-        _edgeList.Clear();
-        _edgeDrawList.Clear();
         _drawList.Clear();
 
         if (blocks.Count == 0)
@@ -316,15 +273,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
         context.LineTo(new Point(left, bottom), isStroked: false, isSmoothJoin: false);
     }
 
-    private static void AddBranch(StreamGeometryContext context, Point from, Point to)
-    {
-        var middle = (from.Y + to.Y) / 2;
-        context.BeginFigure(from, isFilled: false, isClosed: false);
-        context.LineTo(new Point(from.X, middle), isStroked: true, isSmoothJoin: false);
-        context.LineTo(new Point(to.X, middle), isStroked: true, isSmoothJoin: false);
-        context.LineTo(to, isStroked: true, isSmoothJoin: false);
-    }
-
     /// <summary>
     /// Zoomed out, a slab is coloured by the folder it belongs to rather than by
     /// what kind of thing it is: at this size the shape already says folder or
@@ -332,20 +280,6 @@ public sealed class ViewAllOverviewLayer : FrameworkElement
     /// </summary>
     private static Color ResolveColour(ViewAllNodeViewModel node)
         => node.FamilyBrush is SolidColorBrush brush ? brush.Color : Colors.Gray;
-
-    /// <summary>
-    /// One pen per branch colour, at a thickness that cancels the zoom so a line
-    /// stays a hairline however far out the canvas is.
-    /// </summary>
-    private void RebuildEdgePens(double zoom)
-    {
-        _edgeDrawList.Clear();
-        var thickness = EdgeThickness / Math.Max(zoom, 0.01);
-        foreach (var pair in _edgeList)
-        {
-            _edgeDrawList.Add(new KeyValuePair<Pen, Geometry>(CreatePen(pair.Key, thickness), pair.Value));
-        }
-    }
 
     private static Brush SolidBrush(Color color)
     {

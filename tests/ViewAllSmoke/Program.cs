@@ -73,6 +73,7 @@ internal static partial class Program
         await PickerGraphRules(fixtureRoot);
         await HiddenBranches(fixtureRoot);
         await TidyLayout(fixtureRoot);
+        await Harness(fixtureRoot);
         await FolderColours(fixtureRoot);
         await EverythingSearch();
         await ProgramTargets();

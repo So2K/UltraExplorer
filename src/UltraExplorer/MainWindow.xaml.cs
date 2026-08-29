@@ -75,6 +75,7 @@ public partial class MainWindow : Window
         ConfigureNodeDrag();
 
         Overview.Index = _viewModel.Tree.SpatialIndex;
+        Harness.Index = _viewModel.Tree.SpatialIndex;
 
         StateChanged += (_, _) =>
         {
@@ -390,6 +391,8 @@ public partial class MainWindow : Window
     {
         _viewModel.Tree.UpdateViewport(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
 
+        Harness.Update(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
+
         // Cheap unless the viewport left the window the geometry was built for:
         // normally this just moves an already uploaded visual.
         Overview.Update(
@@ -401,6 +404,8 @@ public partial class MainWindow : Window
 
     private void OnGraphInvalidated()
     {
+        Harness.InvalidateGeometry();
+        Harness.Update(Editor.ViewportLocation, Editor.ViewportSize, Editor.ViewportZoom);
         Overview.InvalidateGeometry();
         Overview.Update(
             Editor.ViewportLocation,
@@ -742,6 +747,8 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
+        AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
+        AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
         menu.Items.Add(new Separator());

@@ -388,6 +388,11 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         RemoveDescendants(node);
+
+        // The lattice is deliberately kept: the children come back at exactly
+        // the coordinates that were just recorded, so the record still describes
+        // them, and clearing it would leave the branch with no links until the
+        // next full relayout.
         node.AreChildrenLoaded = false;
         node.IsExpanded = false;
         node.IsTruncated = false;
@@ -568,6 +573,7 @@ public sealed class ViewAllGraphService : IDisposable
         {
             node.ReleaseManualPosition();
             node.ReleaseAutomaticLocation();
+            node.ChildBlocks.Clear();
         }
 
         _layout.PlaceRoots(_roots, Index);
@@ -855,8 +861,35 @@ public sealed class ViewAllGraphService : IDisposable
         {
             edge.IsTreeVisible = edge.Source.IsTreeVisible
                 && edge.Source.IsExpanded
-                && edge.Target.IsTreeVisible;
+                && edge.Target.IsTreeVisible
+                && !IsCoveredByHarness(edge.Source, edge.Target);
         }
+    }
+
+    /// <summary>
+    /// Whether the harness already draws this link.  A child on a multi-row
+    /// lattice hangs off its folder's trunk, so its own connection would be a
+    /// second line to the same place - and it is exactly those second lines,
+    /// crossing the block, that made a folder unreadable.  A child the user
+    /// dragged has left the lattice and keeps its line, which is what makes it
+    /// visibly an exception.
+    /// </summary>
+    private static bool IsCoveredByHarness(ViewAllNodeViewModel parent, ViewAllNodeViewModel child)
+    {
+        if (parent.ChildBlocks.Count == 0 || child.HasManualPosition)
+        {
+            return false;
+        }
+
+        foreach (var block in parent.ChildBlocks)
+        {
+            if (block.Rows > 1 && block.RowOf(parent.Location, child.Location) >= 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private static IEnumerable<ViewAllNodeViewModel> EnumerateDescendants(ViewAllNodeViewModel node)

@@ -79,6 +79,14 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     public Guid? ParentId => Parent?.Id;
     public ObservableCollection<ViewAllNodeViewModel> Children { get; } = [];
 
+    /// <summary>
+    /// The lattices this folder's children were placed on - one per expansion,
+    /// so Load more appends a second rather than disturbing the first.  Empty
+    /// when the layout could not reserve a clean rectangle, which is the signal
+    /// to fall back to a line per child.
+    /// </summary>
+    public List<ViewAllChildBlock> ChildBlocks { get; } = [];
+
     public bool CanExpand => IsDirectory;
     public bool HasVisibleChildren => IsExpanded && Children.Any(child => child.IsTreeVisible);
     public int LoadedChildCount => Children.Count;

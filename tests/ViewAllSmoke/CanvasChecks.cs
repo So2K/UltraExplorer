@@ -138,6 +138,79 @@ internal static partial class Program
         Check("and nothing overlaps afterwards", !overlapping);
     }
 
+    private static async Task Harness(string root)
+    {
+        Section("link harness");
+
+        using var graph = new ViewAllGraphService();
+        await graph.InitializeAsync();
+        var node = (await graph.AddRootAsync(root))!;
+        await graph.ExpandAsync(node);
+
+        var wide = node.Children.First(child => child.DisplayName == "wide");
+        await graph.ExpandAsync(wide);
+
+        Check("a wrapped folder records the lattice its children were placed on",
+            wide.ChildBlocks.Count == 1);
+        var block = wide.ChildBlocks[0];
+        Check("the lattice has more than one row", block.Rows > 1);
+        Check("it reserves a lane on each side", block.Lane > 0);
+        Check("its bounds hold every child",
+            wide.Children.All(child => block.BoundsFor(wide.Location).Contains(child.Bounds)));
+
+        var harness = ViewAllHarnessGeometry.Build(wide, block, tickLimit: 64);
+        Check("the harness is drawn", harness.Segments.Count > 0);
+        Check("every child gets a tick", harness.Ticks == wide.Children.Count);
+
+        // The complaint was one horizontal run per child, four of them cutting
+        // through the block.  One per row is the whole point.
+        Check("there is one horizontal run per row, not one per child",
+            harness.Horizontals == block.Rows && harness.Horizontals < wide.Children.Count);
+
+        var horizontals = harness.Segments.Where(segment => segment.IsHorizontal).ToArray();
+        Check("no horizontal run passes over a node",
+            horizontals.All(run => wide.Children.All(child =>
+                run.From.Y <= child.Bounds.Top - 0.001 || run.From.Y >= child.Bounds.Bottom + 0.001)));
+
+        var trunkX = block.TrunkXFor(wide.Location);
+        Check("the trunk lane holds no child",
+            wide.Children.All(child => child.Bounds.Left > trunkX + 0.001));
+
+        Check("every segment stays inside the reserved area",
+            harness.Segments.All(segment =>
+                block.BoundsFor(wide.Location).Contains(segment.To)
+                || Math.Abs(segment.To.Y - wide.OutputAnchor.Y) < 1
+                || block.BoundsFor(wide.Location).Contains(segment.From)));
+
+        // Dragging the folder must carry the whole harness with it, because the
+        // lattice is recorded as an offset rather than as absolute points.
+        var before = harness.Segments.Select(segment => segment.From).ToArray();
+        var delta = new Vector(300, -140);
+        wide.Location = wide.Location + delta;
+        var moved = ViewAllHarnessGeometry.Build(wide, wide.ChildBlocks[0], tickLimit: 64);
+        Check("the harness moves with the folder",
+            moved.Segments.Select(segment => segment.From)
+                .Zip(before, (now, then) => (now - (then + delta)).Length)
+                .All(error => error < 1e-6));
+
+        // Past the limit a line to each child was never readable anyway.
+        var few = ViewAllHarnessGeometry.Build(wide, wide.ChildBlocks[0], tickLimit: 4);
+        Check("a big folder draws a trunk but no ticks", few.Ticks == 0 && few.Horizontals == 0);
+        Check("and still draws its stub and trunk", few.Segments.Count == 2);
+
+        // A child that was dragged has left the lattice and keeps its own line.
+        var exile = wide.Children[0];
+        exile.Location = new Point(20_000, 20_000);
+        var afterExile = ViewAllHarnessGeometry.Build(wide, wide.ChildBlocks[0], tickLimit: 64);
+        Check("a hand-placed child leaves the harness",
+            afterExile.Ticks == wide.Children.Count - 1);
+
+        var small = node.Children.First(child => child.DisplayName == "alpha");
+        await graph.ExpandAsync(small);
+        Check("a folder that fits on one row records a lattice with no lane",
+            small.ChildBlocks.Count == 1 && small.ChildBlocks[0].Rows == 1 && small.ChildBlocks[0].Lane == 0);
+    }
+
     private static async Task FolderColours(string root)
     {
         Section("folder colours");

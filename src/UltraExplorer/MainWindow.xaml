@@ -462,6 +462,10 @@
 
                 <!-- Batched drawing of the whole graph, used instead of node
                      controls once the canvas is zoomed far enough out. -->
+                <!-- Every link on the canvas, at every zoom: one harness per
+                     folder rather than a line per child. -->
+                <controls:ViewAllHarnessLayer x:Name="Harness" />
+
                 <controls:ViewAllOverviewLayer x:Name="Overview"
                                                Visibility="{Binding Tree.IsOverviewActive, Converter={StaticResource BoolToVisibility}}" />
 

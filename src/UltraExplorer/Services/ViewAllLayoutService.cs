@@ -15,13 +15,23 @@ public sealed record ViewAllLayoutOptions(
     /// <summary>Vertical gap between two rows of one parent's children.</summary>
     double RowGap = 34,
 
-    /// <summary>A folder small enough to read at a glance stays on one line.</summary>
-    int SingleRowLimit = 12,
+    /// <summary>
+    /// A folder small enough to read at a glance stays on one line.  Six nodes
+    /// is about 1200 units, which fits a viewport; a dozen does not, and that is
+    /// where a row stops reading as a row.
+    /// </summary>
+    int SingleRowLimit = 6,
 
     /// <summary>How many times wider than tall a block of children should be.</summary>
     double BlockAspect = 2.2,
 
-    int MaximumColumns = 512);
+    int MaximumColumns = 512,
+
+    /// <summary>
+    /// Width of the empty lane reserved down each side of a multi-row block: one
+    /// for the trunk the links hang from, one for a line leaving the block.
+    /// </summary>
+    double TrunkLane = 26);
 
 /// <summary>
 /// Top-down tree: a parent sits above a block of its children.  Screens are
@@ -100,36 +110,59 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
 
         var columns = ColumnsFor(count, stepX, stepY);
         var rows = (count + columns - 1) / columns;
-        var blockWidth = columns * stepX - gapX;
+        var nodesWidth = columns * stepX - gapX;
         var blockHeight = rows * stepY - gapY;
 
+        // A multi-row block reserves an empty lane down each side: the left one
+        // carries the trunk every link hangs from, the right one is the way out
+        // for a line leaving the block.  A single row needs neither - its links
+        // already fan straight down from the parent, and that reads fine.
+        var lane = rows > 1 ? _options.TrunkLane * scale : 0;
+
         var origin = new Point(
-            parent.Location.X + parent.Width / 2 - blockWidth / 2,
-            parent.Location.Y + parent.Height + _options.GenerationGap * scale);
+            parent.Location.X + parent.Width / 2 - nodesWidth / 2 - lane,
+            parent.Location.Y + parent.Height + _options.GenerationGap * scale - gapY / 2);
 
         var padX = _options.CollisionPaddingX * scale;
         var padY = _options.CollisionPaddingY * scale;
+        var reservedWidth = nodesWidth + 2 * lane;
+        var reservedHeight = blockHeight + gapY * 1.5;
 
         // The whole block at once, dropped straight down past anything in the
         // way.  Keeping the family together is the point: scattering the children
         // of one folder around a neighbouring branch is what made the canvas
         // unreadable, and the tree grows downwards anyway.
-        if (TryReserveBlock(origin, blockWidth, blockHeight, padX, padY, stepX, stepY, index, out var placed))
+        if (TryReserveBlock(origin, reservedWidth, reservedHeight, padX, padY, stepX, stepY, index, out var placed))
         {
+            var nodeOrigin = new Point(placed.X + lane, placed.Y + gapY / 2);
             for (var position = 0; position < count; position++)
             {
                 unplaced[position].SetAutomaticLocation(
-                    Slot(position, placed, columns, count, blockWidth, stepX, stepY, gapX));
+                    Slot(position, nodeOrigin, columns, count, nodesWidth, stepX, stepY, gapX));
             }
 
+            parent.ChildBlocks.Add(new ViewAllChildBlock(
+                placed - parent.Location,
+                columns,
+                rows,
+                count,
+                stepX,
+                stepY,
+                gapX,
+                gapY,
+                lane,
+                nodesWidth,
+                scale));
             return;
         }
 
         // Nowhere within reach holds the whole block, so each child claims its
-        // own slot from where it would have been.
+        // own slot from where it would have been.  No lattice is recorded: a
+        // comb drawn over children that are no longer on it would be a lie.
+        var fallbackOrigin = new Point(origin.X + lane, origin.Y + gapY / 2);
         for (var position = 0; position < count; position++)
         {
-            var preferred = Slot(position, origin, columns, count, blockWidth, stepX, stepY, gapX);
+            var preferred = Slot(position, fallbackOrigin, columns, count, nodesWidth, stepX, stepY, gapX);
             unplaced[position].SetAutomaticLocation(
                 FindFreeSlot(preferred, unplaced[position], index, stepX, stepY));
         }
@@ -186,6 +219,7 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
         foreach (var node in nodes.Where(node => !node.HasManualPosition))
         {
             node.ReleaseAutomaticLocation();
+            node.ChildBlocks.Clear();
         }
     }
 

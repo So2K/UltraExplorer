@@ -1035,9 +1035,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel);
         RequestIcons(set.Nodes, set.DetailLevel);
 
-        // Rebuilding is only worth it while the batched layer is on screen; if
-        // it is not, the flag survives until the canvas zooms back out.
-        if (_isOverviewStale && IsOverviewActive)
+        // Raised at every zoom, not only while the batched slab layer is on
+        // screen: the links are drawn by a layer of their own that is always
+        // visible, and it has no other way to learn that the tree moved.
+        if (_isOverviewStale)
         {
             _isOverviewStale = false;
             GraphInvalidated?.Invoke();
