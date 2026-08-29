@@ -89,6 +89,13 @@ public sealed class ViewAllHarnessLayer : FrameworkElement
         {
             _penZoom = zoom;
             RebuildPens();
+
+            // The pens and the label size both cancel the zoom, so both are wrong
+            // the moment it changes - and nothing else repaints this layer while
+            // only the zoom moves.  Without this, a line drawn for 10% was still
+            // ten units thick at 300%, which is what turned the links into slabs
+            // and the folder name into a banner across the canvas.
+            InvalidateVisual();
         }
 
         // screen = (graph - viewportLocation) * zoom
