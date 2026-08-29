@@ -697,6 +697,37 @@ public sealed class ViewAllGraphService : IDisposable
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 
+    /// <summary>
+    /// Puts hand-placed nodes back into the flow.  A node the user dragged is an
+    /// island: it keeps its place, its slot is not reserved, and it is the one
+    /// thing on the canvas that can end up on top of something else.  This is the
+    /// way back for one node, where Tidy is the way back for all of them.
+    /// </summary>
+    public bool ReleasePositions(IEnumerable<ViewAllNodeViewModel> nodes)
+    {
+        ThrowIfDisposed();
+        var released = false;
+        foreach (var node in nodes)
+        {
+            if (!node.HasManualPosition)
+            {
+                continue;
+            }
+
+            node.ReleaseManualPosition();
+            released = true;
+        }
+
+        if (!released)
+        {
+            return false;
+        }
+
+        Reflow();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+    }
+
     /// <summary>Folders the user has hidden, whether or not their node exists.</summary>
     public IReadOnlyCollection<string> HiddenPaths => _hiddenPaths;
 

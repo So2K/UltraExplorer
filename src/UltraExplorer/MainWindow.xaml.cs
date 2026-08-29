@@ -581,6 +581,7 @@ public partial class MainWindow : Window
     // ---- Context menus -----------------------------------------------------
 
     private const uint HideFromCanvasCommandId = ShellContextMenu.AppCommandFirst + 1;
+    private const uint ReturnToLayoutCommandId = ShellContextMenu.AppCommandFirst + 2;
     private const uint ColourCommandFirst = ShellContextMenu.AppCommandFirst + 0x10;
 
     /// <summary>
@@ -607,6 +608,12 @@ public partial class MainWindow : Window
             entries.Add(new ShellMenuEntry(HideFromCanvasCommandId, "Hide from canvas"));
         }
 
+        // Only worth offering for something that is actually out of the layout.
+        if (_viewModel.Tree.HasHandPlacedSelection)
+        {
+            entries.Add(new ShellMenuEntry(ReturnToLayoutCommandId, "Return to layout"));
+        }
+
         return entries;
     }
 
@@ -615,6 +622,12 @@ public partial class MainWindow : Window
         if (command == HideFromCanvasCommandId)
         {
             _viewModel.HideSelectedCommand.Execute(null);
+            return;
+        }
+
+        if (command == ReturnToLayoutCommandId)
+        {
+            _viewModel.ReturnToLayoutCommand.Execute(null);
             return;
         }
 
@@ -676,6 +689,11 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Delete permanently", "\uE74D", _viewModel.PermanentDeleteCommand, "Shift+Del");
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Hide from canvas", "\uED1A", _viewModel.HideSelectedCommand, "Ctrl+H");
+        if (_viewModel.Tree.HasHandPlacedSelection)
+        {
+            AddCommandItem(menu, "Return to layout", "\uE8AB", _viewModel.ReturnToLayoutCommand);
+        }
+
         AddColourItems(menu);
         AddCommandItem(menu, "Show in File Explorer", "\uEC50", _viewModel.ShowInExplorerCommand);
         menu.IsOpen = true;

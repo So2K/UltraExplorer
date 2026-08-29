@@ -136,6 +136,26 @@ internal static partial class Program
         }
 
         Check("and nothing overlaps afterwards", !overlapping);
+
+        // Putting one node back is a different thing from tidying everything:
+        // a node dragged out is the only thing on the canvas that can sit on top
+        // of something, and this is the way back for just that one.
+        var single = node.Children.First(child => child.DisplayName == "wide");
+        var home = single.Location;
+        var siblings = node.Children
+            .Where(child => child != single)
+            .ToDictionary(child => child.FullPath, child => child.Location);
+
+        single.Location = new Point(12_000, 12_000);
+        Check("a dragged node is out of the layout", single.HasManualPosition);
+        Check("returning it reports that it did something", graph.ReleasePositions([single]));
+        Check("it is in the flow again", !single.HasManualPosition);
+        Check("and back where the layout wants it", (single.Location - home).Length < 1e-6);
+        Check("its siblings were not disturbed",
+            node.Children.Where(child => child != single)
+                .All(child => (child.Location - siblings[child.FullPath]).Length < 1e-6));
+        Check("returning something that is already in the flow is a no-op",
+            !graph.ReleasePositions([single]));
     }
 
     private static async Task Harness(string root)
@@ -357,7 +377,17 @@ internal static partial class Program
             Check("collapsing gives the space back",
                 graph.Index.Count == indexedBefore - closed.Children.Count);
 
-            // 7. The root still holds everything it started with.
+            // 7. A root the user dragged keeps its place, and the automatic
+            //    ones step over it rather than landing inside its tree.
+            node.Location = new Point(120, 90);
+            await graph.ExpandAsync(node.Children.First(child => child.DisplayName == "four"));
+            var island = SubtreeBounds(node);
+            Check("an automatic root steps over a hand-placed one",
+                graph.Roots
+                    .Where(root => root != node && root.IsTreeVisible)
+                    .All(root => !SubtreeBounds(root).IntersectsWith(island)));
+
+            // 8. The root still holds everything it started with.
             var rowsOf = node.ChildBlock!.Value;
             Check("the root still holds every child in one block",
                 node.Children.Where(child => child.IsTreeVisible)

@@ -482,6 +482,32 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         ScheduleSave();
     }
 
+    /// <summary>True when something in the selection was placed by hand.</summary>
+    public bool HasHandPlacedSelection => SelectedNodes.Any(node => node.HasManualPosition);
+
+    /// <summary>
+    /// Puts the selected nodes back into the layout, leaving the rest of the
+    /// canvas alone.
+    /// </summary>
+    public void ReturnSelectionToLayout()
+    {
+        var targets = SelectedNodes.Where(node => node.HasManualPosition).ToArray();
+        if (!_graph.ReleasePositions(targets))
+        {
+            MessageRequested?.Invoke("Nothing here was placed by hand.", false);
+            return;
+        }
+
+        RebuildRenderSet();
+        GraphInvalidated?.Invoke();
+        MessageRequested?.Invoke(
+            targets.Length == 1
+                ? $"{targets[0].DisplayName} is back in the layout"
+                : $"{targets.Length} items are back in the layout",
+            false);
+        ScheduleSave();
+    }
+
     /// <summary>Throws away every hand-placed position and rebuilds the tree.</summary>
     public void RelayoutCanvas()
     {

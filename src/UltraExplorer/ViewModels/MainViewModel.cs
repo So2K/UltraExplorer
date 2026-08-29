@@ -95,6 +95,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         CollapseAllCommand = new RelayCommand(() => Tree.CollapseAll());
         RelayoutCommand = new RelayCommand(() => Tree.RelayoutCanvas());
         HideSelectedCommand = new RelayCommand(() => Tree.HideSelected());
+        ReturnToLayoutCommand = new RelayCommand(() => Tree.ReturnSelectionToLayout());
         ShowAllHiddenCommand = new RelayCommand(() => Tree.ShowAllHidden());
         ShowHiddenCommand = new RelayCommand<string>(path =>
         {
@@ -161,6 +162,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ICommand CollapseAllCommand { get; }
     public ICommand RelayoutCommand { get; }
     public ICommand HideSelectedCommand { get; }
+    public ICommand ReturnToLayoutCommand { get; }
     public ICommand ShowAllHiddenCommand { get; }
     public ICommand ShowHiddenCommand { get; }
     public ICommand SetAccentCommand { get; }
