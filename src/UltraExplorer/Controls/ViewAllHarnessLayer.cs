@@ -71,9 +71,10 @@ public sealed class ViewAllHarnessLayer : FrameworkElement
             return;
         }
 
-        var viewport = new Rect(
-            viewportLocation,
-            new Size(viewportSize.Width / zoom, viewportSize.Height / zoom));
+        // ViewportSize is already in graph space; dividing by the zoom again
+        // built a window 1/zoom across - twenty-five times the area at 20% - and
+        // every rebuild paid for geometry nowhere near the screen.
+        var viewport = new Rect(viewportLocation, viewportSize);
 
         if (_builtWindow.IsEmpty || !_builtWindow.Contains(viewport))
         {

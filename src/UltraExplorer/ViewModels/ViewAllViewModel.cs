@@ -42,6 +42,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private int _visibleNodeCount;
     private bool _isOverviewActive;
     private bool _isOverviewStale;
+    private IReadOnlyList<ViewAllTrailStep> _trail = [];
+    private readonly List<ViewAllNodeViewModel> _trailProbe = [];
     private string _statusCountText = string.Empty;
     private string _statusPathText = string.Empty;
 
@@ -133,6 +135,24 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>Grid the overview layer draws from.</summary>
     public ViewAllSpatialIndex SpatialIndex => _graph.Index;
+
+    /// <summary>
+    /// The chain of folders whose blocks the middle of the canvas is inside,
+    /// outermost first.  Empty at the top of a tree, where the folder's own
+    /// label is on screen anyway.
+    /// </summary>
+    public IReadOnlyList<ViewAllTrailStep> Trail
+    {
+        get => _trail;
+        private set
+        {
+            _trail = value;
+            OnPropertyChanged(nameof(Trail));
+            OnPropertyChanged(nameof(HasTrail));
+        }
+    }
+
+    public bool HasTrail => _trail.Count > 0;
 
     /// <summary>
     /// True while the canvas is far enough out that the graph is drawn as
@@ -910,6 +930,85 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }, DispatcherPriority.Background);
     }
 
+    /// <summary>
+    /// Works out where the canvas is by asking what is nearest the middle of it
+    /// and reading that node's ancestors.  A small probe first, because the grid
+    /// answers a small query in constant time and the middle of the canvas
+    /// almost always has something in it; the whole viewport only when it does
+    /// not, which happens in the gap between two trees.
+    /// </summary>
+    private void UpdateTrail(Rect viewport)
+    {
+        var centre = new Point(
+            viewport.X + viewport.Width / 2,
+            viewport.Y + viewport.Height / 2);
+
+        var reach = Math.Min(
+            Math.Max(viewport.Width, viewport.Height) / 2,
+            ViewAllSpatialIndex.CellExtent * 1.5);
+        var probe = new Rect(centre.X - reach, centre.Y - reach, reach * 2, reach * 2);
+
+        _trailProbe.Clear();
+        _graph.Index.Query(probe, _trailProbe);
+        if (_trailProbe.Count == 0)
+        {
+            _graph.Index.Query(viewport, _trailProbe);
+        }
+
+        ViewAllNodeViewModel? nearest = null;
+        var best = double.MaxValue;
+        foreach (var node in _trailProbe)
+        {
+            if (!node.IsTreeVisible)
+            {
+                continue;
+            }
+
+            var middle = new Point(
+                node.Location.X + node.Width / 2,
+                node.Location.Y + node.Height / 2);
+            var distance = (middle - centre).LengthSquared;
+            if (distance < best)
+            {
+                best = distance;
+                nearest = node;
+            }
+        }
+
+        if (nearest?.Parent is null)
+        {
+            if (_trail.Count > 0)
+            {
+                Trail = [];
+            }
+
+            return;
+        }
+
+        var chain = new List<ViewAllNodeViewModel>();
+        for (var walk = nearest.Parent; walk is not null; walk = walk.Parent)
+        {
+            chain.Add(walk);
+        }
+
+        chain.Reverse();
+
+        // Rebuilding the list on every pan would repaint the overlay constantly;
+        // the chain only changes when the canvas crosses into another folder.
+        if (chain.Count == _trail.Count
+            && chain.Select((step, index) => step.DisplayName == _trail[index].Name).All(same => same))
+        {
+            return;
+        }
+
+        Trail = chain
+            .Select((step, index) => new ViewAllTrailStep(
+                step.DisplayName,
+                step.BranchBrush,
+                index == 0 ? string.Empty : "  \u203A  "))
+            .ToArray();
+    }
+
     private void OnGraphChanged(object? sender, EventArgs e)
     {
         // Counting once per structural change keeps it off the pan path.
@@ -1042,6 +1141,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         LogicalNodeCount = set.LogicalNodeCount;
         IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel);
         RequestIcons(set.Nodes, set.DetailLevel);
+        UpdateTrail(viewport);
 
         // Raised at every zoom, not only while the batched slab layer is on
         // screen: the links are drawn by a layer of their own that is always

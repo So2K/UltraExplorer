@@ -469,6 +469,40 @@
                 <controls:ViewAllOverviewLayer x:Name="Overview"
                                                Visibility="{Binding Tree.IsOverviewActive, Converter={StaticResource BoolToVisibility}}" />
 
+                <!-- Where the canvas is: the chain of folders whose blocks the
+                     middle of it is inside. -->
+                <Border HorizontalAlignment="Left"
+                        VerticalAlignment="Top"
+                        Margin="14"
+                        Padding="10,5"
+                        CornerRadius="6"
+                        Background="#CC1B1B1B"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="1"
+                        IsHitTestVisible="False"
+                        Visibility="{Binding Tree.HasTrail, Converter={StaticResource BoolToVisibility}}">
+                    <ItemsControl ItemsSource="{Binding Tree.Trail}">
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <StackPanel Orientation="Horizontal">
+                                    <TextBlock Text="{Binding Separator}"
+                                               Foreground="{StaticResource TextMutedBrush}"
+                                               FontSize="12" />
+                                    <TextBlock Text="{Binding Name}"
+                                               Foreground="{Binding Brush}"
+                                               FontSize="12"
+                                               FontWeight="SemiBold" />
+                                </StackPanel>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Border>
+
                 <!-- Search results -->
                 <Border Width="420"
                         MaxHeight="520"
