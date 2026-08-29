@@ -51,6 +51,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// </summary>
     private const int FillBudget = 4;
 
+
     private readonly DispatcherTimer _fillTimer;
     private IReadOnlyList<ViewAllTrailStep> _trail = [];
     private readonly List<ViewAllNodeViewModel> _trailProbe = [];
@@ -569,6 +570,33 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         ScheduleSave();
     }
 
+    /// <summary>
+    /// Told after a drag has finished, so the links can be worked out again for
+    /// wherever the nodes ended up.
+    /// </summary>
+    public void NotifyNodesMoved()
+    {
+        _graph.RefreshLinks();
+        RebuildRenderSet();
+        GraphInvalidated?.Invoke();
+        ScheduleSave();
+    }
+
+    /// <summary>Re-reads the folder the list is showing, if it is showing one.</summary>
+    public Task RefreshFolderListAsync() => FolderList.ReloadAsync();
+
+    /// <summary>The folder whose area on the canvas a point falls in.</summary>
+    public ViewAllNodeViewModel? FolderAt(Point graphPoint) => _graph.FolderAt(graphPoint);
+
+    /// <summary>Makes a folder the current one, as clicking it would.</summary>
+    public void SetActiveFolder(ViewAllNodeViewModel node)
+    {
+        if (node.IsDirectory)
+        {
+            ActiveNode = node;
+        }
+    }
+
     /// <summary>Throws away every hand-placed position and rebuilds the tree.</summary>
     public void RelayoutCanvas()
     {
@@ -603,6 +631,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         {
             await _graph.RefreshBranchAsync(node);
             ScheduleSave();
+        }
+
+        // The list reads the directory itself, so a change the canvas has just
+        // picked up means nothing to it until it is told.  Creating a file and
+        // watching it appear on the canvas but not in the list was the giveaway.
+        if (string.Equals(path, FolderList.FolderPath, StringComparison.OrdinalIgnoreCase))
+        {
+            await FolderList.ReloadAsync();
         }
     }
 
@@ -1225,19 +1261,17 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             _viewportZoom,
             _visibleNodeCount);
         PerfLog.Value("renderset.nodes", set.Nodes.Count);
-        bool filling;
+        int pending;
         using (PerfLog.Measure("renderset.sync"))
         {
             var budget = FillBudget;
-            filling = Sync(RenderNodes, set.Nodes, ref budget);
-            filling |= Sync(RenderEdges, set.Edges, ref budget);
+            pending = Sync(RenderNodes, set.Nodes, ref budget);
+            pending += Sync(RenderEdges, set.Edges, ref budget);
         }
 
-        // While the containers are still arriving the batched picture stays up.
-        // It is drawn over the editor and is a complete picture of the same tree,
-        // so the canvas goes from one finished image to the other rather than
-        // filling in visibly - and never blocks.
-        if (filling)
+        PerfLog.Value("renderset.pending", pending);
+
+        if (pending > 0)
         {
             _fillTimer.Start();
         }
@@ -1248,7 +1282,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         DetailLevel = set.DetailLevel;
         LogicalNodeCount = set.LogicalNodeCount;
-        IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel) || filling;
+        // The batched picture may STAY up while the containers it is standing in
+        // for arrive, but it must never come up because of them.  Coming out of
+        // the batched view is the case worth covering - a screenful at once, and
+        // the slabs are already on screen so nothing changes visually.  Panning
+        // also brings in a hundred nodes at a time, and covering the canvas with
+        // slabs for those was a flash of colour on every scroll: the cure looking
+        // worse than the thing it cured.
+        IsOverviewActive = ViewAllViewportService.UsesOverview(set.DetailLevel)
+            || (IsOverviewActive && pending > 0);
         using (PerfLog.Measure("renderset.icons"))
         {
             RequestIcons(set.Nodes, set.DetailLevel);
@@ -1272,7 +1314,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// Brings <paramref name="target"/> towards <paramref name="desired"/>, adding
-    /// at most <paramref name="budget"/> items and reporting whether more are
+    /// at most <paramref name="budget"/> items and returning how many are still
     /// waiting.
     ///
     /// Removals are not budgeted - tearing a container down is cheap.  Adding one
@@ -1281,7 +1323,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// view wanted a hundred of them in a single frame.  That was a third of a
     /// second of nothing moving, measured, every time the zoom came back in.
     /// </summary>
-    private static bool Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired, ref int budget)
+    private static int Sync<T>(ObservableCollection<T> target, IReadOnlyList<T> desired, ref int budget)
         where T : class
     {
         var wanted = new HashSet<T>(desired);
@@ -1294,6 +1336,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
 
         var present = new HashSet<T>(target);
+        var pending = 0;
         foreach (var item in desired)
         {
             if (!present.Add(item))
@@ -1303,14 +1346,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
             if (budget <= 0)
             {
-                return true;
+                pending++;
+                continue;
             }
 
             target.Add(item);
             budget--;
         }
 
-        return false;
+        return pending;
     }
 
     private void UpdateStatus()

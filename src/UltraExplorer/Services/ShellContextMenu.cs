@@ -96,10 +96,6 @@ internal static class ShellContextMenu
         var absolutePidls = new List<IntPtr>(existing.Length);
         IShellFolder? parentFolder = null;
         IContextMenu? contextMenu = null;
-        IContextMenu2? contextMenu2 = null;
-        IContextMenu3? contextMenu3 = null;
-        var menuHandle = IntPtr.Zero;
-        HwndSourceHook? hook = null;
 
         try
         {
@@ -140,6 +136,135 @@ internal static class ShellContextMenu
                 return false;
             }
 
+            return Present(contextMenu, source, screenX, screenY, extended, appCommands, parentDirectory, out chosenAppCommand);
+        }
+        catch (COMException)
+        {
+            return false;
+        }
+        finally
+        {
+            ReleaseComObject(contextMenu);
+            ReleaseComObject(parentFolder);
+
+            foreach (var pidl in absolutePidls)
+            {
+                ILFree(pidl);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The menu Explorer shows on the empty part of a folder: New, Paste,
+    /// Properties, and whatever the installed shell extensions add.  It comes
+    /// from the folder's own view object rather than from any item in it, which
+    /// is why it cannot be had from <see cref="TryShow"/>.
+    /// </summary>
+    public static bool TryShowForFolderBackground(
+        string folderPath,
+        HwndSource source,
+        int screenX,
+        int screenY,
+        bool extended,
+        IReadOnlyList<ShellMenuEntry>? appCommands,
+        out uint chosenAppCommand)
+    {
+        chosenAppCommand = 0;
+        if (!Directory.Exists(folderPath))
+        {
+            return false;
+        }
+
+        var absolutePidl = IntPtr.Zero;
+        IShellFolder? parentFolder = null;
+        IShellFolder? folder = null;
+        IContextMenu? contextMenu = null;
+
+        try
+        {
+            if (SHParseDisplayName(folderPath, IntPtr.Zero, out absolutePidl, 0, out _) != 0
+                || absolutePidl == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            var folderId = IidShellFolder;
+            if (SHBindToParent(absolutePidl, ref folderId, out parentFolder, out var childPidl) != 0
+                || parentFolder is null
+                || childPidl == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            folderId = IidShellFolder;
+            if (parentFolder.BindToObject(childPidl, IntPtr.Zero, ref folderId, out var folderPointer) != 0
+                || folderPointer == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            folder = Marshal.GetObjectForIUnknown(folderPointer) as IShellFolder;
+            Marshal.Release(folderPointer);
+            if (folder is null)
+            {
+                return false;
+            }
+
+            var menuId = IidContextMenu;
+            if (folder.CreateViewObject(source.Handle, ref menuId, out var menuPointer) != 0
+                || menuPointer == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            contextMenu = Marshal.GetObjectForIUnknown(menuPointer) as IContextMenu;
+            Marshal.Release(menuPointer);
+            if (contextMenu is null)
+            {
+                return false;
+            }
+
+            return Present(contextMenu, source, screenX, screenY, extended, appCommands, folderPath, out chosenAppCommand);
+        }
+        catch (COMException)
+        {
+            return false;
+        }
+        finally
+        {
+            ReleaseComObject(contextMenu);
+            ReleaseComObject(folder);
+            ReleaseComObject(parentFolder);
+
+            if (absolutePidl != IntPtr.Zero)
+            {
+                ILFree(absolutePidl);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Builds the popup for a menu the Shell has handed over, shows it, and
+    /// invokes whatever was chosen.  Identical for an item menu and a folder
+    /// background menu; only where the <see cref="IContextMenu"/> came from
+    /// differs.
+    /// </summary>
+    private static bool Present(
+        IContextMenu contextMenu,
+        HwndSource source,
+        int screenX,
+        int screenY,
+        bool extended,
+        IReadOnlyList<ShellMenuEntry>? appCommands,
+        string? workingDirectory,
+        out uint chosenAppCommand)
+    {
+        chosenAppCommand = 0;
+        var menuHandle = IntPtr.Zero;
+        HwndSourceHook? hook = null;
+
+        try
+        {
             menuHandle = CreatePopupMenu();
             if (menuHandle == IntPtr.Zero)
             {
@@ -158,13 +283,13 @@ internal static class ShellContextMenu
                 AppendEntries(menuHandle, appCommands);
             }
 
-            contextMenu2 = contextMenu as IContextMenu2;
-            contextMenu3 = contextMenu as IContextMenu3;
-
             // Owner-draw entries (icons, "Open with" thumbnails, cascading
             // shell extensions) only paint if these messages reach the menu.
-            var menu2 = contextMenu2;
-            var menu3 = contextMenu3;
+            // These are QueryInterface aliases of the same wrapper, so they are
+            // never released separately: that over-release is itself a double
+            // free.  The caller releases the one wrapper.
+            var menu2 = contextMenu as IContextMenu2;
+            var menu3 = contextMenu as IContextMenu3;
             hook = (IntPtr _, int message, IntPtr wParam, IntPtr lParam, ref bool handled) =>
             {
                 switch (message)
@@ -205,7 +330,7 @@ internal static class ShellContextMenu
 
             if (command >= CmdFirst && command <= CmdLast)
             {
-                Invoke(contextMenu, source.Handle, command - CmdFirst, parentDirectory, screenX, screenY);
+                Invoke(contextMenu, source.Handle, command - CmdFirst, workingDirectory, screenX, screenY);
             }
             else if (command >= AppCommandFirst)
             {
@@ -213,10 +338,6 @@ internal static class ShellContextMenu
             }
 
             return true;
-        }
-        catch (COMException)
-        {
-            return false;
         }
         finally
         {
@@ -228,19 +349,6 @@ internal static class ShellContextMenu
             if (menuHandle != IntPtr.Zero)
             {
                 DestroyMenu(menuHandle);
-            }
-
-            // contextMenu2 and contextMenu3 are QueryInterface aliases of the very
-            // same runtime callable wrapper, so they must NOT be released
-            // separately: that over-release is itself a double free.
-            contextMenu3 = null;
-            contextMenu2 = null;
-            ReleaseComObject(contextMenu);
-            ReleaseComObject(parentFolder);
-
-            foreach (var pidl in absolutePidls)
-            {
-                ILFree(pidl);
             }
         }
     }

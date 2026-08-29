@@ -519,6 +519,7 @@
                      "what is where"; this answers "where is the one called X",
                      which is the half a canvas is bad at. -->
                 <Border x:Name="FolderListPanel"
+                        PreviewMouseRightButtonUp="FolderListPanel_PreviewMouseRightButtonUp"
                         Width="320"
                         Height="380"
                         HorizontalAlignment="Left"

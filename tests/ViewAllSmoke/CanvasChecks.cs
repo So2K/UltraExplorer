@@ -349,6 +349,29 @@ internal static partial class Program
                 graph.Nodes.Where(item => item.IsTreeVisible && before.ContainsKey(item.FullPath))
                     .All(item => (item.Location - before[item.FullPath]).Length < 1e-9));
 
+            // 4b. Every folder owns a rectangle, so a point in it belongs to that
+            //     folder - the innermost one, since the rectangles nest.  This is
+            //     what lets a right-click on empty canvas know which folder a new
+            //     file should be created in.
+            var one = node.Children.First(child => child.DisplayName == "one");
+            var oneBlock = one.ChildBlock!.Value.BoundsFor(one.Location);
+            var insideOne = new Point(oneBlock.Right - 4, oneBlock.Bottom - 4);
+            Check("a point in a folder's area belongs to that folder",
+                ReferenceEquals(graph.FolderAt(insideOne), one));
+
+            var rootBlock = node.ChildBlock!.Value.BoundsFor(node.Location);
+            Check("the innermost folder wins over the one containing it",
+                rootBlock.Contains(insideOne) && !ReferenceEquals(graph.FolderAt(insideOne), node));
+
+            Check("a point on a folder's own node is that folder",
+                ReferenceEquals(graph.FolderAt(new Point(one.Location.X + 2, one.Location.Y + 2)), one));
+            Check("a point on empty canvas belongs to nothing",
+                graph.FolderAt(new Point(-90_000, -90_000)) is null);
+
+            var justOutside = new Point(rootBlock.Right + 40, rootBlock.Bottom + 40);
+            Check("and neither does a point just outside every block",
+                graph.FolderAt(justOutside) is null);
+
             // 5. The harness and the per-child lines are two pictures of the
             //    same link.  Drawing both is what put a line across every block,
             //    and it came back the moment the layout was held over a batch of

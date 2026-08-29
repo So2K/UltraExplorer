@@ -738,6 +738,57 @@ public sealed class ViewAllGraphService : IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Works out which links the harness carries and which draw their own line.
+    /// Dragging a node changes that - a node pulled out of its block is no longer
+    /// one of the children the block was laid out for - and a drag does not go
+    /// through any of the graph operations that recompute it.  Without this the
+    /// node was left with no line at all: the harness had let go of it, and its
+    /// own connection was still hidden from back when the harness carried it.
+    /// </summary>
+    public void RefreshLinks()
+    {
+        ThrowIfDisposed();
+        UpdateEdgeVisibility();
+        LayoutChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// The folder whose area a point falls in: the folder itself if the point is
+    /// on its node, otherwise the innermost folder whose block of children
+    /// surrounds it.  Blocks nest, so a click inside a sub-folder's frame belongs
+    /// to that sub-folder and not to the drive three levels above it.
+    /// </summary>
+    public ViewAllNodeViewModel? FolderAt(Point graphPoint)
+    {
+        ViewAllNodeViewModel? area = null;
+        foreach (var node in _nodes)
+        {
+            if (!node.IsTreeVisible || node.IsUserHidden)
+            {
+                continue;
+            }
+
+            if (node.IsDirectory && node.HasLayoutPosition && node.Bounds.Contains(graphPoint))
+            {
+                return node;
+            }
+
+            if (node.ChildBlock is not { } block
+                || !block.BoundsFor(node.Location).Contains(graphPoint))
+            {
+                continue;
+            }
+
+            if (area is null || node.Depth > area.Depth)
+            {
+                area = node;
+            }
+        }
+
+        return area;
+    }
+
     /// <summary>Folders the user has hidden, whether or not their node exists.</summary>
     public IReadOnlyCollection<string> HiddenPaths => _hiddenPaths;
 

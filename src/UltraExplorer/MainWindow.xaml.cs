@@ -551,6 +551,60 @@ public partial class MainWindow : Window
             FolderListItems,
             e.GetPosition(FolderListItems),
             includeCanvasCommands: false);
+
+        // Rename, delete, a new file from a shell extension - the list cannot
+        // know which, so it looks again either way.
+        _ = _viewModel.Tree.RefreshFolderListAsync();
+    }
+
+    /// <summary>
+    /// Right-clicking the empty part of the list gets the folder's own menu -
+    /// New, Paste, Properties and whatever the shell extensions add - which is
+    /// what Explorer does with the empty part of a folder.
+    /// </summary>
+    private void FolderListPanel_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (RowUnder(e) is not null)
+        {
+            // A row has its own menu; that handler runs first and marks it.
+            return;
+        }
+
+        var folder = _viewModel.Tree.FolderList.FolderPath;
+        if (folder.Length == 0 || PresentationSource.FromVisual(this) is not HwndSource source)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        var screenPoint = FolderListPanel.PointToScreen(e.GetPosition(FolderListPanel));
+
+        try
+        {
+            if (NativeShellService.TryShowFolderBackgroundMenu(
+                    folder,
+                    source,
+                    screenPoint,
+                    Keyboard.Modifiers.HasFlag(ModifierKeys.Shift),
+                    null,
+                    out _))
+            {
+                // Whatever it did - a new file, a paste - the list has to look again.
+                _ = _viewModel.Tree.RefreshFolderListAsync();
+                return;
+            }
+        }
+        catch (Exception exception)
+        {
+            _viewModel.Toast.ShowError($"Windows context menu failed: {exception.Message}");
+        }
+
+        // No Shell menu for this folder: the app's own is better than nothing.
+        var menu = new ContextMenu { PlacementTarget = FolderListPanel };
+        AddCommandItem(menu, "New folder", "\uE8F4", _viewModel.NewFolderCommand, "Ctrl+Shift+N");
+        AddCommandItem(menu, "New text file", "\uE8A5", _viewModel.NewTextFileCommand);
+        AddCommandItem(menu, "Paste", "\uE77F", _viewModel.PasteCommand, "Ctrl+V");
+        menu.IsOpen = true;
     }
 
     /// <summary>The folder-list row the mouse is over, or null between rows.</summary>
@@ -627,7 +681,7 @@ public partial class MainWindow : Window
         }
 
         e.Handled = true;
-        ShowCanvasMenu(e.GetPosition(Editor));
+        ShowCanvasMenu(e.GetPosition(Editor), Editor.GetLocationInsideEditor(e));
     }
 
     // ---- Drag and drop -----------------------------------------------------
@@ -883,12 +937,38 @@ public partial class MainWindow : Window
         menu.Items.Add(group);
     }
 
-    private void ShowCanvasMenu(Point point)
+    private void ShowCanvasMenu(Point point, Point graphPoint)
     {
+        // Every folder owns a rectangle on the canvas, so a right-click inside one
+        // is a right-click "in" that folder - which is where a new file belongs.
+        // Blocks nest, so this is the innermost one the click landed in.
+        if (_viewModel.Tree.FolderAt(graphPoint) is { IsDirectory: true } area)
+        {
+            _viewModel.Tree.SetActiveFolder(area);
+        }
+
+        var where = _viewModel.Tree.ActiveNode is { IsDirectory: true } folder
+            ? folder.DisplayName
+            : null;
+
         var menu = new ContextMenu { PlacementTarget = Editor };
-        AddCommandItem(menu, "New folder", "\uE8F4", _viewModel.NewFolderCommand, "Ctrl+Shift+N");
-        AddCommandItem(menu, "New text file", "\uE8A5", _viewModel.NewTextFileCommand);
-        AddCommandItem(menu, "Paste", "\uE77F", _viewModel.PasteCommand, "Ctrl+V");
+        AddCommandItem(
+            menu,
+            where is null ? "New folder" : $"New folder in {where}",
+            "\uE8F4",
+            _viewModel.NewFolderCommand,
+            "Ctrl+Shift+N");
+        AddCommandItem(
+            menu,
+            where is null ? "New text file" : $"New text file in {where}",
+            "\uE8A5",
+            _viewModel.NewTextFileCommand);
+        AddCommandItem(
+            menu,
+            where is null ? "Paste" : $"Paste into {where}",
+            "\uE77F",
+            _viewModel.PasteCommand,
+            "Ctrl+V");
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");

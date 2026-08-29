@@ -177,6 +177,11 @@ public partial class MainWindow
         _nodeDragExcluded = [];
         ClearNodeDropTarget();
 
+        // Wherever the nodes ended up, which links the harness carries has to be
+        // decided again: a node dragged out of its block keeps its own line, and
+        // one dropped back into it gives it up.
+        _viewModel.Tree.NotifyNodesMoved();
+
         if (!committed || target is null || action == NodeDropAction.None)
         {
             return;

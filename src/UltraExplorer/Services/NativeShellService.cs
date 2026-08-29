@@ -29,6 +29,26 @@ public sealed class NativeShellService
             appCommands,
             out chosenAppCommand);
 
+    /// <summary>
+    /// The menu Explorer shows on the empty part of a folder, for the folder the
+    /// list is looking at.
+    /// </summary>
+    public static bool TryShowFolderBackgroundMenu(
+        string folderPath,
+        HwndSource source,
+        System.Windows.Point screenPoint,
+        bool extended,
+        IReadOnlyList<ShellMenuEntry>? appCommands,
+        out uint chosenAppCommand)
+        => ShellContextMenu.TryShowForFolderBackground(
+            folderPath,
+            source,
+            (int)screenPoint.X,
+            (int)screenPoint.Y,
+            extended,
+            appCommands,
+            out chosenAppCommand);
+
     public static void Open(string path)
     {
         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
