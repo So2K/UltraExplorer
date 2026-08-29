@@ -23,27 +23,27 @@ internal static partial class Program
 
         var alpha = node.Children.First(child => child.DisplayName == "alpha");
         await graph.ExpandAsync(alpha);
-        var alphaBounds = alpha.Bounds;
-        var childBounds = alpha.Children.Select(child => child.Bounds).ToArray();
-
         Check("a folder starts visible", alpha.IsTreeVisible && !alpha.IsUserHidden);
-        Check("its space is taken", graph.Index.IsOccupied(alphaBounds));
+        Check("its space is taken", IsIndexed(graph.Index, alpha));
 
         graph.Hide(alpha);
         Check("hiding takes the folder off the canvas", !alpha.IsTreeVisible && alpha.IsUserHidden);
         Check("and everything under it", alpha.Children.All(child => !child.IsTreeVisible));
 
-        // The point of hiding is the room, not just the pixels.
-        Check("the space it took is free again", !graph.Index.IsOccupied(alphaBounds));
+        // The point of hiding is the room, not just the pixels: the folder leaves
+        // the grid, and the tree closes over the gap it left.  Asking whether its
+        // old rectangle is empty would be the wrong question now - a sibling has
+        // very likely moved into it, which is exactly what should happen.
+        Check("the space it took is free again", !IsIndexed(graph.Index, alpha));
         Check("so is the space its children took",
-            childBounds.All(bounds => !graph.Index.IsOccupied(bounds)));
+            alpha.Children.All(child => !IsIndexed(graph.Index, child)));
         Check("it is listed as hidden",
             graph.HiddenPaths.Contains(alpha.FullPath, StringComparer.OrdinalIgnoreCase));
 
         // Dragging the parent offsets every descendant, hidden ones included.
         node.Location = new Point(node.Location.X + 700, node.Location.Y + 400);
         Check("dragging an ancestor does not put a hidden branch back in the way",
-            !graph.Index.IsOccupied(alpha.Bounds));
+            !IsIndexed(graph.Index, alpha));
 
         graph.CollapseAll();
         await graph.ExpandAsync(node);
@@ -66,7 +66,7 @@ internal static partial class Program
         await reopened.ExpandAsync(reopenedRoot);
         var reopenedAlpha = reopenedRoot.Children.FirstOrDefault(child => child.DisplayName == "alpha");
         Check("a hidden folder comes back hidden", reopenedAlpha is { IsUserHidden: true, IsTreeVisible: false });
-        Check("and takes no space", reopenedAlpha is null || !reopened.Index.IsOccupied(reopenedAlpha.Bounds));
+        Check("and takes no space", reopenedAlpha is null || !IsIndexed(reopened.Index, reopenedAlpha));
         Check("its siblings are laid out as if it were not there",
             reopenedRoot.Children.Where(child => !child.IsUserHidden).All(child => child.HasLayoutPosition));
 
@@ -150,10 +150,10 @@ internal static partial class Program
         var wide = node.Children.First(child => child.DisplayName == "wide");
         await graph.ExpandAsync(wide);
 
-        Check("a wrapped folder records the lattice its children were placed on",
-            wide.ChildBlocks.Count == 1);
-        var block = wide.ChildBlocks[0];
-        Check("the lattice has more than one row", block.Rows > 1);
+        Check("a wrapped folder records the rectangle its children were placed in",
+            wide.ChildBlock is not null);
+        var block = wide.ChildBlock!.Value;
+        Check("the block has more than one row", block.Rows > 1);
         Check("it reserves a lane on each side", block.Lane > 0);
         Check("its bounds hold every child",
             wide.Children.All(child => block.BoundsFor(wide.Location).Contains(child.Bounds)));
@@ -176,6 +176,14 @@ internal static partial class Program
         Check("the trunk lane holds no child",
             wide.Children.All(child => child.Bounds.Left > trunkX + 0.001));
 
+        // The link down from the folder has to land on a run, not next to one.
+        var stub = harness.Segments[0];
+        var firstRun = harness.Segments.First(segment =>
+            segment.IsHorizontal && Math.Abs(segment.From.Y - stub.To.Y) < 0.001);
+        Check("the link down from the folder lands on the first run",
+            stub.To.X >= Math.Min(firstRun.From.X, firstRun.To.X) - 0.001
+            && stub.To.X <= Math.Max(firstRun.From.X, firstRun.To.X) + 0.001);
+
         Check("every segment stays inside the reserved area",
             harness.Segments.All(segment =>
                 block.BoundsFor(wide.Location).Contains(segment.To)
@@ -183,32 +191,286 @@ internal static partial class Program
                 || block.BoundsFor(wide.Location).Contains(segment.From)));
 
         // Dragging the folder must carry the whole harness with it, because the
-        // lattice is recorded as an offset rather than as absolute points.
+        // rectangle is recorded as an offset rather than as absolute points.
         var before = harness.Segments.Select(segment => segment.From).ToArray();
         var delta = new Vector(300, -140);
         wide.Location = wide.Location + delta;
-        var moved = ViewAllHarnessGeometry.Build(wide, wide.ChildBlocks[0], tickLimit: 64);
+        var moved = ViewAllHarnessGeometry.Build(wide, wide.ChildBlock!.Value, tickLimit: 64);
         Check("the harness moves with the folder",
             moved.Segments.Select(segment => segment.From)
                 .Zip(before, (now, then) => (now - (then + delta)).Length)
                 .All(error => error < 1e-6));
 
         // Past the limit a line to each child was never readable anyway.
-        var few = ViewAllHarnessGeometry.Build(wide, wide.ChildBlocks[0], tickLimit: 4);
+        var few = ViewAllHarnessGeometry.Build(wide, wide.ChildBlock!.Value, tickLimit: 4);
         Check("a big folder draws a trunk but no ticks", few.Ticks == 0 && few.Horizontals == 0);
         Check("and still draws its stub and trunk", few.Segments.Count == 2);
 
-        // A child that was dragged has left the lattice and keeps its own line.
+        // A child that was dragged has left the block and keeps its own line.
         var exile = wide.Children[0];
         exile.Location = new Point(20_000, 20_000);
-        var afterExile = ViewAllHarnessGeometry.Build(wide, wide.ChildBlocks[0], tickLimit: 64);
+        var afterExile = ViewAllHarnessGeometry.Build(wide, wide.ChildBlock!.Value, tickLimit: 64);
         Check("a hand-placed child leaves the harness",
             afterExile.Ticks == wide.Children.Count - 1);
 
         var small = node.Children.First(child => child.DisplayName == "alpha");
         await graph.ExpandAsync(small);
-        Check("a folder that fits on one row records a lattice with no lane",
-            small.ChildBlocks.Count == 1 && small.ChildBlocks[0].Rows == 1 && small.ChildBlocks[0].Lane == 0);
+        Check("a folder that fits on one row records a block with no lane",
+            small.ChildBlock is { Rows: 1, Lane: 0 });
+    }
+
+    /// <summary>
+    /// The property the whole layout rests on: every folder owns a rectangle,
+    /// and nothing that is not inside that folder may enter it.  With several
+    /// folders open at once this is the difference between a tree and a soup -
+    /// it is what stops two branches interleaving, two frames crossing, and a
+    /// link running through a folder it has nothing to do with.
+    /// </summary>
+    private static async Task TidyTree()
+    {
+        Section("tidy tree");
+
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerTree", Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(root);
+            BuildTreeFixture(root);
+
+            using var graph = new ViewAllGraphService();
+            await graph.InitializeAsync();
+            var node = (await graph.AddRootAsync(root))!;
+            await graph.ExpandAsync(node);
+
+            // Several folders open at once is the case that used to collapse.
+            foreach (var name in new[] { "one", "two", "three" })
+            {
+                await graph.ExpandAsync(node.Children.First(child => child.DisplayName == name));
+            }
+
+            var visible = graph.Nodes.Where(item => item.IsTreeVisible && item.HasLayoutPosition).ToArray();
+            Check("every folder that was opened has a block",
+                visible.Where(item => item.IsExpanded && item.Children.Count > 0)
+                    .All(item => item.ChildBlock is not null));
+
+            // 1. A child's whole subtree is inside its parent's block.
+            var contained = true;
+            foreach (var parent in visible.Where(item => item.ChildBlock is not null))
+            {
+                var bounds = parent.ChildBlock!.Value.BoundsFor(parent.Location);
+                foreach (var child in parent.Children.Where(item => item.IsTreeVisible))
+                {
+                    if (!bounds.Contains(SubtreeBounds(child)))
+                    {
+                        contained = false;
+                    }
+                }
+            }
+
+            Check("a child's whole subtree stays inside its parent's block", contained);
+
+            // 2. No two subtrees that are not related overlap.  This is the one
+            //    that used to fail: blocks reserved room the index never knew
+            //    about, so two folders interlocked as long as no node touched a
+            //    node.
+            var boxes = visible.Select(item => (Node: item, Box: SubtreeBounds(item))).ToArray();
+            var crossing = 0;
+            for (var i = 0; i < boxes.Length; i++)
+            {
+                for (var j = i + 1; j < boxes.Length; j++)
+                {
+                    if (IsRelated(boxes[i].Node, boxes[j].Node))
+                    {
+                        continue;
+                    }
+
+                    if (boxes[i].Box.IntersectsWith(boxes[j].Box))
+                    {
+                        crossing++;
+                    }
+                }
+            }
+
+            Check("two unrelated subtrees never overlap", crossing == 0);
+
+            // 3. No link a folder draws touches a node that is not its own child.
+            var struck = 0;
+            foreach (var parent in visible.Where(item => item.ChildBlock is { Rows: > 1 }))
+            {
+                var harness = ViewAllHarnessGeometry.Build(parent, parent.ChildBlock!.Value, 64);
+                foreach (var segment in harness.Segments)
+                {
+                    foreach (var other in visible)
+                    {
+                        if (ReferenceEquals(other, parent) || ReferenceEquals(other.Parent, parent))
+                        {
+                            continue;
+                        }
+
+                        if (Crosses(segment, other.Bounds))
+                        {
+                            struck++;
+                        }
+                    }
+                }
+            }
+
+            Check("no link crosses a node it does not belong to", struck == 0);
+
+            // 4. The pass is deterministic, which is what lets a refresh, a
+            //    reload or a second run leave the canvas exactly where it was.
+            var before = visible.ToDictionary(item => item.FullPath, item => item.Location);
+            graph.Relayout();
+            Check("laying out again produces the same canvas",
+                visible.All(item => (item.Location - before[item.FullPath]).Length < 1e-9));
+
+            var refreshed = node.Children.First(child => child.DisplayName == "two");
+            await graph.RefreshBranchAsync(refreshed);
+            Check("refreshing a branch does not rearrange the canvas",
+                graph.Nodes.Where(item => item.IsTreeVisible && before.ContainsKey(item.FullPath))
+                    .All(item => (item.Location - before[item.FullPath]).Length < 1e-9));
+
+            // 5. The harness and the per-child lines are two pictures of the
+            //    same link.  Drawing both is what put a line across every block,
+            //    and it came back the moment the layout was held over a batch of
+            //    expansions - which is exactly what restoring a session does.
+            Check("a link the harness carries is not drawn twice", DoubledLinks(graph) == 0);
+
+            var saved = graph.CaptureState(new ViewAllViewportState(new Point(0, 0), 1));
+            using (var reopened = new ViewAllGraphService())
+            {
+                await reopened.InitializeAsync(saved);
+                Check("a restored session opens the same folders",
+                    reopened.Nodes.Count(item => item.IsExpanded) == graph.Nodes.Count(item => item.IsExpanded));
+                Check("and does not draw its links twice", DoubledLinks(reopened) == 0);
+                Check("and every folder it opened has a block",
+                    reopened.Nodes
+                        .Where(item => item.IsExpanded && item.IsTreeVisible && item.Children.Count > 0)
+                        .All(item => item.ChildBlock is not null));
+            }
+
+            // 6. A collapsed branch stops reserving room.  It used to stay in
+            //    the grid and push later expansions around nodes nobody could
+            //    see.
+            var closed = node.Children.First(child => child.DisplayName == "one");
+            var indexedBefore = graph.Index.Count;
+            graph.Collapse(closed);
+            Check("collapsing gives the space back",
+                graph.Index.Count == indexedBefore - closed.Children.Count);
+
+            // 7. The root still holds everything it started with.
+            var rowsOf = node.ChildBlock!.Value;
+            Check("the root still holds every child in one block",
+                node.Children.Where(child => child.IsTreeVisible)
+                    .All(child => rowsOf.BoundsFor(node.Location).Contains(child.Bounds)));
+        }
+        finally
+        {
+            TryDelete(root);
+        }
+    }
+
+    private static void BuildTreeFixture(string root)
+    {
+        for (var index = 0; index < 9; index++)
+        {
+            File.WriteAllText(Path.Combine(Directory.CreateDirectory(
+                Path.Combine(root, "one")).FullName, $"one-{index}.txt"), "x");
+        }
+
+        for (var index = 0; index < 14; index++)
+        {
+            File.WriteAllText(Path.Combine(Directory.CreateDirectory(
+                Path.Combine(root, "two")).FullName, $"two-{index}.txt"), "x");
+        }
+
+        for (var index = 0; index < 5; index++)
+        {
+            File.WriteAllText(Path.Combine(Directory.CreateDirectory(
+                Path.Combine(root, "three")).FullName, $"three-{index}.txt"), "x");
+        }
+
+        Directory.CreateDirectory(Path.Combine(root, "four"));
+        for (var index = 0; index < 8; index++)
+        {
+            File.WriteAllText(Path.Combine(root, $"plain-{index}.txt"), "x");
+        }
+    }
+
+    /// <summary>
+    /// Links that are drawn by the harness and by their own connection at the
+    /// same time.  There should never be any: one link, one line.
+    /// </summary>
+    private static int DoubledLinks(ViewAllGraphService graph) =>
+        graph.Edges.Count(edge =>
+            edge.IsTreeVisible
+            && edge.Source.ChildBlock is { Rows: > 1 } block
+            && block.Holds(edge.Source.Location, edge.Target));
+
+    /// <summary>
+    /// Whether the grid still holds this node.  The grid is what culling, hit
+    /// testing and drop targets read, so "is it out of the way" means "is it out
+    /// of the grid" - not "is its old rectangle still empty".
+    /// </summary>
+    private static bool IsIndexed(ViewAllSpatialIndex index, ViewAllNodeViewModel node)
+    {
+        var found = new List<ViewAllNodeViewModel>();
+        index.Query(node.Bounds, found);
+        return found.Contains(node);
+    }
+
+    /// <summary>The rectangle a node and everything visible under it occupies.</summary>
+    private static Rect SubtreeBounds(ViewAllNodeViewModel node)
+    {
+        var bounds = node.Bounds;
+        foreach (var child in node.Children)
+        {
+            if (child.IsTreeVisible && child.HasLayoutPosition)
+            {
+                bounds.Union(SubtreeBounds(child));
+            }
+        }
+
+        return bounds;
+    }
+
+    private static bool IsRelated(ViewAllNodeViewModel left, ViewAllNodeViewModel right)
+    {
+        for (var walk = left; walk is not null; walk = walk.Parent)
+        {
+            if (ReferenceEquals(walk, right))
+            {
+                return true;
+            }
+        }
+
+        for (var walk = right; walk is not null; walk = walk.Parent)
+        {
+            if (ReferenceEquals(walk, left))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a straight run passes through a rectangle.  Every run is either
+    /// horizontal or vertical, so this is two interval tests rather than a
+    /// general segment-rectangle intersection.
+    /// </summary>
+    private static bool Crosses(ViewAllHarnessSegment segment, Rect box)
+    {
+        var left = Math.Min(segment.From.X, segment.To.X);
+        var right = Math.Max(segment.From.X, segment.To.X);
+        var top = Math.Min(segment.From.Y, segment.To.Y);
+        var bottom = Math.Max(segment.From.Y, segment.To.Y);
+
+        const double Tolerance = 0.001;
+        return right > box.Left + Tolerance
+            && left < box.Right - Tolerance
+            && bottom > box.Top + Tolerance
+            && top < box.Bottom - Tolerance;
     }
 
     private static async Task FolderColours(string root)

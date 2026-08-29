@@ -169,7 +169,7 @@ public sealed class ViewAllHarnessLayer : FrameworkElement
                 _parents.Add(parent);
             }
 
-            if (node.IsExpanded && node.IsTreeVisible && node.ChildBlocks.Count > 0)
+            if (node.IsExpanded && node.IsTreeVisible && node.ChildBlock is not null)
             {
                 _parents.Add(node);
             }
@@ -183,55 +183,52 @@ public sealed class ViewAllHarnessLayer : FrameworkElement
         {
             foreach (var parent in _parents)
             {
-                foreach (var block in parent.ChildBlocks)
+                // One row of children already fans straight down from the parent
+                // and reads fine; those keep their own connections.
+                if (parent.ChildBlock is not { Rows: > 1 } block || !parent.IsExpanded)
                 {
-                    // One row of children already fans straight down from the
-                    // parent and reads fine; those keep their own connections.
-                    if (block.Rows <= 1 || !parent.IsExpanded)
+                    continue;
+                }
+
+                if (!window.IntersectsWith(block.BoundsFor(parent.Location)))
+                {
+                    continue;
+                }
+
+                var built = ViewAllHarnessGeometry.Build(parent, block, TickLimit);
+                DrawnHorizontals += built.Horizontals;
+
+                var colour = parent.BranchColor;
+                if (!contexts.TryGetValue(colour, out var context))
+                {
+                    var geometry = new StreamGeometry();
+                    links[colour] = geometry;
+                    context = geometry.Open();
+                    contexts[colour] = context;
+                }
+
+                foreach (var segment in built.Segments)
+                {
+                    context.BeginFigure(segment.From, isFilled: false, isClosed: false);
+                    context.LineTo(segment.To, isStroked: true, isSmoothJoin: false);
+                }
+
+                _labels.Add(new BlockLabel(
+                    new Point(built.Frame.Left, built.Frame.Top),
+                    built.Frame.Width,
+                    parent.DisplayName,
+                    colour));
+
+                if (DrawFrames)
+                {
+                    if (!frames.TryGetValue(colour, out var group))
                     {
-                        continue;
+                        group = new GeometryGroup();
+                        frames[colour] = group;
                     }
 
-                    if (!window.IntersectsWith(block.BoundsFor(parent.Location)))
-                    {
-                        continue;
-                    }
-
-                    var built = ViewAllHarnessGeometry.Build(parent, block, TickLimit);
-                    DrawnHorizontals += built.Horizontals;
-
-                    var colour = parent.BranchColor;
-                    if (!contexts.TryGetValue(colour, out var context))
-                    {
-                        var geometry = new StreamGeometry();
-                        links[colour] = geometry;
-                        context = geometry.Open();
-                        contexts[colour] = context;
-                    }
-
-                    foreach (var segment in built.Segments)
-                    {
-                        context.BeginFigure(segment.From, isFilled: false, isClosed: false);
-                        context.LineTo(segment.To, isStroked: true, isSmoothJoin: false);
-                    }
-
-                    _labels.Add(new BlockLabel(
-                        new Point(built.Frame.Left, built.Frame.Top),
-                        built.Frame.Width,
-                        parent.DisplayName,
-                        colour));
-
-                    if (DrawFrames)
-                    {
-                        if (!frames.TryGetValue(colour, out var group))
-                        {
-                            group = new GeometryGroup();
-                            frames[colour] = group;
-                        }
-
-                        var corner = 6 * block.Scale;
-                        group.Children.Add(new RectangleGeometry(built.Frame, corner, corner));
-                    }
+                    var corner = 6 * block.Scale;
+                    group.Children.Add(new RectangleGeometry(built.Frame, corner, corner));
                 }
             }
         }

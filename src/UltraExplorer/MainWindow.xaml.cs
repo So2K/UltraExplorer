@@ -71,6 +71,7 @@ public partial class MainWindow : Window
         _viewModel.ContextMenuRequested += ShowContextMenu;
         _viewModel.Tree.FocusNodeRequested += FocusNode;
         _viewModel.Tree.GraphInvalidated += OnGraphInvalidated;
+        _viewModel.Tree.ViewShiftRequested += OnViewShiftRequested;
 
         ConfigureNodeDrag();
 
@@ -400,6 +401,25 @@ public partial class MainWindow : Window
             Editor.ViewportSize,
             Editor.ViewportZoom,
             _viewModel.Tree.DetailLevel);
+    }
+
+    /// <summary>
+    /// Follows the tree when it moves under the cursor.  Opening a folder makes
+    /// room for what came out of it, which shifts the folder itself; panning by
+    /// the same vector leaves it exactly where the user was looking, and the new
+    /// children appear beneath it rather than the whole canvas jumping.
+    /// </summary>
+    private void OnViewShiftRequested(Vector delta)
+    {
+        if (Math.Abs(delta.X) < 0.001 && Math.Abs(delta.Y) < 0.001)
+        {
+            return;
+        }
+
+        Editor.ViewportLocation = new Point(
+            Editor.ViewportLocation.X + delta.X,
+            Editor.ViewportLocation.Y + delta.Y);
+        PushViewport();
     }
 
     private void OnGraphInvalidated()

@@ -74,6 +74,7 @@ internal static partial class Program
         await HiddenBranches(fixtureRoot);
         await TidyLayout(fixtureRoot);
         await Harness(fixtureRoot);
+        await TidyTree();
         await FolderColours(fixtureRoot);
         await EverythingSearch();
         await ProgramTargets();
@@ -207,7 +208,6 @@ internal static partial class Program
         await graph.ExpandAsync(node);
         var alpha = node.Children.First(child => child.DisplayName == "alpha");
         await graph.ExpandAsync(alpha);
-        var alphaLocation = alpha.Location;
 
         var added = Path.Combine(root, "gamma");
         Directory.CreateDirectory(added);
@@ -219,7 +219,18 @@ internal static partial class Program
             var alphaAfter = node.Children.First(child => child.DisplayName == "alpha");
             Check("refresh keeps the branch expanded", alphaAfter.IsExpanded);
             Check("refresh restores grandchildren", alphaAfter.Children.Count == 3);
-            Check("refresh keeps saved coordinates", alphaAfter.Location == alphaLocation);
+
+            // A refresh that finds a new folder has to make room for it, so
+            // coordinates move.  A refresh that finds nothing new must leave the
+            // canvas alone - that is what makes F5 safe to press.
+            var settled = graph.Nodes
+                .Where(item => item.IsTreeVisible && item.HasLayoutPosition)
+                .ToDictionary(item => item.FullPath, item => item.Location);
+            await graph.RefreshBranchAsync(node);
+            Check("refreshing again moves nothing",
+                graph.Nodes
+                    .Where(item => item.IsTreeVisible && settled.ContainsKey(item.FullPath))
+                    .All(item => (item.Location - settled[item.FullPath]).Length < 1e-9));
         }
         finally
         {
@@ -299,11 +310,42 @@ internal static partial class Program
         Check("the block sits below its parent",
             wide.Children.All(child => child.Location.Y > wide.Location.Y));
 
-        var before = node.Children.Select(child => child.Location).ToArray();
         var alpha = node.Children.First(child => child.DisplayName == "alpha");
+        var openedFrom = alpha.Location;
+        var shift = new Vector(0, 0);
+        var shifts = 0;
+        graph.LayoutShifted += delta =>
+        {
+            shift = delta;
+            shifts++;
+        };
+
         await graph.ExpandAsync(alpha);
-        Check("expanding a branch does not move existing nodes",
-            node.Children.Select(child => child.Location).SequenceEqual(before));
+
+        // Opening a folder has to make room for what came out of it, so its
+        // siblings move: that is what keeps the tree tidy rather than letting a
+        // branch wander off to wherever there happened to be a gap.  What must
+        // not happen is the thing under the cursor jumping, so the graph reports
+        // how far it carried the folder and the canvas pans by the same amount.
+        Check("opening a folder reports the shift at most once", shifts <= 1);
+        Check("and reports it exactly",
+            (alpha.Location - (openedFrom + shift)).Length < 0.01);
+
+        var overlappingAfterExpand = false;
+        var afterExpand = graph.Nodes.Where(item => item.IsTreeVisible && item.HasLayoutPosition).ToArray();
+        for (var i = 0; i < afterExpand.Length && !overlappingAfterExpand; i++)
+        {
+            for (var j = i + 1; j < afterExpand.Length; j++)
+            {
+                if (afterExpand[i].Bounds.IntersectsWith(afterExpand[j].Bounds))
+                {
+                    overlappingAfterExpand = true;
+                    break;
+                }
+            }
+        }
+
+        Check("and the tree is still tidy afterwards", !overlappingAfterExpand);
 
         // Anything caching drawn geometry has to hear about a move, otherwise a
         // drag only shows up after the next pan or zoom.
@@ -313,6 +355,9 @@ internal static partial class Program
         // Dragging a node has to carry its whole subtree, so dragging a drive
         // drags its tree.
         var beforeDrag = alpha.Children.Select(child => child.Location).ToArray();
+        var siblingsBefore = node.Children
+            .Where(child => child != alpha)
+            .ToDictionary(child => child.FullPath, child => child.Location);
         var dragDelta = new Vector(500, 300);
         alpha.Location = alpha.Location + dragDelta;
         // The delta is recovered by subtracting two large coordinates, so the
@@ -327,7 +372,7 @@ internal static partial class Program
             layoutSignals >= 1 + alpha.Children.Count);
         Check("siblings of the dragged node stay put",
             node.Children.Where(child => child != alpha)
-                .All(child => child.Location.Y == node.Children.First(other => other != alpha).Location.Y));
+                .All(child => child.Location == siblingsBefore[child.FullPath]));
 
         var manual = new Point(4321, 1234);
         alpha.Location = manual;
@@ -529,9 +574,11 @@ internal static partial class Program
             false,
             null,
             DateTime.UnixEpoch);
-        var parent = new ViewAllNodeViewModel(parentEntry, 0);
-        parent.SetAutomaticLocation(new Point(0, 0));
-        layoutIndex.AddOrUpdate(parent);
+        var parent = new ViewAllNodeViewModel(parentEntry, 0)
+        {
+            IsExpanded = true,
+            LocationObserver = layoutIndex.AddOrUpdate
+        };
 
         var children = new List<ViewAllNodeViewModel>(20_000);
         for (var i = 0; i < 20_000; i++)
@@ -549,13 +596,25 @@ internal static partial class Program
                 LocationObserver = layoutIndex.AddOrUpdate
             };
             children.Add(child);
+            parent.Children.Add(child);
         }
 
         var placing = Stopwatch.StartNew();
-        layout.PlaceChildren(parent, children, layoutIndex);
+        layout.Arrange([parent]);
         placing.Stop();
         Report("laid out 20k children", placing.ElapsedMilliseconds, 4_000);
         Check("every child was placed", children.All(child => child.HasLayoutPosition));
+
+        // Every expansion lays the whole tree out again, so the second pass is
+        // the one that matters, and it has to land on exactly the same picture:
+        // otherwise opening one folder would shuffle every other one.
+        var settled = children.Select(child => child.Location).ToArray();
+        var second = Stopwatch.StartNew();
+        layout.Arrange([parent]);
+        second.Stop();
+        Report("laid them out again", second.ElapsedMilliseconds, 4_000);
+        Check("and put every one back where it was",
+            children.Select((child, index) => (child.Location - settled[index]).Length).All(error => error < 1e-9));
 
         // A row grows with the child count; a block grows with its square root.
         // Neither side of twenty thousand children may be twenty thousand long.

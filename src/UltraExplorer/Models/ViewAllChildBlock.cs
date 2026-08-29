@@ -3,36 +3,44 @@ using System.Windows;
 namespace UltraExplorer.Models;
 
 /// <summary>
-/// The lattice a folder's children were laid out on, recorded when they were
+/// The rectangle one folder's children were laid out in, recorded when they were
 /// placed.
 ///
-/// The links are drawn from this rather than from where the children happen to
-/// sit, which matters for two reasons.  It is stored as an offset from the
-/// parent, so dragging a folder moves the whole harness with it and no
-/// bookkeeping is needed.  And when the layout could not reserve a clean
-/// rectangle and fell back to placing children one by one, no record is written
-/// at all - so a comb is never drawn pointing at a lattice that is not there.
+/// It is stored as an offset from the folder rather than as absolute points, so
+/// dragging a folder carries its whole harness along and no bookkeeping is
+/// needed.  Rows are deliberately <i>not</i> recorded: a row is simply the
+/// children that share a top edge, and reading it back off the children keeps
+/// the record honest when one of them has been dragged out of it, and lets rows
+/// be different heights - which they are as soon as one child is open.
 /// </summary>
+/// <param name="Offset">Top-left of the reserved rectangle, relative to the folder.</param>
+/// <param name="Width">Reserved width, both lanes included.</param>
+/// <param name="Height">Reserved height, both half-gap bands included.</param>
+/// <param name="NodesWidth">Width of the widest row of children.</param>
+/// <param name="Lane">Width of the empty lane down each side; zero for a single row.</param>
+/// <param name="BusGap">
+/// Vertical gap between rows.  A row's horizontal run lives half of this above
+/// the row's top edge, which is the middle of the empty band.
+/// </param>
+/// <param name="Rows">How many rows the children were packed into.</param>
+/// <param name="Count">How many children the block was laid out for.</param>
+/// <param name="Scale">The size the children are drawn at, relative to a root.</param>
 public readonly record struct ViewAllChildBlock(
     Vector Offset,
-    int Columns,
+    double Width,
+    double Height,
+    double NodesWidth,
+    double Lane,
+    double BusGap,
     int Rows,
     int Count,
-    double StepX,
-    double StepY,
-    double GapX,
-    double GapY,
-    double Lane,
-    double NodesWidth,
     double Scale)
 {
     /// <summary>Top-left of the reserved rectangle, in graph coordinates.</summary>
     public Point OriginFor(Point parentLocation) => parentLocation + Offset;
 
-    /// <summary>The reserved rectangle: the lattice plus its trunk and margin lanes.</summary>
-    public Rect BoundsFor(Point parentLocation) => new(
-        OriginFor(parentLocation),
-        new Size(NodesWidth + 2 * Lane, Rows * StepY - GapY + GapY * 1.5));
+    public Rect BoundsFor(Point parentLocation) =>
+        new(OriginFor(parentLocation), new Size(Width, Height));
 
     /// <summary>Left edge of the first column of nodes.</summary>
     public double NodesLeftFor(Point parentLocation) => parentLocation.X + Offset.X + Lane;
@@ -44,29 +52,22 @@ public readonly record struct ViewAllChildBlock(
     public double MarginXFor(Point parentLocation) =>
         NodesLeftFor(parentLocation) + NodesWidth + Lane / 2;
 
-    /// <summary>Top of the nodes in row <paramref name="row"/>.</summary>
-    public double RowTopFor(Point parentLocation, int row) =>
-        parentLocation.Y + Offset.Y + GapY / 2 + row * StepY;
+    /// <summary>
+    /// Where the horizontal run for a row of children whose top edge is at
+    /// <paramref name="rowTop"/> belongs: the middle of the empty band above
+    /// them.  A row is a node plus that band, so a run here cannot touch a node.
+    /// </summary>
+    public double BusYFor(double rowTop) => rowTop - BusGap / 2;
 
     /// <summary>
-    /// Where a row's horizontal run lives: the middle of the empty band above
-    /// its nodes.  Row heights are node height plus this gap, so a run here can
-    /// never touch a node.
+    /// Whether this child is still one of the children the block was laid out
+    /// for.  A child the user dragged is not: it keeps a line of its own and
+    /// visibly detaches, instead of being claimed by a harness it has left.
     /// </summary>
-    public double BusYFor(Point parentLocation, int row) => RowTopFor(parentLocation, row) - GapY / 2;
-
-    /// <summary>Which row a child sits in, or -1 when it is not on this lattice.</summary>
-    public int RowOf(Point parentLocation, Point childLocation)
-    {
-        if (StepY <= 0)
-        {
-            return -1;
-        }
-
-        var top = parentLocation.Y + Offset.Y + GapY / 2;
-        var row = (int)Math.Round((childLocation.Y - top) / StepY);
-        return row >= 0 && row < Rows && Math.Abs(top + row * StepY - childLocation.Y) < 1
-            ? row
-            : -1;
-    }
+    public bool Holds(Point parentLocation, ViewAllNodeViewModel child) =>
+        !child.HasManualPosition
+        && child.HasLayoutPosition
+        && child.IsTreeVisible
+        && !child.IsUserHidden
+        && BoundsFor(parentLocation).Contains(child.Location);
 }

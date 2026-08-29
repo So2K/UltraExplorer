@@ -59,6 +59,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         _graph.GraphChanged += OnGraphChanged;
         _graph.NodeCreated += OnNodeCreated;
         _graph.LayoutChanged += OnLayoutChanged;
+        _graph.LayoutShifted += delta => ViewShiftRequested?.Invoke(delta);
         _marks.MarkChanged += OnMarkChanged;
 
         SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
@@ -122,6 +123,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>Raised when the graph structure changed and cached drawing is stale.</summary>
     public event Action? GraphInvalidated;
+
+    /// <summary>
+    /// How far the layout carried the folder the user just opened or closed.
+    /// The canvas pans by the same amount, so the tree grows around the thing
+    /// under the cursor instead of sliding out from under it.
+    /// </summary>
+    public event Action<Vector>? ViewShiftRequested;
 
     /// <summary>Grid the overview layer draws from.</summary>
     public ViewAllSpatialIndex SpatialIndex => _graph.Index;

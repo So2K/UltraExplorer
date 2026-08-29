@@ -80,12 +80,12 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     public ObservableCollection<ViewAllNodeViewModel> Children { get; } = [];
 
     /// <summary>
-    /// The lattices this folder's children were placed on - one per expansion,
-    /// so Load more appends a second rather than disturbing the first.  Empty
-    /// when the layout could not reserve a clean rectangle, which is the signal
-    /// to fall back to a line per child.
+    /// The rectangle this folder's children were laid out in, or null when it
+    /// holds none.  There is one per folder rather than one per expansion: the
+    /// layout is a single pass over the whole tree, so a second page of children
+    /// joins the same block instead of starting one beside it.
     /// </summary>
-    public List<ViewAllChildBlock> ChildBlocks { get; } = [];
+    public ViewAllChildBlock? ChildBlock { get; internal set; }
 
     public bool CanExpand => IsDirectory;
     public bool HasVisibleChildren => IsExpanded && Children.Any(child => child.IsTreeVisible);

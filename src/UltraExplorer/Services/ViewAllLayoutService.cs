@@ -8,19 +8,19 @@ public sealed record ViewAllLayoutOptions(
     double OriginY = 90,
     double SiblingGap = 26,
     double GenerationGap = 96,
-    double RootGap = 420,
-    double CollisionPaddingX = 14,
-    double CollisionPaddingY = 22,
 
-    /// <summary>Vertical gap between two rows of one parent's children.</summary>
+    /// <summary>Clear space left between two root trees.</summary>
+    double RootGap = 420,
+
+    /// <summary>Vertical gap between two rows of one folder's children.</summary>
     double RowGap = 34,
 
     /// <summary>
-    /// A folder small enough to read at a glance stays on one line.  Six nodes
-    /// is about 1200 units, which fits a viewport; a dozen does not, and that is
-    /// where a row stops reading as a row.
+    /// A folder with no more children than this keeps them on one line.  Four is
+    /// about 830 units - still a glance.  Six was 1250, a third of a screen, and
+    /// that is where a row stops reading as a row and starts reading as a queue.
     /// </summary>
-    int SingleRowLimit = 6,
+    int SingleRowLimit = 4,
 
     /// <summary>How many times wider than tall a block of children should be.</summary>
     double BlockAspect = 2.2,
@@ -34,270 +34,448 @@ public sealed record ViewAllLayoutOptions(
     double TrunkLane = 26);
 
 /// <summary>
-/// Top-down tree: a parent sits above a block of its children.  Screens are
-/// wider than they are tall, so growing downwards and spreading sideways fills
-/// the viewport far better than a left-to-right tree.
+/// A tidy top-down tree: every folder owns a rectangle, and nothing that is not
+/// inside that folder may enter it.
+///
+/// The rectangle - the folder's <i>extent</i> - is measured bottom-up.  A
+/// collapsed folder is as big as its own node.  An open one is its node stacked
+/// above the block its children occupy, and each of those children is measured
+/// the same way first.  Arranging then walks back down, handing each child the
+/// corner of the space it was measured for.
+///
+/// Everything that made the canvas unreadable with several folders open follows
+/// from that one property, and follows by construction rather than by luck:
+///
+/// <list type="bullet">
+/// <item>a child's whole subtree sits inside its parent's block, so frames nest
+/// instead of crossing;</item>
+/// <item>two sibling subtrees are disjoint rectangles, so no branch interleaves
+/// with another;</item>
+/// <item>every line a folder draws stays inside that folder's own rectangle, so
+/// no link crosses a folder it has nothing to do with;</item>
+/// <item>roots are spaced by the real width of their trees rather than by a
+/// constant, so two drives cannot land on top of each other.</item>
+/// </list>
 ///
 /// The children of one folder wrap into a block rather than a single row.  A row
-/// grows linearly with the number of children, so a folder with five thousand
-/// entries was a line half a million units long - unreadable, and impossible to
-/// frame.  A block grows with the square root instead: both sides of the same
-/// folder come out around sixty by eighty.
+/// grows linearly with the child count, so a folder with five thousand entries
+/// was a line half a million units long; a block grows with the square root, and
+/// both sides come out around sixty by eighty.  A child that is itself open is
+/// wider than a row can hold, so it takes a row of its own - which is exactly how
+/// an outline reads: the open folder in place, its contents beneath it.
 ///
 /// Nodes shrink with depth (see <see cref="ViewAllNodeViewModel.Scale"/>), and
-/// every gap, step and padding below is multiplied by that same scale, so a deep
-/// branch stays compact instead of taking as much room as a root.
+/// every gap and step below is multiplied by that same scale, so a deep branch
+/// stays compact instead of taking as much room as a root.
 ///
-/// The layout is incremental on purpose: expanding a branch positions only the
-/// newly created nodes, so a node the user dragged stays where it was put and the
-/// graph never jumps.  The common case reserves the whole block with a single
-/// occupancy query; only when something is already parked in the way does each
-/// child pay for its own search.
+/// The pass is deterministic: the same tree always produces the same picture.
+/// That is what lets a refresh, a reload from disk or a second run leave the
+/// canvas exactly where it was, without saving a single coordinate.
 /// </summary>
 public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
 {
-    /// <summary>Sideways probes before a search gives up on a row and drops down.</summary>
-    private const int LanesProbed = 9;
-
-    private const int MaximumProbes = 20_000;
-
-    /// <summary>Rows a block will descend past an obstruction before giving up.</summary>
-    private const int DescentsProbed = 256;
-
     private readonly ViewAllLayoutOptions _options = options ?? new ViewAllLayoutOptions();
+    private readonly Dictionary<ViewAllNodeViewModel, Extent> _extents = new(ReferenceComparer.Instance);
+    private readonly List<Rect> _pinnedIslands = [];
 
-    public void PlaceRoots(IEnumerable<ViewAllNodeViewModel> roots, ViewAllSpatialIndex index)
+    /// <summary>The space one node's whole subtree needs, and how it is divided.</summary>
+    private sealed class Extent
     {
-        var slot = 0;
-        foreach (var root in roots.OrderBy(node => node.FullPath, StringComparer.OrdinalIgnoreCase))
-        {
-            if (root.HasLayoutPosition)
-            {
-                slot++;
-                continue;
-            }
+        public double Width;
+        public double Height;
 
-            var preferred = new Point(_options.OriginX + slot * _options.RootGap, _options.OriginY);
-            var stepX = root.Width + _options.SiblingGap * root.Scale;
-            var stepY = root.Height + _options.RowGap * root.Scale;
-            root.SetAutomaticLocation(FindFreeSlot(preferred, root, index, stepX, stepY));
-            slot++;
-        }
+        /// <summary>Widest row of children; zero when the node holds no block.</summary>
+        public double NodesWidth;
+
+        public double Lane;
+
+        /// <summary>Where the node sits inside its extent, from the extent's left.</summary>
+        public double NodeOffsetX;
+
+        /// <summary>Where the reserved rectangle starts, from the extent's left.</summary>
+        public double BlockOffsetX;
+
+        public double GapX;
+        public double GapY;
+        public double GenerationGap;
+        public double Scale;
+        public int Count;
+        public List<Row>? Rows;
     }
 
-    public void PlaceChildren(
-        ViewAllNodeViewModel parent,
-        IEnumerable<ViewAllNodeViewModel> children,
-        ViewAllSpatialIndex index)
+    private sealed class Row
     {
-        var unplaced = children
-            .Where(child => !child.HasLayoutPosition && !child.IsUserHidden)
-            .OrderBy(child => child.Kind)
-            .ThenBy(child => child.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+        public readonly List<ViewAllNodeViewModel> Children = [];
+        public double Width;
+        public double Height;
+    }
+
+    /// <summary>
+    /// Lays out every root and everything open beneath it.  This is the only
+    /// entry point: a tidy tree is a property of the whole tree, so there is no
+    /// such thing as laying out one branch and leaving the rest alone.
+    /// </summary>
+    public void Arrange(IReadOnlyList<ViewAllNodeViewModel> roots)
+    {
+        _extents.Clear();
+        _pinnedIslands.Clear();
+
+        var visible = roots
+            .Where(root => !root.IsUserHidden)
+            .OrderBy(root => root.FullPath, StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (unplaced.Length == 0)
+
+        foreach (var root in visible)
         {
-            return;
+            Measure(root);
         }
 
-        // One parent means one depth, so one scale for every step and gap.
-        var count = unplaced.Length;
-        var scale = unplaced[0].Scale;
-        var gapX = _options.SiblingGap * scale;
-        var gapY = _options.RowGap * scale;
-        var stepX = ViewAllNodeViewModel.DefaultWidth * scale + gapX;
-        var stepY = ViewAllNodeViewModel.DefaultHeight * scale + gapY;
-
-        var columns = ColumnsFor(count, stepX, stepY);
-        var rows = (count + columns - 1) / columns;
-        var nodesWidth = columns * stepX - gapX;
-        var blockHeight = rows * stepY - gapY;
-
-        // A multi-row block reserves an empty lane down each side: the left one
-        // carries the trunk every link hangs from, the right one is the way out
-        // for a line leaving the block.  A single row needs neither - its links
-        // already fan straight down from the parent, and that reads fine.
-        var lane = rows > 1 ? _options.TrunkLane * scale : 0;
-
-        var origin = new Point(
-            parent.Location.X + parent.Width / 2 - nodesWidth / 2 - lane,
-            parent.Location.Y + parent.Height + _options.GenerationGap * scale - gapY / 2);
-
-        var padX = _options.CollisionPaddingX * scale;
-        var padY = _options.CollisionPaddingY * scale;
-        var reservedWidth = nodesWidth + 2 * lane;
-        var reservedHeight = blockHeight + gapY * 1.5;
-
-        // The whole block at once, dropped straight down past anything in the
-        // way.  Keeping the family together is the point: scattering the children
-        // of one folder around a neighbouring branch is what made the canvas
-        // unreadable, and the tree grows downwards anyway.
-        if (TryReserveBlock(origin, reservedWidth, reservedHeight, padX, padY, stepX, stepY, index, out var placed))
+        // A root the user dragged keeps its place and its tree flows below it;
+        // the rest are laid out along the top, stepping over anything pinned so
+        // an automatic tree never lands on a hand-placed one.
+        foreach (var root in visible.Where(root => root.HasManualPosition))
         {
-            var nodeOrigin = new Point(placed.X + lane, placed.Y + gapY / 2);
-            for (var position = 0; position < count; position++)
-            {
-                unplaced[position].SetAutomaticLocation(
-                    Slot(position, nodeOrigin, columns, count, nodesWidth, stepX, stepY, gapX));
-            }
-
-            parent.ChildBlocks.Add(new ViewAllChildBlock(
-                placed - parent.Location,
-                columns,
-                rows,
-                count,
-                stepX,
-                stepY,
-                gapX,
-                gapY,
-                lane,
-                nodesWidth,
-                scale));
-            return;
+            ArrangePinned(root);
+            _pinnedIslands.Add(IslandOf(root));
         }
 
-        // Nowhere within reach holds the whole block, so each child claims its
-        // own slot from where it would have been.  No lattice is recorded: a
-        // comb drawn over children that are no longer on it would be a lie.
-        var fallbackOrigin = new Point(origin.X + lane, origin.Y + gapY / 2);
-        for (var position = 0; position < count; position++)
+        var x = _options.OriginX;
+        foreach (var root in visible.Where(root => !root.HasManualPosition))
         {
-            var preferred = Slot(position, fallbackOrigin, columns, count, nodesWidth, stepX, stepY, gapX);
-            unplaced[position].SetAutomaticLocation(
-                FindFreeSlot(preferred, unplaced[position], index, stepX, stepY));
+            var extent = _extents[root];
+            x = ClearOfPinned(x, extent);
+            ArrangeExtent(root, new Point(x, _options.OriginY));
+            x += extent.Width + _options.RootGap;
         }
     }
 
     /// <summary>
-    /// Looks for somewhere the whole block fits, starting under the parent and
-    /// descending a row at a time.  One occupancy query per attempt, and the
-    /// first attempt succeeds whenever the space below the parent is clear.
+    /// Where one node's whole subtree sits, once it has been arranged.  Used to
+    /// keep automatic roots clear of hand-placed ones.
     /// </summary>
-    private static bool TryReserveBlock(
-        Point preferred,
-        double blockWidth,
-        double blockHeight,
-        double padX,
-        double padY,
-        double stepX,
-        double stepY,
-        ViewAllSpatialIndex index,
-        out Point origin)
+    private Rect IslandOf(ViewAllNodeViewModel node)
     {
-        origin = preferred;
-        for (var descent = 0; descent < DescentsProbed; descent++)
-        {
-            // Sideways first, a column at a time and alternating: one node parked
-            // in the way should cost a nudge, not a whole floor.  Only when no
-            // nearby column fits does the block drop to the next row.
-            for (var lane = 0; lane < LanesProbed; lane++)
-            {
-                var ring = (lane + 1) / 2;
-                var candidate = new Point(
-                    preferred.X + (lane % 2 == 1 ? ring : -ring) * stepX,
-                    preferred.Y + descent * stepY);
+        var extent = _extents[node];
+        return new Rect(
+            new Point(node.Location.X - (extent.Width - node.Width) / 2, node.Location.Y),
+            new Size(extent.Width, extent.Height));
+    }
 
-                var area = new Rect(candidate, new Size(blockWidth, blockHeight));
-                area.Inflate(padX, padY);
-                if (!index.IsOccupied(area))
+    private double ClearOfPinned(double x, Extent extent)
+    {
+        // Root trees all start at the same line, so one sweep is enough: push
+        // right past every pinned island the candidate would run into.
+        for (var attempt = 0; attempt < _pinnedIslands.Count + 1; attempt++)
+        {
+            var candidate = new Rect(
+                new Point(x, _options.OriginY),
+                new Size(extent.Width, extent.Height));
+
+            var blocked = false;
+            foreach (var island in _pinnedIslands)
+            {
+                if (island.IntersectsWith(candidate))
                 {
-                    origin = candidate;
-                    return true;
+                    x = island.Right + _options.RootGap;
+                    blocked = true;
+                    break;
                 }
             }
+
+            if (!blocked)
+            {
+                break;
+            }
         }
 
-        return false;
+        return x;
     }
 
     /// <summary>
-    /// Clears only automatic locations. Manual nodes remain anchors; the graph
-    /// service can then call PlaceRoots/PlaceChildren in depth order.
+    /// Drops every automatic position so the next pass places the node afresh.
+    /// A position the user chose is left alone: that one was a decision.
     /// </summary>
     public void ReleaseAutomaticLayout(IEnumerable<ViewAllNodeViewModel> nodes)
     {
         foreach (var node in nodes.Where(node => !node.HasManualPosition))
         {
             node.ReleaseAutomaticLocation();
-            node.ChildBlocks.Clear();
+            node.ChildBlock = null;
         }
     }
 
-    /// <summary>
-    /// Columns that make the block about <see cref="ViewAllLayoutOptions.BlockAspect"/>
-    /// times wider than it is tall.  Both sides then grow with the square root of
-    /// the child count: five thousand children are 64 x 79, never 5000 x 1 and
-    /// never 1 x 5000.  A folder small enough to read at a glance is left on one
-    /// row, so opening a handful of files does not look like a grid.
-    /// </summary>
-    private int ColumnsFor(int count, double stepX, double stepY)
+    // ---- measuring ---------------------------------------------------------
+
+    private void Measure(ViewAllNodeViewModel node)
     {
-        if (count <= _options.SingleRowLimit)
+        var extent = new Extent
         {
-            return count;
+            Width = node.Width,
+            Height = node.Height,
+            Scale = node.Scale
+        };
+        _extents[node] = extent;
+
+        if (!node.IsExpanded)
+        {
+            return;
         }
 
-        var ideal = (int)Math.Ceiling(Math.Sqrt(_options.BlockAspect * count * stepY / stepX));
-        return Math.Clamp(ideal, 1, Math.Min(count, _options.MaximumColumns));
-    }
-
-    /// <summary>
-    /// Where one child sits on the block's lattice.  Full rows start at the
-    /// block's left edge; only the short last row is centred inside it, which
-    /// keeps the block symmetric under its parent instead of ragged.
-    /// </summary>
-    private static Point Slot(
-        int position,
-        Point origin,
-        int columns,
-        int count,
-        double blockWidth,
-        double stepX,
-        double stepY,
-        double gapX)
-    {
-        var row = position / columns;
-        var column = position % columns;
-        var inRow = Math.Min(columns, count - row * columns);
-        var indent = (blockWidth - (inRow * stepX - gapX)) / 2;
-
-        return new Point(origin.X + indent + column * stepX, origin.Y + row * stepY);
-    }
-
-    /// <summary>
-    /// The nearest free lattice slot to <paramref name="preferred"/>: sideways
-    /// first, alternating right and left so a row stays centred on its parent,
-    /// and only then down a row - which is the direction the tree grows anyway.
-    /// </summary>
-    private Point FindFreeSlot(
-        Point preferred,
-        ViewAllNodeViewModel node,
-        ViewAllSpatialIndex index,
-        double stepX,
-        double stepY)
-    {
-        var size = new Size(node.Width, node.Height);
-        var padX = _options.CollisionPaddingX * node.Scale;
-        var padY = _options.CollisionPaddingY * node.Scale;
-
-        var candidate = preferred;
-        for (var attempt = 0; attempt < MaximumProbes; attempt++)
+        var children = VisibleChildren(node);
+        if (children.Count == 0)
         {
-            var lane = attempt / LanesProbed;
-            var slot = attempt % LanesProbed;
-            var ring = (slot + 1) / 2;
-            candidate = new Point(
-                preferred.X + (slot % 2 == 1 ? ring : -ring) * stepX,
-                preferred.Y + lane * stepY);
+            return;
+        }
 
-            var bounds = new Rect(candidate, size);
-            bounds.Inflate(padX, padY);
-            if (!index.IsOccupied(bounds))
+        foreach (var child in children)
+        {
+            Measure(child);
+        }
+
+        // A pinned child has left the flow: its slot is not reserved and its own
+        // tree is arranged where the user put it, as an island.
+        var flow = children.Where(child => !child.HasManualPosition).ToList();
+        if (flow.Count == 0)
+        {
+            return;
+        }
+
+        // One parent means one depth, so one scale for every step and gap.
+        var scale = flow[0].Scale;
+        extent.GapX = _options.SiblingGap * scale;
+        extent.GapY = _options.RowGap * scale;
+        extent.GenerationGap = _options.GenerationGap * scale;
+
+        // Closed children are packed on their own, and the open ones after them.
+        // Mixed rows are as tall as the subtree in them, so one closed folder
+        // sharing a row with an open one wasted a screen of blank space below
+        // itself; and a folder reads better as its own contents first, then the
+        // branches that were opened out of it.
+        var closed = flow.Where(child => _extents[child].Rows is null).ToList();
+        var open = flow.Where(child => _extents[child].Rows is not null).ToList();
+
+        var rows = new List<Row>();
+        if (flow.Count <= _options.SingleRowLimit)
+        {
+            Pack(rows, flow, double.MaxValue, extent);
+        }
+        else
+        {
+            Pack(rows, closed, TargetWidth(closed, extent), extent);
+            Pack(rows, open, TargetWidth(open, extent), extent);
+        }
+
+        extent.Rows = rows;
+        extent.Count = flow.Count;
+        extent.NodesWidth = rows.Max(item => item.Width);
+        extent.Lane = rows.Count > 1 ? _options.TrunkLane * scale : 0;
+
+        var blockHeight = rows.Sum(item => item.Height) + extent.GapY * (rows.Count - 1);
+        var blockWidth = extent.NodesWidth + 2 * extent.Lane;
+        extent.Width = Math.Max(node.Width, blockWidth);
+        extent.BlockOffsetX = (extent.Width - blockWidth) / 2;
+
+        // The folder hangs over its first row rather than over the whole block.
+        // Rows are left-aligned, so with a compact grid of closed children above
+        // a much wider open branch the two would otherwise drift apart: the link
+        // down from the folder has to land on the first row's run, and it can
+        // only do that if the folder is above that row.
+        extent.NodeOffsetX = Math.Clamp(
+            extent.BlockOffsetX + extent.Lane + rows[0].Width / 2 - node.Width / 2,
+            0,
+            Math.Max(0, extent.Width - node.Width));
+
+        // Half a gap of clear air below the last row, matching the half above the
+        // first, so the reserved rectangle is the frame and two siblings never
+        // touch.
+        extent.Height = node.Height + extent.GenerationGap + blockHeight + extent.GapY / 2;
+    }
+
+    /// <summary>
+    /// Fills rows left to right, wrapping when the next child would take the row
+    /// past <paramref name="target"/>.  The first child of a row always goes on
+    /// however wide it is, so a child that is itself open - wider than any target
+    /// - takes a row of its own instead of being dropped.
+    /// </summary>
+    private void Pack(
+        List<Row> rows,
+        List<ViewAllNodeViewModel> children,
+        double target,
+        Extent extent)
+    {
+        if (children.Count == 0)
+        {
+            return;
+        }
+
+        var row = new Row();
+        foreach (var child in children)
+        {
+            var childExtent = _extents[child];
+
+            // Half a unit of slack: the target is a whole number of steps and the
+            // row is the same arithmetic accumulated one child at a time, so
+            // rounding must not cost a full row its last column.
+            if (row.Children.Count > 0 && row.Width + extent.GapX + childExtent.Width > target + 0.5)
             {
-                return candidate;
+                rows.Add(row);
+                row = new Row();
             }
+
+            row.Width += (row.Children.Count > 0 ? extent.GapX : 0) + childExtent.Width;
+            row.Height = Math.Max(row.Height, childExtent.Height);
+            row.Children.Add(child);
         }
 
-        return candidate;
+        rows.Add(row);
+    }
+
+    /// <summary>
+    /// How wide to let a row grow before it wraps, so the block comes out about
+    /// <see cref="ViewAllLayoutOptions.BlockAspect"/> times wider than it is
+    /// tall.  It is the square root of the area the children need, which for a
+    /// folder of same-sized entries is exactly a column count: both sides then
+    /// grow with the square root of the entry count, so five thousand files are
+    /// 64 x 79 and never 5000 x 1.
+    ///
+    /// Measuring area rather than counting children is what keeps a folder
+    /// readable once some of its children are open.  An open child is a whole
+    /// subtree - a hundred times the area of a collapsed one - and a target
+    /// derived from the count alone would put one per row and turn the folder
+    /// into a column thousands of units tall.
+    /// </summary>
+    private double TargetWidth(List<ViewAllNodeViewModel> children, Extent extent)
+    {
+        if (children.Count == 0)
+        {
+            return 0;
+        }
+
+        var area = 0.0;
+        var line = 0.0;
+        var uniform = true;
+        var first = _extents[children[0]];
+
+        foreach (var child in children)
+        {
+            var childExtent = _extents[child];
+            area += (childExtent.Width + extent.GapX) * (childExtent.Height + extent.GapY);
+            line += childExtent.Width + extent.GapX;
+            uniform &= Math.Abs(childExtent.Width - first.Width) < 0.001
+                && Math.Abs(childExtent.Height - first.Height) < 0.001;
+        }
+
+        // A handful of items reads better as a line than as a grid.
+        if (children.Count <= _options.SingleRowLimit)
+        {
+            return line;
+        }
+
+        var target = Math.Sqrt(_options.BlockAspect * area);
+
+        // Closed children are all exactly the same size, and for those the target
+        // has to be a whole number of columns: rounded down, eighteen entries go
+        // into three columns of six rather than the four of five the aspect asked
+        // for, and the block comes out taller than it is wide.
+        if (uniform)
+        {
+            var step = first.Width + extent.GapX;
+            var columns = Math.Max(1, (int)Math.Ceiling((target + extent.GapX) / step - 0.001));
+            target = columns * step - extent.GapX;
+        }
+
+        return Math.Min(line, target);
+    }
+
+    private static List<ViewAllNodeViewModel> VisibleChildren(ViewAllNodeViewModel node) =>
+        node.Children
+            .Where(child => child is { IsUserHidden: false, IsTreeVisible: true })
+            .OrderBy(child => child.Kind)
+            .ThenBy(child => child.DisplayName, StringComparer.CurrentCultureIgnoreCase)
+            .ToList();
+
+    // ---- arranging ---------------------------------------------------------
+
+    /// <summary>Places a node in the space it was measured for.</summary>
+    private void ArrangeExtent(ViewAllNodeViewModel node, Point extentTopLeft)
+    {
+        var extent = _extents[node];
+        node.SetAutomaticLocation(new Point(
+            extentTopLeft.X + extent.NodeOffsetX,
+            extentTopLeft.Y));
+        ArrangeBlock(node, extent, extentTopLeft.X);
+    }
+
+    /// <summary>Arranges the tree of a node whose own position the user chose.</summary>
+    private void ArrangePinned(ViewAllNodeViewModel node)
+    {
+        var extent = _extents[node];
+        ArrangeBlock(node, extent, node.Location.X - extent.NodeOffsetX);
+    }
+
+    private void ArrangeBlock(ViewAllNodeViewModel node, Extent extent, double extentLeft)
+    {
+        node.ChildBlock = null;
+
+        foreach (var pinned in node.Children.Where(child =>
+                     child is { IsUserHidden: false, IsTreeVisible: true, HasManualPosition: true }))
+        {
+            ArrangePinned(pinned);
+        }
+
+        if (extent.Rows is not { Count: > 0 })
+        {
+            return;
+        }
+
+        var blockWidth = extent.NodesWidth + 2 * extent.Lane;
+        var blockLeft = extentLeft + extent.BlockOffsetX;
+        var nodesLeft = blockLeft + extent.Lane;
+        var top = node.Location.Y + node.Height + extent.GenerationGap;
+
+        var y = top;
+        foreach (var row in extent.Rows)
+        {
+            // Every row starts at the same left edge, hard against the lane the
+            // trunk runs down.  Centring them looked tidier for a plain grid but
+            // left a narrow row stranded in the middle of a wide block, with its
+            // run crossing the empty half to reach it; and columns that line up
+            // read better anyway.
+            var cursor = nodesLeft;
+            foreach (var child in row.Children)
+            {
+                ArrangeExtent(child, new Point(cursor, y));
+                cursor += _extents[child].Width + extent.GapX;
+            }
+
+            y += row.Height + extent.GapY;
+        }
+
+        var blockHeight = y - extent.GapY - top;
+        node.ChildBlock = new ViewAllChildBlock(
+            new Vector(blockLeft - node.Location.X, top - extent.GapY / 2 - node.Location.Y),
+            blockWidth,
+            blockHeight + extent.GapY,
+            extent.NodesWidth,
+            extent.Lane,
+            extent.GapY,
+            extent.Rows.Count,
+            extent.Count,
+            extent.Scale);
+    }
+
+    /// <summary>
+    /// Nodes are compared by identity here, never by value: two different nodes
+    /// must never share a measurement.
+    /// </summary>
+    private sealed class ReferenceComparer : IEqualityComparer<ViewAllNodeViewModel>
+    {
+        public static readonly ReferenceComparer Instance = new();
+
+        public bool Equals(ViewAllNodeViewModel? left, ViewAllNodeViewModel? right) =>
+            ReferenceEquals(left, right);
+
+        public int GetHashCode(ViewAllNodeViewModel node) =>
+            System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(node);
     }
 }

@@ -25,21 +25,20 @@ public sealed class ViewAllGraphService : IDisposable
     private readonly Dictionary<string, ViewAllNodeState> _restoredStates = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Paths whose automatic coordinates came from a saved workspace.  They are
-    /// laid out afresh rather than restored, so a change to the layout reaches a
-    /// canvas that was saved before it.  Positions recorded during this session -
-    /// by a branch refresh - are not in here and are restored exactly, because
-    /// pressing F5 must not rearrange the canvas.
-    /// </summary>
-    private readonly HashSet<string> _staleAutomaticPositions = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
     /// Folders the user hid, by path.  A path outlives the node: a hidden folder
     /// inside a branch that is refreshed is destroyed and recreated, and this is
     /// what makes the hide stick across that, across restarts, and across a
     /// change to the enumeration options.
     /// </summary>
     private readonly HashSet<string> _hiddenPaths = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Set while a layout pass is moving nodes, so each move is not
+    /// separately indexed and announced - the index is rebuilt in one go after.</summary>
+    private bool _arranging;
+
+    /// <summary>Depth of nested <see cref="SuspendLayout"/> scopes.</summary>
+    private int _layoutSuspended;
+    private bool _layoutPending;
     private bool _disposed;
 
     public ViewAllGraphService(
@@ -65,6 +64,13 @@ public sealed class ViewAllGraphService : IDisposable
 
     /// <summary>Raised after a structural or logical visibility change.</summary>
     public event EventHandler? GraphChanged;
+
+    /// <summary>
+    /// How far the node the user just acted on was carried by the layout.  The
+    /// canvas pans by the same amount, so opening a folder never yanks the thing
+    /// under the cursor out from under it - the tree grows around it instead.
+    /// </summary>
+    public event Action<Vector>? LayoutShifted;
 
     /// <summary>
     /// Raised once per node, right after it is created.  The view model uses it
@@ -105,7 +111,6 @@ public sealed class ViewAllGraphService : IDisposable
         ClearGraph();
 
         _restoredStates.Clear();
-        _staleAutomaticPositions.Clear();
         _hiddenPaths.Clear();
 
         // Seeded before the first node is created, so a hidden folder is never
@@ -128,12 +133,7 @@ public sealed class ViewAllGraphService : IDisposable
             {
                 try
                 {
-                    var path = ViewAllPath.Normalize(state.Path);
-                    _restoredStates[path] = state;
-                    if (!state.HasManualPosition)
-                    {
-                        _staleAutomaticPositions.Add(path);
-                    }
+                    _restoredStates[ViewAllPath.Normalize(state.Path)] = state;
                 }
                 catch
                 {
@@ -149,7 +149,7 @@ public sealed class ViewAllGraphService : IDisposable
             RestorePosition(root);
         }
 
-        _layout.PlaceRoots(_roots, Index);
+        Reflow();
 
         if (restoredState is null)
         {
@@ -175,12 +175,126 @@ public sealed class ViewAllGraphService : IDisposable
             .ThenBy(state => state.Path, StringComparer.OrdinalIgnoreCase)
             .Select(state => state.Path)
             .ToArray();
-        foreach (var path in expandedPaths)
+        using (SuspendLayout())
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (TryGetNode(path, out var node))
+            foreach (var path in expandedPaths)
             {
-                await ExpandAsync(node, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (TryGetNode(path, out var node))
+                {
+                    await ExpandAsync(node, cancellationToken);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Lays the whole tree out again.  It is a whole-tree operation on purpose:
+    /// opening a folder changes how much room its branch needs, and a tidy tree
+    /// is only tidy if its siblings then move over.  The pass is deterministic,
+    /// so a refresh, a restart or a second call leaves the canvas exactly as it
+    /// was; only a real change to the tree changes the picture.
+    /// </summary>
+    private void Reflow()
+    {
+        if (_layoutSuspended > 0)
+        {
+            _layoutPending = true;
+            return;
+        }
+
+        _arranging = true;
+        try
+        {
+            _layout.Arrange(_roots);
+        }
+        finally
+        {
+            _arranging = false;
+        }
+
+        RebuildIndex();
+
+        // Which links the harness covers depends on where the children ended up,
+        // so it can only be worked out once they have been placed.  Deciding it
+        // before the pass - which is what happened while the layout was held back
+        // for a batch of expansions - left every child drawing its own line on
+        // top of the harness that already carried it.
+        UpdateEdgeVisibility();
+        LayoutChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Lays out again and reports how far <paramref name="anchor"/> travelled, so
+    /// the canvas can pan by the same amount and leave it where the user is
+    /// looking.
+    /// </summary>
+    private void ReflowAnchoredOn(ViewAllNodeViewModel? anchor)
+    {
+        var before = anchor?.Location ?? default;
+        Reflow();
+        if (anchor is null)
+        {
+            return;
+        }
+
+        var shift = anchor.Location - before;
+        if (Math.Abs(shift.X) > 0.001 || Math.Abs(shift.Y) > 0.001)
+        {
+            LayoutShifted?.Invoke(shift);
+        }
+    }
+
+    /// <summary>
+    /// Holds the layout back until the scope closes.  Restoring a saved session
+    /// expands dozens of folders one after another; laying the tree out once at
+    /// the end is the difference between one pass and dozens.
+    /// </summary>
+    private IDisposable SuspendLayout() => new LayoutScope(this);
+
+    private sealed class LayoutScope : IDisposable
+    {
+        private readonly ViewAllGraphService _graph;
+        private bool _closed;
+
+        public LayoutScope(ViewAllGraphService graph)
+        {
+            _graph = graph;
+            _graph._layoutSuspended++;
+        }
+
+        public void Dispose()
+        {
+            if (_closed)
+            {
+                return;
+            }
+
+            _closed = true;
+            _graph._layoutSuspended--;
+            if (_graph._layoutSuspended == 0 && _graph._layoutPending)
+            {
+                _graph._layoutPending = false;
+                _graph.Reflow();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Refills the grid from what is actually on the canvas.  The index stopped
+    /// being an input to the layout when the layout became a tree pass, so it is
+    /// now purely what culling, hit testing and drop targets read - and it holds
+    /// visible nodes only.  A collapsed branch used to stay in it and quietly
+    /// reserve room for nodes nobody could see.
+    /// </summary>
+    private void RebuildIndex()
+    {
+        Index.Clear();
+        foreach (var node in _nodes)
+        {
+            if (node.HasLayoutPosition && node.IsTreeVisible && !node.IsUserHidden)
+            {
+                Index.AddOrUpdate(node);
             }
         }
     }
@@ -215,6 +329,7 @@ public sealed class ViewAllGraphService : IDisposable
         {
             node.IsExpanded = true;
             RevealLoadedBranch(node);
+            ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
@@ -240,7 +355,7 @@ public sealed class ViewAllGraphService : IDisposable
             node.ChildLoadLimit = Options.SafeMaximumChildren;
             node.NotifyChildrenChanged();
             RevealLoadedBranch(node);
-            _layout.PlaceChildren(node, node.Children, Index);
+            ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return new ViewAllExpansionResult(node, added, WasLoaded: true, snapshot.IsTruncated);
@@ -275,6 +390,7 @@ public sealed class ViewAllGraphService : IDisposable
         CancelLoad(node);
         node.IsExpanded = false;
         HideDescendants(node);
+        ReflowAnchoredOn(node);
         UpdateEdgeVisibility();
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
@@ -294,6 +410,7 @@ public sealed class ViewAllGraphService : IDisposable
             HideDescendants(root);
         }
 
+        Reflow();
         UpdateEdgeVisibility();
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
@@ -333,7 +450,7 @@ public sealed class ViewAllGraphService : IDisposable
             node.ChildLoadLimit = nextLimit;
             node.IsTruncated = snapshot.IsTruncated;
             node.NotifyChildrenChanged();
-            _layout.PlaceChildren(node, added, Index);
+            ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return new ViewAllExpansionResult(node, added, WasLoaded: true, snapshot.IsTruncated);
@@ -371,16 +488,19 @@ public sealed class ViewAllGraphService : IDisposable
         var previouslyExpanded = new List<string>();
         foreach (var descendant in EnumerateDescendants(node))
         {
-            _restoredStates[descendant.FullPath] = new ViewAllNodeState(
-                descendant.FullPath,
-                descendant.Location.X,
-                descendant.Location.Y,
-                descendant.HasManualPosition,
-                descendant.IsExpanded);
+            // Only a position the user chose is worth carrying across the
+            // rebuild.  An automatic one is reproduced exactly by the layout,
+            // which is why F5 does not rearrange the canvas.
+            if (descendant.HasManualPosition)
+            {
+                _restoredStates[descendant.FullPath] = new ViewAllNodeState(
+                    descendant.FullPath,
+                    descendant.Location.X,
+                    descendant.Location.Y,
+                    true,
+                    descendant.IsExpanded);
+            }
 
-            // Recorded now, from a node that is already laid out the current
-            // way, so it is restored as it is rather than reflowed.
-            _staleAutomaticPositions.Remove(descendant.FullPath);
             if (descendant.IsExpanded)
             {
                 previouslyExpanded.Add(descendant.FullPath);
@@ -388,27 +508,27 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         RemoveDescendants(node);
-
-        // The lattice is deliberately kept: the children come back at exactly
-        // the coordinates that were just recorded, so the record still describes
-        // them, and clearing it would leave the branch with no links until the
-        // next full relayout.
         node.AreChildrenLoaded = false;
         node.IsExpanded = false;
         node.IsTruncated = false;
         node.NotifyChildrenChanged();
-        var result = await ExpandAsync(node, cancellationToken);
 
-        // Parents sort before descendants, so each re-expansion has already
-        // created the node the next path needs.
-        foreach (var path in previouslyExpanded
-                     .OrderBy(PathDepth)
-                     .ThenBy(path => path, StringComparer.OrdinalIgnoreCase))
+        ViewAllExpansionResult result;
+        using (SuspendLayout())
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (TryGetNode(path, out var restored) && !restored.IsExpanded)
+            result = await ExpandAsync(node, cancellationToken);
+
+            // Parents sort before descendants, so each re-expansion has already
+            // created the node the next path needs.
+            foreach (var path in previouslyExpanded
+                         .OrderBy(PathDepth)
+                         .ThenBy(path => path, StringComparer.OrdinalIgnoreCase))
             {
-                await ExpandAsync(restored, cancellationToken);
+                cancellationToken.ThrowIfCancellationRequested();
+                if (TryGetNode(path, out var restored) && !restored.IsExpanded)
+                {
+                    await ExpandAsync(restored, cancellationToken);
+                }
             }
         }
 
@@ -470,7 +590,7 @@ public sealed class ViewAllGraphService : IDisposable
         _edges.Add(edge);
         _incomingEdges[child.Id] = edge;
         parent.NotifyChildrenChanged();
-        _layout.PlaceChildren(parent, [child], Index);
+        Reflow();
         UpdateEdgeVisibility();
         GraphChanged?.Invoke(this, EventArgs.Empty);
         return child;
@@ -500,7 +620,7 @@ public sealed class ViewAllGraphService : IDisposable
 
             var root = CreateNode(descriptor, depth: 0, parent: null);
             RestorePosition(root);
-            _layout.PlaceRoots([root], Index);
+            Reflow();
             GraphChanged?.Invoke(this, EventArgs.Empty);
             return root;
         }
@@ -567,26 +687,13 @@ public sealed class ViewAllGraphService : IDisposable
     public void Relayout()
     {
         ThrowIfDisposed();
-        Index.Clear();
 
         foreach (var node in _nodes)
         {
             node.ReleaseManualPosition();
-            node.ReleaseAutomaticLocation();
-            node.ChildBlocks.Clear();
         }
 
-        _layout.PlaceRoots(_roots, Index);
-
-        // Depth order: a parent is placed before the block that hangs off it.
-        foreach (var parent in _nodes
-                     .Where(node => node.IsExpanded && !node.IsUserHidden && node.IsTreeVisible)
-                     .OrderBy(node => node.Depth))
-        {
-            _layout.PlaceChildren(parent, parent.Children, Index);
-        }
-
-        LayoutChanged?.Invoke();
+        Reflow();
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -619,6 +726,7 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         node.Parent?.NotifyChildrenChanged();
+        Reflow();
         UpdateEdgeVisibility();
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
@@ -658,32 +766,12 @@ public sealed class ViewAllGraphService : IDisposable
         node.IsUserHidden = false;
         node.IsTreeVisible = node.Parent is null || (node.Parent.IsTreeVisible && node.Parent.IsExpanded);
 
-        var subtree = EnumerateDescendants(node).ToArray();
-        _layout.ReleaseAutomaticLayout([node]);
-        _layout.ReleaseAutomaticLayout(subtree);
-
-        if (node.Parent is { } parent)
-        {
-            _layout.PlaceChildren(parent, parent.Children, Index);
-        }
-        else
-        {
-            _layout.PlaceRoots([node], Index);
-        }
-
         if (node.IsExpanded)
         {
             RevealLoadedBranch(node);
         }
 
-        // Depth order, so a parent is placed before the children that hang off it.
-        foreach (var branch in subtree
-                     .Where(item => item.IsExpanded && item.IsTreeVisible)
-                     .OrderBy(item => item.Depth))
-        {
-            _layout.PlaceChildren(branch, branch.Children, Index);
-        }
-
+        Reflow();
         UpdateEdgeVisibility();
         GraphChanged?.Invoke(this, EventArgs.Empty);
         return true;
@@ -763,6 +851,14 @@ public sealed class ViewAllGraphService : IDisposable
 
     private void OnNodeMoved(ViewAllNodeViewModel node)
     {
+        // A layout pass moves every node on the canvas; indexing and announcing
+        // each one separately would cost thousands of redraws for one pass.  The
+        // index is refilled and the change announced once, when the pass ends.
+        if (_arranging)
+        {
+            return;
+        }
+
         // A hidden node must stay out of the grid however it moves.  Dragging an
         // ancestor offsets every descendant, hidden ones included, and would
         // otherwise quietly put the whole hidden spread back in the way.
@@ -813,15 +909,16 @@ public sealed class ViewAllGraphService : IDisposable
             return;
         }
 
-        // An automatic position that came from a saved workspace is dropped, so
-        // the node is laid out the way this build lays things out.  A position
-        // the user chose, and one recorded during this session, are kept.
-        if (!state.HasManualPosition && _staleAutomaticPositions.Contains(node.FullPath))
+        // Only a position the user chose is restored.  An automatic one is not
+        // worth saving: the layout is deterministic, so it reproduces the same
+        // coordinate from the shape of the tree alone - and a saved coordinate
+        // would freeze a canvas into the way an older build laid it out.
+        if (!state.HasManualPosition)
         {
             return;
         }
 
-        node.RestoreLocation(new Point(state.X, state.Y), state.HasManualPosition);
+        node.RestoreLocation(new Point(state.X, state.Y), true);
     }
 
     private void RevealLoadedBranch(ViewAllNodeViewModel parent)
@@ -876,20 +973,8 @@ public sealed class ViewAllGraphService : IDisposable
     /// </summary>
     private static bool IsCoveredByHarness(ViewAllNodeViewModel parent, ViewAllNodeViewModel child)
     {
-        if (parent.ChildBlocks.Count == 0 || child.HasManualPosition)
-        {
-            return false;
-        }
-
-        foreach (var block in parent.ChildBlocks)
-        {
-            if (block.Rows > 1 && block.RowOf(parent.Location, child.Location) >= 0)
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return parent.ChildBlock is { Rows: > 1 } block
+            && block.Holds(parent.Location, child);
     }
 
     private static IEnumerable<ViewAllNodeViewModel> EnumerateDescendants(ViewAllNodeViewModel node)
