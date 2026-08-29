@@ -34,9 +34,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isInitialized;
     private bool _isDisposed;
     private bool _isNavigating;
-    private string _addressText = string.Empty;
     private string _searchText = string.Empty;
-    private bool _isAddressEditing;
     private bool _isSearchOpen;
     private bool _isSearchBusy;
     private string _searchStatusText = string.Empty;
@@ -61,9 +59,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         UpCommand = new AsyncRelayCommand(GoUpAsync);
         HomeCommand = new AsyncRelayCommand(GoHomeAsync);
         RefreshCommand = new AsyncRelayCommand(RefreshActiveAsync);
-        GoToAddressCommand = new AsyncRelayCommand(GoToAddressAsync);
-        OpenBreadcrumbCommand = new AsyncRelayCommand<BreadcrumbSegment>(OpenBreadcrumbAsync);
         OpenSidebarItemCommand = new AsyncRelayCommand<FavoriteItemViewModel>(OpenSidebarItemAsync);
+
+        Address = new AddressBarViewModel(
+            path => Tree.RevealPathAsync(path),
+            RecentLocations,
+            (message, isError) => OnTreeMessage(message, isError));
 
         NewFolderCommand = new AsyncRelayCommand(CreateFolderAsync);
         NewTextFileCommand = new AsyncRelayCommand(CreateTextFileAsync);
@@ -113,6 +114,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ViewAllViewModel Tree { get; }
     public OperationToastService Toast { get; } = new();
 
+    /// <summary>
+    /// The address bar: crumbs, the path line they turn into, and the folders it
+    /// offers while it is being typed in.
+    /// </summary>
+    public AddressBarViewModel Address { get; }
+
     /// <summary>Home sits alone above the first divider, as in Explorer.</summary>
     public ObservableCollection<FavoriteItemViewModel> HomeItems { get; } = [];
 
@@ -125,7 +132,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<FavoriteItemViewModel> PickerPlaces { get; } = [];
     public ObservableCollection<FavoriteItemViewModel> Drives { get; } = [];
     public ObservableCollection<FavoriteItemViewModel> NetworkLocations { get; } = [];
-    public ObservableCollection<BreadcrumbSegment> Breadcrumbs { get; } = [];
     public ObservableCollection<SearchResultViewModel> SearchResults { get; } = [];
 
     public ICommand BackCommand { get; }
@@ -133,8 +139,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ICommand UpCommand { get; }
     public ICommand HomeCommand { get; }
     public ICommand RefreshCommand { get; }
-    public ICommand GoToAddressCommand { get; }
-    public ICommand OpenBreadcrumbCommand { get; }
     public ICommand OpenSidebarItemCommand { get; }
     public ICommand NewFolderCommand { get; }
     public ICommand NewTextFileCommand { get; }
@@ -215,18 +219,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 Mode = CanvasMode.ViewSelect;
             }
         }
-    }
-
-    public string AddressText
-    {
-        get => _addressText;
-        set => SetProperty(ref _addressText, value);
-    }
-
-    public bool IsAddressEditing
-    {
-        get => _isAddressEditing;
-        set => SetProperty(ref _isAddressEditing, value);
     }
 
     public string SearchText
@@ -367,7 +359,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         await Tree.InitializeAsync(initialPath);
-        UpdateBreadcrumbs();
+        Address.SetPath(Tree.ActivePath);
         UpdateSidebarSelection();
     }
 
@@ -449,6 +441,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _searchCancellation?.Dispose();
         Tree.PropertyChanged -= OnTreePropertyChanged;
         Tree.MessageRequested -= OnTreeMessage;
+        Address.Dispose();
         Tree.Dispose();
     }
 
@@ -471,8 +464,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             case nameof(ViewAllViewModel.ActivePath):
                 OnPropertyChanged(nameof(TabTitle));
                 OnPropertyChanged(nameof(SearchPlaceholder));
-                AddressText = Tree.ActivePath;
-                UpdateBreadcrumbs();
+                Address.SetPath(Tree.ActivePath);
                 UpdateSidebarSelection();
                 RecordNavigation(Tree.ActivePath);
                 break;
@@ -491,36 +483,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void UpdateBreadcrumbs()
+    /// <summary>
+    /// Where this window has already been, newest first and each place once.
+    /// The address bar offers these when there is nothing typed to work from.
+    /// </summary>
+    private IReadOnlyList<string> RecentLocations()
     {
-        Breadcrumbs.Clear();
-        var path = Tree.ActivePath;
-        if (string.IsNullOrWhiteSpace(path))
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var recent = new List<string>();
+        for (var index = _navigationHistory.Count - 1; index >= 0; index--)
         {
-            return;
-        }
-
-        IReadOnlyList<string> chain;
-        try
-        {
-            chain = ViewAllPath.AncestorChain(path);
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
-        {
-            return;
-        }
-
-        for (var index = 0; index < chain.Count; index++)
-        {
-            var segment = chain[index];
-            var name = Path.GetFileName(segment.TrimEnd(Path.DirectorySeparatorChar));
-            if (string.IsNullOrEmpty(name))
+            var path = _navigationHistory[index];
+            if (!string.IsNullOrWhiteSpace(path) && seen.Add(path))
             {
-                name = segment;
+                recent.Add(path);
             }
-
-            Breadcrumbs.Add(new BreadcrumbSegment(name, segment, index == chain.Count - 1));
         }
+
+        return recent;
     }
 
     private void UpdateSidebarSelection()
@@ -620,38 +600,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (Tree.ActiveNode is { } node)
         {
             await Tree.RefreshAsync(node.IsDirectory ? node : node.Parent ?? node);
-        }
-    }
-
-    private async Task GoToAddressAsync()
-    {
-        var expanded = Environment.ExpandEnvironmentVariables(AddressText.Trim().Trim('"'));
-        if (string.IsNullOrWhiteSpace(expanded))
-        {
-            return;
-        }
-
-        if (File.Exists(expanded))
-        {
-            await Tree.RevealPathAsync(expanded);
-            return;
-        }
-
-        if (!Directory.Exists(expanded))
-        {
-            Toast.ShowError("That location does not exist.");
-            return;
-        }
-
-        IsAddressEditing = false;
-        await Tree.RevealPathAsync(expanded);
-    }
-
-    private async Task OpenBreadcrumbAsync(BreadcrumbSegment? segment)
-    {
-        if (segment is not null)
-        {
-            await Tree.RevealPathAsync(segment.FullPath);
         }
     }
 

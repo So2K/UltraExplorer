@@ -45,6 +45,79 @@
         <converters:ZeroCountToVisibilityConverter x:Key="ZeroCountToVisibility" />
         <infra:BindingProxy x:Key="Shell" Data="{Binding}" />
 
+        <!-- One row of an address suggestion, used both under the line and
+             behind a crumb's chevron. -->
+        <DataTemplate x:Key="AddressSuggestionTemplate" DataType="{x:Type models:AddressSuggestion}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="18" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding Glyph}"
+                           Style="{StaticResource IconText}"
+                           FontSize="12"
+                           Foreground="{Binding Tint}"
+                           VerticalAlignment="Center" />
+                <TextBlock Grid.Column="1"
+                           Text="{Binding Name}"
+                           ToolTip="{Binding FullPath}"
+                           Foreground="{StaticResource TextBrush}"
+                           FontSize="12"
+                           TextTrimming="CharacterEllipsis"
+                           VerticalAlignment="Center"
+                           Margin="6,0,10,0" />
+                <TextBlock Grid.Column="2"
+                           Text="{Binding Detail}"
+                           Foreground="{StaticResource TextDimBrush}"
+                           FontSize="10"
+                           MaxWidth="240"
+                           TextTrimming="CharacterEllipsis"
+                           VerticalAlignment="Center" />
+            </Grid>
+        </DataTemplate>
+
+        <Style x:Key="AddressSuggestionList" TargetType="ListBox">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="MaxHeight" Value="304" />
+            <Setter Property="ItemTemplate" Value="{StaticResource AddressSuggestionTemplate}" />
+            <Setter Property="ScrollViewer.HorizontalScrollBarVisibility" Value="Disabled" />
+
+            <!-- The list never takes the keyboard: the caret stays in the line
+                 while the arrow keys walk this, which is what makes typing and
+                 choosing the same gesture. -->
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="ItemContainerStyle">
+                <Setter.Value>
+                    <Style TargetType="ListBoxItem">
+                        <Setter Property="Padding" Value="0" />
+                        <Setter Property="Background" Value="Transparent" />
+                        <Setter Property="Focusable" Value="False" />
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ListBoxItem">
+                                    <Border x:Name="Chrome" CornerRadius="4" Background="{TemplateBinding Background}" Padding="7,5">
+                                        <ContentPresenter />
+                                    </Border>
+                                    <ControlTemplate.Triggers>
+                                        <Trigger Property="IsMouseOver" Value="True">
+                                            <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                                        </Trigger>
+                                        <Trigger Property="IsSelected" Value="True">
+                                            <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentSoftBrush}" />
+                                        </Trigger>
+                                    </ControlTemplate.Triggers>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <DataTemplate x:Key="SidebarItemTemplate" DataType="{x:Type models:FavoriteItemViewModel}">
             <Button Style="{StaticResource SidebarItem}"
                     Tag="{Binding StateTag}"
@@ -158,7 +231,7 @@
         </Grid>
 
         <!-- Navigation / address / search -->
-        <Grid Grid.Row="1" Background="{StaticResource WindowBrush}">
+        <Grid Grid.Row="1" Background="{StaticResource WindowBrush}" Panel.ZIndex="10">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
                 <ColumnDefinition Width="*" />
@@ -177,7 +250,11 @@
                 </Button>
             </StackPanel>
 
-            <Border Grid.Column="1"
+            <!-- The address bar.  Crumbs until it is clicked, a path line
+                 afterwards, and either way the path itself is one button or one
+                 menu entry away from the clipboard. -->
+            <Border x:Name="AddressArea"
+                    Grid.Column="1"
                     Height="32"
                     Margin="8,0,8,0"
                     VerticalAlignment="Center"
@@ -185,12 +262,13 @@
                     Background="{StaticResource SurfaceRaisedBrush}"
                     BorderBrush="{StaticResource BorderStrongBrush}"
                     BorderThickness="1"
-                    MouseLeftButtonDown="AddressArea_MouseLeftButtonDown">
+                    PreviewMouseLeftButtonDown="AddressArea_PreviewMouseLeftButtonDown"
+                    PreviewMouseRightButtonUp="AddressArea_PreviewMouseRightButtonUp">
                 <Grid>
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="26" />
                         <ColumnDefinition Width="*" />
-                        <ColumnDefinition Width="30" />
+                        <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
 
                     <TextBlock Text="&#xE8B7;"
@@ -202,8 +280,10 @@
                     <ScrollViewer Grid.Column="1"
                                   HorizontalScrollBarVisibility="Hidden"
                                   VerticalScrollBarVisibility="Disabled"
-                                  Visibility="{Binding IsAddressEditing, Converter={StaticResource InverseBoolToVisibility}}">
-                        <ItemsControl ItemsSource="{Binding Breadcrumbs}" VerticalAlignment="Center">
+                                  Background="Transparent"
+                                  Cursor="IBeam"
+                                  Visibility="{Binding Address.IsShowingCrumbs, Converter={StaticResource BoolToVisibility}}">
+                        <ItemsControl ItemsSource="{Binding Address.Breadcrumbs}" VerticalAlignment="Center">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate>
                                     <StackPanel Orientation="Horizontal" />
@@ -215,7 +295,7 @@
                                         <Button Style="{StaticResource FlatButton}"
                                                 Height="24"
                                                 Padding="6,0"
-                                                Command="{Binding Data.OpenBreadcrumbCommand, Source={StaticResource Shell}}"
+                                                Command="{Binding Data.Address.OpenSegmentCommand, Source={StaticResource Shell}}"
                                                 CommandParameter="{Binding}"
                                                 ToolTip="{Binding FullPath}">
                                             <TextBlock Text="{Binding Name}"
@@ -223,45 +303,143 @@
                                                        FontSize="12"
                                                        VerticalAlignment="Center" />
                                         </Button>
-                                        <TextBlock Text="&#xE76C;"
-                                                   Style="{StaticResource IconText}"
-                                                   FontSize="7"
-                                                   Margin="1,0"
-                                                   Foreground="{StaticResource TextDimBrush}"
-                                                   Visibility="{Binding IsLast, Converter={StaticResource InverseBoolToVisibility}}" />
+
+                                        <!-- The chevron is a crumb of its own: it
+                                             opens the folders that could have been
+                                             taken from here instead of the one that
+                                             was. -->
+                                        <Button x:Name="CrumbChevron"
+                                                Style="{StaticResource FlatButton}"
+                                                Width="16"
+                                                Height="24"
+                                                Padding="0"
+                                                Command="{Binding Data.Address.ToggleSegmentMenuCommand, Source={StaticResource Shell}}"
+                                                CommandParameter="{Binding}"
+                                                ToolTip="Folders in here"
+                                                AutomationProperties.Name="Folders in here">
+                                            <TextBlock Text="&#xE76C;"
+                                                       Style="{StaticResource IconText}"
+                                                       FontSize="7"
+                                                       Foreground="{StaticResource TextDimBrush}" />
+                                        </Button>
+
+                                        <Popup PlacementTarget="{Binding ElementName=CrumbChevron}"
+                                               Placement="Bottom"
+                                               VerticalOffset="6"
+                                               HorizontalOffset="-8"
+                                               AllowsTransparency="True"
+                                               Focusable="False"
+                                               PopupAnimation="Fade"
+                                               StaysOpen="False"
+                                               IsOpen="{Binding IsMenuOpen, Mode=TwoWay}">
+                                            <Border MinWidth="220"
+                                                    MaxWidth="460"
+                                                    Padding="4"
+                                                    CornerRadius="6"
+                                                    Background="#F2242424"
+                                                    BorderBrush="{StaticResource BorderStrongBrush}"
+                                                    BorderThickness="1">
+                                                <Border.Effect>
+                                                    <DropShadowEffect BlurRadius="18" ShadowDepth="5" Opacity="0.45" Color="#000000" />
+                                                </Border.Effect>
+                                                <Grid>
+                                                    <ListBox ItemsSource="{Binding Children}"
+                                                             Style="{StaticResource AddressSuggestionList}"
+                                                             PreviewMouseLeftButtonUp="AddressSuggestions_PreviewMouseLeftButtonUp" />
+                                                    <TextBlock Text="{Binding EmptyText}"
+                                                               Foreground="{StaticResource TextMutedBrush}"
+                                                               FontSize="12"
+                                                               Margin="10,8"
+                                                               Visibility="{Binding Children.Count, Converter={StaticResource ZeroCountToVisibility}}" />
+                                                </Grid>
+                                            </Border>
+                                        </Popup>
                                     </StackPanel>
                                 </DataTemplate>
                             </ItemsControl.ItemTemplate>
                         </ItemsControl>
                     </ScrollViewer>
 
-                    <TextBox x:Name="AddressBox"
-                             Grid.Column="1"
-                             Text="{Binding AddressText, UpdateSourceTrigger=PropertyChanged}"
-                             Background="Transparent"
-                             Foreground="{StaticResource TextBrush}"
-                             CaretBrush="{StaticResource TextBrush}"
-                             SelectionBrush="{StaticResource AccentBrush}"
-                             BorderThickness="0"
-                             Height="26"
-                             Padding="4,0"
-                             VerticalContentAlignment="Center"
-                             FontSize="12"
-                             KeyDown="AddressBox_KeyDown"
-                             LostKeyboardFocus="AddressBox_LostKeyboardFocus"
-                             Visibility="{Binding IsAddressEditing, Converter={StaticResource BoolToVisibility}}" />
+                    <Grid Grid.Column="1"
+                          Visibility="{Binding Address.IsEditing, Converter={StaticResource BoolToVisibility}}">
+                        <TextBox x:Name="AddressBox"
+                                 Text="{Binding Address.Text, UpdateSourceTrigger=PropertyChanged}"
+                                 Background="Transparent"
+                                 Foreground="{StaticResource TextBrush}"
+                                 CaretBrush="{StaticResource TextBrush}"
+                                 SelectionBrush="{StaticResource AccentBrush}"
+                                 BorderThickness="0"
+                                 Height="26"
+                                 Padding="4,0"
+                                 VerticalContentAlignment="Center"
+                                 FontSize="12"
+                                 PreviewKeyDown="AddressBox_PreviewKeyDown"
+                                 TextChanged="AddressBox_TextChanged"
+                                 LostKeyboardFocus="AddressBox_LostKeyboardFocus" />
 
-                    <Button Grid.Column="2"
-                            Width="28"
-                            Height="26"
-                            Padding="0"
-                            Style="{StaticResource FlatButton}"
-                            Command="{Binding RefreshCommand}"
-                            ToolTip="Refresh (F5)" AutomationProperties.Name="Refresh">
-                        <TextBlock Text="&#xE72C;" Style="{StaticResource IconText}" FontSize="12" />
-                    </Button>
+                    </Grid>
+
+                    <StackPanel Grid.Column="2" Orientation="Horizontal">
+                        <Button Width="28"
+                                Height="26"
+                                Padding="0"
+                                Style="{StaticResource FlatButton}"
+                                Command="{Binding Address.CopyCommand}"
+                                ToolTip="Copy this path"
+                                AutomationProperties.Name="Copy this path">
+                            <TextBlock Text="&#xE8C8;" Style="{StaticResource IconText}" FontSize="12" />
+                        </Button>
+                        <Button Width="22"
+                                Height="26"
+                                Padding="0"
+                                Style="{StaticResource FlatButton}"
+                                Command="{Binding Address.ShowRecentCommand}"
+                                ToolTip="Recent locations (F4)"
+                                AutomationProperties.Name="Recent locations">
+                            <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="10" />
+                        </Button>
+                        <Button Width="28"
+                                Height="26"
+                                Padding="0"
+                                Style="{StaticResource FlatButton}"
+                                Command="{Binding RefreshCommand}"
+                                ToolTip="Refresh (F5)" AutomationProperties.Name="Refresh">
+                            <TextBlock Text="&#xE72C;" Style="{StaticResource IconText}" FontSize="12" />
+                        </Button>
+                    </StackPanel>
                 </Grid>
             </Border>
+
+            <!-- The suggestions, part of the window rather than a popup of
+                 their own: a popup is a separate window, and opening one takes
+                 the keyboard out of the line that opened it - the line would
+                 close itself half a second after being asked for.  The row
+                 paints above the rest of the window so this can hang out of it,
+                 and it hangs from a canvas because a row 48 pixels tall would
+                 otherwise measure the list as 4 pixels tall and show nothing. -->
+            <Canvas Grid.Column="1" Margin="8,0,8,0" Height="0" VerticalAlignment="Top">
+                <Border x:Name="AddressDropDown"
+                        Canvas.Left="0"
+                        Canvas.Top="44"
+                        Width="{Binding ActualWidth, ElementName=AddressArea}"
+                        Padding="4"
+                        CornerRadius="6"
+                        Background="#F2242424"
+                        BorderBrush="{StaticResource BorderStrongBrush}"
+                        BorderThickness="1"
+                        Visibility="{Binding Address.IsDropDownOpen, Converter={StaticResource BoolToVisibility}}">
+                    <Border.Effect>
+                        <DropShadowEffect BlurRadius="20" ShadowDepth="6" Opacity="0.45" Color="#000000" />
+                    </Border.Effect>
+                    <ListBox x:Name="AddressSuggestionItems"
+                             ItemsSource="{Binding Address.Suggestions}"
+                             SelectedItem="{Binding Address.Highlighted, Mode=TwoWay}"
+                             Style="{StaticResource AddressSuggestionList}"
+                             VirtualizingPanel.IsVirtualizing="True"
+                             VirtualizingPanel.VirtualizationMode="Recycling"
+                             PreviewMouseLeftButtonUp="AddressSuggestions_PreviewMouseLeftButtonUp" />
+                </Border>
+            </Canvas>
 
             <Border Grid.Column="2"
                     Width="300"

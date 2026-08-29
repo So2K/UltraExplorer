@@ -76,6 +76,7 @@ internal static partial class Program
         await Harness(fixtureRoot);
         await TidyTree();
         await FolderList();
+        await AddressBar();
         await FolderColours(fixtureRoot);
         await EverythingSearch();
         await ProgramTargets();

@@ -213,7 +213,7 @@ public partial class MainWindow
             return;
         }
 
-        if (e.Key == Key.Escape && !_viewModel.IsSearchOpen && !_viewModel.IsAddressEditing)
+        if (e.Key == Key.Escape && !_viewModel.IsSearchOpen && !_viewModel.Address.IsEditing)
         {
             e.Handled = true;
             CancelPicker();

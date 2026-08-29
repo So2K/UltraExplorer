@@ -46,6 +46,8 @@ public partial class MainWindow : Window
     private Point _overviewDragNodeOrigin;
     private bool _overviewDragMoved;
     private bool _folderListClickWasOnSelection;
+    private bool _addressMayComplete;
+    private bool _addressCompleting;
     private readonly DispatcherTimer _folderListRenameTimer = new(DispatcherPriority.Input)
     {
         Interval = TimeSpan.FromMilliseconds(NativeShellService.DoubleClickMilliseconds + 60)
@@ -81,6 +83,10 @@ public partial class MainWindow : Window
 
         ConfigureNodeDrag();
         _folderListRenameTimer.Tick += FolderListRename_Tick;
+
+        _viewModel.Address.EditRequested += FocusAddressBox;
+        _viewModel.Address.CompletionOffered += OfferAddressCompletion;
+        _viewModel.Address.PropertyChanged += Address_PropertyChanged;
 
         Overview.Index = _viewModel.Tree.SpatialIndex;
         Harness.Index = _viewModel.Tree.SpatialIndex;
@@ -1198,9 +1204,22 @@ public partial class MainWindow : Window
     private void ToggleMaximized()
         => WindowState = WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
 
-    private void AddressArea_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    /// <summary>
+    /// Clicking the bar anywhere that is not a crumb or a button turns it into a
+    /// line to type a path in - the empty strip beside the crumbs included,
+    /// which is where the pointer usually is.  On the preview so that nothing
+    /// inside the bar can quietly swallow the click on its way up.
+    /// </summary>
+    private void AddressArea_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        if (e.OriginalSource is FrameworkElement { TemplatedParent: Button })
+        // Already a line: this click is someone putting the caret where they
+        // want it, not asking for the line they are already typing in.
+        if (_viewModel.Address.IsEditing)
+        {
+            return;
+        }
+
+        if (FindAncestor<Button>(e.OriginalSource as DependencyObject) is not null)
         {
             return;
         }
@@ -1208,36 +1227,202 @@ public partial class MainWindow : Window
         BeginAddressEdit();
     }
 
-    private void BeginAddressEdit()
+    /// <summary>
+    /// Right-clicking the bar offers what can be done with the path itself,
+    /// which is mostly getting it into and out of the clipboard.
+    /// </summary>
+    private void AddressArea_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
-        _viewModel.AddressText = _viewModel.Tree.ActivePath;
-        _viewModel.IsAddressEditing = true;
-        Dispatcher.InvokeAsync(() =>
-        {
-            AddressBox.Focus();
-            AddressBox.SelectAll();
-        }, DispatcherPriority.Input);
+        e.Handled = true;
+
+        var address = _viewModel.Address;
+        var menu = new ContextMenu { PlacementTarget = AddressArea };
+        AddCommandItem(menu, "Edit address", "\uE70F", address.EditCommand, "Ctrl+L");
+        AddCommandItem(menu, "Copy address", "\uE8C8", address.CopyCommand);
+        AddCommandItem(menu, "Copy address as a quoted path", "\uE71B", address.CopyQuotedCommand);
+        AddCommandItem(menu, "Paste and go", "\uE77F", address.PasteAndGoCommand);
+        menu.Items.Add(new Separator());
+        AddCommandItem(menu, "Open in Windows Explorer", "\uEC50", address.OpenInExplorerCommand);
+        menu.IsOpen = true;
     }
 
-    private void AddressBox_KeyDown(object sender, KeyEventArgs e)
+    private void BeginAddressEdit() => _viewModel.Address.BeginEdit();
+
+    /// <summary>
+    /// The line has been opened: it needs the keyboard, and everything in it
+    /// selected so that typing a fresh path replaces the old one.
+    /// </summary>
+    private void FocusAddressBox()
+        => Dispatcher.InvokeAsync(
+            () =>
+            {
+                AddressBox.Focus();
+                AddressBox.SelectAll();
+            },
+
+            // Behind the pending input, not in front of it: the click that asked
+            // for the line is still on its way through, and the text box would
+            // answer it by putting the caret where the pointer is and dropping
+            // the selection - so the next thing typed would land in the middle
+            // of the old path instead of replacing it.
+            DispatcherPriority.Background);
+
+    /// <summary>
+    /// Whatever ended the editing - Enter, Escape, a suggestion - the keyboard
+    /// must land somewhere, and the canvas is where it came from.  Only when the
+    /// line still holds it: focus that moved elsewhere on its own stays there.
+    /// </summary>
+    private void Address_PropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.Key == Key.Enter)
+        if (e.PropertyName == nameof(AddressBarViewModel.IsEditing)
+            && !_viewModel.Address.IsEditing
+            && AddressBox.IsKeyboardFocusWithin)
         {
-            _viewModel.GoToAddressCommand.Execute(null);
-            _viewModel.IsAddressEditing = false;
             Editor.Focus();
-            e.Handled = true;
         }
-        else if (e.Key == Key.Escape)
+    }
+
+    /// <summary>
+    /// Enter goes, Escape backs out one step at a time, the arrows walk the
+    /// drop-down and Tab takes the offered folder and asks for its contents -
+    /// one key per level, no mouse.  This is on the preview because Tab and the
+    /// arrow keys never reach a text box otherwise.
+    /// </summary>
+    private void AddressBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        var address = _viewModel.Address;
+        switch (e.Key)
         {
-            _viewModel.IsAddressEditing = false;
-            Editor.Focus();
+            case Key.Enter:
+                address.GoCommand.Execute(null);
+                break;
+
+            case Key.Escape:
+                // The drop-down first, the line second: one Escape should not
+                // throw away a path that was only obscured by a list.
+                if (address.IsDropDownOpen)
+                {
+                    address.IsDropDownOpen = false;
+                }
+                else
+                {
+                    address.EndEdit();
+                }
+
+                break;
+
+            case Key.Down:
+                address.MoveHighlight(1);
+                AddressBox.CaretIndex = AddressBox.Text.Length;
+                break;
+
+            case Key.Up:
+                address.MoveHighlight(-1);
+                AddressBox.CaretIndex = AddressBox.Text.Length;
+                break;
+
+            case Key.Tab:
+                address.Complete();
+                AddressBox.CaretIndex = AddressBox.Text.Length;
+                break;
+
+            case Key.F4:
+                address.ShowRecentCommand.Execute(null);
+                break;
+
+            default:
+                return;
+        }
+
+        e.Handled = true;
+    }
+
+    /// <summary>
+    /// Remembers whether the caret is sitting at the end of something just
+    /// typed, which is the only place a completion may be offered: appending to
+    /// the middle of a path, or to something being deleted, would fight the
+    /// person typing.
+    /// </summary>
+    private void AddressBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_addressCompleting)
+        {
+            return;
+        }
+
+        _addressMayComplete =
+            e.Changes.Any(change => change.AddedLength > 0 && change.RemovedLength == 0)
+            && AddressBox.CaretIndex == AddressBox.Text.Length;
+    }
+
+    /// <summary>
+    /// Finishes the typed path in place with the rest of the best match, the
+    /// added part selected: carrying on typing throws it away, Right or End
+    /// keeps it.
+    /// </summary>
+    private void OfferAddressCompletion(string completion)
+    {
+        var typed = AddressBox.Text;
+        if (!_addressMayComplete
+            || !_viewModel.Address.IsEditing
+            || typed.Length == 0
+            || AddressBox.SelectionLength > 0
+            || AddressBox.CaretIndex != typed.Length
+            || completion.Length <= typed.Length
+            || !completion.StartsWith(typed, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _addressCompleting = true;
+        try
+        {
+            // What was typed is left exactly as typed, even where the folder on
+            // disk is spelled with other capitals; only the tail is ours.
+            AddressBox.Text = typed + completion[typed.Length..];
+            AddressBox.Select(typed.Length, completion.Length - typed.Length);
+        }
+        finally
+        {
+            _addressCompleting = false;
+
+            // The completed line asks for its own contents, and that answer must
+            // not complete again - otherwise one keystroke walks the whole tree.
+            _addressMayComplete = false;
+        }
+    }
+
+    /// <summary>
+    /// A click on a suggestion - under the line or behind a crumb's chevron -
+    /// goes there.  Button-up rather than selection, so walking the list with
+    /// the arrow keys stays reading rather than travelling.
+    /// </summary>
+    private void AddressSuggestions_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is ListBox list
+            && ItemsControl.ContainerFromElement(list, e.OriginalSource as DependencyObject) is ListBoxItem container
+            && container.DataContext is AddressSuggestion suggestion)
+        {
             e.Handled = true;
+            _viewModel.Address.AcceptCommand.Execute(suggestion);
         }
     }
 
     private void AddressBox_LostKeyboardFocus(object sender, KeyboardFocusChangedEventArgs e)
-        => _viewModel.IsAddressEditing = false;
+    {
+        // Focus that lands nowhere at all is not somebody clicking elsewhere: it
+        // is the keyboard leaving the window - a menu opening, a tooltip, the
+        // window losing the foreground - and the line should still be there when
+        // it comes back.  Clicking something else in the window names what was
+        // clicked, and that does finish the line; switching away from the window
+        // finishes it too, from Window_Deactivated.
+        if (e.NewFocus is null)
+        {
+            return;
+        }
+
+        _viewModel.Address.EndEdit();
+    }
 
     private void SearchBox_KeyDown(object sender, KeyEventArgs e)
     {
@@ -1273,9 +1458,19 @@ public partial class MainWindow : Window
         // Alt+Up, Alt+Enter and Shift+F10.
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
 
-        if (modifiers == ModifierKeys.Control && key == Key.L)
+        // Ctrl+L and Alt+D are both "put the path in a line I can type in";
+        // Windows has answered to either for twenty years.
+        if ((modifiers == ModifierKeys.Control && key == Key.L)
+            || (modifiers == ModifierKeys.Alt && key == Key.D))
         {
             BeginAddressEdit();
+            e.Handled = true;
+            return;
+        }
+
+        if (modifiers == ModifierKeys.None && key == Key.F4)
+        {
+            _viewModel.Address.ShowRecentCommand.Execute(null);
             e.Handled = true;
             return;
         }
@@ -1384,6 +1579,13 @@ public partial class MainWindow : Window
                 await _viewModel.Tree.ToggleAsync(collapse);
                 break;
             case (ModifierKeys.None, Key.Escape):
+                // A crumb's list of folders is the nearest thing to a menu the
+                // bar has, and Escape closes menus.
+                foreach (var crumb in _viewModel.Address.Breadcrumbs)
+                {
+                    crumb.IsMenuOpen = false;
+                }
+
                 _viewModel.CloseSearchCommand.Execute(null);
                 return;
             default:
@@ -1407,6 +1609,9 @@ public partial class MainWindow : Window
         // Alt+Tab while space is held would otherwise leave the grab hand on.
         _isSpacePanning = false;
         SetSpacePanArmed(false);
+
+        // Going to another program puts the crumbs back, as Explorer does.
+        _viewModel.Address.EndEdit();
     }
 
     private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
