@@ -43,6 +43,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private int _visibleNodeCount;
     private bool _isOverviewActive;
     private bool _isOverviewStale;
+    private bool _isCanvasShown = true;
+    private bool _graphChangedWhileHidden;
 
     /// <summary>
     /// Node containers added per pass.  Measured: a container costs about a
@@ -196,6 +198,89 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     {
         get => _isOverviewActive;
         private set => SetProperty(ref _isOverviewActive, value);
+    }
+
+    /// <summary>
+    /// Whether a path is brought into the graph by name rather than by opening
+    /// its ancestors.  Off, revealing a path expands every folder on the way to
+    /// it, which is what the tree canvas needs: the path has to be on the tree to
+    /// be seen there.  On, only the steps that have no node yet get one, and no
+    /// folder is read - see <see cref="ViewAllGraphService.MaterializeChainAsync"/>.
+    /// A first click deep inside System32 goes from half a second to a couple of
+    /// milliseconds, because nothing in System32 but the one folder on the way
+    /// is created.
+    ///
+    /// It is meant for while the tree canvas is not the one on screen.  The
+    /// nested canvas draws from its own tree and selects through this view model
+    /// by path, so the selection, the commands, the list, the address and the
+    /// status bar all work from a node that is not on the tree - and none of
+    /// them notices that the folders above it were never opened.
+    ///
+    /// Everything that reveals goes through it: <see cref="RevealPathAsync"/>
+    /// itself, and so <see cref="SelectPathAsync"/>,
+    /// <see cref="ToggleSelectionAsync"/> and <see cref="MaterializeAsync"/>.
+    /// What happens once the node exists does not change - it is still selected,
+    /// still flown to through <see cref="FocusNodeRequested"/>, still saved, and
+    /// a path that is not there still gets the same message.
+    ///
+    /// Turning it off does not put the tree right by itself: nodes brought in by
+    /// name stay off the tree until their folder is opened.  Switching back to the
+    /// tree should turn this off and reveal <see cref="ActivePath"/> again,
+    /// preferably before <see cref="IsCanvasShown"/> is turned back on, so the
+    /// canvas comes up already open at the selection.  To have a selection that
+    /// only existed this way picked up again after a restart, turn it on before
+    /// <see cref="InitializeAsync"/>.
+    /// </summary>
+    public bool PreferLightReveal { get; set; }
+
+    /// <summary>
+    /// Whether the tree canvas is on screen.  Most of what this view model does
+    /// after the graph changes is for that canvas alone: culling the nodes the
+    /// editor should realize, handing them to it a few per frame, asking for
+    /// their icons, working out the trail and telling the batched layers to
+    /// rebuild.  While the nested canvas is the one showing, the editor is
+    /// collapsed and all of that is work for a picture nobody can see, so it is
+    /// not done; the view model only remembers that it is behind.
+    ///
+    /// The rest carries on exactly as before: the selection,
+    /// <see cref="ActiveNode"/> and the status texts, the folder list, the
+    /// watcher, hidden folders and saving.  The node count keeps being kept
+    /// too - it is one pass over the graph, and the status bar reads it whenever
+    /// nothing is selected, whichever canvas is showing.
+    ///
+    /// Turning it back on catches up in one go: anything opened while the tree
+    /// was away is checked against the tree (see
+    /// <see cref="ViewAllGraphService.SettleVisibility"/>), the render set is
+    /// rebuilt once and <see cref="GraphInvalidated"/> is raised, so the editor,
+    /// the harness and the batched overview all come up current.
+    /// </summary>
+    public bool IsCanvasShown
+    {
+        get => _isCanvasShown;
+        set
+        {
+            if (!SetProperty(ref _isCanvasShown, value))
+            {
+                return;
+            }
+
+            if (!value)
+            {
+                _renderThrottle.Stop();
+                _fillTimer.Stop();
+                return;
+            }
+
+            // Settling announces a change when it finds one, and that already
+            // rebuilds everything below; otherwise it is done here.
+            var settled = _graphChangedWhileHidden && !_isDisposed && _graph.SettleVisibility();
+            _graphChangedWhileHidden = false;
+            if (!settled)
+            {
+                _isOverviewStale = true;
+                RebuildRenderSet();
+            }
+        }
     }
 
     /// <summary>The visible node under a graph-space point.</summary>
@@ -355,6 +440,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
                 if (!string.IsNullOrWhiteSpace(state.ActivePath) && _graph.TryGetNode(state.ActivePath, out var active))
                 {
                     SelectOnly(active);
+                }
+                else if (PreferLightReveal
+                    && !string.IsNullOrWhiteSpace(state.ActivePath)
+                    && await _graph.MaterializeChainAsync(state.ActivePath) is { IsComplete: true, Node: { } named })
+                {
+                    // Selected by name last time, so no opened folder brought it
+                    // back: the workspace only reopens what was open.
+                    SelectOnly(named);
                 }
                 else if (_graph.Roots.FirstOrDefault() is { } firstRoot)
                 {
@@ -542,7 +635,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
                 : $"{targets.Length} folders hidden — bring them back from the canvas menu",
             false);
         RebuildRenderSet();
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
         ScheduleSave();
     }
 
@@ -556,7 +649,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HiddenPaths));
         OnPropertyChanged(nameof(HiddenCount));
         RebuildRenderSet();
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
         ScheduleSave();
     }
 
@@ -571,7 +664,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(HiddenPaths));
         OnPropertyChanged(nameof(HiddenCount));
         RebuildRenderSet();
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
         ScheduleSave();
     }
 
@@ -592,7 +685,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
 
         RebuildRenderSet();
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
         MessageRequested?.Invoke(
             targets.Length == 1
                 ? $"{targets[0].DisplayName} is back in the layout"
@@ -609,7 +702,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     {
         _graph.RefreshLinks();
         RebuildRenderSet();
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
         ScheduleSave();
     }
 
@@ -633,7 +726,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     {
         _graph.Relayout();
         RebuildRenderSet();
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
         MessageRequested?.Invoke("Canvas tidied", false);
         ScheduleSave();
     }
@@ -656,13 +749,26 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         PathRefreshed?.Invoke(node.FullPath);
     }
 
-    /// <summary>Re-reads a directory if it is currently part of the graph.</summary>
+    /// <summary>
+    /// Re-reads a directory if it is currently part of the graph.  One that has
+    /// never been read has nothing to re-read, but it can still hold children
+    /// brought in by name - a folder selected on the nested canvas, say - and
+    /// those are checked against the disk instead, so deleting or renaming one
+    /// does not leave its node behind for the next reveal to find.
+    /// </summary>
     public async Task RefreshPathAsync(string path)
     {
-        if (_graph.TryGetNode(path, out var node) && node.AreChildrenLoaded)
+        if (_graph.TryGetNode(path, out var node))
         {
-            await _graph.RefreshBranchAsync(node);
-            ScheduleSave();
+            if (node.AreChildrenLoaded)
+            {
+                await _graph.RefreshBranchAsync(node);
+                ScheduleSave();
+            }
+            else if (await _graph.PruneMissingChildrenAsync(node) > 0)
+            {
+                ScheduleSave();
+            }
         }
 
         // The list reads the directory itself, so a change the canvas has just
@@ -690,6 +796,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// <summary>
     /// Expands every ancestor of <paramref name="path"/> and selects it.  Only
     /// the folders on the way are read, never their siblings' subtrees.
+    ///
+    /// With <see cref="PreferLightReveal"/> on, the ancestors are not expanded:
+    /// the path is brought in by name, one node per missing step, and the rest -
+    /// selecting, flying there, saving, the message for a path that is not
+    /// there - is the same.
     /// </summary>
     public async Task<ViewAllNodeViewModel?> RevealPathAsync(string path, bool focus = true, bool select = true)
     {
@@ -711,40 +822,56 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return null;
         }
 
-        // A UNC share or a WSL distribution is not a DriveInfo root, so it only
-        // enters the graph when it is explicitly added.
-        if (chain.Count > 0 && !_graph.TryGetNode(chain[0], out _))
-        {
-            await _graph.AddRootAsync(chain[0]);
-        }
-
         ViewAllNodeViewModel? node = null;
-        foreach (var step in chain)
+        if (PreferLightReveal)
         {
-            if (!_graph.TryGetNode(step, out var found))
+            var result = await _graph.MaterializeChainAsync(normalized);
+            node = result.Node;
+            if (result.MissingStep is { } missing)
             {
-                // The step may simply be filtered out of its parent - hidden,
-                // or not of the file type on offer.  Asking for it by name
-                // outranks that.
-                var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
-                if (adopted is null)
-                {
-                    MessageRequested?.Invoke(
-                        node is null
-                            ? "That drive is not available on this machine."
-                            : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
-                        true);
-                    break;
-                }
-
-                found = adopted;
+                MessageRequested?.Invoke(
+                    node is null
+                        ? "That drive is not available on this machine."
+                        : $"{Path.GetFileName(missing)} is no longer inside {node.DisplayName}.",
+                    true);
+            }
+        }
+        else
+        {
+            // A UNC share or a WSL distribution is not a DriveInfo root, so it only
+            // enters the graph when it is explicitly added.
+            if (chain.Count > 0 && !_graph.TryGetNode(chain[0], out _))
+            {
+                await _graph.AddRootAsync(chain[0]);
             }
 
-            node = found;
-            var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
-            if (!isDestination && node.IsDirectory)
+            foreach (var step in chain)
             {
-                await _graph.ExpandAsync(node);
+                if (!_graph.TryGetNode(step, out var found))
+                {
+                    // The step may simply be filtered out of its parent - hidden,
+                    // or not of the file type on offer.  Asking for it by name
+                    // outranks that.
+                    var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
+                    if (adopted is null)
+                    {
+                        MessageRequested?.Invoke(
+                            node is null
+                                ? "That drive is not available on this machine."
+                                : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
+                            true);
+                        break;
+                    }
+
+                    found = adopted;
+                }
+
+                node = found;
+                var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
+                if (!isDestination && node.IsDirectory)
+                {
+                    await _graph.ExpandAsync(node);
+                }
             }
         }
 
@@ -959,8 +1086,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(ViewportLocation));
 
         // Restarting on every viewport event would starve the tick during a
-        // continuous pan and leave the culling on a stale viewport.
-        if (!_renderThrottle.IsEnabled)
+        // continuous pan and leave the culling on a stale viewport.  A canvas
+        // that is not showing is culled once, when it comes back.
+        if (_isCanvasShown && !_renderThrottle.IsEnabled)
         {
             _renderThrottle.Start();
         }
@@ -1233,6 +1361,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         _visibleNodeCount = visible;
         _isOverviewStale = true;
+
+        if (!_isCanvasShown)
+        {
+            // Nothing below runs for a canvas that is not showing, and the count
+            // normally reaches the status bar through the render set.
+            _graphChangedWhileHidden = true;
+            LogicalNodeCount = visible;
+            return;
+        }
+
         RebuildRenderSet();
     }
 
@@ -1244,10 +1382,25 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private void OnLayoutChanged()
     {
         _isOverviewStale = true;
-        if (!_renderThrottle.IsEnabled)
+        if (_isCanvasShown && !_renderThrottle.IsEnabled)
         {
             _renderThrottle.Start();
         }
+    }
+
+    /// <summary>
+    /// Tells the tree canvas's batched layers that what they drew is out of date
+    /// - or, while it is not showing, remembers to tell them when it is.
+    /// </summary>
+    private void InvalidateCanvas()
+    {
+        if (!_isCanvasShown)
+        {
+            _isOverviewStale = true;
+            return;
+        }
+
+        GraphInvalidated?.Invoke();
     }
 
     private void OnNodeCreated(ViewAllNodeViewModel node)
@@ -1302,7 +1455,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         // Zoomed out the canvas is one cached geometry per colour, so a recolour
         // is not visible until it is rebuilt.
-        GraphInvalidated?.Invoke();
+        InvalidateCanvas();
     }
 
     private void OnSelectedNodesChanged(object? sender, NotifyCollectionChangedEventArgs e)
@@ -1334,6 +1487,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     {
         if (_isDisposed)
         {
+            return;
+        }
+
+        // Everything below feeds the tree canvas and nothing else: the editor's
+        // containers, their icons, the trail and the batched layers.  While the
+        // tree is not on screen it is skipped outright, and done once when it
+        // comes back (see IsCanvasShown).
+        if (!_isCanvasShown)
+        {
+            _fillTimer.Stop();
             return;
         }
 

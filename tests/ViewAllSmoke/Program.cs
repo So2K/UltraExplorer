@@ -84,6 +84,7 @@ internal static partial class Program
         await NestedTreeChecks();
         await NestedReaderChecks(fixtureRoot);
         await NestedCanvasChecks();
+        await LightReveal(fixtureRoot);
     }
 
     // ---- fixture -----------------------------------------------------------

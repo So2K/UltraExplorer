@@ -111,6 +111,18 @@ public sealed record ViewAllExpansionResult(
     bool WasLoaded,
     bool IsTruncated);
 
+/// <summary>
+/// How far bringing a path into the graph got.  <see cref="Node"/> is the
+/// deepest step that exists - the destination itself when nothing is missing -
+/// and is null only when not even the root could be found.
+/// <see cref="MissingStep"/> is the first step that could not be found, spelled
+/// as it was asked for, so the message about it names what the user typed.
+/// </summary>
+public sealed record ViewAllChainResult(ViewAllNodeViewModel? Node, string? MissingStep)
+{
+    public bool IsComplete => Node is not null && MissingStep is null;
+}
+
 public sealed record ViewAllRenderSet(
     IReadOnlyList<ViewAllNodeViewModel> Nodes,
     IReadOnlyList<ViewAllEdgeViewModel> Edges,

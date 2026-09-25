@@ -597,6 +597,297 @@ public sealed class ViewAllGraphService : IDisposable
     }
 
     /// <summary>
+    /// Brings <paramref name="path"/> into the graph without opening anything
+    /// on the way: every step that has no node yet gets exactly one, for itself,
+    /// and no folder on the chain is read.  It is the counterpart of revealing a
+    /// path by expanding its ancestors, for when the tree is not on screen to
+    /// show them - the nested canvas has its own picture, and all it needs from
+    /// the graph is a node to select.  Expanding the ancestors of
+    /// <c>C:\Windows\System32\drivers\etc</c> creates five thousand nodes for
+    /// System32 alone and lays the whole tree out again; this creates four.
+    ///
+    /// The folders on the way are left exactly as they were: not loaded, not
+    /// expanded.  A node brought in under a folder that is not open on the tree
+    /// is not on the tree either - <see cref="ViewAllNodeViewModel.IsTreeVisible"/>
+    /// is false, so it is not counted, indexed, laid out or drawn - and the tree
+    /// is only laid out again when one of them lands somewhere it can be seen.
+    /// Reading such a folder later keeps the node that is already there, same
+    /// object and same identity, and shows it like any of its siblings.
+    ///
+    /// Everything that exists is described in one trip to the thread pool, and
+    /// the graph hears about the result once.  A name the disk spells
+    /// differently is taken the disk's way, and a step that already has a node -
+    /// under another spelling, or as a root of its own - reuses it.
+    /// </summary>
+    public async Task<ViewAllChainResult> MaterializeChainAsync(
+        string path,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+
+        IReadOnlyList<string> chain;
+        try
+        {
+            chain = ViewAllPath.AncestorChain(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return new ViewAllChainResult(null, path);
+        }
+
+        if (chain.Count == 0)
+        {
+            return new ViewAllChainResult(null, path);
+        }
+
+        // A UNC share or a WSL distribution is not a drive, so it only enters
+        // the graph when it is asked for.
+        if (!_nodesByPath.ContainsKey(chain[0]))
+        {
+            await AddRootAsync(chain[0], cancellationToken);
+        }
+
+        // The graph can change while the disk is being asked - a refresh can
+        // take the folder the chain was hanging from away - and then the walk
+        // starts again from whatever is there now.  Three goes is plenty: it
+        // takes a refresh landing inside a couple of milliseconds each time.
+        ViewAllNodeViewModel? reached = null;
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            ViewAllNodeViewModel? node = null;
+            var next = 0;
+            while (next < chain.Count && _nodesByPath.TryGetValue(chain[next], out var known))
+            {
+                node = known;
+                next++;
+            }
+
+            if (node is null)
+            {
+                return new ViewAllChainResult(null, chain[0]);
+            }
+
+            if (next == chain.Count)
+            {
+                return new ViewAllChainResult(node, null);
+            }
+
+            reached = node;
+            var steps = chain.Skip(next).ToArray();
+            var described = await _fileSystem.DescribeChainAsync(node.FullPath, steps, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_disposed)
+            {
+                return new ViewAllChainResult(null, null);
+            }
+
+            if (!IsLive(node))
+            {
+                continue;
+            }
+
+            return AdoptChain(node, steps, described);
+        }
+
+        return new ViewAllChainResult(reached is not null && IsLive(reached) ? reached : null, path);
+    }
+
+    /// <summary>
+    /// The graph half of <see cref="MaterializeChainAsync"/>: turns what the disk
+    /// said into nodes, under one layout scope and with one announcement.
+    /// </summary>
+    private ViewAllChainResult AdoptChain(
+        ViewAllNodeViewModel from,
+        IReadOnlyList<string> steps,
+        IReadOnlyList<ViewAllEntryDescriptor> described)
+    {
+        var node = from;
+        var edges = new List<ViewAllEdgeViewModel>(described.Count);
+        var onTree = false;
+        string? missing = null;
+
+        using (SuspendLayout())
+        {
+            for (var index = 0; index < steps.Count; index++)
+            {
+                if (index >= described.Count)
+                {
+                    missing = steps[index];
+                    break;
+                }
+
+                var entry = described[index];
+                if (_nodesByPath.TryGetValue(entry.FullPath, out var existing))
+                {
+                    node = existing;
+                    continue;
+                }
+
+                if (!node.IsDirectory)
+                {
+                    missing = steps[index];
+                    break;
+                }
+
+                var child = CreateNode(entry, node.Depth + 1, node);
+
+                // On the tree only if its folder is open on the tree.  A hidden
+                // folder was already taken off it by CreateNode.
+                if (!child.IsUserHidden)
+                {
+                    child.IsTreeVisible = node.IsTreeVisible && node.IsExpanded;
+                }
+
+                RestorePosition(child);
+                if (!child.IsTreeVisible)
+                {
+                    // A restored position indexes the node as it lands; one
+                    // that is not on the tree has no business in the grid.
+                    Index.Remove(child);
+                }
+
+                node.Children.Add(child);
+                var edge = new ViewAllEdgeViewModel(node, child);
+                _edges.Add(edge);
+                _incomingEdges[child.Id] = edge;
+                edges.Add(edge);
+                node.NotifyChildrenChanged();
+
+                if (child.IsTreeVisible)
+                {
+                    onTree = true;
+                    Reflow();
+                }
+
+                node = child;
+            }
+        }
+
+        if (edges.Count == 0)
+        {
+            return new ViewAllChainResult(node, missing);
+        }
+
+        // Laying the tree out settles every link.  Without a layout nothing that
+        // was already there moved or changed visibility, so only the new links
+        // need deciding.
+        if (!onTree)
+        {
+            foreach (var edge in edges)
+            {
+                ApplyEdgeVisibility(edge);
+            }
+        }
+
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+        return new ViewAllChainResult(node, missing);
+    }
+
+    /// <summary>
+    /// Drops the children of a folder that has not been read which are no longer
+    /// what the disk has: deleted, moved away, or renamed to another spelling.
+    /// Such a folder's children are only the ones brought in by name, and
+    /// nothing else would ever notice them going - a folder that has been read
+    /// is re-read by <see cref="RefreshBranchAsync"/>, which rebuilds the list
+    /// from the disk, but one that has not has no list to rebuild.  Left alone,
+    /// a folder deleted after it was selected would keep its node, and asking
+    /// for its path again would find it.
+    ///
+    /// A pruned node goes the way a refreshed-away descendant goes: its whole
+    /// subtree leaves the index, the lookup and the edge list.  Returns how many
+    /// children went.
+    /// </summary>
+    public async Task<int> PruneMissingChildrenAsync(
+        ViewAllNodeViewModel node,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        if (node.AreChildrenLoaded || node.Children.Count == 0)
+        {
+            return 0;
+        }
+
+        var candidates = node.Children.ToArray();
+        var stale = await _fileSystem.FindStaleAsync(
+            [.. candidates.Select(child => child.FullPath)],
+            cancellationToken);
+
+        // Read while the disk was being asked: the folder is now the business of
+        // RefreshBranchAsync, which does this and more.
+        if (_disposed || !IsLive(node) || node.AreChildrenLoaded)
+        {
+            return 0;
+        }
+
+        var doomed = candidates
+            .Where((child, index) => stale[index] && node.Children.Contains(child))
+            .ToList();
+        if (doomed.Count == 0)
+        {
+            return 0;
+        }
+
+        var wasOnTree = doomed.Any(child => child.IsTreeVisible);
+        RemoveSubtrees(node, doomed);
+        node.NotifyChildrenChanged();
+        if (wasOnTree)
+        {
+            Reflow();
+        }
+
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+        return doomed.Count;
+    }
+
+    /// <summary>
+    /// Works out again, from the roots down, which nodes are on the tree: a node
+    /// is on it when its folder is on it and open, and it has not been hidden.
+    /// Opening a folder decides that for its own children only, so opening one
+    /// that is itself off the tree - as happens while the tree is not on screen
+    /// and a node was brought in by name, not by opening its ancestors - leaves
+    /// children marked as shown under a folder that is not.  They are laid out
+    /// nowhere, but they count, and any that kept an old position would be
+    /// indexed at it.  This puts that right in one pass, and lays out and
+    /// announces only if something was wrong.
+    /// </summary>
+    /// <returns>True when anything changed.</returns>
+    public bool SettleVisibility()
+    {
+        ThrowIfDisposed();
+        var changed = false;
+        foreach (var root in _roots)
+        {
+            changed |= Settle(root, !root.IsUserHidden);
+        }
+
+        if (!changed)
+        {
+            return false;
+        }
+
+        Reflow();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+        return true;
+
+        static bool Settle(ViewAllNodeViewModel node, bool onTree)
+        {
+            var changed = node.IsTreeVisible != onTree;
+            node.IsTreeVisible = onTree;
+            var childrenOnTree = onTree && node.IsExpanded;
+            foreach (var child in node.Children)
+            {
+                changed |= Settle(child, childrenOnTree && !child.IsUserHidden);
+            }
+
+            return changed;
+        }
+    }
+
+    /// <summary>True while <paramref name="node"/> is still the graph's node for its path.</summary>
+    private bool IsLive(ViewAllNodeViewModel node)
+        => _nodesByPath.TryGetValue(node.FullPath, out var current) && ReferenceEquals(current, node);
+
+    /// <summary>
     /// Adds an extra top-level root for a directory that is not a local drive
     /// (a WSL distribution or a UNC share).  Existing roots are left alone.
     /// </summary>
@@ -1048,11 +1339,16 @@ public sealed class ViewAllGraphService : IDisposable
     {
         foreach (var edge in _edges)
         {
-            edge.IsTreeVisible = edge.Source.IsTreeVisible
-                && edge.Source.IsExpanded
-                && edge.Target.IsTreeVisible
-                && !IsCoveredByHarness(edge.Source, edge.Target);
+            ApplyEdgeVisibility(edge);
         }
+    }
+
+    private static void ApplyEdgeVisibility(ViewAllEdgeViewModel edge)
+    {
+        edge.IsTreeVisible = edge.Source.IsTreeVisible
+            && edge.Source.IsExpanded
+            && edge.Target.IsTreeVisible
+            && !IsCoveredByHarness(edge.Source, edge.Target);
     }
 
     /// <summary>
@@ -1101,6 +1397,40 @@ public sealed class ViewAllGraphService : IDisposable
             return;
         }
 
+        Forget(doomed);
+        parent.Children.Clear();
+    }
+
+    /// <summary>
+    /// Removes some of a folder's children, each with everything under it, the
+    /// same way a refresh removes all of them.
+    /// </summary>
+    private void RemoveSubtrees(ViewAllNodeViewModel parent, IReadOnlyCollection<ViewAllNodeViewModel> children)
+    {
+        var doomed = new List<ViewAllNodeViewModel>();
+        foreach (var child in children)
+        {
+            doomed.Add(child);
+            doomed.AddRange(EnumerateDescendants(child));
+        }
+
+        var leaving = new HashSet<ViewAllNodeViewModel>(children);
+        Forget(doomed);
+        for (var index = parent.Children.Count - 1; index >= 0; index--)
+        {
+            if (leaving.Contains(parent.Children[index]))
+            {
+                parent.Children.RemoveAt(index);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Takes nodes out of every structure the graph keeps: the index, the path
+    /// lookup, the node and edge lists, and any read still in flight.
+    /// </summary>
+    private void Forget(List<ViewAllNodeViewModel> doomed)
+    {
         var doomedSet = new HashSet<ViewAllNodeViewModel>(doomed);
         foreach (var node in doomed)
         {
@@ -1119,7 +1449,6 @@ public sealed class ViewAllGraphService : IDisposable
         // One compacting pass instead of a removal scan per node.
         _nodes.RemoveAll(doomedSet.Contains);
         _edges.RemoveAll(edge => doomedSet.Contains(edge.Target) || doomedSet.Contains(edge.Source));
-        parent.Children.Clear();
     }
 
     private void CancelLoad(ViewAllNodeViewModel node)
