@@ -32,10 +32,7 @@ public sealed class FolderMarkService
 
     public FolderMarkService(string? statePath = null)
     {
-        StatePath = statePath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "UltraExplorer",
-            "folder-marks.json");
+        StatePath = statePath ?? AppPaths.State("folder-marks.json");
     }
 
     public string StatePath { get; }
@@ -45,6 +42,10 @@ public sealed class FolderMarkService
 
     public FolderMark Get(string path)
         => _marks.TryGetValue(Key(path), out var mark) ? mark : FolderMark.None;
+
+    /// <summary>Every mark there is, for drawing them all at once (the nested canvas's beacons).</summary>
+    public IReadOnlyList<KeyValuePair<string, FolderMark>> Snapshot()
+        => [.. _marks.Where(pair => !pair.Value.IsEmpty)];
 
     public string GetAccentHex(string path, string fallback)
     {

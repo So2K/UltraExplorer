@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Win32;
+using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Picker.Com;
 
@@ -256,10 +257,7 @@ internal static class ComTrace
 {
     private static readonly object Gate = new();
 
-    public static string LogPath { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "UltraExplorer",
-        "com-server.log");
+    public static string LogPath { get; } = AppPaths.State("com-server.log");
 
     public static void Write(string message)
     {

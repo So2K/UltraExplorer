@@ -14,6 +14,9 @@ public sealed class WorkspaceState
     /// <summary>Whether the current folder is also shown as a list.</summary>
     public bool IsFolderListVisible { get; set; } = true;
 
+    /// <summary>"Nested" or "Tree": which picture of the drives the canvas shows.</summary>
+    public string CanvasLayout { get; set; } = "Nested";
+
     /// <summary>
     /// Version 1 stored a colour label and a note per canvas node.  They are
     /// migrated into the path-keyed folder mark store on first load and then

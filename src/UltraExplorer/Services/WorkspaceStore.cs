@@ -1,5 +1,6 @@
 using System.Text.Json;
 using UltraExplorer.Models;
+using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Services;
 
@@ -15,10 +16,8 @@ public sealed class WorkspaceStore
 
     public WorkspaceStore()
     {
-        var appData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var stateDirectory = Path.Combine(appData, "UltraExplorer");
-        Directory.CreateDirectory(stateDirectory);
-        _statePath = Path.Combine(stateDirectory, "workspace.json");
+        Directory.CreateDirectory(AppPaths.StateDirectory);
+        _statePath = AppPaths.State("workspace.json");
     }
 
     public async Task<WorkspaceState?> LoadAsync(CancellationToken cancellationToken = default)

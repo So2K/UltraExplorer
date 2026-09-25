@@ -2,6 +2,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
 using System.Windows.Interop;
+using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Picker;
 
@@ -16,10 +17,7 @@ public static class FileDialogHost
     /// A picker session lays the canvas out for the caller's folder, so it gets
     /// its own workspace file and cannot disturb the one the user arranged.
     /// </summary>
-    public static string WorkspacePath { get; } = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "UltraExplorer",
-        "picker.workspace.json");
+    public static string WorkspacePath { get; } = AppPaths.State("picker.workspace.json");
 
     /// <summary>
     /// Puts the picker above the window that asked for it.  The owner is not

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using UltraExplorer.Models;
+using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Services;
 
@@ -14,10 +15,7 @@ public sealed class ViewAllWorkspaceStore
 
     public ViewAllWorkspaceStore(string? statePath = null)
     {
-        StatePath = statePath ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "UltraExplorer",
-            "view-all.workspace.json");
+        StatePath = statePath ?? AppPaths.State("view-all.workspace.json");
     }
 
     public string StatePath { get; }

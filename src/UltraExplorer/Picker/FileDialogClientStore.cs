@@ -1,4 +1,5 @@
 using System.Text.Json;
+using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Picker;
 
@@ -26,10 +27,7 @@ public sealed class FileDialogClientStore
 
     public FileDialogClientStore(string? path = null)
     {
-        _path = path ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "UltraExplorer",
-            "picker-clients.json");
+        _path = path ?? AppPaths.State("picker-clients.json");
     }
 
     public string StatePath => _path;

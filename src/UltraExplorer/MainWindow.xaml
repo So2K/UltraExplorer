@@ -591,107 +591,121 @@
                           ResizeBehavior="PreviousAndNext" />
 
             <Grid Grid.Column="2" Background="{StaticResource CanvasBrush}" ClipToBounds="True">
-                <nodify:NodifyEditor x:Name="Editor"
-                                     Focusable="True"
-                                     ItemsSource="{Binding Tree.RenderNodes}"
-                                     Connections="{Binding Tree.RenderEdges}"
-                                     SelectedItems="{Binding Tree.SelectedNodes}"
-                                     MinViewportZoom="0.06"
-                                     MaxViewportZoom="3"
-                                     GridCellSize="16"
-                                     BringIntoViewSpeed="2200"
-                                     BringIntoViewMaxDuration="0.32"
-                                     DisplayConnectionsOnTop="False"
-                                     AllowDrop="True"
-                                     ViewportUpdated="Editor_ViewportUpdated"
-                                     PreviewDragOver="Editor_PreviewDragOver"
-                                     PreviewDragLeave="Editor_PreviewDragLeave"
-                                     PreviewDrop="Editor_PreviewDrop"
-                                     PreviewMouseLeftButtonDown="Editor_PreviewMouseLeftButtonDown"
-                                     LostMouseCapture="Editor_LostMouseCapture"
-                                     PreviewMouseMove="Editor_PreviewMouseMove"
-                                     PreviewMouseLeftButtonUp="Editor_PreviewMouseLeftButtonUp"
-                                     PreviewMouseRightButtonUp="Editor_PreviewMouseRightButtonUp">
-                    <nodify:NodifyEditor.Background>
-                        <DrawingBrush TileMode="Tile" Viewport="0,0,26,26" ViewportUnits="Absolute" Viewbox="0,0,26,26" ViewboxUnits="Absolute">
-                            <DrawingBrush.Drawing>
-                                <GeometryDrawing Brush="#242424">
-                                    <GeometryDrawing.Geometry>
-                                        <EllipseGeometry Center="1,1" RadiusX="0.8" RadiusY="0.8" />
-                                    </GeometryDrawing.Geometry>
-                                </GeometryDrawing>
-                            </DrawingBrush.Drawing>
-                        </DrawingBrush>
-                    </nodify:NodifyEditor.Background>
-                    <nodify:NodifyEditor.ItemTemplate>
-                        <DataTemplate DataType="{x:Type models:ViewAllNodeViewModel}">
-                            <controls:ViewAllNodeView />
-                        </DataTemplate>
-                    </nodify:NodifyEditor.ItemTemplate>
-                    <nodify:NodifyEditor.ItemContainerStyle>
-                        <Style TargetType="{x:Type nodify:ItemContainer}" BasedOn="{StaticResource {x:Type nodify:ItemContainer}}">
-                            <Setter Property="Location" Value="{Binding Location, Mode=TwoWay}" />
-                            <Setter Property="BorderBrush" Value="Transparent" />
-                        </Style>
-                    </nodify:NodifyEditor.ItemContainerStyle>
-                    <nodify:NodifyEditor.ConnectionTemplate>
-                        <DataTemplate DataType="{x:Type models:ViewAllEdgeViewModel}">
-                            <nodify:StepConnection Source="{Binding SourceAnchor}"
-                                                   Target="{Binding TargetAnchor}"
-                                                   SourcePosition="Bottom"
-                                                   TargetPosition="Top"
-                                                   Stroke="{Binding Stroke}"
-                                                   StrokeThickness="1.4"
-                                                   CornerRadius="7"
-                                                   Spacing="14"
-                                                   ArrowEnds="None"
-                                                   IsHitTestVisible="False" />
-                        </DataTemplate>
-                    </nodify:NodifyEditor.ConnectionTemplate>
-                </nodify:NodifyEditor>
-
-                <!-- Batched drawing of the whole graph, used instead of node
-                     controls once the canvas is zoomed far enough out. -->
-                <!-- Every link on the canvas, at every zoom: one harness per
-                     folder rather than a line per child. -->
-                <controls:ViewAllHarnessLayer x:Name="Harness" />
-
-                <controls:ViewAllOverviewLayer x:Name="Overview"
-                                               Visibility="{Binding Tree.IsOverviewActive, Converter={StaticResource BoolToVisibility}}" />
-
-                <!-- Where the canvas is: the chain of folders whose blocks the
-                     middle of it is inside. -->
-                <Border HorizontalAlignment="Left"
-                        VerticalAlignment="Top"
-                        Margin="14"
-                        Padding="10,5"
-                        CornerRadius="6"
-                        Background="#CC1B1B1B"
-                        BorderBrush="{StaticResource BorderBrush}"
-                        BorderThickness="1"
-                        IsHitTestVisible="False"
-                        Visibility="{Binding Tree.HasTrail, Converter={StaticResource BoolToVisibility}}">
-                    <ItemsControl ItemsSource="{Binding Tree.Trail}">
-                        <ItemsControl.ItemsPanel>
-                            <ItemsPanelTemplate>
-                                <StackPanel Orientation="Horizontal" />
-                            </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <StackPanel Orientation="Horizontal">
-                                    <TextBlock Text="{Binding Separator}"
-                                               Foreground="{StaticResource TextMutedBrush}"
-                                               FontSize="12" />
-                                    <TextBlock Text="{Binding Name}"
-                                               Foreground="{Binding Brush}"
-                                               FontSize="12"
-                                               FontWeight="SemiBold" />
-                                </StackPanel>
+                <!-- The tree: nodes opened a folder at a time. -->
+                <Grid x:Name="TreeCanvasHost"
+                      Visibility="{Binding IsTreeLayout, Converter={StaticResource BoolToVisibility}}">
+                    <nodify:NodifyEditor x:Name="Editor"
+                                         Focusable="True"
+                                         ItemsSource="{Binding Tree.RenderNodes}"
+                                         Connections="{Binding Tree.RenderEdges}"
+                                         SelectedItems="{Binding Tree.SelectedNodes}"
+                                         MinViewportZoom="0.06"
+                                         MaxViewportZoom="3"
+                                         GridCellSize="16"
+                                         BringIntoViewSpeed="2200"
+                                         BringIntoViewMaxDuration="0.32"
+                                         DisplayConnectionsOnTop="False"
+                                         AllowDrop="True"
+                                         ViewportUpdated="Editor_ViewportUpdated"
+                                         PreviewDragOver="Editor_PreviewDragOver"
+                                         PreviewDragLeave="Editor_PreviewDragLeave"
+                                         PreviewDrop="Editor_PreviewDrop"
+                                         PreviewMouseLeftButtonDown="Editor_PreviewMouseLeftButtonDown"
+                                         LostMouseCapture="Editor_LostMouseCapture"
+                                         PreviewMouseMove="Editor_PreviewMouseMove"
+                                         PreviewMouseLeftButtonUp="Editor_PreviewMouseLeftButtonUp"
+                                         PreviewMouseRightButtonUp="Editor_PreviewMouseRightButtonUp">
+                        <nodify:NodifyEditor.Background>
+                            <DrawingBrush TileMode="Tile" Viewport="0,0,26,26" ViewportUnits="Absolute" Viewbox="0,0,26,26" ViewboxUnits="Absolute">
+                                <DrawingBrush.Drawing>
+                                    <GeometryDrawing Brush="#242424">
+                                        <GeometryDrawing.Geometry>
+                                            <EllipseGeometry Center="1,1" RadiusX="0.8" RadiusY="0.8" />
+                                        </GeometryDrawing.Geometry>
+                                    </GeometryDrawing>
+                                </DrawingBrush.Drawing>
+                            </DrawingBrush>
+                        </nodify:NodifyEditor.Background>
+                        <nodify:NodifyEditor.ItemTemplate>
+                            <DataTemplate DataType="{x:Type models:ViewAllNodeViewModel}">
+                                <controls:ViewAllNodeView />
                             </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                </Border>
+                        </nodify:NodifyEditor.ItemTemplate>
+                        <nodify:NodifyEditor.ItemContainerStyle>
+                            <Style TargetType="{x:Type nodify:ItemContainer}" BasedOn="{StaticResource {x:Type nodify:ItemContainer}}">
+                                <Setter Property="Location" Value="{Binding Location, Mode=TwoWay}" />
+                                <Setter Property="BorderBrush" Value="Transparent" />
+                            </Style>
+                        </nodify:NodifyEditor.ItemContainerStyle>
+                        <nodify:NodifyEditor.ConnectionTemplate>
+                            <DataTemplate DataType="{x:Type models:ViewAllEdgeViewModel}">
+                                <nodify:StepConnection Source="{Binding SourceAnchor}"
+                                                       Target="{Binding TargetAnchor}"
+                                                       SourcePosition="Bottom"
+                                                       TargetPosition="Top"
+                                                       Stroke="{Binding Stroke}"
+                                                       StrokeThickness="1.4"
+                                                       CornerRadius="7"
+                                                       Spacing="14"
+                                                       ArrowEnds="None"
+                                                       IsHitTestVisible="False" />
+                            </DataTemplate>
+                        </nodify:NodifyEditor.ConnectionTemplate>
+                    </nodify:NodifyEditor>
+
+                    <!-- Batched drawing of the whole graph, used instead of node
+                         controls once the canvas is zoomed far enough out. -->
+                    <!-- Every link on the canvas, at every zoom: one harness per
+                         folder rather than a line per child. -->
+                    <controls:ViewAllHarnessLayer x:Name="Harness" />
+
+                    <controls:ViewAllOverviewLayer x:Name="Overview"
+                                                   Visibility="{Binding Tree.IsOverviewActive, Converter={StaticResource BoolToVisibility}}" />
+
+                    <!-- Where the canvas is: the chain of folders whose blocks the
+                         middle of it is inside. -->
+                    <Border HorizontalAlignment="Left"
+                            VerticalAlignment="Top"
+                            Margin="14"
+                            Padding="10,5"
+                            CornerRadius="6"
+                            Background="#CC1B1B1B"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            IsHitTestVisible="False"
+                            Visibility="{Binding Tree.HasTrail, Converter={StaticResource BoolToVisibility}}">
+                        <ItemsControl ItemsSource="{Binding Tree.Trail}">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                            <ItemsControl.ItemTemplate>
+                                <DataTemplate>
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="{Binding Separator}"
+                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                   FontSize="12" />
+                                        <TextBlock Text="{Binding Name}"
+                                                   Foreground="{Binding Brush}"
+                                                   FontSize="12"
+                                                   FontWeight="SemiBold" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                    </Border>
+                </Grid>
+
+                <!-- The nested canvas: every folder a cell inside its parent,
+                     the whole of This PC on one screen. -->
+                <controls:NestedCanvas x:Name="Nested"
+                                       AllowDrop="True"
+                                       AutomationProperties.Name="Folders"
+                                       DragOver="Nested_DragOver"
+                                       DragLeave="Nested_DragLeave"
+                                       Drop="Nested_Drop"
+                                       Visibility="{Binding IsNestedLayout, Converter={StaticResource BoolToVisibility}}" />
 
                 <!-- The current folder as a plain list.  The canvas answers
                      "what is where"; this answers "where is the one called X",
@@ -1008,7 +1022,7 @@
                         BorderBrush="{StaticResource BorderStrongBrush}"
                         BorderThickness="1"
                         Background="#E6202020"
-                        Visibility="{Binding IsMinimapVisible, Converter={StaticResource BoolToVisibility}}">
+                        Visibility="{Binding IsMinimapShown, Converter={StaticResource BoolToVisibility}}">
                     <nodify:Minimap ItemsSource="{Binding Tree.RenderNodes}"
                                     ViewportLocation="{Binding ViewportLocation, ElementName=Editor}"
                                     ViewportSize="{Binding ViewportSize, ElementName=Editor}"
@@ -1051,7 +1065,7 @@
                             <TextBlock Text="&#xE949;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
                         <Button Width="54" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100% (Shift+0)" AutomationProperties.Name="Reset to 100%">
-                            <TextBlock Text="{Binding Tree.ZoomLabel}" FontSize="10.5" />
+                            <TextBlock Text="{Binding ZoomLabel}" FontSize="10.5" />
                         </Button>
                         <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in (Ctrl++, Ctrl+wheel)" AutomationProperties.Name="Zoom in">
                             <TextBlock Text="&#xE948;" Style="{StaticResource IconText}" FontSize="12" />

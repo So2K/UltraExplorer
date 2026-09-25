@@ -31,6 +31,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private bool _isDisposed;
     private bool _isBusy;
     private bool _isSyncingSelection;
+    private int _selectTicket;
     private ViewAllNodeViewModel? _activeNode;
     private ViewAllNodeViewModel? _dropTarget;
     private ViewAllNodeViewModel? _runTarget;
@@ -148,6 +149,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>Raised when the graph structure changed and cached drawing is stale.</summary>
     public event Action? GraphInvalidated;
+
+    /// <summary>
+    /// Raised after a directory was read again because something in it changed
+    /// - a file operation, the folder watcher, F5.  The nested canvas keeps its
+    /// own tree and listens here rather than to the graph.
+    /// </summary>
+    public event Action<string>? PathRefreshed;
 
     /// <summary>
     /// How far the layout carried the folder the user just opened or closed.
@@ -309,6 +317,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     public bool HasRestoredViewport { get; private set; }
 
+    /// <summary>Where the nested canvas was looking last session.</summary>
+    public NestedCameraState? RestoredNestedCamera { get; private set; }
+
+    /// <summary>Where the nested canvas is looking now; written with the rest of the canvas state.</summary>
+    public NestedCameraState? NestedCamera { get; set; }
+
+    /// <summary>The graph's roots: every drive, and any WSL distribution or share added as one.</summary>
+    public IReadOnlyList<ViewAllNodeViewModel> Roots => _graph.Roots;
+
     /// <param name="initialPath">
     /// Opened instead of the profile folder on a first run, which is how a file
     /// dialog lands on the folder its caller asked for.
@@ -325,6 +342,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         try
         {
             var state = await _store.LoadAsync();
+            RestoredNestedCamera = state?.NestedCamera;
+            NestedCamera = RestoredNestedCamera;
             await _graph.InitializeAsync(state);
 
             if (state is { Nodes.Count: > 0 })
@@ -634,6 +653,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         await _graph.RefreshBranchAsync(node);
         ScheduleSave();
+        PathRefreshed?.Invoke(node.FullPath);
     }
 
     /// <summary>Re-reads a directory if it is currently part of the graph.</summary>
@@ -652,6 +672,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         {
             await FolderList.ReloadAsync();
         }
+
+        PathRefreshed?.Invoke(path);
     }
 
     public async Task LoadMoreAsync(ViewAllNodeViewModel node)
@@ -669,7 +691,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// Expands every ancestor of <paramref name="path"/> and selects it.  Only
     /// the folders on the way are read, never their siblings' subtrees.
     /// </summary>
-    public async Task<ViewAllNodeViewModel?> RevealPathAsync(string path, bool focus = true)
+    public async Task<ViewAllNodeViewModel?> RevealPathAsync(string path, bool focus = true, bool select = true)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
@@ -731,7 +753,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return null;
         }
 
-        SelectOnly(node);
+        if (select)
+        {
+            SelectOnly(node);
+        }
+
         RebuildRenderSet();
         if (focus)
         {
@@ -741,6 +767,51 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         ScheduleSave();
         return node;
     }
+
+    /// <summary>
+    /// Selects a path picked somewhere other than this graph - on the nested
+    /// canvas - bringing its node into being first if it has to.  Two clicks in
+    /// quick succession both have to read their way down, and the second one
+    /// must win even if the first finishes later.
+    /// </summary>
+    public async Task<ViewAllNodeViewModel?> SelectPathAsync(string path)
+    {
+        var ticket = ++_selectTicket;
+        var node = TryGetNode(path, out var known)
+            ? known
+            : await RevealPathAsync(path, focus: false, select: false);
+        if (node is null || ticket != _selectTicket)
+        {
+            return node;
+        }
+
+        SelectOnly(node);
+        ScheduleSave();
+        return node;
+    }
+
+    /// <summary>Adds a path to the selection, or takes it out - Ctrl+click on the nested canvas.</summary>
+    public async Task ToggleSelectionAsync(string path)
+    {
+        var node = TryGetNode(path, out var known)
+            ? known
+            : await RevealPathAsync(path, focus: false, select: false);
+        if (node is null)
+        {
+            return;
+        }
+
+        if (!SelectedNodes.Remove(node))
+        {
+            SelectedNodes.Add(node);
+        }
+    }
+
+    /// <summary>Makes sure a path has a node, without selecting it or moving the canvas.</summary>
+    public async Task<ViewAllNodeViewModel?> MaterializeAsync(string path)
+        => TryGetNode(path, out var known)
+            ? known
+            : await RevealPathAsync(path, focus: false, select: false);
 
     public void SelectOnly(ViewAllNodeViewModel node)
     {
@@ -945,6 +1016,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         {
             var state = _graph.CaptureState(new ViewAllViewportState(_viewportLocation, _viewportZoom));
             state.ActivePath = ActiveNode?.FullPath ?? string.Empty;
+            state.NestedCamera = NestedCamera;
             await _store.SaveAsync(state);
             await _marks.SaveAsync();
         }
@@ -1020,7 +1092,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// </summary>
     private void AttachWatcher(ViewAllNodeViewModel? node)
     {
-        var path = node is { IsDirectory: true, AreChildrenLoaded: true } ? node.FullPath : string.Empty;
+        // Loaded or not: the list beside the canvas shows this folder either
+        // way, and the nested canvas draws what is in it without opening it.
+        var path = node is { IsDirectory: true } ? node.FullPath : string.Empty;
         if (string.Equals(path, _watchedPath, StringComparison.OrdinalIgnoreCase))
         {
             return;

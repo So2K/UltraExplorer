@@ -42,6 +42,9 @@ public sealed class FolderListViewModel : ObservableObject
     private string _emptyText = string.Empty;
     private bool _isVisible;
     private int _held;
+
+    /// <summary>True while the list is revealing one of its own rows on the canvas.</summary>
+    public bool IsHoldingFolder => _held > 0;
     private bool _isLoading;
     private bool _isTruncated;
     private FolderListItem? _selected;

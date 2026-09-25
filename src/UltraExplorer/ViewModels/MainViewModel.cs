@@ -14,6 +14,16 @@ public enum CanvasMode
     ViewSelect
 }
 
+/// <summary>Which picture of the drives the canvas shows.</summary>
+public enum CanvasLayout
+{
+    /// <summary>Every folder a cell inside its parent's cell, the whole disk on one screen.</summary>
+    Nested,
+
+    /// <summary>The top-down tree of nodes, opened a folder at a time.</summary>
+    Tree
+}
+
 /// <summary>
 /// The Explorer-like shell around the canvas: navigation pane, address bar,
 /// command bar, search and status bar.  Everything that concerns the graph
@@ -41,6 +51,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
+    private CanvasLayout _layout = CanvasLayout.Nested;
+    private string _savedLayout = nameof(CanvasLayout.Nested);
+    private string _nestedZoomLabel = "Fit";
+    private readonly bool _isPickerSession;
     private string? _dialogTitle;
 
     /// <param name="treeStatePath">
@@ -50,6 +64,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public MainViewModel(string? treeStatePath = null)
     {
         _fileSystemService = new FileSystemService(_iconService);
+
+        // A file dialog lists files on its canvas and its rules are built around
+        // the tree, so it keeps that picture whatever the user chose for their
+        // own window.
+        _isPickerSession = treeStatePath is not null;
+        if (_isPickerSession)
+        {
+            _layout = CanvasLayout.Tree;
+        }
+
         Tree = new ViewAllViewModel(_marks, _iconService, treeStatePath);
         Tree.PropertyChanged += OnTreePropertyChanged;
         Tree.MessageRequested += OnTreeMessage;
@@ -209,6 +233,66 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    public CanvasLayout Layout
+    {
+        get => _layout;
+        set
+        {
+            if (_isPickerSession || !SetProperty(ref _layout, value))
+            {
+                return;
+            }
+
+            _savedLayout = value.ToString();
+            OnPropertyChanged(nameof(IsNestedLayout));
+            OnPropertyChanged(nameof(IsTreeLayout));
+            OnPropertyChanged(nameof(ZoomLabel));
+            OnPropertyChanged(nameof(IsMinimapShown));
+            _ = SaveNowAsync();
+        }
+    }
+
+    public bool IsNestedLayout => _layout == CanvasLayout.Nested;
+
+    public bool IsTreeLayout => _layout == CanvasLayout.Tree;
+
+    /// <summary>The zoom shown on the canvas controls, from whichever canvas is showing.</summary>
+    public string ZoomLabel => IsNestedLayout ? _nestedZoomLabel : Tree.ZoomLabel;
+
+    /// <summary>Set by the nested canvas as it moves.</summary>
+    public string NestedZoomLabel
+    {
+        get => _nestedZoomLabel;
+        set
+        {
+            if (SetProperty(ref _nestedZoomLabel, value) && IsNestedLayout)
+            {
+                OnPropertyChanged(nameof(ZoomLabel));
+            }
+        }
+    }
+
+    /// <summary>The minimap draws the tree's nodes; the nested canvas is its own overview.</summary>
+    public bool IsMinimapShown => IsMinimapVisible && IsTreeLayout;
+
+    /// <summary>Colour labels and notes, by path.</summary>
+    public FolderMarkService Marks => _marks;
+
+    /// <summary>Shell icons, shared by every view in the window.</summary>
+    public ShellIconService Icons => _iconService;
+
+    public bool IsPinned(string path)
+        => QuickAccess.Any(item => item.IsCustom && ViewAllPath.Equals(item.Path, path));
+
+    /// <summary>Takes a folder the user pinned off Home.</summary>
+    public void UnpinPath(string path)
+    {
+        if (QuickAccess.FirstOrDefault(item => item.IsCustom && ViewAllPath.Equals(item.Path, path)) is { } item)
+        {
+            RemoveFavorite(item);
+        }
+    }
+
     public bool IsViewSelect
     {
         get => _mode == CanvasMode.ViewSelect;
@@ -255,7 +339,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsMinimapVisible
     {
         get => _isMinimapVisible;
-        set => SetProperty(ref _isMinimapVisible, value);
+        set
+        {
+            if (SetProperty(ref _isMinimapVisible, value))
+            {
+                OnPropertyChanged(nameof(IsMinimapShown));
+            }
+        }
     }
 
     public double SidebarWidth
@@ -309,6 +399,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             SidebarWidth = Math.Clamp(state.SidebarWidth <= 0 ? 240 : state.SidebarWidth, 190, 340);
             IsMinimapVisible = state.IsMinimapVisible;
             Tree.FolderList.IsVisible = state.IsFolderListVisible;
+            _savedLayout = string.IsNullOrWhiteSpace(state.CanvasLayout) ? nameof(CanvasLayout.Nested) : state.CanvasLayout;
+            if (!_isPickerSession && Enum.TryParse<CanvasLayout>(_savedLayout, ignoreCase: true, out var layout) && layout != _layout)
+            {
+                _layout = layout;
+                OnPropertyChanged(nameof(Layout));
+                OnPropertyChanged(nameof(IsNestedLayout));
+                OnPropertyChanged(nameof(IsTreeLayout));
+                OnPropertyChanged(nameof(ZoomLabel));
+                OnPropertyChanged(nameof(IsMinimapShown));
+            }
             foreach (var legacy in state.Nodes)
             {
                 _marks.Seed(legacy.Path, legacy.AccentHex, legacy.Note);
@@ -412,6 +512,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             SidebarWidth = SidebarWidth,
             IsMinimapVisible = IsMinimapVisible,
             IsFolderListVisible = Tree.FolderList.IsVisible,
+            CanvasLayout = _savedLayout,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))
@@ -451,6 +552,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             case nameof(ViewAllViewModel.StatusCountText):
                 OnPropertyChanged(nameof(StatusCountText));
+                break;
+            case nameof(ViewAllViewModel.ZoomLabel):
+                if (IsTreeLayout)
+                {
+                    OnPropertyChanged(nameof(ZoomLabel));
+                }
+
                 break;
             case nameof(ViewAllViewModel.StatusPathText):
                 OnPropertyChanged(nameof(StatusPathText));

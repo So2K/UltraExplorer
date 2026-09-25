@@ -91,6 +91,9 @@ public sealed class ViewAllWorkspaceState
     /// that is refreshed loses its node and would lose the flag with it.
     /// </summary>
     public List<string> HiddenPaths { get; set; } = [];
+
+    /// <summary>Where the nested canvas was looking, if it was the one in use.</summary>
+    public NestedCameraState? NestedCamera { get; set; }
 }
 
 public sealed record ViewAllNodeState(

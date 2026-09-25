@@ -90,6 +90,7 @@ public partial class MainWindow : Window
 
         Overview.Index = _viewModel.Tree.SpatialIndex;
         Harness.Index = _viewModel.Tree.SpatialIndex;
+        AttachNested();
 
         StateChanged += (_, _) =>
         {
@@ -129,6 +130,7 @@ public partial class MainWindow : Window
         // the caller asked for is already filtered when it appears.
         await ApplyPickerRulesAsync();
         await _viewModel.InitializeAsync(_pickerStartFolder);
+        await InitializeNestedAsync();
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
         SidebarColumn.Width = new GridLength(_restoredSidebarWidth);
@@ -181,7 +183,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        Editor.Focus();
+        FocusCanvas();
     }
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
@@ -195,6 +197,7 @@ public partial class MainWindow : Window
                 .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
                 .RemoveValueChanged(Editor, OnViewportLocationChanged);
             DetachNodeDrag();
+            DetachNested();
             _capture?.Dispose();
             _viewModel.Dispose();
             return;
@@ -202,6 +205,7 @@ public partial class MainWindow : Window
 
         e.Cancel = true;
         _viewModel.SidebarWidth = SidebarColumn.ActualWidth > 0 ? SidebarColumn.ActualWidth : _restoredSidebarWidth;
+        CaptureNestedCamera();
         await _viewModel.SaveNowAsync();
         _allowClose = true;
         Close();
@@ -255,6 +259,8 @@ public partial class MainWindow : Window
 
         _isSpaceHeld = armed;
         Editor.Cursor = armed ? Cursors.Hand : null;
+        Nested.IsSpacePanArmed = armed;
+        Nested.Cursor = armed ? Cursors.Hand : null;
     }
 
     /// <summary>
@@ -404,6 +410,16 @@ public partial class MainWindow : Window
 
     private void ZoomToSelection()
     {
+        if (IsNested)
+        {
+            if (!string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
+            {
+                _ = FlyNestedToAsync(_viewModel.Tree.ActivePath, gentle: false);
+            }
+
+            return;
+        }
+
         var extent = _viewModel.Tree.GetSelectionExtent();
         if (extent.IsEmpty)
         {
@@ -683,12 +699,34 @@ public partial class MainWindow : Window
 
     private void FitAll()
     {
+        if (IsNested)
+        {
+            Nested.FitAll();
+            return;
+        }
+
         Editor.FitToScreen(_viewModel.Tree.GetContentExtent());
         PushViewport();
     }
 
     private void ApplyZoom(double factor)
     {
+        if (IsNested)
+        {
+            // "100%" has no meaning where every level has its own size; the
+            // reset is the whole of This PC on screen.
+            if (factor <= 0)
+            {
+                Nested.FitAll();
+            }
+            else
+            {
+                Nested.ZoomBy(factor > 1 ? 1.5 : 1 / 1.5);
+            }
+
+            return;
+        }
+
         if (factor <= 0)
         {
             // Zoom about the viewport centre so resetting does not jump the view.
@@ -713,6 +751,15 @@ public partial class MainWindow : Window
 
     private void FocusNode(ViewAllNodeViewModel node, bool animated)
     {
+        if (IsNested)
+        {
+            // Decided now, while the list may still be holding its folder: a row
+            // picked in the list only needs to be in view, not flown into.
+            var gentle = _viewModel.Tree.FolderList.IsHoldingFolder;
+            _ = FlyNestedToAsync(node.FullPath, gentle, animated);
+            return;
+        }
+
         Dispatcher.InvokeAsync(() =>
         {
             var center = new Point(
@@ -829,6 +876,9 @@ public partial class MainWindow : Window
 
     private const uint HideFromCanvasCommandId = ShellContextMenu.AppCommandFirst + 1;
     private const uint ReturnToLayoutCommandId = ShellContextMenu.AppCommandFirst + 2;
+    private const uint NoteCommandId = ShellContextMenu.AppCommandFirst + 3;
+    private const uint PinCommandId = ShellContextMenu.AppCommandFirst + 4;
+    private const uint UnpinCommandId = ShellContextMenu.AppCommandFirst + 5;
     private const uint ColourCommandFirst = ShellContextMenu.AppCommandFirst + 0x10;
 
     /// <summary>
@@ -849,6 +899,19 @@ public partial class MainWindow : Window
         {
             new(0, "Colour", colours)
         };
+
+        // A mark is what makes a folder findable once it is a speck on the
+        // nested canvas, so making one is one right-click away.
+        if (_viewModel.Tree.ActiveNode is { } active)
+        {
+            entries.Add(new ShellMenuEntry(NoteCommandId, active.HasNote ? "Edit note…" : "Add note…"));
+            if (active.IsDirectory && !IsPickerMode)
+            {
+                entries.Add(_viewModel.IsPinned(active.FullPath)
+                    ? new ShellMenuEntry(UnpinCommandId, "Unpin from Home")
+                    : new ShellMenuEntry(PinCommandId, "Pin to Home"));
+            }
+        }
 
         if (_viewModel.Tree.SelectedNodes.Any(node => node.IsDirectory))
         {
@@ -875,6 +938,28 @@ public partial class MainWindow : Window
         if (command == ReturnToLayoutCommandId)
         {
             _viewModel.ReturnToLayoutCommand.Execute(null);
+            return;
+        }
+
+        if (command == NoteCommandId)
+        {
+            _viewModel.EditNoteCommand.Execute(null);
+            return;
+        }
+
+        if (command == PinCommandId)
+        {
+            _viewModel.AddToFavoritesCommand.Execute(null);
+            return;
+        }
+
+        if (command == UnpinCommandId)
+        {
+            if (_viewModel.Tree.ActiveNode is { } node)
+            {
+                _viewModel.UnpinPath(node.FullPath);
+            }
+
             return;
         }
 
@@ -997,7 +1082,13 @@ public partial class MainWindow : Window
         // Every folder owns a rectangle on the canvas, so a right-click inside one
         // is a right-click "in" that folder - which is where a new file belongs.
         // Blocks nest, so this is the innermost one the click landed in.
-        if (_viewModel.Tree.FolderAt(graphPoint) is { IsDirectory: true } area)
+        ShowFolderAreaMenu(Editor, _viewModel.Tree.FolderAt(graphPoint));
+    }
+
+    /// <summary>The menu for the open space of a folder: what can be made or put in it, and the canvas's own commands.</summary>
+    private void ShowFolderAreaMenu(FrameworkElement placementTarget, ViewAllNodeViewModel? area)
+    {
+        if (area is { IsDirectory: true })
         {
             _viewModel.Tree.SetActiveFolder(area);
         }
@@ -1006,7 +1097,7 @@ public partial class MainWindow : Window
             ? folder.DisplayName
             : null;
 
-        var menu = new ContextMenu { PlacementTarget = Editor };
+        var menu = new ContextMenu { PlacementTarget = placementTarget };
         AddCommandItem(
             menu,
             where is null ? "New folder" : $"New folder in {where}",
@@ -1026,13 +1117,40 @@ public partial class MainWindow : Window
             "Ctrl+V");
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
+        if (IsNested)
+        {
+            AddHiddenFolderItems(menu);
+            AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
+            AddLayoutItems(menu);
+            menu.IsOpen = true;
+            return;
+        }
+
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
         AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
+        AddLayoutItems(menu);
         menu.IsOpen = true;
+    }
+
+    /// <summary>The two pictures of the drives, as a pair of radio items.</summary>
+    private void AddLayoutItems(ContextMenu menu)
+    {
+        if (IsPickerMode)
+        {
+            return;
+        }
+
+        menu.Items.Add(new Separator());
+        var nested = new MenuItem { Header = "Nested canvas", IsCheckable = true, IsChecked = IsNested, ToolTip = "Every folder inside its parent, the whole disk on one screen" };
+        nested.Click += (_, _) => _viewModel.Layout = CanvasLayout.Nested;
+        var tree = new MenuItem { Header = "Tree canvas", IsCheckable = true, IsChecked = !IsNested, ToolTip = "Folders opened one at a time as a top-down tree" };
+        tree.Click += (_, _) => _viewModel.Layout = CanvasLayout.Tree;
+        menu.Items.Add(nested);
+        menu.Items.Add(tree);
     }
 
     private void OrganizeButton_Click(object sender, RoutedEventArgs e)
@@ -1066,16 +1184,26 @@ public partial class MainWindow : Window
     {
         var menu = new ContextMenu { PlacementTarget = (UIElement)sender, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
-        AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
-        AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
-        AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
+        if (!IsNested)
+        {
+            AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
+            AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
+            AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
+        }
+
         AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
-        AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
+        if (!IsNested)
+        {
+            AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
+        }
+
         AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
         menu.Items.Add(new Separator());
         AddColourItems(menu);
         AddCommandItem(menu, "Note…", "\uE70B", _viewModel.EditNoteCommand);
+        AddCommandItem(menu, "Pin to Home", "\uE718", _viewModel.AddToFavoritesCommand);
+        AddLayoutItems(menu);
         menu.IsOpen = true;
     }
 
@@ -1278,7 +1406,7 @@ public partial class MainWindow : Window
             && !_viewModel.Address.IsEditing
             && AddressBox.IsKeyboardFocusWithin)
         {
-            Editor.Focus();
+            FocusCanvas();
         }
     }
 
@@ -1434,7 +1562,7 @@ public partial class MainWindow : Window
         else if (e.Key == Key.Escape)
         {
             _viewModel.CloseSearchCommand.Execute(null);
-            Editor.Focus();
+            FocusCanvas();
             e.Handled = true;
         }
     }
@@ -1485,6 +1613,15 @@ public partial class MainWindow : Window
 
         if (Keyboard.FocusedElement is TextBox)
         {
+            return;
+        }
+
+        // The nested canvas moves between cells with the arrows and goes in and
+        // out with Enter and Backspace; the tree's meanings for those keys
+        // (open, expand, collapse) do not exist there.
+        if (TryHandleNestedKey(key, modifiers))
+        {
+            e.Handled = true;
             return;
         }
 
@@ -1600,7 +1737,7 @@ public partial class MainWindow : Window
         // Coming back from another window can leave focus nowhere.
         if (Keyboard.FocusedElement is null)
         {
-            Editor.Focus();
+            FocusCanvas();
         }
     }
 
@@ -1627,6 +1764,22 @@ public partial class MainWindow : Window
         var paths = _viewModel.Tree.SelectedPaths;
         if (paths.Count == 0)
         {
+            return;
+        }
+
+        if (IsNested)
+        {
+            var at = new Point(Nested.ActualWidth / 2, Nested.ActualHeight / 2);
+            if (_nestedTree.Find(_viewModel.Tree.ActivePath) is { } folder && Nested.ScreenRectOf(folder) is { } rect)
+            {
+                var visible = Rect.Intersect(rect, new Rect(0, 0, Nested.ActualWidth, Nested.ActualHeight));
+                if (!visible.IsEmpty)
+                {
+                    at = new Point(visible.X + visible.Width / 2, visible.Y + Math.Min(visible.Height / 2, 24));
+                }
+            }
+
+            ShowContextMenu(paths, Nested, at);
             return;
         }
 
