@@ -14,6 +14,9 @@ public sealed record NestedListing(
     /// <summary>The files by name, up to <see cref="NestedTree.MaximumFiles"/>; the counts cover all of them.</summary>
     public IReadOnlyList<NestedFile> Files { get; init; } = [];
 
+    /// <summary>The failure may pass - a network or device error rather than access denied.</summary>
+    public bool IsRetryable { get; init; }
+
     public static NestedListing Failed(string message) => new([], 0, 0, false, message);
 }
 
@@ -48,18 +51,32 @@ public sealed class NestedTree : IDisposable
     /// <summary>Reads in flight at once.  More than this only makes a spinning disk seek.</summary>
     public const int MaximumConcurrentReads = 3;
 
-    private readonly Dictionary<string, NestedFolder> _byPath = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _userHidden = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _forcedVisible = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Folders that have at least one child in either set above.  Only their
+    /// children need looking up at all; every other folder's children are
+    /// filtered by their attributes alone, without hashing a single path.
+    /// </summary>
+    private readonly HashSet<string> _filterParents = new(StringComparer.OrdinalIgnoreCase);
+
     private readonly List<NestedFolder> _queue = [];
     private readonly CancellationTokenSource _lifetime = new();
+    private readonly CancellationToken _lifetimeToken;
     private readonly Func<string, CancellationToken, NestedListing> _reader;
     private int _running;
+    private int _networkRunning;
+    private bool _disposed;
+    private int _knownCount;
     private bool _includeHidden;
 
     public NestedTree(Func<string, CancellationToken, NestedListing>? reader = null)
     {
         _reader = reader ?? NestedDirectoryReader.Read;
+
+        // Taken once: a disposed source throws on every later read of its token.
+        _lifetimeToken = _lifetime.Token;
         Root = new NestedFolder(string.Empty, "This PC", NestedFolderKind.Computer, null)
         {
             LoadState = NestedLoadState.Loaded
@@ -75,11 +92,18 @@ public sealed class NestedTree : IDisposable
     /// </summary>
     public long Frame { get; private set; }
 
-    /// <summary>Folders loaded so far.</summary>
-    public int LoadedCount => _byPath.Count;
+    /// <summary>Folders known to the tree so far: every one that has been listed by its parent.</summary>
+    public int LoadedCount => _knownCount;
 
     /// <summary>Reads waiting or running.</summary>
     public int PendingCount => _queue.Count + _running;
+
+    /// <summary>
+    /// Bumped on every change to the shape of the tree.  The canvas compares it
+    /// with the one its last picture was made from to know whether anything it
+    /// drew could have moved.
+    /// </summary>
+    public int Version { get; private set; }
 
     /// <summary>Raised on the owning thread whenever the shape of the tree changed.</summary>
     public event EventHandler? Changed;
@@ -130,9 +154,8 @@ public sealed class NestedTree : IDisposable
                 Forget(kept);
             }
 
-            var folder = new NestedFolder(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText);
-            _byPath[folder.FullPath] = folder;
-            children.Add(folder);
+            children.Add(new NestedFolder(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText));
+            _knownCount++;
         }
 
         foreach (var removed in existing.Values)
@@ -142,18 +165,19 @@ public sealed class NestedTree : IDisposable
 
         Root.AllChildren = [.. children];
         ApplyVisibleChildren(Root);
-        Changed?.Invoke(this, EventArgs.Empty);
+        RaiseChanged();
     }
 
-    /// <summary>The folder with this path, if it has been read into the tree.</summary>
+    /// <summary>
+    /// The folder with this path, if it has been read into the tree.  Found by
+    /// walking down from its drive, one name per level, each a binary search
+    /// in its parent's sorted listing - so reading a folder of fifty thousand
+    /// sub-folders never has to register fifty thousand paths anywhere.
+    /// </summary>
     public NestedFolder? Find(string path)
     {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return null;
-        }
-
-        return _byPath.TryGetValue(Key(path), out var folder) ? folder : null;
+        var found = Walk(path, nearest: false);
+        return found;
     }
 
     /// <summary>
@@ -161,19 +185,93 @@ public sealed class NestedTree : IDisposable
     /// the folder itself once everything above it has been read, otherwise the
     /// ancestor the reading has got to.
     /// </summary>
-    public NestedFolder? FindNearest(string path)
+    public NestedFolder? FindNearest(string path) => Walk(path, nearest: true);
+
+    private NestedFolder? Walk(string path, bool nearest)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
             return null;
         }
 
-        var chain = Chain(path);
-        for (var index = chain.Count - 1; index >= 0; index--)
+        var target = Key(path);
+        var current = OwnerRoot(target);
+        if (current is null)
         {
-            if (_byPath.TryGetValue(chain[index], out var folder) && IsOnCanvas(folder))
+            return null;
+        }
+
+        if (target.Length > current.FullPath.Length)
+        {
+            foreach (var segment in target[current.FullPath.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
             {
-                return folder;
+                var next = FindChild(current, segment);
+                if (next is null)
+                {
+                    return nearest && IsOnCanvas(current) ? current : null;
+                }
+
+                current = next;
+            }
+        }
+
+        if (nearest)
+        {
+            // The deepest one still among the cells.
+            while (current.Parent is not null && !IsOnCanvas(current))
+            {
+                current = current.Parent;
+            }
+
+            return current.IsComputer ? null : current;
+        }
+
+        return current;
+    }
+
+    /// <summary>
+    /// A child of <paramref name="folder"/> by name.  Listings are sorted by the
+    /// reader in culture order, so this is a binary search; a name culture order
+    /// treats oddly falls back to a plain scan rather than being reported missing.
+    /// </summary>
+    internal static NestedFolder? FindChild(NestedFolder folder, string name)
+    {
+        var children = folder.AllChildren;
+        if (!folder.IsComputer && children.Length >= 16)
+        {
+            var low = 0;
+            var high = children.Length - 1;
+            while (low <= high)
+            {
+                var middle = (low + high) / 2;
+                var order = StringComparer.CurrentCultureIgnoreCase.Compare(children[middle].Name, name);
+                if (order == 0)
+                {
+                    if (string.Equals(children[middle].Name, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return children[middle];
+                    }
+
+                    break;
+                }
+
+                if (order < 0)
+                {
+                    low = middle + 1;
+                }
+                else
+                {
+                    high = middle - 1;
+                }
+            }
+        }
+
+        foreach (var child in children)
+        {
+            if (string.Equals(child.Name, name, StringComparison.OrdinalIgnoreCase)
+                || folder.IsComputer && string.Equals(child.FullPath, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return child;
             }
         }
 
@@ -185,13 +283,31 @@ public sealed class NestedTree : IDisposable
     {
         for (var current = folder; current.Parent is not null; current = current.Parent)
         {
-            if (current.Index < 0)
+            if (current.Index < 0 || current.IsForgotten)
             {
                 return false;
             }
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Whether the folder, or any folder above it, was dropped by a refresh.
+    /// Forgetting marks only the folder that went; what was under it is cut
+    /// off with it, and this is how that is noticed.
+    /// </summary>
+    public static bool IsDetached(NestedFolder folder)
+    {
+        for (var current = folder; current is not null; current = current.Parent)
+        {
+            if (current.IsForgotten)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -206,8 +322,21 @@ public sealed class NestedTree : IDisposable
             return;
         }
 
+        if (_disposed)
+        {
+            return;
+        }
+
         folder.RequestedFrame = Frame;
         folder.Priority = priority;
+        if (folder.LoadState == NestedLoadState.Failed && folder.IsRetryable
+            && System.Diagnostics.Stopwatch.GetElapsedTime(folder.FailedAt).TotalSeconds > 20)
+        {
+            // A share that did not answer, a drive that was not ready: worth
+            // another try once in a while.  Access denied is not.
+            folder.LoadState = NestedLoadState.NotLoaded;
+        }
+
         if (folder.LoadState != NestedLoadState.NotLoaded)
         {
             return;
@@ -230,27 +359,44 @@ public sealed class NestedTree : IDisposable
             return null;
         }
 
-        var chain = Chain(path);
-        if (chain.Count > 0)
+        var target = Key(path);
+        var current = OwnerRoot(target);
+        if (current is null)
         {
-            ForceVisible([chain[^1]]);
+            return null;
         }
 
-        NestedFolder? current = null;
-        foreach (var step in chain)
+        ForceVisible([target]);
+        if (target.Length > current.FullPath.Length)
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (current is not null)
+            var refreshed = false;
+            foreach (var segment in target[current.FullPath.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 await LoadAsync(current, cancellationToken);
-            }
+                var next = FindChild(current, segment);
+                if (next is null && !refreshed && current.IsLoaded)
+                {
+                    // Asked for a folder the listing does not have: it may
+                    // have been made since the parent was read.  Read it once
+                    // more - but only for a folder that really is there, or
+                    // every file mark would re-read its folder on every look.
+                    var childPath = Path.Combine(current.FullPath, segment);
+                    if (await Task.Run(() => Directory.Exists(childPath), cancellationToken))
+                    {
+                        refreshed = true;
+                        await RefreshAsync(current, cancellationToken);
+                        next = FindChild(current, segment);
+                    }
+                }
 
-            if (!_byPath.TryGetValue(step, out var next) || !IsOnCanvas(next))
-            {
-                break;
-            }
+                if (next is null || !IsOnCanvas(next))
+                {
+                    break;
+                }
 
-            current = next;
+                current = next;
+            }
         }
 
         return current;
@@ -261,15 +407,14 @@ public sealed class NestedTree : IDisposable
     {
         // Asked for by name, a junction is read like any folder: it is only
         // the canvas wandering into one on its own that is refused.
-        if (folder.IsComputer || folder.IsForgotten)
+        if (folder.IsComputer || IsDetached(folder) || _disposed)
         {
             return;
         }
 
-        while (folder.LoadState is NestedLoadState.Loading)
+        if (!await WaitForReadAsync(folder, cancellationToken))
         {
-            // Somebody else's read is in flight; its result is ours too.
-            await Task.Delay(10, cancellationToken);
+            return;
         }
 
         if (folder.LoadState is NestedLoadState.Loaded or NestedLoadState.Failed)
@@ -279,8 +424,40 @@ public sealed class NestedTree : IDisposable
 
         _queue.Remove(folder);
         folder.LoadState = NestedLoadState.Loading;
-        var listing = await ReadAsync(folder.FullPath, cancellationToken);
-        Apply(folder, listing);
+        try
+        {
+            var read = await ReadAsync(folder, cancellationToken);
+            Apply(folder, read);
+        }
+        catch
+        {
+            if (folder.LoadState == NestedLoadState.Loading)
+            {
+                folder.LoadState = NestedLoadState.NotLoaded;
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Waits out a read of the same folder already in flight; its result is
+    /// ours too.  False when the folder was dropped meanwhile or the tree is
+    /// going away - then there is nothing to wait for and nothing to read.
+    /// </summary>
+    private async Task<bool> WaitForReadAsync(NestedFolder folder, CancellationToken cancellationToken)
+    {
+        while (folder.LoadState is NestedLoadState.Loading)
+        {
+            if (IsDetached(folder) || _disposed)
+            {
+                return false;
+            }
+
+            await Task.Delay(10, cancellationToken);
+        }
+
+        return !IsDetached(folder) && !_disposed;
     }
 
     /// <summary>
@@ -290,19 +467,32 @@ public sealed class NestedTree : IDisposable
     /// </summary>
     public async Task RefreshAsync(NestedFolder folder, CancellationToken cancellationToken = default)
     {
-        if (folder.IsComputer || folder.IsForgotten || folder.LoadState is NestedLoadState.NotLoaded or NestedLoadState.Queued)
+        if (folder.IsComputer || IsDetached(folder) || _disposed || folder.LoadState is NestedLoadState.NotLoaded or NestedLoadState.Queued)
         {
             return;
         }
 
-        while (folder.LoadState is NestedLoadState.Loading)
+        if (!await WaitForReadAsync(folder, cancellationToken))
         {
-            await Task.Delay(10, cancellationToken);
+            return;
         }
 
+        var previous = folder.LoadState;
         folder.LoadState = NestedLoadState.Loading;
-        var listing = await ReadAsync(folder.FullPath, cancellationToken);
-        Apply(folder, listing);
+        try
+        {
+            var read = await ReadAsync(folder, cancellationToken);
+            Apply(folder, read);
+        }
+        catch
+        {
+            if (folder.LoadState == NestedLoadState.Loading)
+            {
+                folder.LoadState = previous;
+            }
+
+            throw;
+        }
     }
 
     /// <summary>Forgets what was read below <paramref name="folder"/> so the canvas reads it afresh.</summary>
@@ -321,7 +511,7 @@ public sealed class NestedTree : IDisposable
         folder.FileGrid = NestedFileGrid.Empty;
         folder.LoadState = folder.IsComputer ? NestedLoadState.Loaded : NestedLoadState.NotLoaded;
         folder.ErrorMessage = string.Empty;
-        Changed?.Invoke(this, EventArgs.Empty);
+        RaiseChanged();
     }
 
     /// <summary>Folders the user hid from the canvas, with everything under them.</summary>
@@ -333,6 +523,7 @@ public sealed class NestedTree : IDisposable
             _userHidden.Add(Key(path));
         }
 
+        RebuildFilterParents();
         RefilterAll();
     }
 
@@ -344,9 +535,9 @@ public sealed class NestedTree : IDisposable
     /// </summary>
     public void ForceVisible(IEnumerable<string> paths)
     {
-        // Only the parents of folders that were filtered out and now are not
-        // need placing again.  A step that has not been read yet needs
-        // nothing: its parent consults this set when it is read.
+        // Only a folder already read, one of whose children was filtered out
+        // and now is not, needs placing again.  A step not read yet needs
+        // nothing: its parent consults these sets when it is read.
         var parents = new HashSet<NestedFolder>();
         foreach (var path in paths)
         {
@@ -357,18 +548,23 @@ public sealed class NestedTree : IDisposable
                     continue;
                 }
 
-                if (_byPath.TryGetValue(step, out var folder))
+                if (Path.GetDirectoryName(step) is not { Length: > 0 } directory)
                 {
-                    if (folder.Index < 0 && folder.Parent is { } parent)
-                    {
-                        parents.Add(parent);
-                    }
+                    continue;
                 }
-                else if (Path.GetDirectoryName(step) is { Length: > 0 } directory
-                         && _byPath.TryGetValue(directory, out var holder)
-                         && holder.IsLoaded)
+
+                _filterParents.Add(Key(directory));
+                if (Find(directory) is not { IsLoaded: true } holder)
                 {
-                    // Not a folder we know: perhaps a hidden file in one we have read.
+                    continue;
+                }
+
+                var name = Path.GetFileName(step);
+                var child = FindChild(holder, name);
+                var isFilteredFolder = child is { Index: < 0 };
+                var mayBeHiddenFile = child is null && !_includeHidden && holder.HiddenFileCount > 0;
+                if (isFilteredFolder || mayBeHiddenFile)
+                {
                     parents.Add(holder);
                 }
             }
@@ -381,14 +577,28 @@ public sealed class NestedTree : IDisposable
 
         if (parents.Count > 0)
         {
-            Changed?.Invoke(this, EventArgs.Empty);
+            RaiseChanged();
         }
     }
 
     public void Dispose()
     {
+        if (_disposed)
+        {
+            return;
+        }
+
+        _disposed = true;
+
+        // Cancelled but not disposed: reads still in flight observe the token
+        // after this, and a disposed source would throw at them instead.
         _lifetime.Cancel();
-        _lifetime.Dispose();
+    }
+
+    private void RaiseChanged()
+    {
+        Version++;
+        Changed?.Invoke(this, EventArgs.Empty);
     }
 
     // ---- reading -----------------------------------------------------------
@@ -408,10 +618,18 @@ public sealed class NestedTree : IDisposable
                 }
 
                 // Two pictures without being asked for: it has left the screen.
-                if (!candidate.IsSticky && candidate.RequestedFrame < Frame - 2)
+                // Cut off by a refresh: there is no screen for it to be on.
+                if (!candidate.IsSticky && candidate.RequestedFrame < Frame - 2 || IsDetached(candidate) || _disposed)
                 {
                     candidate.LoadState = NestedLoadState.NotLoaded;
                     _queue.RemoveAt(index);
+                    continue;
+                }
+
+                // A share that hangs holds its read for as long as the network
+                // takes to give up; one at a time keeps the local drives moving.
+                if (candidate.IsNetwork && _networkRunning > 0)
+                {
                     continue;
                 }
 
@@ -431,6 +649,11 @@ public sealed class NestedTree : IDisposable
             _queue.Remove(best);
             best.LoadState = NestedLoadState.Loading;
             _running++;
+            if (best.IsNetwork)
+            {
+                _networkRunning++;
+            }
+
             _ = RunQueuedAsync(best);
         }
     }
@@ -439,83 +662,139 @@ public sealed class NestedTree : IDisposable
     {
         try
         {
-            var listing = await ReadAsync(folder.FullPath, _lifetime.Token);
-            Apply(folder, listing);
+            var read = await ReadAsync(folder, _lifetimeToken);
+            Apply(folder, read);
         }
         catch (OperationCanceledException)
         {
             folder.LoadState = NestedLoadState.NotLoaded;
         }
+        catch (Exception ex)
+        {
+            // Whatever went wrong, the folder must not stay "reading" forever.
+            folder.LoadState = NestedLoadState.Failed;
+            folder.ErrorMessage = ex.Message;
+            folder.FailedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            folder.IsRetryable = true;
+        }
         finally
         {
             _running--;
-            if (!_lifetime.IsCancellationRequested)
+            if (folder.IsNetwork)
+            {
+                _networkRunning--;
+            }
+
+            if (!_disposed)
             {
                 Pump();
             }
         }
     }
 
-    private async Task<NestedListing> ReadAsync(string path, CancellationToken cancellationToken)
+    /// <summary>What a read brings back: the listing, and the child folders already built from it.</summary>
+    private sealed record Read(NestedListing Listing, NestedFolder[] Children, NestedFolder[] Removed, NestedFolder[] Basis);
+
+    /// <summary>
+    /// Reads a folder and, still off the UI thread, builds its child objects:
+    /// a folder of twenty-five thousand sub-folders is twenty-five thousand
+    /// paths to join and objects to make, and doing that in the dispatcher was
+    /// a visible hitch in the middle of a zoom.  Children that were there
+    /// before are carried over as they are, with everything read below them.
+    /// </summary>
+    private async Task<Read> ReadAsync(NestedFolder folder, CancellationToken cancellationToken)
     {
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetime.Token);
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _lifetimeToken);
         var token = linked.Token;
-        return await Task.Run(() => _reader(path, token), token).ConfigureAwait(true);
+        var basis = folder.AllChildren;
+        var path = folder.FullPath;
+        return await Task.Run(() =>
+        {
+            var listing = _reader(path, token);
+            return string.IsNullOrEmpty(listing.ErrorMessage)
+                ? Prepare(folder, basis, listing)
+                : new Read(listing, basis, [], basis);
+        }, token).ConfigureAwait(true);
     }
 
-    private void Apply(NestedFolder folder, NestedListing listing)
+    private static Read Prepare(NestedFolder folder, NestedFolder[] basis, NestedListing listing)
     {
-        folder.IsSticky = false;
-
-        // Its parent was read again while this was in flight and it is gone:
-        // its children must not be registered under a folder nobody can reach.
-        if (folder.IsForgotten)
+        Dictionary<string, NestedFolder>? existing = null;
+        if (basis.Length > 0)
         {
-            return;
-        }
-
-        if (!string.IsNullOrEmpty(listing.ErrorMessage))
-        {
-            folder.LoadState = NestedLoadState.Failed;
-            folder.ErrorMessage = listing.ErrorMessage;
-            Changed?.Invoke(this, EventArgs.Empty);
-            return;
-        }
-
-        var existing = new Dictionary<string, NestedFolder>(folder.AllChildren.Length, StringComparer.OrdinalIgnoreCase);
-        foreach (var child in folder.AllChildren)
-        {
-            existing[child.FullPath] = child;
+            existing = new Dictionary<string, NestedFolder>(basis.Length, StringComparer.Ordinal);
+            foreach (var child in basis)
+            {
+                existing[child.Name] = child;
+            }
         }
 
         var children = new NestedFolder[listing.Folders.Count];
         for (var index = 0; index < children.Length; index++)
         {
             var entry = listing.Folders[index];
-            var path = Path.Combine(folder.FullPath, entry.Name);
-            if (existing.Remove(path, out var kept) && kept.IsReparsePoint == entry.IsReparsePoint && kept.IsHidden == entry.IsHidden)
+            if (existing is not null
+                && existing.Remove(entry.Name, out var kept)
+                && kept.IsReparsePoint == entry.IsReparsePoint
+                && kept.IsHidden == entry.IsHidden)
             {
                 children[index] = kept;
                 continue;
             }
 
-            if (kept is not null)
-            {
-                Forget(kept);
-            }
-
-            var child = new NestedFolder(path, entry.Name, NestedFolderKind.Folder, folder, entry.IsHidden, entry.IsReparsePoint);
-            _byPath[path] = child;
-            children[index] = child;
+            children[index] = new NestedFolder(
+                Path.Combine(folder.FullPath, entry.Name),
+                entry.Name,
+                NestedFolderKind.Folder,
+                folder,
+                entry.IsHidden,
+                entry.IsReparsePoint);
         }
 
-        foreach (var removed in existing.Values)
+        NestedFolder[] removed = existing is null ? [] : [.. existing.Values];
+        return new Read(listing, children, removed, basis);
+    }
+
+    private void Apply(NestedFolder folder, Read read)
+    {
+        folder.IsSticky = false;
+
+        // Its parent was read again while this was in flight and it is gone:
+        // nothing may be hung on a folder nobody can reach.
+        if (IsDetached(folder))
+        {
+            // Nothing reads it now; if it is ever reached again, read afresh.
+            folder.LoadState = NestedLoadState.NotLoaded;
+            return;
+        }
+
+        var listing = read.Listing;
+        if (!string.IsNullOrEmpty(listing.ErrorMessage))
+        {
+            folder.LoadState = NestedLoadState.Failed;
+            folder.ErrorMessage = listing.ErrorMessage;
+            folder.FailedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+            folder.IsRetryable = listing.IsRetryable;
+            RaiseChanged();
+            return;
+        }
+
+        // The listing was matched against the children as they were when the
+        // read started.  If something replaced them meanwhile, match again
+        // against what is there now; it is rare, and correctness beats speed.
+        if (!ReferenceEquals(read.Basis, folder.AllChildren))
+        {
+            read = Prepare(folder, folder.AllChildren, listing);
+        }
+
+        foreach (var removed in read.Removed)
         {
             Forget(removed);
         }
 
-        folder.AllChildren = children;
-        folder.AllFiles = [.. listing.Files];
+        _knownCount += read.Children.Length - read.Basis.Length;
+        folder.AllChildren = read.Children;
+        folder.AllFiles = listing.Files as NestedFile[] ?? [.. listing.Files];
         folder.FileCount = listing.FileCount;
         folder.HiddenFileCount = listing.HiddenFileCount;
         folder.IsTruncated = listing.IsTruncated;
@@ -524,9 +803,15 @@ public sealed class NestedTree : IDisposable
         ApplyVisibleChildren(folder);
 
         FolderLoaded?.Invoke(folder);
-        Changed?.Invoke(this, EventArgs.Empty);
+        RaiseChanged();
     }
 
+    /// <summary>
+    /// Drops a folder that is no longer there.  Only the folder itself is
+    /// marked: everything below it is unreachable through it anyway, and
+    /// walking a subtree of thousands to say so again was the slow part of a
+    /// refresh.  <see cref="IsDetached"/> is how the rest find out.
+    /// </summary>
     private void Forget(NestedFolder folder)
     {
         folder.Index = -1;
@@ -534,16 +819,6 @@ public sealed class NestedTree : IDisposable
         if (folder.LoadState == NestedLoadState.Queued)
         {
             folder.LoadState = NestedLoadState.NotLoaded;
-        }
-
-        if (_byPath.TryGetValue(folder.FullPath, out var registered) && ReferenceEquals(registered, folder))
-        {
-            _byPath.Remove(folder.FullPath);
-        }
-
-        foreach (var child in folder.AllChildren)
-        {
-            Forget(child);
         }
     }
 
@@ -556,7 +831,10 @@ public sealed class NestedTree : IDisposable
         while (stack.Count > 0)
         {
             var folder = stack.Pop();
-            if (folder.LoadState != NestedLoadState.Loaded && !folder.IsComputer)
+
+            // Whatever its state - being read again, or failed on a re-read -
+            // a folder that has contents gets the rules applied to them.
+            if (!folder.IsComputer && folder.AllChildren.Length == 0 && folder.AllFiles.Length == 0)
             {
                 continue;
             }
@@ -568,31 +846,50 @@ public sealed class NestedTree : IDisposable
             }
         }
 
-        Changed?.Invoke(this, EventArgs.Empty);
+        RaiseChanged();
     }
 
-    private bool IsVisible(NestedFolder folder)
+    private void RebuildFilterParents()
     {
-        if (_forcedVisible.Contains(folder.FullPath))
+        _filterParents.Clear();
+        foreach (var path in _userHidden.Concat(_forcedVisible))
         {
-            return true;
+            if (Path.GetDirectoryName(path) is { Length: > 0 } directory)
+            {
+                _filterParents.Add(Key(directory));
+            }
         }
-
-        if (_userHidden.Contains(folder.FullPath))
-        {
-            return false;
-        }
-
-        return _includeHidden || !folder.IsHidden;
     }
 
     /// <summary>Decides which children are cells and where each one goes.</summary>
     private void ApplyVisibleChildren(NestedFolder folder)
     {
-        var visible = new List<NestedFolder>(folder.AllChildren.Length);
-        foreach (var child in folder.AllChildren)
+        // Only folders with a hidden or forced child look paths up; the rest
+        // decide by attribute alone, which is what keeps placing a folder of
+        // fifty thousand sub-folders cheap.
+        var hasRules = !folder.IsComputer && _filterParents.Contains(folder.FullPath);
+        var all = folder.AllChildren;
+        var visible = new List<NestedFolder>(all.Length);
+        foreach (var child in all)
         {
-            if (IsVisible(child))
+            // "Hide from canvas" is the user's own word and outranks a folder
+            // being asked for by name; being asked for outranks only the
+            // hidden attribute.
+            bool shown;
+            if (hasRules && _userHidden.Contains(child.FullPath))
+            {
+                shown = false;
+            }
+            else if (hasRules && _forcedVisible.Contains(child.FullPath))
+            {
+                shown = true;
+            }
+            else
+            {
+                shown = _includeHidden || !child.IsHidden;
+            }
+
+            if (shown)
             {
                 visible.Add(child);
             }
@@ -604,9 +901,15 @@ public sealed class NestedTree : IDisposable
 
         // A hidden file someone marked or searched for is shown like a hidden
         // folder on the way to one: asking for it by name outranks the filter.
-        NestedFile[] files = _includeHidden
-            ? folder.AllFiles
-            : [.. folder.AllFiles.Where(file => !file.IsHidden || _forcedVisible.Contains(folder.PathOf(file)))];
+        NestedFile[] files;
+        if (_includeHidden || folder.HiddenFileCount == 0)
+        {
+            files = folder.AllFiles;
+        }
+        else
+        {
+            files = [.. folder.AllFiles.Where(file => !file.IsHidden || hasRules && _forcedVisible.Contains(folder.PathOf(file)))];
+        }
 
         // Sub-folders take the top of the cell and files what is left under
         // them: the folder grid is fitted into its share first, then the files
@@ -636,14 +939,9 @@ public sealed class NestedTree : IDisposable
 
     // ---- paths ---------------------------------------------------------------
 
-    /// <summary>
-    /// The root-first chain of paths from the root that holds <paramref name="path"/>
-    /// down to it.  A root can be a drive or a deeper extra root such as a UNC
-    /// share, so the chain starts at the longest root that is a prefix.
-    /// </summary>
-    internal List<string> Chain(string path)
+    /// <summary>The root - a drive or a deeper extra root such as a share - that holds a normalised path.</summary>
+    private NestedFolder? OwnerRoot(string target)
     {
-        var target = Key(path);
         NestedFolder? owner = null;
         foreach (var root in Root.AllChildren)
         {
@@ -654,6 +952,18 @@ public sealed class NestedTree : IDisposable
             }
         }
 
+        return owner;
+    }
+
+    /// <summary>
+    /// The root-first chain of paths from the root that holds <paramref name="path"/>
+    /// down to it.  A root can be a drive or a deeper extra root such as a UNC
+    /// share, so the chain starts at the longest root that is a prefix.
+    /// </summary>
+    internal List<string> Chain(string path)
+    {
+        var target = Key(path);
+        var owner = OwnerRoot(target);
         var chain = new List<string>();
         if (owner is null)
         {
@@ -707,12 +1017,18 @@ public sealed class NestedTree : IDisposable
 }
 
 /// <summary>
-/// Reads the sub-folders of one directory and counts its files, in one pass
-/// over the raw directory entries.  File names are never turned into strings:
-/// only folders become cells, and a file only needs to be counted.
+/// Reads one directory in a single pass over its raw entries: the sub-folders,
+/// and the files - named up to <see cref="NestedTree.MaximumFiles"/>, counted
+/// past it without a string ever being made for them.
 /// </summary>
 public static class NestedDirectoryReader
 {
+    private sealed class Counts
+    {
+        public int Files;
+        public int HiddenFiles;
+    }
+
     public static NestedListing Read(string path, CancellationToken cancellationToken)
     {
         var options = new EnumerationOptions
@@ -725,34 +1041,47 @@ public static class NestedDirectoryReader
 
         var folders = new List<NestedEntry>();
         var listed = new List<NestedFile>();
-        var files = 0;
-        var hiddenFiles = 0;
+        var counts = new Counts();
         var truncated = false;
 
         try
         {
-            var entries = new FileSystemEnumerable<(string Name, FileAttributes Attributes, long Length, bool IsDirectory)>(
-                path,
-                static (ref FileSystemEntry entry) => (entry.FileName.ToString(), entry.Attributes, entry.IsDirectory ? 0 : entry.Length, entry.IsDirectory),
-                options);
+            var entries = new FileSystemEnumerable<(string Name, FileAttributes Attributes, long Length, bool IsDirectory, bool IsLink)>(
+                ExtendedLength(path),
+                static (ref FileSystemEntry entry) => (
+                    entry.FileName.ToString(),
+                    entry.Attributes,
+                    entry.IsDirectory ? 0 : entry.Length,
+                    entry.IsDirectory,
+                    entry.IsDirectory && (entry.Attributes & FileAttributes.ReparsePoint) != 0 && IsLink(ref entry)),
+                options)
+            {
+                // Files are counted here, before the transform, so the ones
+                // past the cap are never turned into anything.
+                ShouldIncludePredicate = (ref FileSystemEntry entry) =>
+                {
+                    if (entry.IsDirectory)
+                    {
+                        return true;
+                    }
 
-            foreach (var (name, attributes, length, isDirectory) in entries)
+                    counts.Files++;
+                    if ((entry.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0)
+                    {
+                        counts.HiddenFiles++;
+                    }
+
+                    return counts.Files <= NestedTree.MaximumFiles;
+                }
+            };
+
+            foreach (var (name, attributes, length, isDirectory, isLink) in entries)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var isHidden = (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
                 if (!isDirectory)
                 {
-                    files++;
-                    if (isHidden)
-                    {
-                        hiddenFiles++;
-                    }
-
-                    if (listed.Count < NestedTree.MaximumFiles)
-                    {
-                        listed.Add(new NestedFile(name, isHidden, length));
-                    }
-
+                    listed.Add(new NestedFile(name, isHidden, length));
                     continue;
                 }
 
@@ -762,7 +1091,7 @@ public static class NestedDirectoryReader
                     continue;
                 }
 
-                folders.Add(new NestedEntry(name, isHidden, (attributes & FileAttributes.ReparsePoint) != 0));
+                folders.Add(new NestedEntry(name, isHidden, isLink));
             }
         }
         catch (UnauthorizedAccessException)
@@ -775,11 +1104,52 @@ public static class NestedDirectoryReader
         }
         catch (IOException ex)
         {
-            return NestedListing.Failed(ex.Message);
+            // A share that did not answer or a drive that was not ready may
+            // well answer later; the canvas tries such a folder again.
+            return NestedListing.Failed(ex.Message) with { IsRetryable = true };
         }
 
-        folders.Sort(static (left, right) => StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name));
-        listed.Sort(static (left, right) => StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name));
-        return new NestedListing(folders, files, hiddenFiles, truncated) { Files = listed };
+        // Culture order as Explorer shows it, and ordinal order between names
+        // culture order calls equal, so two folders differing only in case (a
+        // WSL tree can have them) always come out the same way round.
+        folders.Sort(static (left, right) =>
+        {
+            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
+            return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
+        });
+        listed.Sort(static (left, right) =>
+        {
+            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
+            return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
+        });
+        return new NestedListing(folders, counts.Files, counts.HiddenFiles, truncated) { Files = listed.ToArray() };
     }
+
+    /// <summary>
+    /// Whether a folder with a reparse point is a link - a junction, a symbolic
+    /// link, a mount point - rather than a cloud placeholder (OneDrive files on
+    /// demand) or a projected folder, which carry the same attribute but are
+    /// ordinary folders to read.  Only links report a target.
+    /// </summary>
+    private static bool IsLink(ref FileSystemEntry entry)
+    {
+        try
+        {
+            return entry.ToFileSystemInfo().LinkTarget is not null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The path in its extended-length form for a local drive.  Without it the
+    /// enumerator normalises the path, which strips a trailing dot or space -
+    /// and a folder named "backup." would be read as its neighbour "backup".
+    /// </summary>
+    private static string ExtendedLength(string path) =>
+        path.Length >= 3 && path[1] == ':' && path[2] == Path.DirectorySeparatorChar
+            ? @"\\?\" + path
+            : path;
 }

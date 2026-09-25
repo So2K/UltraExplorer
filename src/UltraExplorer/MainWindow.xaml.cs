@@ -1092,9 +1092,13 @@ public partial class MainWindow : Window
     /// <summary>The menu for the open space of a folder: what can be made or put in it, and the canvas's own commands.</summary>
     private void ShowFolderAreaMenu(FrameworkElement placementTarget, ViewAllNodeViewModel? area)
     {
+        // The folder the menu names is the folder its commands act on: New
+        // folder, New text file and Paste go to the selection, so the folder
+        // clicked in becomes the selection - as a click on empty space in an
+        // Explorer window does.
         if (area is { IsDirectory: true })
         {
-            _viewModel.Tree.SetActiveFolder(area);
+            _viewModel.Tree.SelectOnly(area);
         }
 
         var where = _viewModel.Tree.ActiveNode is { IsDirectory: true } folder
@@ -1835,6 +1839,20 @@ public partial class MainWindow : Window
                 }
 
                 SetMaximizeHover(false);
+
+                // Maximized, the top edge of the window is the top edge of the
+                // screen - the easiest place there is to throw the pointer at.
+                // WindowChrome still called that band a resize border, and a
+                // resize border on a maximized window does nothing, so every
+                // quick grab at the very top missed.  There it is the caption,
+                // except over the caption buttons, whose top pixel must still
+                // close the window.
+                if (WindowState == WindowState.Maximized && TopBandHit(lParam) is { } code)
+                {
+                    handled = true;
+                    return new IntPtr(code);
+                }
+
                 return IntPtr.Zero;
 
             case WmNcLeftButtonDown when wParam.ToInt32() == HtMaxButton:
@@ -1896,6 +1914,66 @@ public partial class MainWindow : Window
 
         Marshal.StructureToPtr(bounds, lParam, false);
     }
+
+    private const int HtClient = 1;
+    private const int HtCaption = 2;
+
+    /// <summary>
+    /// For a maximized window: the caption code for a point in the top band,
+    /// the client code over the caption buttons, and null anywhere else (where
+    /// WindowChrome's own answer stands).
+    /// </summary>
+    private int? TopBandHit(IntPtr lParam)
+    {
+        var packed = lParam.ToInt64();
+        var screenPoint = new Point((short)(packed & 0xFFFF), (short)((packed >> 16) & 0xFFFF));
+        try
+        {
+            var local = PointFromScreen(screenPoint);
+            if (local.Y < 0 || local.Y > 8)
+            {
+                return null;
+            }
+
+            var buttons = CaptionButtons.PointFromScreen(screenPoint);
+            return buttons.X >= 0 && buttons.X <= CaptionButtons.ActualWidth ? HtClient : HtCaption;
+        }
+        catch (InvalidOperationException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The tab is what the eye goes to when the window is to be moved, as in a
+    /// browser: pressing it anywhere but its close button picks the window up,
+    /// through the caption's own machinery, so snapping and dragging a
+    /// maximized window back down work exactly as on the empty strip beside it.
+    /// </summary>
+    private void Tab_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (FindAncestor<Button>(e.OriginalSource as DependencyObject) is not null)
+        {
+            return;
+        }
+
+        e.Handled = true;
+        if (e.ClickCount == 2)
+        {
+            ToggleMaximized();
+            return;
+        }
+
+        var handle = new WindowInteropHelper(this).Handle;
+        ReleaseCapture();
+        SendMessage(handle, WmNcLeftButtonDown, new IntPtr(HtCaption), IntPtr.Zero);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool ReleaseCapture();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr window, int message, IntPtr wParam, IntPtr lParam);
 
     private bool IsOverMaximizeButton(IntPtr lParam)
     {

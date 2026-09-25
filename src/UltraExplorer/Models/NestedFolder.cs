@@ -25,16 +25,49 @@ public sealed record NestedCameraState(string AnchorPath, double X, double Y, do
 /// A file inside a folder on the nested canvas: a name to draw and a size to
 /// show.  A value, not an object - a folder can hold a hundred thousand.
 /// </summary>
-public readonly record struct NestedFile(string Name, bool IsHidden, long Length)
+public readonly record struct NestedFile
 {
-    /// <summary>Lower-case extension without the dot, or empty.</summary>
-    public string Extension
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Extensions = new(StringComparer.Ordinal);
+
+    public NestedFile(string name, bool isHidden, long length)
     {
-        get
+        Name = name;
+        IsHidden = isHidden;
+        Length = length;
+        Extension = ExtensionOf(name);
+    }
+
+    public string Name { get; }
+
+    public bool IsHidden { get; }
+
+    public long Length { get; }
+
+    /// <summary>
+    /// Lower-case extension without the dot, or empty.  Worked out once, when
+    /// the folder is read, and shared: drawing a folder of ten thousand DLLs
+    /// looks their colour up by one string, not ten thousand new ones a frame.
+    /// </summary>
+    public string Extension { get; }
+
+    private static string ExtensionOf(string name)
+    {
+        var dot = name.LastIndexOf('.');
+        if (dot <= 0 || dot == name.Length - 1 || name.Length - dot > 33)
         {
-            var dot = Name.LastIndexOf('.');
-            return dot <= 0 || dot == Name.Length - 1 ? string.Empty : Name[(dot + 1)..].ToLowerInvariant();
+            return string.Empty;
         }
+
+        Span<char> lower = stackalloc char[name.Length - dot - 1];
+        name.AsSpan(dot + 1).ToLowerInvariant(lower);
+        var lookup = Extensions.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(lower, out var shared))
+        {
+            return shared;
+        }
+
+        var extension = lower.ToString();
+        return Extensions.GetOrAdd(extension, extension);
     }
 }
 
@@ -105,6 +138,15 @@ public sealed class NestedFolder
     public bool CanLoad => !IsComputer && !IsReparsePoint;
 
     public NestedLoadState LoadState { get; internal set; }
+
+    /// <summary>When the last read failed, as a <see cref="System.Diagnostics.Stopwatch"/> timestamp.</summary>
+    internal long FailedAt { get; set; }
+
+    /// <summary>The last failure may pass if tried again.</summary>
+    internal bool IsRetryable { get; set; }
+
+    /// <summary>On a share: read one at a time, so a share that hangs cannot starve the local drives.</summary>
+    public bool IsNetwork => FullPath.StartsWith(@"\\", StringComparison.Ordinal);
 
     public bool IsLoaded => LoadState == NestedLoadState.Loaded;
 

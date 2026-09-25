@@ -32,14 +32,40 @@ public sealed record NestedBeacon(string Path, NestedBeaconKind Kind, Color Colo
 /// folder's cell or the file's tile; the flag says the point is on a folder's
 /// title band (always true for a file).
 /// </summary>
-public readonly record struct NestedHit(NestedFolder Folder, Rect Bounds, bool IsOnHeader, int FileIndex = -1)
+/// <remarks>
+/// A file is held by name as well as by position.  Between a press and the
+/// drag it starts, the folder can be read again and its files shift; the
+/// name is what makes sure the file dragged is the file pressed.
+/// </remarks>
+public readonly record struct NestedHit(NestedFolder Folder, Rect Bounds, bool IsOnHeader, int FileIndex = -1, string? FileName = null)
 {
-    public bool IsFile => FileIndex >= 0 && FileIndex < Folder.Files.Count;
+    public bool IsFile => FileName is not null;
 
-    public NestedFile File => Folder.Files[FileIndex];
+    /// <summary>The file, found again by name if the folder's files moved since the hit.</summary>
+    public NestedFile File
+    {
+        get
+        {
+            var files = Folder.Files;
+            if (FileIndex >= 0 && FileIndex < files.Count && files[FileIndex].Name == FileName)
+            {
+                return files[FileIndex];
+            }
+
+            foreach (var file in files)
+            {
+                if (file.Name == FileName)
+                {
+                    return file;
+                }
+            }
+
+            return new NestedFile(FileName ?? string.Empty, false, 0);
+        }
+    }
 
     /// <summary>The path of whatever was hit.</summary>
-    public string Path => IsFile ? Folder.PathOf(Folder.Files[FileIndex]) : Folder.FullPath;
+    public string Path => FileName is not null ? System.IO.Path.Combine(Folder.FullPath, FileName) : Folder.FullPath;
 }
 
 /// <summary>
@@ -90,6 +116,9 @@ public sealed class NestedCanvas : FrameworkElement
     private const double PillFontSize = 9.5;
     private const double PillMinimumWidth = 56;
     private const int MaximumCellsPerFrame = 400_000;
+    private const int MaximumTilesPerFrame = 250_000;
+    private int _foldersDrawn;
+    private long _tilesDrawn;
 
     private static readonly Typeface TextFace = new(new FontFamily("Segoe UI Variable Text, Segoe UI"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
     private static readonly Typeface TextFaceBold = new(new FontFamily("Segoe UI Variable Text, Segoe UI"), FontStyles.Normal, FontWeights.SemiBold, FontStretches.Normal);
@@ -119,13 +148,43 @@ public sealed class NestedCanvas : FrameworkElement
     private readonly Dictionary<string, (uint Body, uint Stripe, uint Speck)> _filePalette = new(StringComparer.Ordinal);
     private readonly HashSet<NestedFolder> _labelled = [];
     private readonly List<Hotspot> _hotspots = [];
-    private readonly Dictionary<TextKey, FormattedText> _textCache = [];
+    private Dictionary<TextKey, FormattedText> _textCache = [];
+    private Dictionary<TextKey, FormattedText> _oldTextCache = [];
+    private double _minCell = MinimumCellPixels;
+
+    /// <summary>Text sizes laid out per octave: every fourth root of two, each within 9 % of any size drawn.</summary>
+    private const int LevelsPerOctave = 4;
+
+    /// <summary>New text layouts allowed in one frame while the camera moves.</summary>
+    private const int MotionTextBudget = 48;
+
+    private int _textBudget = int.MaxValue;
+    private bool _textDeferred;
+    private double _minTile = 2.5;
     private readonly HashSet<string> _selected = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _resolving = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _unresolvable = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> _pinned = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Color, Brush> _brushes = [];
+
+    // The picture is four layers, each redrawn only when what it shows
+    // changed: the cells (a bitmap), the names on them, the marks and outlines
+    // over them, and the pointer's outline and tag on top.  A click that only
+    // moves the selection redraws the third; an icon arriving, the second;
+    // moving the mouse, the fourth.  Only the camera or the tree moving
+    // repaints the cells.
+    private readonly DrawingVisual _sceneVisual = new();
+    private readonly DrawingVisual _labelVisual = new();
+    private readonly DrawingVisual _decorVisual = new();
     private readonly DrawingVisual _overlay = new();
+    private readonly List<Hotspot> _labelHotspots = [];
+    private Layers _dirty = Layers.All;
+    private bool _frameHooked;
+    private WriteableBitmap? _shownBitmap;
+    private long _lastMotion;
+    private double _lod = 1;
+    private bool _lodDegraded;
+    private bool _textAnimated;
     private IReadOnlyList<NestedBeacon> _beacons = [];
 
     private NestedTree? _tree;
@@ -144,7 +203,6 @@ public sealed class NestedCanvas : FrameworkElement
     private bool _cameraTouched;
 
     private Flight? _flight;
-    private bool _isRenderingHooked;
 
     private PressKind _press;
     private Point _pressPoint;
@@ -167,15 +225,29 @@ public sealed class NestedCanvas : FrameworkElement
         ClipToBounds = true;
         SnapsToDevicePixels = true;
         UseLayoutRounding = true;
-        RenderOptions.SetBitmapScalingMode(this, BitmapScalingMode.NearestNeighbor);
+        // The cells are drawn pixel for pixel and must never be smoothed; the
+        // icons on the names are scaled, and must be.
+        RenderOptions.SetBitmapScalingMode(_sceneVisual, BitmapScalingMode.NearestNeighbor);
+        RenderOptions.SetBitmapScalingMode(_labelVisual, BitmapScalingMode.HighQuality);
+        ClipToBounds = true;
+        AddVisualChild(_sceneVisual);
+        AddVisualChild(_labelVisual);
+        AddVisualChild(_decorVisual);
         AddVisualChild(_overlay);
-        Unloaded += (_, _) => StopRenderingHook();
+        Unloaded += (_, _) => UnhookFrame();
+        Loaded += (_, _) => RequestFrame(Layers.All);
     }
 
-    protected override int VisualChildrenCount => 1;
+    protected override int VisualChildrenCount => 4;
 
-    protected override Visual GetVisualChild(int index) =>
-        index == 0 ? _overlay : throw new ArgumentOutOfRangeException(nameof(index));
+    protected override Visual GetVisualChild(int index) => index switch
+    {
+        0 => _sceneVisual,
+        1 => _labelVisual,
+        2 => _decorVisual,
+        3 => _overlay,
+        _ => throw new ArgumentOutOfRangeException(nameof(index))
+    };
 
     // ---- surface -------------------------------------------------------------
 
@@ -226,7 +298,7 @@ public sealed class NestedCanvas : FrameworkElement
                 _tree.Changed += OnTreeChanged;
             }
 
-            InvalidateVisual();
+            RequestFrame(Layers.All);
         }
     }
 
@@ -253,7 +325,7 @@ public sealed class NestedCanvas : FrameworkElement
             if (!ReferenceEquals(_dropTarget, value))
             {
                 _dropTarget = value;
-                InvalidateVisual();
+                RequestFrame(Layers.Decor);
             }
         }
     }
@@ -294,6 +366,15 @@ public sealed class NestedCanvas : FrameworkElement
     /// <summary>How long the last frame took to build on the UI thread.</summary>
     public double LastRenderMilliseconds { get; private set; }
 
+    /// <summary>How long the names and icons took to record in the last frame that drew them.</summary>
+    public double LastLabelsMilliseconds { get; private set; }
+
+    /// <summary>How long the marks, outlines and trail took to record in the last frame.</summary>
+    public double LastDecorMilliseconds { get; private set; }
+
+    /// <summary>Texts laid out afresh in the last frame, rather than found already laid out.</summary>
+    public int NewTextLayouts { get; private set; }
+
     /// <summary>Frames built so far; a benchmark tells a new frame from an old one by it.</summary>
     public long RenderCount { get; private set; }
 
@@ -307,7 +388,7 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         _activePath = activePath ?? string.Empty;
-        InvalidateVisual();
+        RequestFrame(Layers.Decor);
     }
 
     public void SetBeacons(IReadOnlyList<NestedBeacon> beacons)
@@ -323,7 +404,7 @@ public sealed class NestedCanvas : FrameworkElement
             }
         }
 
-        InvalidateVisual();
+        RequestFrame(Layers.Labels | Layers.Decor);
         _ = ResolveBeaconsAsync();
     }
 
@@ -331,7 +412,24 @@ public sealed class NestedCanvas : FrameworkElement
     public void InvalidateMarks()
     {
         _paletteStamp++;
-        InvalidateVisual();
+        RequestFrame(Layers.All);
+    }
+
+    /// <summary>Everything again, from the cells up.</summary>
+    public void Redraw() => RequestFrame(Layers.All);
+
+    /// <summary>A Shell icon arrived: only the names and icons on the cells need drawing again.</summary>
+    public void RefreshIcons() => RequestFrame(Layers.Labels);
+
+    /// <summary>
+    /// Draws whatever is out of date right now, rather than on the next frame.
+    /// For a snapshot of the control, and for a test with no frame loop.
+    /// </summary>
+    public void RenderNow()
+    {
+        var layers = _dirty | Layers.All;
+        _dirty = Layers.None;
+        RenderLayers(layers, inMotion: false);
     }
 
     // ---- camera --------------------------------------------------------------
@@ -375,23 +473,68 @@ public sealed class NestedCanvas : FrameworkElement
             return false;
         }
 
-        var (endX, endY, endW) = FitRect(fill);
+        return FlyToRect(target, FitRect(fill), animated);
+    }
+
+    /// <summary>Moves the camera so <paramref name="target"/> ends up exactly at <paramref name="end"/> on screen.</summary>
+    private bool FlyToRect(NestedFolder target, (double X, double Y, double W) end, bool animated = true)
+    {
+        EnsureCamera();
+        var current = ScreenRectOf(target);
+        if (current is null || _viewWidth <= 0 || !(end.W > 0) || double.IsInfinity(end.W))
+        {
+            return false;
+        }
+
         if (!animated)
         {
             StopFlight();
             _anchor = target;
-            _ax = endX;
-            _ay = endY;
-            _aw = endW;
+            _ax = end.X;
+            _ay = end.Y;
+            _aw = end.W;
             _cameraTouched = true;
             AfterCameraMove();
             return true;
         }
 
-        _flight = Flight.Create(target, current.Value, (endX, endY, endW), _viewWidth, _viewHeight);
+        _flight = Flight.Create(target, current.Value, end, _viewWidth, _viewHeight);
         _cameraTouched = true;
-        StartRenderingHook();
+        RequestFrame(Layers.All);
         return true;
+    }
+
+    /// <summary>
+    /// Flies to where a folder or a file can actually be read: a file with its
+    /// tile tall enough for its name, a folder a third of the view wide - each
+    /// centred.  Fitting the container instead left a file among thousands
+    /// just as unreadable as before, and every arrow press flew to the same
+    /// view again.
+    /// </summary>
+    private void FlyToReadable(NestedFolder folder, int fileIndex)
+    {
+        if (fileIndex >= 0 && fileIndex < folder.Files.Count && folder.FileGrid is { IsEmpty: false } files)
+        {
+            var width = 2 * FileLabelPixels / files.TileHeight;
+            width = Math.Max(width, FitRect(0.92).W);
+            var (fx, fy) = files.Origin(fileIndex);
+            var cx = fx + files.TileWidth / 2;
+            var cy = fy + files.TileHeight / 2;
+            FlyToRect(folder, (_viewWidth / 2 - cx * width, _viewHeight / 2 - cy * width, width));
+            return;
+        }
+
+        if (folder.Parent is not { IsComputer: false } parent)
+        {
+            FlyTo(folder, 0.6);
+            return;
+        }
+
+        var wanted = Math.Max(160, Math.Min(_viewWidth, _viewHeight * NestedLayout.Aspect) * 0.35);
+        var parentWidth = wanted / folder.Scale;
+        var centreX = folder.OffsetX + folder.Scale / 2;
+        var centreY = folder.OffsetY + folder.Scale * NestedLayout.CellHeight / 2;
+        FlyToRect(parent, (_viewWidth / 2 - centreX * parentWidth, _viewHeight / 2 - centreY * parentWidth, parentWidth));
     }
 
     /// <summary>Reads everything on the way to <paramref name="path"/>, then flies to it.</summary>
@@ -424,6 +567,7 @@ public sealed class NestedCanvas : FrameworkElement
         ZoomAround(at, factor);
         Normalize();
         ClampZoom(at);
+        ClampPan();
         _cameraTouched = true;
         AfterCameraMove();
     }
@@ -447,9 +591,14 @@ public sealed class NestedCanvas : FrameworkElement
         AfterCameraMove();
     }
 
+    /// <summary>
+    /// The camera as something that can be saved, or null when there is none
+    /// to save (never shown, no size yet).  A camera on This PC itself is saved
+    /// with an empty path, so an overview comes back as an overview.
+    /// </summary>
     public NestedCameraState? CaptureCamera()
     {
-        if (_anchor is null || !_hasCamera || _viewWidth <= 0 || _anchor.IsComputer)
+        if (_anchor is null || !_hasCamera || _viewWidth <= 0)
         {
             return null;
         }
@@ -457,7 +606,7 @@ public sealed class NestedCanvas : FrameworkElement
         var centreX = _viewWidth / 2;
         var centreY = _viewHeight / 2;
         return new NestedCameraState(
-            _anchor.FullPath,
+            _anchor.IsComputer ? string.Empty : _anchor.FullPath,
             (_ax - centreX) / _viewWidth,
             (_ay - centreY) / _viewWidth,
             _aw / _viewWidth);
@@ -469,14 +618,18 @@ public sealed class NestedCanvas : FrameworkElement
     /// </summary>
     public async Task RestoreCameraAsync(NestedCameraState state)
     {
-        if (_tree is null || string.IsNullOrWhiteSpace(state.AnchorPath) || state.Width <= 0 || double.IsNaN(state.Width))
+        if (_tree is null || !(state.Width > 0) || double.IsInfinity(state.Width))
         {
             return;
         }
 
         _cameraTouched = false;
-        var folder = await _tree.RevealAsync(state.AnchorPath);
-        if (folder is null || _cameraTouched || !ViewAllPath.Equals(folder.FullPath, state.AnchorPath) || _viewWidth <= 0)
+        var isRoot = string.IsNullOrWhiteSpace(state.AnchorPath);
+        var folder = isRoot ? _tree.Root : await _tree.RevealAsync(state.AnchorPath);
+        if (folder is null
+            || _cameraTouched
+            || !isRoot && !ViewAllPath.Equals(folder.FullPath, state.AnchorPath)
+            || _viewWidth <= 0)
         {
             return;
         }
@@ -489,6 +642,7 @@ public sealed class NestedCanvas : FrameworkElement
         _hasCamera = true;
         Normalize();
         ClampZoom(new Point(_viewWidth / 2, _viewHeight / 2));
+        ClampPan();
         AfterCameraMove();
     }
 
@@ -561,7 +715,7 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 var (fx, fy) = files.Origin(fileIndex);
                 var tile = new Rect(x + fx * w, y + fy * w, files.TileWidth * w, files.TileHeight * w);
-                return new NestedHit(folder, tile, true, fileIndex);
+                return new NestedHit(folder, tile, true, fileIndex, folder.Files[fileIndex].Name);
             }
         }
 
@@ -672,7 +826,12 @@ public sealed class NestedCanvas : FrameworkElement
         switch (key)
         {
             case Key.Enter when active is { } target:
-                var hit = new NestedHit(target.Folder, default, true, target.FileIndex);
+                var hit = new NestedHit(
+                    target.Folder,
+                    default,
+                    true,
+                    target.FileIndex,
+                    target.FileIndex >= 0 ? target.Folder.Files[target.FileIndex].Name : null);
                 OpenRequested?.Invoke(hit);
                 if (!hit.IsFile)
                 {
@@ -763,7 +922,9 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         // A folder that was refreshed away or filtered out cannot be the anchor.
-        while (_anchor.Parent is not null && (_anchor.IsForgotten || _anchor.Index < 0))
+        // Filtered out, or inside something that was: hiding a folder the
+        // view is deep inside must take the view out of it.
+        while (_anchor.Parent is not null && (!NestedTree.IsOnCanvas(_anchor) || NestedTree.IsDetached(_anchor)))
         {
             Up();
         }
@@ -834,9 +995,16 @@ public sealed class NestedCanvas : FrameworkElement
             return;
         }
 
+        // Nothing further in: an empty folder need not fill more than the
+        // screen.  A folder of files goes as far in as it takes for its
+        // smallest names to be read and picked up.
         var isDeadEnd = _anchor.Children.Count == 0
             && (_anchor.LoadState is NestedLoadState.Loaded or NestedLoadState.Failed || _anchor.IsReparsePoint);
-        var maximum = isDeadEnd ? 3 * _viewWidth : 1e7 * _viewWidth;
+        var maximum = !isDeadEnd
+            ? 1e7 * _viewWidth
+            : _anchor.FileGrid is { IsEmpty: false } files
+                ? Math.Max(3 * _viewWidth, 4 * FileLabelPixels / files.TileHeight)
+                : 3 * _viewWidth;
         if (_aw > maximum)
         {
             ZoomAround(at, maximum / _aw);
@@ -938,7 +1106,8 @@ public sealed class NestedCanvas : FrameworkElement
 
     private void AfterCameraMove()
     {
-        InvalidateVisual();
+        _lastMotion = System.Diagnostics.Stopwatch.GetTimestamp();
+        RequestFrame(Layers.All);
         CameraChanged?.Invoke();
     }
 
@@ -947,62 +1116,91 @@ public sealed class NestedCanvas : FrameworkElement
 
     // ---- flights -------------------------------------------------------------
 
-    private void StopFlight()
-    {
-        _flight = null;
-        StopRenderingHook();
-    }
+    private void StopFlight() => _flight = null;
 
-    private void StartRenderingHook()
+    /// <summary>Marks layers out of date and makes sure the next frame draws them.</summary>
+    private void RequestFrame(Layers layers)
     {
-        if (_isRenderingHooked)
+        _dirty |= layers;
+        if (_frameHooked)
         {
             return;
         }
 
-        _isRenderingHooked = true;
-        CompositionTarget.Rendering += OnRenderingTick;
+        _frameHooked = true;
+        CompositionTarget.Rendering += OnFrame;
     }
 
-    private void StopRenderingHook()
+    private void UnhookFrame()
     {
-        if (!_isRenderingHooked)
+        if (!_frameHooked)
         {
             return;
         }
 
-        _isRenderingHooked = false;
-        CompositionTarget.Rendering -= OnRenderingTick;
+        _frameHooked = false;
+        CompositionTarget.Rendering -= OnFrame;
     }
 
-    private void OnRenderingTick(object? sender, EventArgs e)
+    /// <summary>
+    /// One frame of the canvas's own loop, the way a game engine runs one: the
+    /// camera advances if a flight is under way, then whatever went out of date
+    /// since the last frame is drawn - once, however many things asked for it.
+    /// A hundred folders finishing their reads in one frame are one redraw.
+    /// The loop unhooks itself when there is nothing left to do.
+    /// </summary>
+    private void OnFrame(object? sender, EventArgs e)
     {
-        if (_flight is not { } flight)
+        if (_flight is { } flight)
         {
-            StopRenderingHook();
-            return;
+            if (NestedTree.IsDetached(flight.Target) || !NestedTree.IsOnCanvas(flight.Target))
+            {
+                StopFlight();
+            }
+            else
+            {
+                var done = flight.Sample(_viewWidth, _viewHeight, out var x, out var y, out var w);
+                _anchor = flight.Target;
+                _ax = x;
+                _ay = y;
+                _aw = w;
+                _hasCamera = true;
+                Normalize();
+                if (done)
+                {
+                    StopFlight();
+                }
+
+                AfterCameraMove();
+            }
         }
 
-        if (flight.Target.IsForgotten)
+        var moving = IsMoving();
+
+        // The camera has come to rest after frames drawn with less detail, or
+        // with text set for motion: one more frame, at full quality.
+        if (!moving && (_lodDegraded || _textAnimated))
         {
-            StopFlight();
-            return;
+            _dirty |= Layers.All;
         }
 
-        var done = flight.Sample(_viewWidth, _viewHeight, out var x, out var y, out var w);
-        _anchor = flight.Target;
-        _ax = x;
-        _ay = y;
-        _aw = w;
-        _hasCamera = true;
-        Normalize();
-        if (done)
+        if (_dirty != Layers.None)
         {
-            StopFlight();
+            var layers = _dirty;
+            _dirty = Layers.None;
+            RenderLayers(layers, moving);
         }
 
-        AfterCameraMove();
+        if (_dirty == Layers.None && _flight is null && !_lodDegraded && !_textAnimated && !moving)
+        {
+            UnhookFrame();
+        }
     }
+
+    /// <summary>Whether the camera moved in the last few frames.</summary>
+    private bool IsMoving() =>
+        _flight is not null
+        || _lastMotion != 0 && System.Diagnostics.Stopwatch.GetElapsedTime(_lastMotion).TotalMilliseconds < 140;
 
     /// <summary>
     /// A smooth zoom-and-pan in the sense of van Wijk and Nuij: the path
@@ -1054,27 +1252,36 @@ public sealed class NestedCanvas : FrameworkElement
                     / (2 * flight._w0 * rho2 * flight._u1);
                 var b1 = (flight._w1 * flight._w1 - flight._w0 * flight._w0 - rho4 * flight._u1 * flight._u1)
                     / (2 * flight._w1 * rho2 * flight._u1);
-                flight._r0 = Math.Log(-b0 + Math.Sqrt(b0 * b0 + 1));
-                var r1 = Math.Log(-b1 + Math.Sqrt(b1 * b1 + 1));
+                // log(sqrt(b^2 + 1) - b) is -asinh(b), and only the second
+                // survives the ratios a deep jump produces: at b ~ 1e8 the first
+                // cancels to nothing and the flight collapses into a cut.
+                flight._r0 = -Math.Asinh(b0);
+                var r1 = -Math.Asinh(b1);
                 flight._length = (r1 - flight._r0) / Rho;
             }
 
             if (double.IsNaN(flight._length) || double.IsInfinity(flight._length))
             {
                 flight._isPureZoom = true;
-                flight._length = 0;
+                flight._length = Math.Abs(Math.Log(flight._w1 / flight._w0)) / Rho;
+                if (double.IsNaN(flight._length) || double.IsInfinity(flight._length))
+                {
+                    flight._length = 0;
+                }
             }
 
             // Long journeys take longer, but never so long that it feels slow.
             flight._duration = Math.Clamp(0.22 + 0.16 * Math.Abs(flight._length), 0.25, 1.1);
-            flight._started = Environment.TickCount64;
+            flight._started = System.Diagnostics.Stopwatch.GetTimestamp();
             return flight;
         }
 
         /// <summary>The target's rectangle at this moment; true once the flight has arrived.</summary>
         public bool Sample(double viewWidth, double viewHeight, out double x, out double y, out double w)
         {
-            var t = (Environment.TickCount64 - _started) / 1000.0 / _duration;
+            // The system tick moves in 15.6 ms steps: at 120 Hz most frames
+            // would read the same time and the camera would stutter.
+            var t = System.Diagnostics.Stopwatch.GetElapsedTime(_started).TotalSeconds / _duration;
             var done = t >= 1;
             t = Math.Clamp(t, 0, 1);
 
@@ -1120,11 +1327,21 @@ public sealed class NestedCanvas : FrameworkElement
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
     {
         base.OnRenderSizeChanged(sizeInfo);
-        if (_hasCamera && sizeInfo.PreviousSize.Width > 0 && sizeInfo.PreviousSize.Height > 0)
+
+        // Collapsed (the tree canvas is showing): nothing to frame, and the
+        // camera stays as it was for when the canvas comes back.
+        if (sizeInfo.NewSize.Width <= 0 || sizeInfo.NewSize.Height <= 0)
         {
-            // Keep the middle of the view on the same spot of the same folder.
-            var dx = (sizeInfo.NewSize.Width - sizeInfo.PreviousSize.Width) / 2;
-            var dy = (sizeInfo.NewSize.Height - sizeInfo.PreviousSize.Height) / 2;
+            return;
+        }
+
+        if (_hasCamera && _viewWidth > 0 && _viewHeight > 0)
+        {
+            // Keep the middle of the view on the same spot of the same folder -
+            // measured from the size the camera was actually set up for, which
+            // before the first layout is a placeholder, not the previous size.
+            var dx = (sizeInfo.NewSize.Width - _viewWidth) / 2;
+            var dy = (sizeInfo.NewSize.Height - _viewHeight) / 2;
             _ax += dx;
             _ay += dy;
         }
@@ -1139,7 +1356,7 @@ public sealed class NestedCanvas : FrameworkElement
             _hasCamera = false;
         }
 
-        InvalidateVisual();
+        RequestFrame(Layers.All);
     }
 
     protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
@@ -1147,49 +1364,192 @@ public sealed class NestedCanvas : FrameworkElement
         base.OnDpiChanged(oldDpi, newDpi);
         _bitmap = null;
         _textCache.Clear();
-        InvalidateVisual();
+        _oldTextCache.Clear();
+        RequestFrame(Layers.All);
     }
 
-    private void OnTreeChanged(object? sender, EventArgs e) => InvalidateVisual();
+    private void OnTreeChanged(object? sender, EventArgs e) => RequestFrame(Layers.All);
 
+    /// <summary>
+    /// The control's own drawing is only a transparent sheet, so every point
+    /// of it takes the mouse; the picture is in the layers above.  Outside a
+    /// window - a test, a snapshot - there is no frame loop, so the layers are
+    /// drawn here and then.
+    /// </summary>
     protected override void OnRender(DrawingContext dc)
     {
-        _viewWidth = ActualWidth;
-        _viewHeight = ActualHeight;
-        if (_viewWidth < 1 || _viewHeight < 1 || _tree is null)
+        dc.DrawRectangle(Brushes.Transparent, null, new Rect(0, 0, ActualWidth, ActualHeight));
+        if (PresentationSource.FromVisual(this) is null)
+        {
+            _dirty = Layers.None;
+            RenderLayers(Layers.All, inMotion: false);
+        }
+        else
+        {
+            RequestFrame(Layers.All);
+        }
+    }
+
+    private void RenderLayers(Layers layers, bool inMotion)
+    {
+        // Hidden or not laid out yet: draw nothing, and keep the size the
+        // camera was set up for rather than forgetting it.
+        if (ActualWidth < 1 || ActualHeight < 1 || _tree is null)
         {
             return;
         }
 
-        using var frame = PerfLog.Measure("nested.frame");
-        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        _viewWidth = ActualWidth;
+        _viewHeight = ActualHeight;
+
+        var dpi = VisualTreeHelper.GetDpi(this);
+        if (dpi.DpiScaleX != _scaleX || dpi.DpiScaleY != _scaleY)
+        {
+            _scaleX = dpi.DpiScaleX;
+            _scaleY = dpi.DpiScaleY;
+            _bitmap = null;
+            _textCache.Clear();
+            _oldTextCache.Clear();
+            layers = Layers.All;
+        }
+
         EnsureCamera();
         Normalize();
         BuildChain();
-        _tree.BeginFrame();
 
-        var dpi = VisualTreeHelper.GetDpi(this);
-        _scaleX = dpi.DpiScaleX;
-        _scaleY = dpi.DpiScaleY;
+        // Text is set for motion while the camera moves: WPF then scales the
+        // glyphs it already has instead of rendering every size afresh, which
+        // is most of what a zoom over a folder of names used to cost.
+        var animated = inMotion;
+        if (animated != _textAnimated)
+        {
+            _textAnimated = animated;
+            var mode = animated ? TextHintingMode.Animated : TextHintingMode.Auto;
+            TextOptions.SetTextHintingMode(_labelVisual, mode);
+            TextOptions.SetTextHintingMode(_decorVisual, mode);
+            layers |= Layers.Labels | Layers.Decor;
+        }
+
+        if ((layers & Layers.Scene) != 0)
+        {
+            RenderScene(inMotion);
+            layers |= Layers.Labels | Layers.Decor | Layers.Overlay;
+        }
+
+        var layerStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        NewTextLayouts = 0;
+        _textBudget = inMotion ? MotionTextBudget : int.MaxValue;
+        _textDeferred = false;
+        if ((layers & Layers.Labels) != 0)
+        {
+            _labelHotspots.Clear();
+            using var dc = _labelVisual.RenderOpen();
+            DrawLabels(dc);
+            DrawFileLabels(dc);
+        }
+
+        LastLabelsMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(layerStarted).TotalMilliseconds;
+        layerStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        if ((layers & Layers.Decor) != 0)
+        {
+            _hotspots.Clear();
+            using var dc = _decorVisual.RenderOpen();
+            DrawSelection(dc);
+            DrawDropTarget(dc);
+            DrawBeacons(dc);
+            DrawTrail(dc);
+        }
+
+        LastDecorMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(layerStarted).TotalMilliseconds;
+        if (_textDeferred)
+        {
+            // Some names waited for their layout: the next frame has budget again.
+            RequestFrame(Layers.Labels | Layers.Decor);
+        }
+
+        if ((layers & Layers.Overlay) != 0)
+        {
+            RenderOverlay();
+        }
+
+        if (_textCache.Count > 4000)
+        {
+            // Two generations rather than one clear: what is still in use is
+            // carried over on its next lookup, so no frame has to lay out
+            // every name on screen at once.
+            (_oldTextCache, _textCache) = (_textCache, _oldTextCache);
+            _textCache.Clear();
+        }
+    }
+
+    /// <summary>
+    /// The cells: one walk from the outermost folder that still covers the
+    /// whole view down through everything on screen and big enough to see,
+    /// filling rectangles into the bitmap.
+    /// </summary>
+    private void RenderScene(bool inMotion)
+    {
+        using var frame = PerfLog.Measure("nested.frame");
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        _tree!.BeginFrame();
+
         var pixelWidth = Math.Max(1, (int)Math.Ceiling(_viewWidth * _scaleX));
         var pixelHeight = Math.Max(1, (int)Math.Ceiling(_viewHeight * _scaleY));
-        if (_bitmap is null || _bitmap.PixelWidth != pixelWidth || _bitmap.PixelHeight != pixelHeight)
+
+        // Grown in steps and reused.  Dragging a window edge is a new size on
+        // every step, and a new full-screen bitmap each time - tens of
+        // megabytes of native memory freed only by a full collection - was
+        // what made a live resize stutter.  The part past the control is
+        // simply never drawn into, and clipped away.
+        if (_bitmap is null
+            || _bitmap.PixelWidth < pixelWidth
+            || _bitmap.PixelHeight < pixelHeight
+            || (long)_bitmap.PixelWidth * _bitmap.PixelHeight > 3L * pixelWidth * pixelHeight + 2_000_000)
         {
-            _bitmap = new WriteableBitmap(pixelWidth, pixelHeight, 96 * _scaleX, 96 * _scaleY, PixelFormats.Pbgra32, null);
+            _bitmap = new WriteableBitmap(
+                (pixelWidth + 255) / 256 * 256,
+                (pixelHeight + 255) / 256 * 256,
+                96 * _scaleX,
+                96 * _scaleY,
+                PixelFormats.Pbgra32,
+                null);
         }
+
+        if (!ReferenceEquals(_shownBitmap, _bitmap))
+        {
+            // The layer holds the bitmap itself; from then on only its pixels
+            // change, and the layer never has to be recorded again.
+            _shownBitmap = _bitmap;
+            using var dc = _sceneVisual.RenderOpen();
+            dc.DrawImage(_bitmap, new Rect(0, 0, _bitmap.PixelWidth / _scaleX, _bitmap.PixelHeight / _scaleY));
+        }
+
+        // Motion LOD, the way a game drops detail it cannot afford in a frame:
+        // while the camera moves, cells and file tiles below a size that grows
+        // when frames run long are left out; the frame after it stops draws
+        // them all again.  At rest the picture is always complete.
+        var lod = inMotion ? _lod : 1;
+        _minCell = MinimumCellPixels * lod;
+        _minTile = 2.5 * lod;
 
         _labels.Clear();
         _labelled.Clear();
         _fileLabels.Clear();
         DrawnCellCount = 0;
+        _foldersDrawn = 0;
+        _tilesDrawn = 0;
 
         _bitmap.Lock();
         try
         {
             _raster.Attach(_bitmap.BackBuffer, pixelWidth, pixelHeight, _bitmap.BackBufferStride);
-            _raster.Clear(CanvasColour);
-            var (x, y, w) = _chain[_tree.Root];
-            DrawCell(_tree.Root, x, y, w, labelsAllowed: true);
+            var (cover, x, y, w, covers) = CoverCell();
+            if (!covers)
+            {
+                _raster.Clear(CanvasColour);
+            }
+
+            DrawCell(cover, x, y, w, labelsAllowed: true);
             _bitmap.AddDirtyRect(new Int32Rect(0, 0, pixelWidth, pixelHeight));
         }
         finally
@@ -1198,36 +1558,67 @@ public sealed class NestedCanvas : FrameworkElement
             _bitmap.Unlock();
         }
 
-        dc.DrawImage(_bitmap, new Rect(0, 0, pixelWidth / _scaleX, pixelHeight / _scaleY));
-
-        _hotspots.Clear();
-        DrawLabels(dc);
-        DrawFileLabels(dc);
-        DrawSelection(dc);
-        DrawDropTarget(dc);
-        DrawBeacons(dc);
-        DrawTrail(dc);
-        RenderOverlay();
-
-        PerfLog.Value("nested.cells", DrawnCellCount);
-        if (_textCache.Count > 6000)
+        var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        if (inMotion)
         {
-            _textCache.Clear();
+            // A 120 Hz frame is 8 ms, and the labels and WPF's own work need
+            // their share of it.
+            _lod = elapsed > 4.5 ? Math.Min(_lod * 1.6, 16) : elapsed < 2 ? Math.Max(1, _lod / 1.25) : _lod;
+        }
+        else
+        {
+            _lod = 1;
         }
 
-        LastRenderMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        _lodDegraded = lod > 1.0001;
+        PerfLog.Value("nested.cells", DrawnCellCount);
+        LastRenderMilliseconds = elapsed;
         RenderCount++;
     }
+
+    /// <summary>
+    /// The deepest folder on the anchor's line whose cell covers the whole
+    /// view.  Everything outside it is off screen, so the walk starts there:
+    /// deep in, the ten folders above it would each fill the screen with a
+    /// colour only to be painted over by the next.
+    /// </summary>
+    private (NestedFolder Folder, double X, double Y, double W, bool Covers) CoverCell()
+    {
+        for (var folder = _anchor; folder is not null; folder = folder.Parent)
+        {
+            if (!_chain.TryGetValue(folder, out var rect))
+            {
+                break;
+            }
+
+            if (Covers(rect.X, rect.Y, rect.W))
+            {
+                return (folder, rect.X, rect.Y, rect.W, true);
+            }
+        }
+
+        var (rx, ry, rw) = _chain[_tree!.Root];
+        return (_tree.Root, rx, ry, rw, false);
+    }
+
+    /// <summary>
+    /// Whether a cell covers the view with room to spare for its rim and its
+    /// rounded corners (at most 6 DIPs), so that nothing of what lies outside
+    /// it can show at the view's corners.
+    /// </summary>
+    private bool Covers(double x, double y, double w) =>
+        x <= -8 && y <= -8 && x + w >= _viewWidth + 8 && y + w * NestedLayout.CellHeight >= _viewHeight + 8;
 
     private void DrawCell(NestedFolder folder, double x, double y, double w, bool labelsAllowed)
     {
         var h = w * NestedLayout.CellHeight;
-        if (x >= _viewWidth || y >= _viewHeight || x + w <= 0 || y + h <= 0 || w < MinimumCellPixels)
+        if (x >= _viewWidth || y >= _viewHeight || x + w <= 0 || y + h <= 0 || w < _minCell)
         {
             return;
         }
 
-        if (++DrawnCellCount > MaximumCellsPerFrame)
+        DrawnCellCount++;
+        if (++_foldersDrawn > MaximumCellsPerFrame)
         {
             return;
         }
@@ -1251,7 +1642,7 @@ public sealed class NestedCanvas : FrameworkElement
         DrawFiles(folder, x, y, w, childLabels);
 
         var grid = folder.Grid;
-        if (grid.IsEmpty || w * grid.Scale < MinimumCellPixels)
+        if (grid.IsEmpty || w * grid.Scale < _minCell)
         {
             return;
         }
@@ -1300,7 +1691,7 @@ public sealed class NestedCanvas : FrameworkElement
 
         var tileWidth = grid.TileWidth * w;
         var tileHeight = grid.TileHeight * w;
-        if (tileWidth * _scaleX < 2.5)
+        if (tileWidth * _scaleX < _minTile)
         {
             if (w * _scaleX < 12)
             {
@@ -1327,6 +1718,22 @@ public sealed class NestedCanvas : FrameworkElement
             (_viewHeight - y) / w);
         var files = folder.Files;
         var labels = labelsAllowed && tileHeight >= FileLabelPixels;
+        var visibleTiles = (long)(lastColumn - firstColumn + 1) * (lastRow - firstRow + 1);
+        if (_tilesDrawn + visibleTiles > MaximumTilesPerFrame)
+        {
+            // Past the frame's budget for tiles, a folder's files are its wash:
+            // detail is what goes, never a whole folder further along.
+            var zoneWidth = Math.Min(NestedLayout.ContentWidth, grid.Columns * grid.StepX - grid.Gap);
+            var zoneHeight = Math.Min(NestedLayout.CellHeight - NestedLayout.Padding - grid.Top, grid.Rows * grid.StepY - grid.Gap);
+            _raster.Fill(
+                NestedRaster.Px((x + grid.Left * w) * _scaleX),
+                NestedRaster.Px((y + grid.Top * w) * _scaleY),
+                NestedRaster.Px((x + (grid.Left + zoneWidth) * w) * _scaleX),
+                NestedRaster.Px((y + (grid.Top + zoneHeight) * w) * _scaleY),
+                NestedRaster.Mix(folder.BodyColour, 0xFF8A8F96, 0.1));
+            return;
+        }
+
         for (var row = firstRow; row <= lastRow; row++)
         {
             for (var column = firstColumn; column <= lastColumn; column++)
@@ -1337,10 +1744,8 @@ public sealed class NestedCanvas : FrameworkElement
                     break;
                 }
 
-                if (++DrawnCellCount > MaximumCellsPerFrame)
-                {
-                    return;
-                }
+                DrawnCellCount++;
+                _tilesDrawn++;
 
                 var fx = x + (grid.Left + column * grid.StepX) * w;
                 var fy = y + (grid.Top + row * grid.StepY) * w;
@@ -1448,27 +1853,27 @@ public sealed class NestedCanvas : FrameworkElement
 
             if (!string.IsNullOrWhiteSpace(mark.Note))
             {
-                var note = Text("\uE70B", font * 0.85, TextDimBrush, double.MaxValue, bold: false, icon: true);
+                var note = Text("\uE70B", font * 0.85, TextDimBrush, double.MaxValue, bold: false, icon: true, scaled: true);
                 right -= note.Width;
-                dc.DrawText(note, new Point(right, job.Y + (job.H - note.Height) / 2));
+                DrawTextAt(dc, note, new Point(right, job.Y + (job.H - note.Height) / 2));
                 right -= font * 0.4;
             }
 
             if (job.W >= 190)
             {
-                var size = Text(FormatSize(file.Length), font * 0.85, TextDimBrush, double.MaxValue, bold: false);
+                var size = Text(FormatSize(file.Length), font * 0.85, TextDimBrush, double.MaxValue, bold: false, scaled: true);
                 if (right - size.Width - cursor > font * 5)
                 {
                     right -= size.Width;
-                    dc.DrawText(size, new Point(right, job.Y + (job.H - size.Height) / 2));
+                    DrawTextAt(dc, size, new Point(right, job.Y + (job.H - size.Height) / 2));
                     right -= font * 0.6;
                 }
             }
 
             if (right - cursor > font)
             {
-                var name = Text(file.Name, font, file.IsHidden ? TextDimBrush : TextBrush, right - cursor, bold: false);
-                dc.DrawText(name, new Point(cursor, job.Y + (job.H - name.Height) / 2));
+                var name = Text(file.Name, font, file.IsHidden ? TextDimBrush : TextBrush, right - cursor, bold: false, scaled: true);
+                DrawTextAt(dc, name, new Point(cursor, job.Y + (job.H - name.Height) / 2));
             }
         }
     }
@@ -1524,8 +1929,7 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         var radius = pixelWidth >= 40 ? Math.Min(6 * _scaleX, pixelWidth * 0.03) : 0;
-        _raster.FillRounded(left, top, right, bottom, radius, folder.RimColour);
-        _raster.FillRounded(left + 1, top + 1, right - 1, bottom - 1, Math.Max(0, radius - 1), folder.BodyColour);
+        _raster.FillFramed(left, top, right, bottom, radius, folder.RimColour, folder.BodyColour);
 
         var header = w * NestedLayout.HeaderHeight * _scaleY;
         if (header >= 2)
@@ -1617,7 +2021,7 @@ public sealed class NestedCanvas : FrameworkElement
                 }
 
                 dc.DrawRoundedRectangle(PillBrush, null, pill, 3, 3);
-                dc.DrawText(text, new Point(pill.X + 4, pill.Y + 1));
+                DrawTextAt(dc, text, new Point(pill.X + 4, pill.Y + 1));
                 AddGrabHotspot(folder, pill);
                 continue;
             }
@@ -1642,11 +2046,11 @@ public sealed class NestedCanvas : FrameworkElement
             var badges = Badges(folder);
             if (badges.Length > 0)
             {
-                var icons = Text(badges, font * 0.82, BadgeBrush(folder), double.MaxValue, bold: false, icon: true);
+                var icons = Text(badges, font * 0.82, BadgeBrush(folder), double.MaxValue, bold: false, icon: true, scaled: true);
                 right -= icons.Width;
                 if (right - cursor > font * 3)
                 {
-                    dc.DrawText(icons, new Point(right, job.Y + (header - icons.Height) / 2));
+                    DrawTextAt(dc, icons, new Point(right, job.Y + (header - icons.Height) / 2));
                     right -= font * 0.4;
                 }
                 else
@@ -1658,27 +2062,27 @@ public sealed class NestedCanvas : FrameworkElement
             var detail = DetailText(folder);
             if (detail.Length > 0 && job.W >= 280)
             {
-                var info = Text(detail, font * 0.78, TextDimBrush, double.MaxValue, bold: false);
+                var info = Text(detail, font * 0.78, TextDimBrush, double.MaxValue, bold: false, scaled: true);
                 if (right - info.Width - cursor > font * 6)
                 {
                     right -= info.Width;
-                    dc.DrawText(info, new Point(right, job.Y + (header - info.Height) / 2));
+                    DrawTextAt(dc, info, new Point(right, job.Y + (header - info.Height) / 2));
                     right -= font * 0.6;
                 }
             }
 
-            var glyph = Text(Glyph(folder), font * 0.9, GlyphBrush(folder), double.MaxValue, bold: false, icon: true);
+            var glyph = Text(Glyph(folder), font * 0.9, GlyphBrush(folder), double.MaxValue, bold: false, icon: true, scaled: true);
             if (right - cursor > glyph.Width + font)
             {
-                dc.DrawText(glyph, new Point(cursor, job.Y + (header - glyph.Height) / 2 + font * 0.05));
+                DrawTextAt(dc, glyph, new Point(cursor, job.Y + (header - glyph.Height) / 2 + font * 0.05));
                 cursor += glyph.Width + font * 0.4;
             }
 
             var available = right - cursor;
             if (available > font)
             {
-                var name = Text(folder.Name, font, TextBrush, available, bold: folder.Kind != NestedFolderKind.Folder);
-                dc.DrawText(name, new Point(cursor, job.Y + (header - name.Height) / 2));
+                var name = Text(folder.Name, font, TextBrush, available, bold: folder.Kind != NestedFolderKind.Folder, scaled: true);
+                DrawTextAt(dc, name, new Point(cursor, job.Y + (header - name.Height) / 2));
                 AddGrabHotspot(folder, new Rect(job.X, job.Y, job.W, header));
             }
 
@@ -1723,15 +2127,15 @@ public sealed class NestedCanvas : FrameworkElement
         else if (folder.UnlistedFileCount > 0)
         {
             message = $"{folder.UnlistedFileCount:N0} more files are not drawn";
-            var text = Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimBrush, job.W - 16, bold: false);
-            dc.DrawText(text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
+            var text = Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimBrush, job.W - 16, bold: false, scaled: true);
+            DrawTextAt(dc, text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
             return;
         }
         else if (folder.IsTruncated)
         {
             message = $"Only the first {NestedTree.MaximumChildren:N0} folders are shown";
-            var text = Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimBrush, job.W - 16, bold: false);
-            dc.DrawText(text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
+            var text = Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimBrush, job.W - 16, bold: false, scaled: true);
+            DrawTextAt(dc, text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
             return;
         }
         else
@@ -1745,9 +2149,9 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         var size = Math.Clamp(job.W * 0.03, 9, 18);
-        var formatted = Text(message, size, brush, job.W - 16, bold: false);
+        var formatted = Text(message, size, brush, job.W - 16, bold: false, scaled: true);
         var bodyTop = job.Y + header;
-        dc.DrawText(formatted, new Point(job.X + (job.W - formatted.Width) / 2, bodyTop + (h - header - formatted.Height) / 2));
+        DrawTextAt(dc, formatted, new Point(job.X + (job.W - formatted.Width) / 2, bodyTop + (h - header - formatted.Height) / 2));
     }
 
     private static string DetailText(NestedFolder folder)
@@ -1885,9 +2289,16 @@ public sealed class NestedCanvas : FrameworkElement
     /// </summary>
     private void RenderOverlay()
     {
-        using var dc = _overlay.RenderOpen();
-        DrawHover(dc);
-        DrawHoverTip(dc);
+        // A tag is one or two texts; it never waits on the frame's budget.
+        var budget = _textBudget;
+        _textBudget = int.MaxValue;
+        using (var dc = _overlay.RenderOpen())
+        {
+            DrawHover(dc);
+            DrawHoverTip(dc);
+        }
+
+        _textBudget = budget;
     }
 
     private void DrawHover(DrawingContext dc)
@@ -1917,7 +2328,7 @@ public sealed class NestedCanvas : FrameworkElement
                 tipText.Width + 16,
                 tipText.Height + 8);
             dc.DrawRoundedRectangle(TipBrush, TipPen, tipBox, 5, 5);
-            dc.DrawText(tipText, new Point(tipBox.X + 8, tipBox.Y + 4));
+            DrawTextAt(dc, tipText, new Point(tipBox.X + 8, tipBox.Y + 4));
             return;
         }
 
@@ -1953,7 +2364,7 @@ public sealed class NestedCanvas : FrameworkElement
         var mark = _markLookup?.Invoke(hover.Path) ?? FolderMark.None;
         var noteText = string.IsNullOrWhiteSpace(mark.Note) ? string.Empty : mark.Note.Trim();
         var second = noteText.Length > 0 ? noteText : detail;
-        var sub = second.Length > 0 ? Text(second, 11, noteText.Length > 0 ? TextBrush : TextDimBrush, 360, bold: false) : null;
+        ScaledText? sub = second.Length > 0 ? Text(second, 11, noteText.Length > 0 ? TextBrush : TextDimBrush, 360, bold: false) : null;
 
         var width = Math.Max(title.Width, sub?.Width ?? 0) + 16;
         var height = title.Height + (sub?.Height ?? 0) + 10;
@@ -1963,10 +2374,10 @@ public sealed class NestedCanvas : FrameworkElement
         if (y + height > _viewHeight - 4) y = _hoverPoint.Y - height - 8;
         var box = new Rect(Math.Max(4, x), Math.Max(4, y), width, height);
         dc.DrawRoundedRectangle(TipBrush, TipPen, box, 5, 5);
-        dc.DrawText(title, new Point(box.X + 8, box.Y + 5));
+        DrawTextAt(dc, title, new Point(box.X + 8, box.Y + 5));
         if (sub is not null)
         {
-            dc.DrawText(sub, new Point(box.X + 8, box.Y + 5 + title.Height));
+            DrawTextAt(dc, sub.Value, new Point(box.X + 8, box.Y + 5 + title.Height));
         }
     }
 
@@ -2027,7 +2438,7 @@ public sealed class NestedCanvas : FrameworkElement
                     }
                 }
 
-                InvalidateVisual();
+                RequestFrame(Layers.Decor);
             }
         }
         finally
@@ -2052,8 +2463,11 @@ public sealed class NestedCanvas : FrameworkElement
                 continue;
             }
 
-            // Anything big enough to carry its own name carries its own mark.
-            if (target.FileIndex < 0 ? _labelled.Contains(target.Folder) && rect.Width >= 90 : rect.Height >= FileLabelPixels)
+            // Anything big enough to carry its own name carries its own mark,
+            // and a folder the whole view is inside is not "somewhere else".
+            if (target.FileIndex < 0
+                    ? _labelled.Contains(target.Folder) && rect.Width >= 90 || Covers(rect.X, rect.Y, rect.Width)
+                    : rect.Height >= FileLabelPixels)
             {
                 continue;
             }
@@ -2105,7 +2519,7 @@ public sealed class NestedCanvas : FrameworkElement
                 if (glyph.Length > 0)
                 {
                     var icon = Text(glyph, 7.5, BeaconGlyphBrush(lead.Beacon.Colour), double.MaxValue, bold: false, icon: true);
-                    dc.DrawText(icon, new Point(centre.X - icon.Width / 2, centre.Y - icon.Height / 2));
+                    DrawTextAt(dc, icon, new Point(centre.X - icon.Width / 2, centre.Y - icon.Height / 2));
                 }
             }
             else
@@ -2114,7 +2528,7 @@ public sealed class NestedCanvas : FrameworkElement
                 var radius = Math.Max(8.5, count.Width / 2 + 5);
                 dc.DrawEllipse(null, BeaconHaloPen, centre, radius + 2.5, radius + 2.5);
                 dc.DrawEllipse(brush, BeaconRimPen, centre, radius, radius);
-                dc.DrawText(count, new Point(centre.X - count.Width / 2, centre.Y - count.Height / 2));
+                DrawTextAt(dc, count, new Point(centre.X - count.Width / 2, centre.Y - count.Height / 2));
             }
 
             var hit = new Rect(centre.X - 10, centre.Y - 10, 20, 20);
@@ -2139,7 +2553,7 @@ public sealed class NestedCanvas : FrameworkElement
 
             placedLabels.Add(labelRect);
             dc.DrawRoundedRectangle(PillBrush, null, labelRect, 4, 4);
-            dc.DrawText(text, new Point(labelRect.X + 5, labelRect.Y + 2));
+            DrawTextAt(dc, text, new Point(labelRect.X + 5, labelRect.Y + 2));
             _hotspots.Add(new Hotspot(labelRect, () => OnBeaconClicked(members), null));
         }
     }
@@ -2213,7 +2627,7 @@ public sealed class NestedCanvas : FrameworkElement
             if (members.Count > 1)
             {
                 var count = Text(members.Count.ToString(CultureInfo.CurrentCulture), 8.5, BeaconGlyphBrush(lead.Beacon.Colour), double.MaxValue, bold: true);
-                dc.DrawText(count, new Point(at.X - count.Width / 2, at.Y - count.Height / 2));
+                DrawTextAt(dc, count, new Point(at.X - count.Width / 2, at.Y - count.Height / 2));
             }
 
             var targets = members.Select(pin => (pin.Folder, pin.FileIndex)).ToList();
@@ -2237,9 +2651,15 @@ public sealed class NestedCanvas : FrameworkElement
             var path = fileIndex >= 0 && fileIndex < folder.Files.Count ? folder.PathOf(folder.Files[fileIndex]) : folder.FullPath;
             MarkSelected(path);
             SelectRequested?.Invoke(path, false);
+            if (fileIndex >= 0)
+            {
+                FlyToReadable(folder, fileIndex);
+            }
+            else
+            {
+                FlyTo(folder, 0.6);
+            }
 
-            // A file is flown to in its folder, big enough to read.
-            FlyTo(folder, fileIndex >= 0 ? 0.92 : 0.6);
             return;
         }
 
@@ -2340,7 +2760,7 @@ public sealed class NestedCanvas : FrameworkElement
         const double pad = 8;
         var cursor = 14 + pad;
         var top = 12.0;
-        var pieces = new List<(FormattedText Text, NestedFolder? Folder)>();
+        var pieces = new List<(ScaledText Text, NestedFolder? Folder)>();
         foreach (var step in shown)
         {
             var label = step is null ? "…" : step.Name;
@@ -2355,7 +2775,7 @@ public sealed class NestedCanvas : FrameworkElement
         {
             var (text, step) = pieces[index];
             var at = new Point(cursor, top + 4);
-            dc.DrawText(text, at);
+            DrawTextAt(dc, text, at);
             if (step is not null)
             {
                 var target = step;
@@ -2365,7 +2785,7 @@ public sealed class NestedCanvas : FrameworkElement
             cursor += text.Width;
             if (index < pieces.Count - 1)
             {
-                dc.DrawText(separator, new Point(cursor, top + 4));
+                DrawTextAt(dc, separator, new Point(cursor, top + 4));
                 cursor += separator.Width;
             }
         }
@@ -2386,7 +2806,7 @@ public sealed class NestedCanvas : FrameworkElement
                 return;
             }
 
-            if (HitTest(point) is { } hit && !hit.Folder.IsComputer)
+            if (PointerHit(point) is { } hit && !hit.Folder.IsComputer)
             {
                 OpenRequested?.Invoke(hit);
                 if (!hit.IsFile)
@@ -2402,7 +2822,7 @@ public sealed class NestedCanvas : FrameworkElement
         _pressPoint = point;
         _pressMoved = false;
         _pressHotspot = IsSpacePanArmed ? null : HotspotAt(point);
-        _pressHit = HitTest(point);
+        _pressHit = PointerHit(point);
         CaptureMouse();
         e.Handled = true;
     }
@@ -2485,7 +2905,7 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         // A small cell's name sits on it as a pill; that pill is its handle.
-        return _hotspots.Any(spot => spot.Grab is not null && ReferenceEquals(spot.Grab, hit.Folder) && spot.Bounds.Contains(point));
+        return _labelHotspots.Any(spot => spot.Grab is not null && ReferenceEquals(spot.Grab, hit.Folder) && spot.Bounds.Contains(point));
     }
 
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
@@ -2539,7 +2959,7 @@ public sealed class NestedCanvas : FrameworkElement
         base.OnMouseRightButtonUp(e);
         e.Handled = true;
         var point = e.GetPosition(this);
-        var hit = HitTest(point);
+        var hit = PointerHit(point);
         if (hit is null || hit.Value.Folder.IsComputer)
         {
             ContextMenuRequested?.Invoke(null, true, point);
@@ -2559,18 +2979,16 @@ public sealed class NestedCanvas : FrameworkElement
         {
             _press = PressKind.None;
             ClearValue(CursorProperty);
-            InvalidateVisual();
+            RequestFrame(Layers.Overlay);
         }
     }
 
     protected override void OnMouseLeave(MouseEventArgs e)
     {
         base.OnMouseLeave(e);
-        if (_hover is not null)
-        {
-            _hover = null;
-            RenderOverlay();
-        }
+        _hover = null;
+        _hoverPoint = new Point(double.NaN, double.NaN);
+        RenderOverlay();
     }
 
     protected override void OnMouseWheel(MouseWheelEventArgs e)
@@ -2611,14 +3029,21 @@ public sealed class NestedCanvas : FrameworkElement
         var wasOnTip = HotspotAt(_hoverPoint) is { Tip: not null };
         _hoverPoint = point;
         var spot = HotspotAt(point);
-        if (spot is { Tip: not null } || wasOnTip)
+        if (spot is { Tip: not null })
         {
             _hover = null;
             RenderOverlay();
             return;
         }
 
-        var hit = spot is null ? HitTest(point) : null;
+        if (wasOnTip)
+        {
+            // Off an arrow: its tag goes, and the ordinary hover takes over.
+            _hover = null;
+            RenderOverlay();
+        }
+
+        var hit = spot is null ? PointerHit(point) : null;
         var same = hit is { } now && _hover is { } before
             && ReferenceEquals(now.Folder, before.Folder)
             && now.FileIndex == before.FileIndex;
@@ -2628,6 +3053,25 @@ public sealed class NestedCanvas : FrameworkElement
             _hover = hit;
             RenderOverlay();
         }
+    }
+
+    /// <summary>
+    /// What the pointer is on, as the user sees it: a small folder's name is
+    /// drawn over the top of its first sub-folders, and a press on that name
+    /// means the folder whose name it is, not whatever lies under the letters.
+    /// </summary>
+    private NestedHit? PointerHit(Point point)
+    {
+        for (var index = _labelHotspots.Count - 1; index >= 0; index--)
+        {
+            var spot = _labelHotspots[index];
+            if (spot.Grab is { } folder && spot.Bounds.Contains(point) && ScreenRect(folder) is { } cell)
+            {
+                return new NestedHit(folder, cell, IsOnHeader: true);
+            }
+        }
+
+        return HitTest(point);
     }
 
     private Hotspot? HotspotAt(Point point)
@@ -2644,7 +3088,7 @@ public sealed class NestedCanvas : FrameworkElement
     }
 
     private void AddGrabHotspot(NestedFolder folder, Rect bounds) =>
-        _hotspots.Add(new Hotspot(bounds, null, folder));
+        _labelHotspots.Add(new Hotspot(bounds, null, folder));
 
     /// <summary>Shows a click as selected at once, before the rest of the window catches up.</summary>
     private void MarkSelected(string path)
@@ -2652,7 +3096,7 @@ public sealed class NestedCanvas : FrameworkElement
         _selected.Clear();
         _selected.Add(path);
         _activePath = path;
-        InvalidateVisual();
+        RequestFrame(Layers.Decor);
     }
 
     /// <summary>
@@ -2663,20 +3107,65 @@ public sealed class NestedCanvas : FrameworkElement
     {
         if (active is not { } current || current.FileIndex < 0 && (current.Folder.Parent is null || current.Folder.Index < 0))
         {
-            // Nothing selected yet: start at the first folder in the one in view.
-            return _anchor is { Children.Count: > 0 } anchor ? (anchor.Children[0], -1) : null;
+            // Nothing selected yet: start at the first folder in the one in
+            // view, or its first file if it holds only files.
+            return _anchor switch
+            {
+                { Children.Count: > 0 } anchor => (anchor.Children[0], -1),
+                { Files.Count: > 0 } anchor => (anchor, 0),
+                _ => null
+            };
         }
 
         if (current.FileIndex >= 0)
         {
-            var files = current.Folder.FileGrid;
+            var folder = current.Folder;
+            var files = folder.FileGrid;
             var nextFile = Step(current.FileIndex, files.Columns, key);
-            return nextFile >= 0 && nextFile < current.Folder.Files.Count ? (current.Folder, nextFile) : null;
+            if (nextFile >= 0 && nextFile < folder.Files.Count)
+            {
+                return (folder, nextFile);
+            }
+
+            // Up from the first row of files is the last row of sub-folders
+            // above them, the one nearest along the row.
+            if (key == Key.Up && folder.Children.Count > 0 && current.FileIndex < files.Columns)
+            {
+                var (fx, _) = files.Origin(current.FileIndex);
+                return (Nearest(folder.Children, folder.Grid, fx + files.TileWidth / 2, lastRow: true), -1);
+            }
+
+            return null;
         }
 
         var parent = current.Folder.Parent!;
-        var next = Step(current.Folder.Index, parent.Grid.Columns, key);
-        return next >= 0 && next < parent.Children.Count ? (parent.Children[next], -1) : null;
+        var grid = parent.Grid;
+        var next = Step(current.Folder.Index, grid.Columns, key);
+        if (next >= 0 && next < parent.Children.Count)
+        {
+            return (parent.Children[next], -1);
+        }
+
+        // Down past the last row of sub-folders is the first row of the files under them.
+        if (key == Key.Down && parent.Files.Count > 0 && current.Folder.Index / grid.Columns == grid.Rows - 1)
+        {
+            var centre = current.Folder.OffsetX + current.Folder.Scale / 2;
+            var files = parent.FileGrid;
+            var column = Math.Clamp((int)Math.Floor((centre - files.Left) / files.StepX), 0, Math.Max(0, files.Columns - 1));
+            return (parent, Math.Min(column, parent.Files.Count - 1));
+        }
+
+        return null;
+    }
+
+    /// <summary>The child in a grid's first or last row nearest to <paramref name="x"/>.</summary>
+    private static NestedFolder Nearest(IReadOnlyList<NestedFolder> children, NestedGrid grid, double x, bool lastRow)
+    {
+        var row = lastRow ? grid.Rows - 1 : 0;
+        var first = row * grid.Columns;
+        var last = Math.Min(children.Count - 1, first + grid.Columns - 1);
+        var column = Math.Clamp((int)Math.Floor((x - grid.Left) / grid.StepX), 0, last - first);
+        return children[first + column];
     }
 
     private static int Step(int index, int columns, Key key) => key switch
@@ -2687,29 +3176,51 @@ public sealed class NestedCanvas : FrameworkElement
         _ => index + columns
     };
 
+    /// <summary>
+    /// Brings what an arrow key moved to into view.  Readable but off screen,
+    /// the view only slides - the zoom the user chose stays; too small to read,
+    /// it flies to where it can be read.
+    /// </summary>
     private void EnsureVisible(NestedFolder folder, int fileIndex = -1)
     {
         var rect = TargetRect(folder, fileIndex);
-        var tooSmall = rect is null || (fileIndex >= 0 ? rect.Value.Height < FileLabelPixels : rect.Value.Width < 40);
-        if (tooSmall)
+        var readable = rect is { } r && (fileIndex >= 0 ? r.Height >= FileLabelPixels : r.Width >= 48);
+        if (!readable)
         {
-            var frame = fileIndex >= 0 ? folder : folder.Parent is { IsComputer: false } parent ? parent : folder;
-            FlyTo(frame, 0.92);
+            FlyToReadable(folder, fileIndex);
             return;
         }
 
-        var view = new Rect(0, 0, _viewWidth, _viewHeight);
-        if (!view.Contains(rect!.Value))
+        const double margin = 24;
+        var target = rect!.Value;
+        var dx = Shift(target.Left, target.Right, _viewWidth, margin);
+        var dy = Shift(target.Top, target.Bottom, _viewHeight, margin);
+        if (dx == 0 && dy == 0)
         {
-            if (fileIndex >= 0)
-            {
-                FlyTo(folder, Math.Min(0.92, ScreenRect(folder)?.Width / _viewWidth ?? 0.92));
-            }
-            else
-            {
-                FlyTo(folder, Math.Min(0.92, rect.Value.Width / _viewWidth));
-            }
+            return;
         }
+
+        if (ScreenRect(folder) is { } cell)
+        {
+            FlyToRect(folder, (cell.X + dx, cell.Y + dy, cell.Width));
+        }
+    }
+
+    /// <summary>The smallest slide along one axis that brings [low, high] inside [margin, size - margin].</summary>
+    private static double Shift(double low, double high, double size, double margin)
+    {
+        if (high - low > size - 2 * margin)
+        {
+            // Bigger than the view: line its start up with the view's.
+            return margin - low;
+        }
+
+        if (low < margin)
+        {
+            return margin - low;
+        }
+
+        return high > size - margin ? size - margin - high : 0;
     }
 
     private Rect? ScreenRect(NestedFolder folder)
@@ -2720,22 +3231,79 @@ public sealed class NestedCanvas : FrameworkElement
 
     // ---- text ------------------------------------------------------------------
 
-    private FormattedText Text(string text, double size, Brush brush, double maxWidth, bool bold, bool icon = false)
+    /// <summary>
+    /// Text laid out once and drawn at any size.  A name whose size follows the
+    /// zoom is laid out at the nearest of a fixed ladder of sizes - eight to an
+    /// octave, a mip chain for type - and drawn through a scale to the exact
+    /// size wanted.  Its available width is kept in the same units, so during
+    /// a zoom both grow together and the layout found in the cache is the one
+    /// needed: the text is no longer laid out anew every frame.
+    /// </summary>
+    private ScaledText Text(string text, double size, Brush brush, double maxWidth, bool bold, bool icon = false, bool scaled = false)
     {
-        size = Math.Clamp(Math.Round(size * 4) / 4, 1, 400);
-        var widthKey = double.IsInfinity(maxWidth) || maxWidth >= 10_000 ? -1 : (int)Math.Floor(maxWidth / 6);
-        var key = new TextKey(text, size, widthKey, brush, bold, icon);
-        if (_textCache.TryGetValue(key, out var cached))
+        size = Math.Clamp(size, 1, 400);
+        var level = scaled
+            ? Math.Pow(2, Math.Round(Math.Log2(size) * LevelsPerOctave) / LevelsPerOctave)
+            : Math.Round(size * 4) / 4;
+
+        // The whole name first.  Most names fit, and a name that fits does
+        // not depend on the room it has - so it is the same layout at every
+        // step of a zoom, and only the few that are cut short are laid out
+        // again as their room changes.
+        var natural = Layout(text, level, size, double.PositiveInfinity, brush, bold, icon, scaled);
+        if (natural.Text is null || !(maxWidth < 10_000) || natural.Width <= maxWidth)
         {
-            return cached;
+            return natural;
         }
 
+        var trimmed = Layout(text, level, size, maxWidth, brush, bold, icon, scaled);
+        return trimmed.Text is null ? default : trimmed;
+    }
+
+    /// <summary>
+    /// One layout, from the cache or made now.  While the camera moves only a
+    /// few are made per frame; past that a scaled text takes the nearest level
+    /// already made, the way a game streams a texture - the right one arrives
+    /// a frame or two later - and one never made at any size waits its turn.
+    /// </summary>
+    private ScaledText Layout(string text, double level, double size, double maxWidth, Brush brush, bool bold, bool icon, bool scaled)
+    {
+        var scale = scaled ? size / level : 1;
+        var key = KeyFor(text, level, scale, maxWidth, brush, bold, icon, scaled);
+        if (TryCached(key, out var cached))
+        {
+            return new ScaledText(cached, scale);
+        }
+
+        if (_textBudget <= 0)
+        {
+            if (scaled)
+            {
+                for (var step = 1; step <= 3; step++)
+                {
+                    foreach (var direction in (ReadOnlySpan<int>)[-1, 1])
+                    {
+                        var near = level * Math.Pow(2, direction * step / (double)LevelsPerOctave);
+                        var nearScale = size / near;
+                        if (TryCached(KeyFor(text, near, nearScale, maxWidth, brush, bold, icon, scaled: true), out var neighbour))
+                        {
+                            return new ScaledText(neighbour, nearScale);
+                        }
+                    }
+                }
+            }
+
+            _textDeferred = true;
+            return default;
+        }
+
+        _textBudget--;
         var formatted = new FormattedText(
             text,
             CultureInfo.CurrentUICulture,
             FlowDirection.LeftToRight,
             icon ? IconFace : bold ? TextFaceBold : TextFace,
-            size,
+            level,
             brush,
             _scaleY)
         {
@@ -2743,19 +3311,86 @@ public sealed class NestedCanvas : FrameworkElement
             Trimming = TextTrimming.CharacterEllipsis
         };
 
-        if (widthKey >= 0)
+        if (key.Width >= 0)
         {
-            formatted.MaxTextWidth = Math.Max(1, widthKey * 6);
+            formatted.MaxTextWidth = Math.Max(1, key.Width * (scaled ? 8 : 6));
         }
 
+        NewTextLayouts++;
         _textCache[key] = formatted;
-        return formatted;
+        return new ScaledText(formatted, scale);
+    }
+
+    private static TextKey KeyFor(string text, double level, double scale, double maxWidth, Brush brush, bool bold, bool icon, bool scaled)
+    {
+        var widthKey = double.IsInfinity(maxWidth) || maxWidth >= 10_000
+            ? -1
+            : Math.Max(0, (int)Math.Floor(maxWidth / scale / (scaled ? 8 : 6)));
+        return new TextKey(text, level, widthKey, brush, bold, icon);
+    }
+
+    private bool TryCached(TextKey key, out FormattedText formatted)
+    {
+        if (_textCache.TryGetValue(key, out formatted!))
+        {
+            return true;
+        }
+
+        if (_oldTextCache.Remove(key, out formatted!))
+        {
+            _textCache[key] = formatted;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static void DrawTextAt(DrawingContext dc, ScaledText text, Point origin)
+    {
+        if (text.Text is null)
+        {
+            return;
+        }
+
+        if (Math.Abs(text.Scale - 1) < 1e-9)
+        {
+            dc.DrawText(text.Text, origin);
+            return;
+        }
+
+        dc.PushTransform(new MatrixTransform(text.Scale, 0, 0, text.Scale, origin.X * (1 - text.Scale), origin.Y * (1 - text.Scale)));
+        dc.DrawText(text.Text, origin);
+        dc.Pop();
+    }
+
+    /// <summary>
+    /// Only #RRGGBB or #AARRGGBB.  The converter also takes names and 'sc#'
+    /// forms, and some of those throw exceptions it does not document - from
+    /// inside a frame, where an exception ends the program.  A mark only ever
+    /// holds a hex colour from the palette, so anything else is ignored.
+    /// </summary>
+    internal static bool IsHexColour(string? hex)
+    {
+        if (string.IsNullOrWhiteSpace(hex) || hex[0] != '#' || hex.Length is not (7 or 9))
+        {
+            return false;
+        }
+
+        for (var index = 1; index < hex.Length; index++)
+        {
+            if (!char.IsAsciiHexDigit(hex[index]))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static bool TryParseColour(string hex, out Color colour)
     {
         colour = default;
-        if (string.IsNullOrWhiteSpace(hex))
+        if (!IsHexColour(hex))
         {
             return false;
         }
@@ -2765,7 +3400,7 @@ public sealed class NestedCanvas : FrameworkElement
             colour = (Color)ColorConverter.ConvertFromString(hex);
             return true;
         }
-        catch (FormatException)
+        catch (Exception ex) when (ex is FormatException or InvalidOperationException or ArgumentException or NotSupportedException)
         {
             return false;
         }
@@ -2783,6 +3418,25 @@ public sealed class NestedCanvas : FrameworkElement
         var pen = new Pen(Frozen(colour), thickness);
         pen.Freeze();
         return pen;
+    }
+
+    [Flags]
+    private enum Layers
+    {
+        None = 0,
+        Scene = 1,
+        Labels = 2,
+        Decor = 4,
+        Overlay = 8,
+        All = Scene | Labels | Decor | Overlay
+    }
+
+    /// <summary>A laid-out text and the scale it is drawn at.</summary>
+    private readonly record struct ScaledText(FormattedText? Text, double Scale)
+    {
+        public double Width => Text is null ? 0 : Text.Width * Scale;
+
+        public double Height => Text is null ? 0 : Text.Height * Scale;
     }
 
     private enum PressKind

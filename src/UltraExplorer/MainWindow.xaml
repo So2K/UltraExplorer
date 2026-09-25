@@ -31,7 +31,7 @@
         Deactivated="Window_Deactivated">
     <shell:WindowChrome.WindowChrome>
         <shell:WindowChrome CaptionHeight="40"
-                            ResizeBorderThickness="6"
+                            ResizeBorderThickness="6,3,6,6"
                             CornerRadius="0"
                             GlassFrameThickness="0"
                             UseAeroCaptionButtons="False" />
@@ -179,6 +179,7 @@
                         MaxWidth="260"
                         CornerRadius="7,7,0,0"
                         Background="{StaticResource SurfaceRaisedBrush}"
+                        MouseLeftButtonDown="Tab_MouseLeftButtonDown"
                         shell:WindowChrome.IsHitTestVisibleInChrome="True">
                     <Grid Margin="10,0,4,0">
                         <Grid.ColumnDefinitions>
@@ -217,7 +218,7 @@
                 </Button>
             </StackPanel>
 
-            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top" shell:WindowChrome.IsHitTestVisibleInChrome="True">
+            <StackPanel x:Name="CaptionButtons" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top" shell:WindowChrome.IsHitTestVisibleInChrome="True">
                 <Button Style="{StaticResource CaptionButton}" Click="MinimizeButton_Click" ToolTip="Minimize" AutomationProperties.Name="Minimize">
                     <TextBlock Text="&#xE921;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>

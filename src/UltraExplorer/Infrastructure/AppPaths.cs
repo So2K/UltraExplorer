@@ -19,17 +19,25 @@ public static class AppPaths
     private static string Resolve()
     {
         var overridden = Environment.GetEnvironmentVariable(StateDirectoryVariable);
-        if (!string.IsNullOrWhiteSpace(overridden))
+        if (overridden is not null)
         {
+            // Asked to be kept apart, a copy is never allowed back into the
+            // real state folder: an override it cannot use - empty after its
+            // quotes, a %VARIABLE% nobody set - sends it to a fresh folder of
+            // its own instead, so it still cannot overwrite the user's state.
             try
             {
-                return Path.GetFullPath(Environment.ExpandEnvironmentVariables(overridden.Trim().Trim('"')));
+                var expanded = Environment.ExpandEnvironmentVariables(overridden.Trim().Trim('"'));
+                if (expanded.Length > 0 && !expanded.Contains('%'))
+                {
+                    return Path.GetFullPath(expanded);
+                }
             }
             catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
             {
-                // A malformed override falls back to the normal place rather
-                // than refusing to start.
             }
+
+            return Path.Combine(Path.GetTempPath(), "UltraExplorer-isolated-" + Guid.NewGuid().ToString("N"));
         }
 
         return Path.Combine(

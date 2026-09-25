@@ -78,6 +78,48 @@ internal sealed unsafe class NestedRaster
     /// anywhere else.
     /// </summary>
     public void FillRounded(double left, double top, double right, double bottom, double radius, uint colour, bool roundBottom = true)
+        => FillRounded(left, top, right, bottom, radius, colour, roundBottom, default);
+
+    /// <summary>
+    /// A cell's rim and body in one: exactly the pixels of the rounded rim
+    /// rectangle filled first and the body filled over it one pixel in - but
+    /// without painting the rim colour under the body only to paint over it.
+    /// A cell that covers the screen is the whole screen, so that was a whole
+    /// screen of pixels written twice every frame.  The body's plain rows are
+    /// left out of the rim's fill; they are the only pixels the body is certain
+    /// to cover opaquely, so nothing else about the result changes.
+    /// </summary>
+    public void FillFramed(double left, double top, double right, double bottom, double radius, uint rim, uint body)
+    {
+        var innerRadius = Math.Max(0, radius - 1);
+        var hole = PlainArea(left + 1, top + 1, right - 1, bottom - 1, innerRadius, roundBottom: true);
+        FillRounded(left, top, right, bottom, radius, rim, roundBottom: true, hole);
+        FillRounded(left + 1, top + 1, right - 1, bottom - 1, innerRadius, body, roundBottom: true, default);
+    }
+
+    /// <summary>The rows and columns a rounded fill paints with one plain fill, corners excluded.</summary>
+    private static Hole PlainArea(double left, double top, double right, double bottom, double radius, bool roundBottom)
+    {
+        var x0 = Px(left);
+        var y0 = Px(top);
+        var x1 = Px(right);
+        var y1 = Px(bottom);
+        if (x1 <= x0 || y1 <= y0)
+        {
+            return default;
+        }
+
+        var r = Math.Min(radius, Math.Min(x1 - x0, y1 - y0) / 2.0);
+        if (r < 1.5)
+        {
+            return new Hole(x0, y0, x1, y1);
+        }
+
+        var band = (int)Math.Ceiling(r);
+        return new Hole(x0, y0 + band, x1, roundBottom ? y1 - band : y1);
+    }
+
+    private void FillRounded(double left, double top, double right, double bottom, double radius, uint colour, bool roundBottom, Hole hole)
     {
         var x0 = Px(left);
         var y0 = Px(top);
@@ -91,7 +133,7 @@ internal sealed unsafe class NestedRaster
         var r = Math.Min(radius, Math.Min(x1 - x0, y1 - y0) / 2.0);
         if (r < 1.5)
         {
-            Fill(x0, y0, x1, y1, colour);
+            FillExcept(x0, y0, x1, y1, colour, hole);
             return;
         }
 
@@ -100,7 +142,7 @@ internal sealed unsafe class NestedRaster
         // The straight middle first, in one go.
         var middleTop = y0 + band;
         var middleBottom = roundBottom ? y1 - band : y1;
-        Fill(x0, middleTop, x1, middleBottom, colour);
+        FillExcept(x0, middleTop, x1, middleBottom, colour, hole);
 
         for (var row = 0; row < band; row++)
         {
@@ -113,6 +155,29 @@ internal sealed unsafe class NestedRaster
                 RoundedRow(x0, x1, y1 - 1 - row, inset, colour);
             }
         }
+    }
+
+    /// <summary>Fills [x0, x1) x [y0, y1) except the pixels inside <paramref name="hole"/>.</summary>
+    private void FillExcept(int x0, int y0, int x1, int y1, uint colour, Hole hole)
+    {
+        if (hole.IsEmpty || hole.Right <= x0 || hole.Left >= x1 || hole.Bottom <= y0 || hole.Top >= y1)
+        {
+            Fill(x0, y0, x1, y1, colour);
+            return;
+        }
+
+        var top = Math.Max(y0, hole.Top);
+        var bottom = Math.Min(y1, hole.Bottom);
+        Fill(x0, y0, x1, top, colour);
+        Fill(x0, bottom, x1, y1, colour);
+        Fill(x0, top, Math.Min(x1, hole.Left), bottom, colour);
+        Fill(Math.Max(x0, hole.Right), top, x1, bottom, colour);
+    }
+
+    /// <summary>A rectangle of pixels a fill may skip because something opaque will cover it.</summary>
+    private readonly record struct Hole(int Left, int Top, int Right, int Bottom)
+    {
+        public bool IsEmpty => Right <= Left || Bottom <= Top;
     }
 
     private void RoundedRow(int x0, int x1, int y, double inset, uint colour)

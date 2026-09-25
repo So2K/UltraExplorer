@@ -36,6 +36,8 @@ public partial class MainWindow
     private DispatcherTimer? _nestedSaveTimer;
     private DispatcherTimer? _beaconTimer;
     private string[]? _nestedDragPaths;
+    private bool _nestedReady;
+    private bool _nestedCameraRestored;
     private readonly HashSet<string> _iconsAsked = new(StringComparer.OrdinalIgnoreCase);
 
     private bool IsNested => _viewModel.IsNestedLayout;
@@ -107,37 +109,67 @@ public partial class MainWindow
     /// row of cells, the hidden-folder rules are copied over, and the camera is
     /// put back where the last session left it.
     /// </summary>
-    private async Task InitializeNestedAsync()
+    private Task InitializeNestedAsync()
     {
-        try
+        // A file dialog always shows the tree; it never needs this canvas.
+        if (IsPickerMode)
         {
-            var drives = await new ViewAllFileSystemService().GetDriveRootsAsync();
-            _nestedDrives.Clear();
-            _nestedDrives.AddRange(drives.Select(drive =>
-                new NestedRoot(drive.FullPath, drive.DisplayName, NestedFolderKind.Drive, drive.SecondaryText)));
+            return Task.CompletedTask;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _viewModel.Toast.ShowError($"Could not list the drives: {ex.Message}");
-        }
+
+        // The drives the tree already found, not a second scan of them: a
+        // drive that is slow to answer would otherwise hold up startup twice.
+        _nestedDrives.Clear();
+        _nestedDrives.AddRange(_viewModel.Tree.Roots
+            .Where(root => root.IsDrive)
+            .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
 
         SyncNestedRoots();
         _nestedTree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
         _nestedTree.SetUserHidden(_viewModel.Tree.HiddenPaths);
         SyncNestedSelection();
-        RebuildBeacons();
+        _nestedReady = true;
         _viewModel.NestedZoomLabel = Nested.ZoomText;
+        if (IsNested)
+        {
+            EnterNested(fromStartup: true);
+        }
 
-        if (_viewModel.Tree.RestoredNestedCamera is { } camera)
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// The nested canvas coming into view, at startup or from the tree.  Its
+    /// marks are gathered only now - while it is hidden it reads nothing - and
+    /// the camera goes back to where it was, or to the selection.  Deferred to
+    /// after layout, so the view is framed for the size it really has.
+    /// </summary>
+    private void EnterNested(bool fromStartup)
+    {
+        if (!_nestedReady)
         {
-            // Not awaited: the window is usable while the folders on the way
-            // are read, and the view jumps there once they have been.
-            _ = Nested.RestoreCameraAsync(camera);
+            return;
         }
-        else if (IsNested && !string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
+
+        SyncNestedSelection();
+        RebuildBeacons();
+        Dispatcher.InvokeAsync(() =>
         {
-            _ = FlyNestedToAsync(_viewModel.Tree.ActivePath, gentle: false, animated: false);
-        }
+            Nested.UpdateLayout();
+            if (!_nestedCameraRestored && _viewModel.Tree.RestoredNestedCamera is { } camera)
+            {
+                // Not awaited: the window is usable while the folders on the
+                // way are read, and the view jumps there once they have been.
+                _nestedCameraRestored = true;
+                _ = Nested.RestoreCameraAsync(camera);
+            }
+            else if (!string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
+            {
+                _ = FlyNestedToAsync(_viewModel.Tree.ActivePath, gentle: !fromStartup, animated: false);
+            }
+
+            FocusCanvas();
+        }, DispatcherPriority.Loaded);
     }
 
     /// <summary>Drives, plus every share and WSL distribution the tree has as a root of its own.</summary>
@@ -249,18 +281,18 @@ public partial class MainWindow
                 // whatever is selected.
                 if (IsNested)
                 {
-                    SyncNestedSelection();
-                    if (!string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
-                    {
-                        _ = FlyNestedToAsync(_viewModel.Tree.ActivePath, gentle: true, animated: false);
-                    }
+                    EnterNested(fromStartup: false);
                 }
-                else if (_viewModel.Tree.ActiveNode is { } node)
+                else
                 {
-                    FocusNode(node, animated: false);
+                    if (_viewModel.Tree.ActiveNode is { } node)
+                    {
+                        FocusNode(node, animated: false);
+                    }
+
+                    Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
                 }
 
-                Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
                 break;
             case nameof(MainViewModel.IsSearchOpen):
                 ScheduleBeacons();
@@ -343,8 +375,9 @@ public partial class MainWindow
             {
                 await _nestedTree.RefreshAsync(folder);
             }
-            catch (OperationCanceledException)
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or IOException or UnauthorizedAccessException)
             {
+                // The window is closing, or the folder went; nothing to redraw.
             }
         }
     }
@@ -365,6 +398,13 @@ public partial class MainWindow
 
     private void ScheduleBeacons()
     {
+        // Hidden, the canvas has no use for marks, and gathering them would
+        // read every folder on the way to each one for nothing.
+        if (!IsNested || !_nestedReady)
+        {
+            return;
+        }
+
         _beaconTimer?.Stop();
         _beaconTimer?.Start();
     }
@@ -449,14 +489,19 @@ public partial class MainWindow
 
     private static bool TryParse(string hex, out Color colour)
     {
+        colour = default;
+        if (!NestedCanvas.IsHexColour(hex))
+        {
+            return false;
+        }
+
         try
         {
             colour = (Color)ColorConverter.ConvertFromString(hex);
             return true;
         }
-        catch (FormatException)
+        catch (Exception ex) when (ex is FormatException or InvalidOperationException or ArgumentException or NotSupportedException)
         {
-            colour = default;
             return false;
         }
     }
@@ -531,6 +576,29 @@ public partial class MainWindow
             _nestedDragPaths = null;
             Nested.DropTarget = null;
         }
+
+        // Moved somewhere else - into Explorer, onto the desktop - the items
+        // are gone from where they were, and nothing else will say so.
+        // Explorer often finishes a move after the drop has returned, so the
+        // folders are looked at again now and once more a little later.
+        _ = RefreshSourcesAsync(paths);
+    }
+
+    private async Task RefreshSourcesAsync(IReadOnlyList<string> paths)
+    {
+        var parents = paths
+            .Select(Path.GetDirectoryName)
+            .Where(parent => !string.IsNullOrEmpty(parent))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        foreach (var delay in new[] { 300, 1500 })
+        {
+            await Task.Delay(delay);
+            foreach (var parent in parents)
+            {
+                await _viewModel.Tree.RefreshPathAsync(parent!);
+            }
+        }
     }
 
     private void Nested_DragOver(object sender, DragEventArgs e)
@@ -602,7 +670,7 @@ public partial class MainWindow
         var key = extension is ".exe" or ".lnk" or ".ico" || string.IsNullOrEmpty(extension) ? path : extension;
         if (_iconsAsked.Count < 20_000 && _iconsAsked.Add(key))
         {
-            icons.Request(path, isDirectory: false, _ => Nested.InvalidateVisual());
+            icons.Request(path, isDirectory: false, _ => Nested.RefreshIcons());
         }
 
         return null;

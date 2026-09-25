@@ -63,7 +63,12 @@ public partial class MainWindow
             return false;
         }
 
+        // Always the primary monitor, at the same place and size: two runs on
+        // monitors of different scale are different pictures and different
+        // amounts of work, and could not be compared.
         WindowState = WindowState.Normal;
+        Left = 60;
+        Top = 60;
         Width = 1600;
         Height = 1000;
         _viewModel.Layout = CanvasLayout.Nested;
@@ -115,7 +120,7 @@ public partial class MainWindow
         var lastRenders = Nested.RenderCount;
         while (watch.Elapsed.TotalSeconds < timeoutSeconds)
         {
-            Nested.InvalidateVisual();
+            Nested.Redraw();
             await NextFrameAsync();
             await Task.Delay(30);
             if (_nestedTree.PendingCount > 0 || Nested.RenderCount != lastRenders && _treeChangedRecently)
@@ -144,6 +149,8 @@ public partial class MainWindow
         public List<double> Render { get; } = [];
         public List<double> Interval { get; } = [];
         public List<int> Cells { get; } = [];
+        public List<double> Labels { get; } = [];
+        public List<double> Layouts { get; } = [];
 
         public string Row()
         {
@@ -168,36 +175,67 @@ public partial class MainWindow
                 (Render.Count == 0 ? 0 : Render.Max()).ToString("0.00", inv),
                 (Interval.Count == 0 ? 0 : Interval.Average()).ToString("0.00", inv),
                 P(Interval, 0.95).ToString("0.00", inv),
-                (Cells.Count == 0 ? 0 : Cells.Average()).ToString("0", inv));
+                (Cells.Count == 0 ? 0 : Cells.Average()).ToString("0", inv),
+                Interval.Count(value => value > 20).ToString(inv),
+                (Interval.Count == 0 ? 0 : Interval.Max()).ToString("0.0", inv),
+                (Labels.Count == 0 ? 0 : Labels.Average()).ToString("0.00", inv),
+                (Labels.Count == 0 ? 0 : Labels.Max()).ToString("0.00", inv),
+                (Layouts.Count == 0 ? 0 : Layouts.Average()).ToString("0.0", inv),
+                (Layouts.Count == 0 ? 0 : Layouts.Max()).ToString("0", inv));
         }
     }
 
     /// <summary>Runs <paramref name="step"/> once per frame for <paramref name="frames"/> frames, timing each.</summary>
-    private async Task<PhaseStats> PhaseAsync(string name, int frames, Action<int> step)
+    private Task<PhaseStats> PhaseAsync(string name, int frames, Action<int> step)
     {
+        // One step per real frame.  WPF raises Rendering more than once per
+        // frame when it is asked to, so frames are told apart by their
+        // RenderingTime; the gap between two real frames is what a user sees
+        // as smooth (16 ms) or as a hitch (anything much longer).
         var stats = new PhaseStats(name);
-        var last = Stopwatch.GetTimestamp();
-        for (var frame = 0; frame < frames; frame++)
+        var done = new TaskCompletionSource<PhaseStats>();
+        var frame = 0;
+        var lastTime = TimeSpan.MinValue;
+        var lastStamp = 0L;
+        var lastCount = Nested.RenderCount;
+        void OnFrame(object? sender, EventArgs e)
         {
-            var before = Nested.RenderCount;
-            step(frame);
-            Nested.InvalidateVisual();
-            await NextFrameAsync();
+            var time = ((RenderingEventArgs)e).RenderingTime;
+            if (time == lastTime)
+            {
+                return;
+            }
 
-            // The frame the step asked for is built after this callback; wait
-            // for the one after, by which time it has been.
-            await NextFrameAsync();
+            lastTime = time;
             var now = Stopwatch.GetTimestamp();
-            stats.Interval.Add(Stopwatch.GetElapsedTime(last, now).TotalMilliseconds / 2);
-            last = now;
-            if (Nested.RenderCount != before)
+            if (lastStamp != 0)
+            {
+                stats.Interval.Add(Stopwatch.GetElapsedTime(lastStamp, now).TotalMilliseconds);
+            }
+
+            lastStamp = now;
+            if (Nested.RenderCount != lastCount)
             {
                 stats.Render.Add(Nested.LastRenderMilliseconds);
                 stats.Cells.Add(Nested.DrawnCellCount);
+                stats.Labels.Add(Nested.LastLabelsMilliseconds);
+                stats.Layouts.Add(Nested.NewTextLayouts);
+                lastCount = Nested.RenderCount;
             }
+
+            if (frame >= frames)
+            {
+                CompositionTarget.Rendering -= OnFrame;
+                done.TrySetResult(stats);
+                return;
+            }
+
+            step(frame++);
+            Nested.Redraw();
         }
 
-        return stats;
+        CompositionTarget.Rendering += OnFrame;
+        return done.Task;
     }
 
     private async Task RunNestedBenchAsync(string output)
@@ -205,7 +243,7 @@ public partial class MainWindow
         TrackTreeChanges();
         await Task.Delay(300);
         var report = new StringBuilder();
-        report.AppendLine("phase\tframes\tmean_ms\tp50_ms\tp95_ms\tmax_ms\tinterval_ms\tinterval_p95\tcells");
+        report.AppendLine("phase\tframes\tmean_ms\tp50_ms\tp95_ms\tmax_ms\tinterval_ms\tinterval_p95\tcells\thitches_20ms\tworst_gap_ms\tlabels_ms\tlabels_max\tnew_text\tnew_text_max");
 
         Nested.FitAll(animated: false);
         var settle = await SettleAsync();
@@ -322,6 +360,7 @@ public partial class MainWindow
     private void Save(string path)
     {
         Nested.UpdateLayout();
+        Nested.RenderNow();
         var dpi = VisualTreeHelper.GetDpi(Nested);
         var bitmap = new RenderTargetBitmap(
             (int)Math.Ceiling(Nested.ActualWidth * dpi.DpiScaleX),
