@@ -291,6 +291,12 @@ public sealed class NestedCanvas : FrameworkElement
     /// <summary>Cells drawn in the last frame, for tests and the perf log.</summary>
     public int DrawnCellCount { get; private set; }
 
+    /// <summary>How long the last frame took to build on the UI thread.</summary>
+    public double LastRenderMilliseconds { get; private set; }
+
+    /// <summary>Frames built so far; a benchmark tells a new frame from an old one by it.</summary>
+    public long RenderCount { get; private set; }
+
     /// <summary>What the rest of the app has selected; drawn with the selection outline.</summary>
     public void SetSelection(IEnumerable<string> paths, string activePath)
     {
@@ -1125,6 +1131,14 @@ public sealed class NestedCanvas : FrameworkElement
 
         _viewWidth = sizeInfo.NewSize.Width;
         _viewHeight = sizeInfo.NewSize.Height;
+
+        // The first "everything" was framed before the control knew its size;
+        // until somebody moves it, frame it again for the size it really is.
+        if (!_cameraTouched && _tree is not null && ReferenceEquals(_anchor, _tree.Root))
+        {
+            _hasCamera = false;
+        }
+
         InvalidateVisual();
     }
 
@@ -1148,6 +1162,7 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         using var frame = PerfLog.Measure("nested.frame");
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
         EnsureCamera();
         Normalize();
         BuildChain();
@@ -1199,6 +1214,9 @@ public sealed class NestedCanvas : FrameworkElement
         {
             _textCache.Clear();
         }
+
+        LastRenderMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        RenderCount++;
     }
 
     private void DrawCell(NestedFolder folder, double x, double y, double w, bool labelsAllowed)
@@ -1294,10 +1312,10 @@ public sealed class NestedCanvas : FrameworkElement
                 NestedLayout.CellHeight - NestedLayout.Padding - grid.Top,
                 grid.Rows * grid.StepY - grid.Gap);
             _raster.Fill(
-                (int)Math.Round((x + grid.Left * w) * _scaleX),
-                (int)Math.Round((y + grid.Top * w) * _scaleY),
-                (int)Math.Round((x + (grid.Left + usedWidth) * w) * _scaleX),
-                (int)Math.Round((y + (grid.Top + usedHeight) * w) * _scaleY),
+                NestedRaster.Px((x + grid.Left * w) * _scaleX),
+                NestedRaster.Px((y + grid.Top * w) * _scaleY),
+                NestedRaster.Px((x + (grid.Left + usedWidth) * w) * _scaleX),
+                NestedRaster.Px((y + (grid.Top + usedHeight) * w) * _scaleY),
                 NestedRaster.Mix(folder.BodyColour, 0xFF8A8F96, 0.1));
             return;
         }
@@ -1352,10 +1370,10 @@ public sealed class NestedCanvas : FrameworkElement
         if (right - left < 6 || bottom - top < 3)
         {
             _raster.Fill(
-                (int)Math.Floor(left),
-                (int)Math.Floor(top),
-                Math.Max((int)Math.Floor(left) + 1, (int)Math.Round(right)),
-                Math.Max((int)Math.Floor(top) + 1, (int)Math.Round(bottom)),
+                NestedRaster.PxFloor(left),
+                NestedRaster.PxFloor(top),
+                Math.Max(NestedRaster.PxFloor(left) + 1, NestedRaster.Px(right)),
+                Math.Max(NestedRaster.PxFloor(top) + 1, NestedRaster.Px(bottom)),
                 speck);
             return;
         }
@@ -1367,10 +1385,10 @@ public sealed class NestedCanvas : FrameworkElement
         var stripeWidth = Math.Max(1, Math.Min(3 * _scaleX, height * 0.14));
         var inset = Math.Max(1, height * 0.18);
         _raster.Fill(
-            (int)Math.Round(left + 1),
-            (int)Math.Round(top + inset),
-            (int)Math.Round(left + 1 + stripeWidth),
-            (int)Math.Round(bottom - inset),
+            NestedRaster.Px(left + 1),
+            NestedRaster.Px(top + inset),
+            NestedRaster.Px(left + 1 + stripeWidth),
+            NestedRaster.Px(bottom - inset),
             stripe);
     }
 
@@ -1497,10 +1515,10 @@ public sealed class NestedCanvas : FrameworkElement
         {
             // A speck: one colour, the rim's, which reads against any parent.
             _raster.Fill(
-                (int)Math.Floor(left),
-                (int)Math.Floor(top),
-                Math.Max((int)Math.Floor(left) + 1, (int)Math.Round(right)),
-                Math.Max((int)Math.Floor(top) + 1, (int)Math.Round(bottom)),
+                NestedRaster.PxFloor(left),
+                NestedRaster.PxFloor(top),
+                Math.Max(NestedRaster.PxFloor(left) + 1, NestedRaster.Px(right)),
+                Math.Max(NestedRaster.PxFloor(top) + 1, NestedRaster.Px(bottom)),
                 folder.HasLabel ? folder.StripeColour : folder.RimColour);
             return;
         }
@@ -1521,10 +1539,10 @@ public sealed class NestedCanvas : FrameworkElement
                 var stripe = Math.Max(2, Math.Min(4 * _scaleX, header * 0.12));
                 var stripeLeft = left + 1 + Math.Max(2 * _scaleX, header * 0.18);
                 _raster.Fill(
-                    (int)Math.Round(stripeLeft),
-                    (int)Math.Round(top + inset),
-                    (int)Math.Round(stripeLeft + stripe),
-                    (int)Math.Round(top + header - inset),
+                    NestedRaster.Px(stripeLeft),
+                    NestedRaster.Px(top + inset),
+                    NestedRaster.Px(stripeLeft + stripe),
+                    NestedRaster.Px(top + header - inset),
                     folder.StripeColour);
             }
         }
@@ -1890,6 +1908,19 @@ public sealed class NestedCanvas : FrameworkElement
     /// </summary>
     private void DrawHoverTip(DrawingContext dc)
     {
+        if (_hover is null && _press == PressKind.None && HotspotAt(_hoverPoint) is { Tip: { Length: > 0 } tip })
+        {
+            var tipText = Text(tip, 12, TextBrush, 360, bold: false);
+            var tipBox = new Rect(
+                Math.Clamp(_hoverPoint.X - tipText.Width / 2 - 8, 4, Math.Max(4, _viewWidth - tipText.Width - 20)),
+                Math.Clamp(_hoverPoint.Y + 16, 4, Math.Max(4, _viewHeight - tipText.Height - 14)),
+                tipText.Width + 16,
+                tipText.Height + 8);
+            dc.DrawRoundedRectangle(TipBrush, TipPen, tipBox, 5, 5);
+            dc.DrawText(tipText, new Point(tipBox.X + 8, tipBox.Y + 4));
+            return;
+        }
+
         if (_hover is not { } hover || _press != PressKind.None || hover.Folder.IsComputer)
         {
             return;
@@ -2013,6 +2044,7 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         var pins = new List<Pin>();
+        var offscreen = new List<Pin>();
         foreach (var beacon in _beacons)
         {
             if (Resolve(beacon.Path) is not { } target || TargetRect(target.Folder, target.FileIndex) is not { } rect)
@@ -2029,12 +2061,14 @@ public sealed class NestedCanvas : FrameworkElement
             var centre = new Point(rect.X + rect.Width / 2, rect.Y + Math.Min(rect.Height / 2, 10));
             if (centre.X < -8 || centre.Y < -8 || centre.X > _viewWidth + 8 || centre.Y > _viewHeight + 8)
             {
+                offscreen.Add(new Pin(beacon, target.Folder, target.FileIndex, centre, Priority(beacon.Kind)));
                 continue;
             }
 
             pins.Add(new Pin(beacon, target.Folder, target.FileIndex, centre, Priority(beacon.Kind)));
         }
 
+        DrawEdgeMarkers(dc, offscreen);
         if (pins.Count == 0)
         {
             return;
@@ -2109,6 +2143,86 @@ public sealed class NestedCanvas : FrameworkElement
             _hotspots.Add(new Hotspot(labelRect, () => OnBeaconClicked(members), null));
         }
     }
+
+    /// <summary>
+    /// Marks that are off screen, as arrows on the edge of the view pointing
+    /// the way to them.  Deep inside one folder, everything the user marked
+    /// elsewhere would otherwise be out of sight and out of mind; this is the
+    /// "it is over there" that makes zooming out to look for it unnecessary.
+    /// </summary>
+    private void DrawEdgeMarkers(DrawingContext dc, List<Pin> offscreen)
+    {
+        if (offscreen.Count == 0 || _viewWidth < 80 || _viewHeight < 80)
+        {
+            return;
+        }
+
+        const double inset = 16;
+        var centre = new Point(_viewWidth / 2, _viewHeight / 2);
+        var halfWidth = _viewWidth / 2 - inset;
+        var halfHeight = _viewHeight / 2 - inset;
+
+        // Where the ray from the middle of the view to each mark leaves the
+        // inset frame; marks in the same direction share one arrow.
+        offscreen.Sort((left, right) => right.Priority.CompareTo(left.Priority));
+        var groups = new List<(Point At, Vector Direction, List<Pin> Members)>();
+        foreach (var pin in offscreen)
+        {
+            var direction = pin.Centre - centre;
+            if (double.IsNaN(direction.X) || double.IsNaN(direction.Y) || direction.Length < 1e-9)
+            {
+                continue;
+            }
+
+            var scale = Math.Min(
+                Math.Abs(direction.X) < 1e-12 ? double.MaxValue : halfWidth / Math.Abs(direction.X),
+                Math.Abs(direction.Y) < 1e-12 ? double.MaxValue : halfHeight / Math.Abs(direction.Y));
+            var at = new Point(centre.X + direction.X * scale, centre.Y + direction.Y * scale);
+            direction.Normalize();
+
+            var home = groups.FindIndex(group => (group.At - at).Length < 22);
+            if (home < 0)
+            {
+                groups.Add((at, direction, [pin]));
+            }
+            else
+            {
+                groups[home].Members.Add(pin);
+            }
+        }
+
+        foreach (var (at, direction, members) in groups)
+        {
+            var lead = members[0];
+            var brush = BrushFor(lead.Beacon.Colour);
+
+            // A small arrowhead pointing out of the view, and the mark's dot behind it.
+            var tip = at + direction * 9;
+            var side = new Vector(-direction.Y, direction.X) * 5;
+            var arrow = new StreamGeometry();
+            using (var context = arrow.Open())
+            {
+                context.BeginFigure(tip, isFilled: true, isClosed: true);
+                context.LineTo(at + direction * 2 + side, isStroked: false, isSmoothJoin: false);
+                context.LineTo(at + direction * 2 - side, isStroked: false, isSmoothJoin: false);
+            }
+
+            arrow.Freeze();
+            dc.DrawGeometry(brush, null, arrow);
+            dc.DrawEllipse(brush, BeaconRimPen, at, 5.5, 5.5);
+            if (members.Count > 1)
+            {
+                var count = Text(members.Count.ToString(CultureInfo.CurrentCulture), 8.5, BeaconGlyphBrush(lead.Beacon.Colour), double.MaxValue, bold: true);
+                dc.DrawText(count, new Point(at.X - count.Width / 2, at.Y - count.Height / 2));
+            }
+
+            var targets = members.Select(pin => (pin.Folder, pin.FileIndex)).ToList();
+            _hotspots.Add(new Hotspot(new Rect(at.X - 11, at.Y - 11, 22, 22), () => OnBeaconClicked(targets), null, EdgeTip(members)));
+        }
+    }
+
+    private static string EdgeTip(List<Pin> members) =>
+        members.Count == 1 ? members[0].Beacon.Label : $"{members[0].Beacon.Label} and {members.Count - 1} more";
 
     private void OnBeaconClicked(IReadOnlyList<(NestedFolder Folder, int FileIndex)> targets)
     {
@@ -2494,8 +2608,17 @@ public sealed class NestedCanvas : FrameworkElement
 
     private void UpdateHover(Point point)
     {
+        var wasOnTip = HotspotAt(_hoverPoint) is { Tip: not null };
         _hoverPoint = point;
-        var hit = HotspotAt(point) is null ? HitTest(point) : null;
+        var spot = HotspotAt(point);
+        if (spot is { Tip: not null } || wasOnTip)
+        {
+            _hover = null;
+            RenderOverlay();
+            return;
+        }
+
+        var hit = spot is null ? HitTest(point) : null;
         var same = hit is { } now && _hover is { } before
             && ReferenceEquals(now.Folder, before.Folder)
             && now.FileIndex == before.FileIndex;
@@ -2685,5 +2808,5 @@ public sealed class NestedCanvas : FrameworkElement
     private readonly record struct TextKey(string Text, double Size, int Width, Brush Brush, bool Bold, bool Icon);
 
     /// <summary>A clickable spot drawn this frame (a beacon, a trail step) or a handle to grab a folder by.</summary>
-    private sealed record Hotspot(Rect Bounds, Action? Click, NestedFolder? Grab);
+    private sealed record Hotspot(Rect Bounds, Action? Click, NestedFolder? Grab, string? Tip = null);
 }

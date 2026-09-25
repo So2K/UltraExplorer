@@ -198,6 +198,9 @@
         <Setter Property="HasDropShadow" Value="True" />
     </Style>
 
+    <!-- The menu's own template, not only its colours: the system one draws a
+         light icon gutter down the left of every item, which on a dark menu is
+         a white stripe running through the icons. -->
     <Style TargetType="ContextMenu">
         <Setter Property="Background" Value="{StaticResource SurfaceRaisedBrush}" />
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
@@ -205,6 +208,28 @@
         <Setter Property="BorderThickness" Value="1" />
         <Setter Property="Padding" Value="5" />
         <Setter Property="HasDropShadow" Value="True" />
+        <Setter Property="Grid.IsSharedSizeScope" Value="True" />
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="ContextMenu">
+                    <Border Margin="0,0,8,8"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            CornerRadius="7"
+                            Padding="{TemplateBinding Padding}">
+                        <Border.Effect>
+                            <DropShadowEffect BlurRadius="12" ShadowDepth="2" Direction="300" Opacity="0.45" Color="Black" />
+                        </Border.Effect>
+                        <ScrollViewer VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled"
+                                      CanContentScroll="False">
+                            <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle" />
+                        </ScrollViewer>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
     </Style>
 
     <Style TargetType="MenuItem">
@@ -223,6 +248,17 @@
                                 <ColumnDefinition Width="Auto" />
                             </Grid.ColumnDefinitions>
                             <ContentPresenter Grid.Column="0" ContentSource="Icon" VerticalAlignment="Center" />
+                            <!-- A checkable item says whether it is on; the template
+                                 used to drop that, so "Hidden items" never showed. -->
+                            <TextBlock x:Name="Check"
+                                       Grid.Column="0"
+                                       Text="&#xE73E;"
+                                       FontFamily="{StaticResource IconFont}"
+                                       FontSize="12"
+                                       Foreground="{StaticResource AccentBrush}"
+                                       HorizontalAlignment="Center"
+                                       VerticalAlignment="Center"
+                                       Visibility="Collapsed" />
                             <ContentPresenter Grid.Column="1" ContentSource="Header" VerticalAlignment="Center" RecognizesAccessKey="True" />
                             <TextBlock Grid.Column="2" Margin="24,0,2,0" Foreground="{StaticResource TextDimBrush}"
                                        Text="{TemplateBinding InputGestureText}" VerticalAlignment="Center" />
@@ -234,6 +270,9 @@
                         </Grid>
                     </Border>
                     <ControlTemplate.Triggers>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="Check" Property="Visibility" Value="Visible" />
+                        </Trigger>
                         <Trigger Property="IsHighlighted" Value="True">
                             <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
                         </Trigger>

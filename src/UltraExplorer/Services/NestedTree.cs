@@ -231,7 +231,10 @@ public sealed class NestedTree : IDisposable
         }
 
         var chain = Chain(path);
-        ForceVisible(chain);
+        if (chain.Count > 0)
+        {
+            ForceVisible([chain[^1]]);
+        }
 
         NestedFolder? current = null;
         foreach (var step in chain)
@@ -341,18 +344,44 @@ public sealed class NestedTree : IDisposable
     /// </summary>
     public void ForceVisible(IEnumerable<string> paths)
     {
-        var changed = false;
+        // Only the parents of folders that were filtered out and now are not
+        // need placing again.  A step that has not been read yet needs
+        // nothing: its parent consults this set when it is read.
+        var parents = new HashSet<NestedFolder>();
         foreach (var path in paths)
         {
             foreach (var step in Chain(path))
             {
-                changed |= _forcedVisible.Add(step);
+                if (!_forcedVisible.Add(step))
+                {
+                    continue;
+                }
+
+                if (_byPath.TryGetValue(step, out var folder))
+                {
+                    if (folder.Index < 0 && folder.Parent is { } parent)
+                    {
+                        parents.Add(parent);
+                    }
+                }
+                else if (Path.GetDirectoryName(step) is { Length: > 0 } directory
+                         && _byPath.TryGetValue(directory, out var holder)
+                         && holder.IsLoaded)
+                {
+                    // Not a folder we know: perhaps a hidden file in one we have read.
+                    parents.Add(holder);
+                }
             }
         }
 
-        if (changed)
+        foreach (var parent in parents)
         {
-            RefilterAll();
+            ApplyVisibleChildren(parent);
+        }
+
+        if (parents.Count > 0)
+        {
+            Changed?.Invoke(this, EventArgs.Empty);
         }
     }
 
@@ -573,9 +602,11 @@ public sealed class NestedTree : IDisposable
             }
         }
 
+        // A hidden file someone marked or searched for is shown like a hidden
+        // folder on the way to one: asking for it by name outranks the filter.
         NestedFile[] files = _includeHidden
             ? folder.AllFiles
-            : [.. folder.AllFiles.Where(file => !file.IsHidden)];
+            : [.. folder.AllFiles.Where(file => !file.IsHidden || _forcedVisible.Contains(folder.PathOf(file)))];
 
         // Sub-folders take the top of the cell and files what is left under
         // them: the folder grid is fitted into its share first, then the files

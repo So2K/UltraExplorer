@@ -79,10 +79,10 @@ internal sealed unsafe class NestedRaster
     /// </summary>
     public void FillRounded(double left, double top, double right, double bottom, double radius, uint colour, bool roundBottom = true)
     {
-        var x0 = (int)Math.Round(left);
-        var y0 = (int)Math.Round(top);
-        var x1 = (int)Math.Round(right);
-        var y1 = (int)Math.Round(bottom);
+        var x0 = Px(left);
+        var y0 = Px(top);
+        var x1 = Px(right);
+        var y1 = Px(bottom);
         if (x1 <= x0 || y1 <= y0)
         {
             return;
@@ -170,6 +170,18 @@ internal sealed unsafe class NestedRaster
         ref var target = ref _pixels[y * _stride + x];
         target = Mix(target, colour, alpha);
     }
+
+    /// <summary>
+    /// A coordinate as a pixel index.  Deep in, a parent's edge can be
+    /// trillions of pixels off screen, and a plain cast of that to int wraps
+    /// to a garbage value - the parent's fill then silently goes missing.
+    /// Anything that far out is clamped to "far out", which is all it means.
+    /// </summary>
+    public static int Px(double value) =>
+        double.IsNaN(value) ? 0 : value <= -1e8 ? -100_000_000 : value >= 1e8 ? 100_000_000 : (int)Math.Round(value);
+
+    public static int PxFloor(double value) =>
+        double.IsNaN(value) ? 0 : value <= -1e8 ? -100_000_000 : value >= 1e8 ? 100_000_000 : (int)Math.Floor(value);
 
     public static uint Mix(uint under, uint over, double alpha)
     {

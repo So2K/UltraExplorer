@@ -155,6 +155,10 @@ public partial class MainWindow : Window
 
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
+        if (_picker is null && TryStartNestedDiagnostics())
+        {
+            return;
+        }
 
         if (PerfLog.IsEnabled)
         {
