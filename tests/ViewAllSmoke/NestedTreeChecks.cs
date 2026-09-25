@@ -210,7 +210,7 @@ internal static partial class Program
             x.IsLoaded && ReferenceEquals(tree.Find(@"Q:\r\x\x1"), x1) && x.Children.Contains(x1));
         Check("a child that is gone is forgotten",
             y.IsForgotten && y.Index == -1 && tree.Find(@"Q:\r\y") is null && !rFolder.Children.Contains(y));
-        Check("and so is everything below it", y1.IsForgotten && tree.Find(@"Q:\r\y\y1") is null);
+        Check("and so is everything below it", NestedTree.IsDetached(y1) && !NestedTree.IsOnCanvas(y1) && tree.Find(@"Q:\r\y\y1") is null);
         var w = tree.Find(@"Q:\r\w");
         Check("a new child appears, unread", w is not null && rFolder.Children.Contains(w) && w.LoadState == NestedLoadState.NotLoaded);
         var zNow = tree.Find(@"Q:\r\z");
@@ -229,7 +229,7 @@ internal static partial class Program
         // ---- invalidate ---------------------------------------------------------------------
         tree.Invalidate(rFolder);
         Check("invalidating forgets everything below the folder",
-            x.IsForgotten && x1.IsForgotten && tree.Find(@"Q:\r\x") is null && tree.Find(@"Q:\r\x\x1") is null);
+            x.IsForgotten && NestedTree.IsDetached(x1) && tree.Find(@"Q:\r\x") is null && tree.Find(@"Q:\r\x\x1") is null);
         Check("and empties it until it is read again",
             rFolder.LoadState == NestedLoadState.NotLoaded && rFolder.Children.Count == 0
             && rFolder.Grid.IsEmpty && rFolder.Files.Count == 0 && rFolder.FileGrid.IsEmpty);

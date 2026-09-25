@@ -208,7 +208,12 @@ public sealed class NestedTree : IDisposable
                 var next = FindChild(current, segment);
                 if (next is null)
                 {
-                    return nearest && IsOnCanvas(current) ? current : null;
+                    if (!nearest)
+                    {
+                        return null;
+                    }
+
+                    break;
                 }
 
                 current = next;
@@ -730,16 +735,22 @@ public sealed class NestedTree : IDisposable
         }
 
         var children = new NestedFolder[listing.Folders.Count];
+        List<NestedFolder>? replaced = null;
         for (var index = 0; index < children.Length; index++)
         {
             var entry = listing.Folders[index];
-            if (existing is not null
-                && existing.Remove(entry.Name, out var kept)
-                && kept.IsReparsePoint == entry.IsReparsePoint
-                && kept.IsHidden == entry.IsHidden)
+            if (existing is not null && existing.Remove(entry.Name, out var kept))
             {
-                children[index] = kept;
-                continue;
+                if (kept.IsReparsePoint == entry.IsReparsePoint && kept.IsHidden == entry.IsHidden)
+                {
+                    children[index] = kept;
+                    continue;
+                }
+
+                // Became a link, or hidden: a different cell now, and the old
+                // one - with what was read below it - has to go.
+                replaced ??= [];
+                replaced.Add(kept);
             }
 
             children[index] = new NestedFolder(
@@ -751,7 +762,7 @@ public sealed class NestedTree : IDisposable
                 entry.IsReparsePoint);
         }
 
-        NestedFolder[] removed = existing is null ? [] : [.. existing.Values];
+        NestedFolder[] removed = existing is null ? [] : [.. existing.Values, .. replaced ?? []];
         return new Read(listing, children, removed, basis);
     }
 

@@ -293,7 +293,9 @@ public static class NestedLayout
         // shape of the area; searching a window around it finds the exact
         // optimum without trying fifty thousand counts for a folder of fifty
         // thousand entries.
-        var estimate = Math.Sqrt(count * CellHeight * ContentWidth / height);
+        // Gaps included: without them the estimate drifts from the optimum
+        // as the count grows, and past thirty thousand it left the window.
+        var estimate = Math.Sqrt(count * (CellHeight + Gap) * ContentWidth / (height * (1 + Gap)));
         var from = count <= 64 ? 1 : Math.Max(1, (int)Math.Floor(estimate) - 4);
         var to = count <= 64 ? count : Math.Min(count, (int)Math.Ceiling(estimate) + 4);
 
@@ -344,7 +346,7 @@ public static class NestedLayout
 
         var bestColumns = 1;
         var bestWidth = 0.0;
-        var estimate = Math.Sqrt(count * ContentWidth / (height * FileAspect));
+        var estimate = Math.Sqrt(count * ContentWidth * (1 + FileGap) / (height * FileAspect * (1 + FileGap / FileAspect)));
         var from = count <= 64 ? 1 : Math.Max(1, (int)Math.Floor(estimate) - 4);
         var to = count <= 64 ? count : Math.Min(count, (int)Math.Ceiling(estimate) + 4);
         for (var columns = from; columns <= to; columns++)
