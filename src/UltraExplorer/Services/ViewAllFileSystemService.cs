@@ -165,7 +165,13 @@ public sealed class ViewAllFileSystemService
                 var path = paths[index];
                 try
                 {
-                    if (!Directory.Exists(path) && !File.Exists(path))
+                    // Exists answers false for access denied and for a share
+                    // that is down; only "not found" means gone.
+                    try
+                    {
+                        _ = File.GetAttributes(path);
+                    }
+                    catch (Exception missing) when (missing is FileNotFoundException or DirectoryNotFoundException)
                     {
                         stale[index] = true;
                         continue;

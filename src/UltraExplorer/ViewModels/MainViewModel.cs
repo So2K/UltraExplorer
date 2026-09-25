@@ -458,6 +458,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             NetworkLocations.Add(location);
         }
 
+        // While the nested canvas is the picture, the tree behind it only has
+        // to hold the path of what is selected, not open every folder on the
+        // way; and what only feeds its hidden editor waits until it is shown.
+        Tree.PreferLightReveal = IsNestedLayout;
+        Tree.IsCanvasShown = IsTreeLayout;
         await Tree.InitializeAsync(initialPath);
         Address.SetPath(Tree.ActivePath);
         UpdateSidebarSelection();
@@ -507,12 +512,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // A file dialog never changes the layout, and must not put back the
+        // one it read at its start over a choice made meanwhile in the window.
+        var layout = _savedLayout;
+        if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
+        {
+            layout = current.CanvasLayout;
+        }
+
         var state = new WorkspaceState
         {
             SidebarWidth = SidebarWidth,
             IsMinimapVisible = IsMinimapVisible,
             IsFolderListVisible = Tree.FolderList.IsVisible,
-            CanvasLayout = _savedLayout,
+            CanvasLayout = layout,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))

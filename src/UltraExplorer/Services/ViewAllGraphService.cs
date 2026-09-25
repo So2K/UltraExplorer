@@ -328,7 +328,7 @@ public sealed class ViewAllGraphService : IDisposable
         if (node.AreChildrenLoaded)
         {
             node.IsExpanded = true;
-            RevealLoadedBranch(node);
+            ShowOrHideLoadedBranch(node);
             ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
@@ -354,7 +354,7 @@ public sealed class ViewAllGraphService : IDisposable
             node.IsTruncated = snapshot.IsTruncated;
             node.ChildLoadLimit = Options.SafeMaximumChildren;
             node.NotifyChildrenChanged();
-            RevealLoadedBranch(node);
+            ShowOrHideLoadedBranch(node);
             ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
@@ -572,15 +572,30 @@ public sealed class ViewAllGraphService : IDisposable
             return null;
         }
 
+        // Described the way the light reveal describes a step, so the node has
+        // the name the disk gives it and not whatever was typed: a later prune
+        // compares the two, and a typed "child" for a disk "Child" would be
+        // taken for a rename and removed while it still exists.
         ViewAllEntryDescriptor descriptor;
         try
         {
-            descriptor = await _fileSystem.DescribeEntryAsync(normalized, cancellationToken);
+            var described = await _fileSystem.DescribeChainAsync(parent.FullPath, [normalized], cancellationToken);
+            if (described.Count == 0)
+            {
+                return null;
+            }
+
+            descriptor = described[0];
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
             or DirectoryNotFoundException or FileNotFoundException)
         {
             return null;
+        }
+
+        if (_nodesByPath.TryGetValue(descriptor.FullPath, out var raced))
+        {
+            return raced;
         }
 
         var child = CreateNode(descriptor, parent.Depth + 1, parent);
@@ -1302,6 +1317,23 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         node.RestoreLocation(new Point(state.X, state.Y), true);
+    }
+
+    /// <summary>
+    /// Opening a folder shows what is in it - unless the folder is not on the
+    /// tree itself, which happens when it was only brought in by name while
+    /// the nested canvas was showing.  Its children then stay off the tree too.
+    /// </summary>
+    private void ShowOrHideLoadedBranch(ViewAllNodeViewModel node)
+    {
+        if (node.IsTreeVisible && !node.IsUserHidden)
+        {
+            RevealLoadedBranch(node);
+        }
+        else
+        {
+            HideDescendants(node);
+        }
     }
 
     private void RevealLoadedBranch(ViewAllNodeViewModel parent)

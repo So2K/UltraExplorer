@@ -186,7 +186,7 @@ public partial class MainWindow
     }
 
     /// <summary>Runs <paramref name="step"/> once per frame for <paramref name="frames"/> frames, timing each.</summary>
-    private Task<PhaseStats> PhaseAsync(string name, int frames, Action<int> step)
+    private Task<PhaseStats> PhaseAsync(string name, int frames, Action<int> step, bool force = true)
     {
         // One step per real frame.  WPF raises Rendering more than once per
         // frame when it is asked to, so frames are told apart by their
@@ -231,7 +231,10 @@ public partial class MainWindow
             }
 
             step(frame++);
-            Nested.Redraw();
+            if (force)
+            {
+                Nested.Redraw();
+            }
         }
 
         CompositionTarget.Rendering += OnFrame;
@@ -267,6 +270,11 @@ public partial class MainWindow
                 : centre;
             Nested.ZoomAt(target, 1.035);
         }));
+
+        // The frames right after the camera stops, drawn the way the app
+        // draws them - only what is out of date - where the full-quality
+        // picture replaces the one drawn in motion.
+        phases.Add(await PhaseAsync("zoom-in-settle", 45, _ => { }, force: false));
         phases.Add(await PhaseAsync("pan", 120, frame => Nested.Pan(new Vector(frame < 60 ? -14 : 14, frame < 60 ? -6 : 6))));
         phases.Add(await PhaseAsync("zoom-out", 120, _ => Nested.ZoomAt(centre, 1 / 1.035)));
 
@@ -276,6 +284,7 @@ public partial class MainWindow
             await SettleAsync();
             phases.Add(await PhaseAsync("files-static", 60, _ => { }));
             phases.Add(await PhaseAsync("files-zoom", 120, _ => Nested.ZoomAt(new Point(centre.X, Nested.ActualHeight * 0.75), 1.025)));
+            phases.Add(await PhaseAsync("files-settle", 45, _ => { }, force: false));
             phases.Add(await PhaseAsync("files-pan", 90, _ => Nested.Pan(new Vector(0, -10))));
         }
 
@@ -317,22 +326,25 @@ public partial class MainWindow
         Directory.CreateDirectory(folder);
         await Task.Delay(300);
 
-        var scenes = new (string Name, string? Path, double Fill, double Zoom)[]
+        var scenes = new (string Name, string? Path, double Fill, double Zoom, string Filter)[]
         {
-            ("01-this-pc", null, 1, 1),
-            ("02-drive-c", @"C:\", 0.92, 1),
-            ("03-windows", @"C:\Windows", 0.92, 1),
-            ("04-system32", @"C:\Windows\System32", 0.92, 1),
-            ("05-system32-files", @"C:\Windows\System32", 0.92, 6),
-            ("06-fonts", @"C:\Windows\Fonts", 0.92, 1),
-            ("07-program-files", @"C:\Program Files", 0.92, 1),
-            ("08-winsxs", @"C:\Windows\WinSxS", 0.92, 1),
-            ("09-winsxs-deep", @"C:\Windows\WinSxS", 0.92, 40),
-            ("10-etc", @"C:\Windows\System32\drivers\etc", 0.6, 1),
+            ("01-this-pc", null, 1, 1, ""),
+            ("02-drive-c", @"C:\", 0.92, 1, ""),
+            ("03-windows", @"C:\Windows", 0.92, 1, ""),
+            ("04-system32", @"C:\Windows\System32", 0.92, 1, ""),
+            ("05-system32-files", @"C:\Windows\System32", 0.92, 6, ""),
+            ("06-fonts", @"C:\Windows\Fonts", 0.92, 1, ""),
+            ("07-program-files", @"C:\Program Files", 0.92, 1, ""),
+            ("08-winsxs", @"C:\Windows\WinSxS", 0.92, 1, ""),
+            ("09-winsxs-deep", @"C:\Windows\WinSxS", 0.92, 40, ""),
+            ("10-etc", @"C:\Windows\System32\drivers\etc", 0.6, 1, ""),
+            ("11-filter-exe", @"C:\Windows\System32", 0.92, 1, "*.exe"),
+            ("12-filter-this-pc", null, 1, 1, "config"),
         };
 
-        foreach (var (name, path, fill, zoom) in scenes)
+        foreach (var (name, path, fill, zoom, filter) in scenes)
         {
+            Nested.SetFilter(filter);
             if (path is null)
             {
                 Nested.FitAll(animated: false);
@@ -368,7 +380,15 @@ public partial class MainWindow
             96 * dpi.DpiScaleX,
             96 * dpi.DpiScaleY,
             PixelFormats.Pbgra32);
-        bitmap.Render(Nested);
+        // Through a brush, so the canvas's own offset under the filter strip
+        // is not part of the picture.
+        var sheet = new DrawingVisual();
+        using (var dc = sheet.RenderOpen())
+        {
+            dc.DrawRectangle(new VisualBrush(Nested), null, new Rect(0, 0, Nested.ActualWidth, Nested.ActualHeight));
+        }
+
+        bitmap.Render(sheet);
         var encoder = new PngBitmapEncoder();
         encoder.Frames.Add(BitmapFrame.Create(bitmap));
         using var stream = File.Create(path);

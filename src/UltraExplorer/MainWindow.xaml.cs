@@ -1611,6 +1611,13 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (modifiers == (ModifierKeys.Control | ModifierKeys.Shift) && key == Key.F && IsNested)
+        {
+            FocusCanvasFilter();
+            e.Handled = true;
+            return;
+        }
+
         if (modifiers == ModifierKeys.Control && key == Key.F)
         {
             SearchBox.Focus();

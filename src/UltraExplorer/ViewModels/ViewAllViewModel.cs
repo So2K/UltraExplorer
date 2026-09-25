@@ -769,6 +769,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             {
                 ScheduleSave();
             }
+
+            ReleaseRemovedSelection(node);
         }
 
         // The list reads the directory itself, so a change the canvas has just
@@ -780,6 +782,61 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
 
         PathRefreshed?.Invoke(path);
+    }
+
+    /// <summary>
+    /// After a refresh took nodes out of the graph, nothing may stay selected
+    /// that is no longer there: the selection falls back to the folder that
+    /// was refreshed, so a second Delete does not aim at something gone.
+    /// </summary>
+    private void ReleaseRemovedSelection(ViewAllNodeViewModel refreshed)
+    {
+        // A refresh of an open branch builds its nodes anew, so a selected
+        // node may simply have been replaced by one with the same path: that
+        // one takes its place.  Only what is not there at all is let go.
+        var changed = false;
+        _isSyncingSelection = true;
+        try
+        {
+            foreach (var node in SelectedNodes.ToArray())
+            {
+                if (_graph.TryGetNode(node.FullPath, out var current) && ReferenceEquals(current, node))
+                {
+                    continue;
+                }
+
+                changed = true;
+                var index = SelectedNodes.IndexOf(node);
+                SelectedNodes.RemoveAt(index);
+                node.IsSelected = false;
+                if (current is not null)
+                {
+                    SelectedNodes.Insert(index, current);
+                    current.IsSelected = true;
+                }
+            }
+        }
+        finally
+        {
+            _isSyncingSelection = false;
+        }
+
+        if (ActiveNode is { } active
+            && !(_graph.TryGetNode(active.FullPath, out var replacement) && ReferenceEquals(replacement, active)))
+        {
+            if (replacement is not null)
+            {
+                ActiveNode = replacement;
+            }
+            else if (_graph.TryGetNode(refreshed.FullPath, out var folder))
+            {
+                SelectOnly(folder);
+            }
+        }
+        else if (changed)
+        {
+            UpdateStatus();
+        }
     }
 
     public async Task LoadMoreAsync(ViewAllNodeViewModel node)
@@ -907,9 +964,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         var node = TryGetNode(path, out var known)
             ? known
             : await RevealPathAsync(path, focus: false, select: false);
-        if (node is null || ticket != _selectTicket)
+
+        // Superseded - something else was selected while this was reading its
+        // way down - or not the thing asked for: a path that is gone reveals
+        // its parent, and selecting that instead would point Delete at it.
+        if (node is null || ticket != _selectTicket || !IsExactly(node, path))
         {
-            return node;
+            return null;
         }
 
         SelectOnly(node);
@@ -920,10 +981,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// <summary>Adds a path to the selection, or takes it out - Ctrl+click on the nested canvas.</summary>
     public async Task ToggleSelectionAsync(string path)
     {
+        var ticket = ++_selectTicket;
         var node = TryGetNode(path, out var known)
             ? known
             : await RevealPathAsync(path, focus: false, select: false);
-        if (node is null)
+        if (node is null || ticket != _selectTicket || !IsExactly(node, path))
         {
             return;
         }
@@ -934,14 +996,31 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
     }
 
+    private static bool IsExactly(ViewAllNodeViewModel node, string path)
+    {
+        try
+        {
+            return ViewAllPath.Equals(node.FullPath, ViewAllPath.Normalize(path));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Makes sure a path has a node, without selecting it or moving the canvas.</summary>
     public async Task<ViewAllNodeViewModel?> MaterializeAsync(string path)
-        => TryGetNode(path, out var known)
+    {
+        var node = TryGetNode(path, out var known)
             ? known
             : await RevealPathAsync(path, focus: false, select: false);
+        return node is not null && IsExactly(node, path) ? node : null;
+    }
 
     public void SelectOnly(ViewAllNodeViewModel node)
     {
+        // Any selection made now outranks a click still reading its way down.
+        _selectTicket++;
         _isSyncingSelection = true;
         try
         {

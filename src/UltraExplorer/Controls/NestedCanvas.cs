@@ -152,6 +152,19 @@ public sealed class NestedCanvas : FrameworkElement
     private Dictionary<TextKey, FormattedText> _oldTextCache = [];
     private double _minCell = MinimumCellPixels;
 
+    private const int FilterSelf = 1;
+    private const int FilterInside = 2;
+    private const int FilterUnknown = 4;
+    private static readonly uint FilterColour = 0xFF4CC9D8;
+    private static readonly Pen FilterPen = FrozenPen(Color.FromRgb(0x4C, 0xC9, 0xD8), 1.5);
+    private Func<string, bool>? _filter;
+    private string _filterText = string.Empty;
+    private int _filterStamp;
+    private int _filterCursor = -1;
+    private readonly List<string> _filterMatches = [];
+    private readonly HashSet<string> _filterMatchSet = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<Rect> _filterOutlines = [];
+
     /// <summary>Text sizes laid out per octave: every fourth root of two, each within 9 % of any size drawn.</summary>
     private const int LevelsPerOctave = 4;
 
@@ -289,6 +302,7 @@ public sealed class NestedCanvas : FrameworkElement
             if (_tree is not null)
             {
                 _tree.Changed -= OnTreeChanged;
+                _tree.FolderLoaded -= OnFolderLoadedForFilter;
             }
 
             _tree = value;
@@ -296,6 +310,7 @@ public sealed class NestedCanvas : FrameworkElement
             if (_tree is not null)
             {
                 _tree.Changed += OnTreeChanged;
+                _tree.FolderLoaded += OnFolderLoadedForFilter;
             }
 
             RequestFrame(Layers.All);
@@ -417,6 +432,199 @@ public sealed class NestedCanvas : FrameworkElement
 
     /// <summary>Everything again, from the cells up.</summary>
     public void Redraw() => RequestFrame(Layers.All);
+
+    // ---- filter ---------------------------------------------------------------------
+
+    /// <summary>
+    /// Narrows the canvas to names: what matches is lit, what holds a match
+    /// keeps its colour so the way to it shows, and everything else fades.
+    /// Nothing moves - a filter that re-laid the drive out would lose the one
+    /// thing a spatial view is for, knowing where things are.
+    ///
+    /// Plain text matches anywhere in a name, ignoring case; * and ? make it a
+    /// wildcard pattern for the whole name (*.png); several patterns can be
+    /// separated by ';'.  Only what has been read can match: a folder not read
+    /// yet stays half faded until it is, and then it is judged like the rest.
+    /// </summary>
+    public void SetFilter(string? text)
+    {
+        var matcher = CompileFilter(text);
+        if (matcher is null && _filter is null)
+        {
+            return;
+        }
+
+        _filter = matcher;
+        _filterText = matcher is null ? string.Empty : text!.Trim();
+        _filterStamp++;
+        _filterCursor = -1;
+        _filterMatches.Clear();
+        _filterMatchSet.Clear();
+        if (matcher is not null && _tree is not null)
+        {
+            Evaluate(_tree.Root);
+        }
+
+        _paletteStamp++;
+        RequestFrame(Layers.All);
+        FilterChanged?.Invoke();
+    }
+
+    /// <summary>Raised when the filter's matches changed: new text, or folders read since.</summary>
+    public event Action? FilterChanged;
+
+    public bool IsFiltering => _filter is not null;
+
+    /// <summary>Paths of everything matching the filter among what has been read, in walking order.</summary>
+    public IReadOnlyList<string> FilterMatches => _filterMatches;
+
+    /// <summary>Which match the last step went to, or -1.</summary>
+    public int FilterCursor => _filterCursor;
+
+    /// <summary>
+    /// Goes to the next match (or the previous one), selects it and flies to
+    /// where it can be read.  False when nothing matches.
+    /// </summary>
+    public bool GoToMatch(int direction)
+    {
+        if (_filterMatches.Count == 0)
+        {
+            return false;
+        }
+
+        _filterCursor = ((_filterCursor < 0 && direction < 0 ? 0 : _filterCursor) + direction + _filterMatches.Count) % _filterMatches.Count;
+        var path = _filterMatches[_filterCursor];
+        if (Resolve(path) is not { } target)
+        {
+            return false;
+        }
+
+        MarkSelected(path);
+        SelectRequested?.Invoke(path, false);
+        FlyToReadable(target.Folder, target.FileIndex);
+        FilterChanged?.Invoke();
+        return true;
+    }
+
+    private static Func<string, bool>? CompileFilter(string? text)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return null;
+        }
+
+        var parts = text.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        var tests = new List<Func<string, bool>>(parts.Length);
+        foreach (var part in parts)
+        {
+            if (part.IndexOfAny(['*', '?']) >= 0)
+            {
+                var pattern = "^" + System.Text.RegularExpressions.Regex.Escape(part).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
+                var regex = new System.Text.RegularExpressions.Regex(
+                    pattern,
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+                tests.Add(regex.IsMatch);
+            }
+            else
+            {
+                var fragment = part;
+                tests.Add(name => name.Contains(fragment, StringComparison.OrdinalIgnoreCase));
+            }
+        }
+
+        if (tests.Count == 0)
+        {
+            return null;
+        }
+
+        return tests.Count == 1 ? tests[0] : name => tests.Any(test => test(name));
+    }
+
+    /// <summary>
+    /// Works out, below one folder, what matches and what holds a match.
+    /// Returns whether anything in or under it matches.
+    /// </summary>
+    private bool Evaluate(NestedFolder folder)
+    {
+        var matcher = _filter!;
+        var state = 0;
+        if (!folder.IsComputer && matcher(folder.Name))
+        {
+            state |= FilterSelf;
+            AddMatch(folder.FullPath);
+        }
+
+        foreach (var file in folder.Files)
+        {
+            if (matcher(file.Name))
+            {
+                state |= FilterInside;
+                AddMatch(folder.PathOf(file));
+            }
+        }
+
+        foreach (var child in folder.Children)
+        {
+            if (Evaluate(child))
+            {
+                state |= FilterInside;
+            }
+        }
+
+        if (!folder.IsComputer && !folder.IsLoaded)
+        {
+            state |= FilterUnknown;
+        }
+
+        folder.FilterStamp = _filterStamp;
+        folder.FilterState = state;
+        return (state & (FilterSelf | FilterInside)) != 0;
+    }
+
+    private void AddMatch(string path)
+    {
+        if (_filterMatchSet.Add(path))
+        {
+            _filterMatches.Add(path);
+        }
+    }
+
+    /// <summary>
+    /// A folder was read while a filter is on: judge what came in, and let
+    /// every folder above it know if something in it matched.
+    /// </summary>
+    private void OnFolderLoadedForFilter(NestedFolder folder)
+    {
+        if (_filter is null)
+        {
+            return;
+        }
+
+        var before = _filterMatches.Count;
+        if (Evaluate(folder))
+        {
+            for (var parent = folder.Parent; parent is not null; parent = parent.Parent)
+            {
+                if (parent.FilterStamp == _filterStamp)
+                {
+                    parent.FilterState |= FilterInside;
+                }
+            }
+        }
+
+        _paletteStamp++;
+        if (_filterMatches.Count != before)
+        {
+            FilterChanged?.Invoke();
+        }
+    }
+
+    private int FilterStateOf(NestedFolder folder) =>
+        folder.FilterStamp == _filterStamp ? folder.FilterState : FilterUnknown;
+
+    /// <summary>Whether a folder is faded by the filter: neither a match nor on the way to one.</summary>
+    private bool IsFilteredOut(NestedFolder folder) =>
+        _filter is not null && !folder.IsComputer && (FilterStateOf(folder) & (FilterSelf | FilterInside)) == 0;
 
     /// <summary>A Shell icon arrived: only the names and icons on the cells need drawing again.</summary>
     public void RefreshIcons() => RequestFrame(Layers.Labels);
@@ -1178,8 +1386,14 @@ public sealed class NestedCanvas : FrameworkElement
         var moving = IsMoving();
 
         // The camera has come to rest after frames drawn with less detail, or
-        // with text set for motion: one more frame, at full quality.
-        if (!moving && (_lodDegraded || _textAnimated))
+        // with text set for motion: one more frame, at full quality.  Not the
+        // moment it stops - drawing every name crisp costs WPF's render thread
+        // a frame or two - but once it has been still for a third of a second,
+        // when a frame that takes longer shows as nothing at all, and the
+        // user is not in the middle of the next move.
+        var settled = !moving && _lastMotion != 0
+            && System.Diagnostics.Stopwatch.GetElapsedTime(_lastMotion).TotalMilliseconds >= SettleMilliseconds;
+        if (settled && (_lodDegraded || _textAnimated))
         {
             _dirty |= Layers.All;
         }
@@ -1188,7 +1402,9 @@ public sealed class NestedCanvas : FrameworkElement
         {
             var layers = _dirty;
             _dirty = Layers.None;
-            RenderLayers(layers, moving);
+            // Between stopping and settling, the frames that are drawn keep
+            // the motion look, so nothing flips back and forth.
+            RenderLayers(layers, moving || !settled && (_lodDegraded || _textAnimated));
         }
 
         if (_dirty == Layers.None && _flight is null && !_lodDegraded && !_textAnimated && !moving)
@@ -1196,6 +1412,9 @@ public sealed class NestedCanvas : FrameworkElement
             UnhookFrame();
         }
     }
+
+    /// <summary>How long the camera has to be still before names are drawn crisp again.</summary>
+    private const double SettleMilliseconds = 350;
 
     /// <summary>Whether the camera moved in the last few frames.</summary>
     private bool IsMoving() =>
@@ -1454,6 +1673,12 @@ public sealed class NestedCanvas : FrameworkElement
         {
             _hotspots.Clear();
             using var dc = _decorVisual.RenderOpen();
+            foreach (var outline in _filterOutlines)
+            {
+                var radius = outline.Width >= 40 ? Math.Min(6, outline.Width * 0.03) : 1;
+                dc.DrawRoundedRectangle(null, FilterPen, outline, radius, radius);
+            }
+
             DrawSelection(dc);
             DrawDropTarget(dc);
             DrawBeacons(dc);
@@ -1535,6 +1760,7 @@ public sealed class NestedCanvas : FrameworkElement
         _labels.Clear();
         _labelled.Clear();
         _fileLabels.Clear();
+        _filterOutlines.Clear();
         DrawnCellCount = 0;
         _foldersDrawn = 0;
         _tilesDrawn = 0;
@@ -1625,6 +1851,10 @@ public sealed class NestedCanvas : FrameworkElement
 
         EnsurePalette(folder);
         PaintCell(folder, x, y, w, h);
+        if (_filter is not null && w >= 6 && _filterOutlines.Count < 600 && (FilterStateOf(folder) & FilterSelf) != 0)
+        {
+            _filterOutlines.Add(new Rect(x, y, w, h));
+        }
 
         if (w >= LoadPixels && folder.CanLoad)
         {
@@ -1761,6 +1991,22 @@ public sealed class NestedCanvas : FrameworkElement
     private void PaintFile(NestedFile file, double x, double y, double w, double h)
     {
         var (body, stripe, speck) = FilePalette(file.Extension);
+        if (_filter is not null)
+        {
+            if (_filter(file.Name))
+            {
+                body = NestedRaster.Mix(body, FilterColour, 0.3);
+                stripe = FilterColour;
+                speck = FilterColour;
+            }
+            else
+            {
+                body = NestedRaster.Mix(body, CanvasColour, 0.72);
+                stripe = NestedRaster.Mix(stripe, CanvasColour, 0.72);
+                speck = NestedRaster.Mix(speck, CanvasColour, 0.72);
+            }
+        }
+
         if (file.IsHidden)
         {
             body = NestedRaster.Mix(body, CanvasColour, 0.45);
@@ -1872,7 +2118,8 @@ public sealed class NestedCanvas : FrameworkElement
 
             if (right - cursor > font)
             {
-                var name = Text(file.Name, font, file.IsHidden ? TextDimBrush : TextBrush, right - cursor, bold: false, scaled: true);
+                var faded = file.IsHidden || _filter is not null && !_filter(file.Name);
+                var name = Text(file.Name, font, faded ? TextDimBrush : TextBrush, right - cursor, bold: false, scaled: true);
                 DrawTextAt(dc, name, new Point(cursor, job.Y + (job.H - name.Height) / 2));
             }
         }
@@ -1999,6 +2246,27 @@ public sealed class NestedCanvas : FrameworkElement
             rim = NestedRaster.Mix(rim, CanvasColour, 0.4);
         }
 
+        if (_filter is not null && !folder.IsComputer)
+        {
+            var state = FilterStateOf(folder);
+            if ((state & FilterSelf) != 0)
+            {
+                // A match: its own colours, and a title in the filter's colour.
+                header = NestedRaster.Mix(header, FilterColour, 0.45);
+                rim = FilterColour;
+            }
+            else if ((state & FilterInside) == 0)
+            {
+                // Faded: far for what is known not to match, less for what
+                // has not been read and still might.
+                var fade = (state & FilterUnknown) != 0 ? 0.45 : 0.72;
+                body = NestedRaster.Mix(body, CanvasColour, fade);
+                header = NestedRaster.Mix(header, CanvasColour, fade);
+                rim = NestedRaster.Mix(rim, CanvasColour, fade);
+                stripe = NestedRaster.Mix(stripe, CanvasColour, fade);
+            }
+        }
+
         folder.BodyColour = body;
         folder.HeaderColour = header;
         folder.RimColour = rim;
@@ -2013,7 +2281,7 @@ public sealed class NestedCanvas : FrameworkElement
             var folder = job.Folder;
             if (job.Mode == LabelMode.Pill)
             {
-                var text = Text(folder.Name, PillFontSize, TextBrush, Math.Max(8, job.W - 10), bold: false);
+                var text = Text(folder.Name, PillFontSize, IsFilteredOut(folder) ? TextDimBrush : TextBrush, Math.Max(8, job.W - 10), bold: false);
                 var pill = new Rect(job.X + 2, job.Y + 2, Math.Min(job.W - 4, text.Width + 8), text.Height + 2);
                 if (pill.Width < 12)
                 {
@@ -2081,7 +2349,7 @@ public sealed class NestedCanvas : FrameworkElement
             var available = right - cursor;
             if (available > font)
             {
-                var name = Text(folder.Name, font, TextBrush, available, bold: folder.Kind != NestedFolderKind.Folder, scaled: true);
+                var name = Text(folder.Name, font, IsFilteredOut(folder) ? TextDimBrush : TextBrush, available, bold: folder.Kind != NestedFolderKind.Folder, scaled: true);
                 DrawTextAt(dc, name, new Point(cursor, job.Y + (header - name.Height) / 2));
                 AddGrabHotspot(folder, new Rect(job.X, job.Y, job.W, header));
             }
@@ -2494,7 +2762,8 @@ public sealed class NestedCanvas : FrameworkElement
         var clusters = new List<List<Pin>>();
         foreach (var pin in pins)
         {
-            var home = clusters.FirstOrDefault(cluster => (cluster[0].Centre - pin.Centre).Length < 13);
+            // Close enough that their circles would overlap: one badge.
+            var home = clusters.FirstOrDefault(cluster => (cluster[0].Centre - pin.Centre).Length < 26);
             if (home is null)
             {
                 clusters.Add([pin]);

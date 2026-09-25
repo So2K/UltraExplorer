@@ -220,6 +220,10 @@ public sealed class NestedFolder
     internal bool HasLabel { get; set; }
     internal bool HasNote { get; set; }
 
+    // What the canvas's name filter made of this folder, and for which filter.
+    internal int FilterStamp { get; set; } = -1;
+    internal int FilterState { get; set; }
+
     /// <summary>Whether <paramref name="other"/> is this folder or somewhere inside it.</summary>
     public bool Contains(NestedFolder other)
     {

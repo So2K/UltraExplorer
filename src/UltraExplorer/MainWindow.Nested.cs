@@ -37,6 +37,8 @@ public partial class MainWindow
     private DispatcherTimer? _beaconTimer;
     private string[]? _nestedDragPaths;
     private bool _nestedReady;
+    private DispatcherTimer? _filterTimer;
+    private const int FilterBeaconLimit = 150;
     private bool _nestedCameraRestored;
     private readonly HashSet<string> _iconsAsked = new(StringComparer.OrdinalIgnoreCase);
 
@@ -65,6 +67,14 @@ public partial class MainWindow
         Nested.ContextMenuRequested += OnNestedContextMenuRequested;
         Nested.DragRequested += OnNestedDragRequested;
         Nested.CameraChanged += OnNestedCameraChanged;
+        Nested.FilterChanged += OnNestedFilterChanged;
+
+        _filterTimer = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(140) };
+        _filterTimer.Tick += (_, _) =>
+        {
+            _filterTimer.Stop();
+            Nested.SetFilter(CanvasFilterBox.Text);
+        };
 
         _nestedSaveTimer = new DispatcherTimer(DispatcherPriority.ApplicationIdle) { Interval = TimeSpan.FromMilliseconds(400) };
         _nestedSaveTimer.Tick += (_, _) =>
@@ -197,14 +207,31 @@ public partial class MainWindow
             {
                 await _viewModel.Tree.ToggleSelectionAsync(path);
             }
-            else
+            else if (await _viewModel.Tree.SelectPathAsync(path) is null
+                     && !Directory.Exists(path) && !File.Exists(path))
             {
-                await _viewModel.Tree.SelectPathAsync(path);
+                // A cell for something that is gone: read its folder again
+                // rather than select anything in its place.
+                await RefreshStaleAsync(path);
             }
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
             _viewModel.Toast.ShowError(ex.Message);
+        }
+    }
+
+    private async Task RefreshStaleAsync(string path)
+    {
+        if (Path.GetDirectoryName(path) is { Length: > 0 } parent && _nestedTree.Find(parent) is { } folder)
+        {
+            try
+            {
+                await _nestedTree.RefreshAsync(folder);
+            }
+            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or IOException)
+            {
+            }
         }
     }
 
@@ -281,16 +308,13 @@ public partial class MainWindow
                 // whatever is selected.
                 if (IsNested)
                 {
+                    _viewModel.Tree.PreferLightReveal = true;
+                    _viewModel.Tree.IsCanvasShown = false;
                     EnterNested(fromStartup: false);
                 }
                 else
                 {
-                    if (_viewModel.Tree.ActiveNode is { } node)
-                    {
-                        FocusNode(node, animated: false);
-                    }
-
-                    Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
+                    _ = EnterTreeAsync();
                 }
 
                 break;
@@ -298,6 +322,30 @@ public partial class MainWindow
                 ScheduleBeacons();
                 break;
         }
+    }
+
+    /// <summary>
+    /// Back to the tree: what is selected was only brought in by name, so it
+    /// is revealed properly - its folders opened - before the tree is shown,
+    /// and the reveal itself brings it into view.
+    /// </summary>
+    private async Task EnterTreeAsync()
+    {
+        var tree = _viewModel.Tree;
+        tree.PreferLightReveal = false;
+        try
+        {
+            if (!string.IsNullOrEmpty(tree.ActivePath))
+            {
+                await tree.RevealPathAsync(tree.ActivePath);
+            }
+        }
+        finally
+        {
+            tree.IsCanvasShown = true;
+        }
+
+        await Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
     }
 
     private void SyncNestedSelection() =>
@@ -465,6 +513,14 @@ public partial class MainWindow
             Add(pinned.Path, NestedBeaconKind.Pinned, PinBeaconColour, pinned.Name);
         }
 
+        if (Nested.IsFiltering)
+        {
+            foreach (var match in Nested.FilterMatches.Take(FilterBeaconLimit))
+            {
+                Add(match, NestedBeaconKind.Search, SearchBeaconColour, LeafName(match));
+            }
+        }
+
         if (_viewModel.IsSearchOpen)
         {
             foreach (var result in _viewModel.SearchResults.Take(SearchBeaconLimit))
@@ -538,6 +594,18 @@ public partial class MainWindow
                 tree.Activate(selected);
             }
             else if (await tree.SelectPathAsync(path) is null)
+            {
+                if (!Directory.Exists(path) && !File.Exists(path))
+                {
+                    await RefreshStaleAsync(path);
+                }
+
+                return;
+            }
+
+            // Something else was selected while this one was being read: its
+            // menu would act on that, not on what was right-clicked.
+            if (!ViewAllPath.Equals(tree.ActivePath, path))
             {
                 return;
             }
@@ -674,6 +742,94 @@ public partial class MainWindow
         }
 
         return null;
+    }
+
+    // ---- the name filter ---------------------------------------------------------
+
+    /// <summary>Typing narrows the canvas a moment after the last key, not on every one.</summary>
+    private void CanvasFilterBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        CanvasFilterHint.Visibility = CanvasFilterBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
+        _filterTimer?.Stop();
+        _filterTimer?.Start();
+    }
+
+    /// <summary>Enter goes to the next match, Shift+Enter the previous, Escape clears and goes back to the canvas.</summary>
+    private void CanvasFilterBox_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        switch (e.Key)
+        {
+            case Key.Enter:
+                ApplyFilterNow();
+                Nested.GoToMatch((Keyboard.Modifiers & ModifierKeys.Shift) != 0 ? -1 : 1);
+                e.Handled = true;
+                break;
+            case Key.Down:
+                ApplyFilterNow();
+                Nested.GoToMatch(1);
+                e.Handled = true;
+                break;
+            case Key.Up:
+                ApplyFilterNow();
+                Nested.GoToMatch(-1);
+                e.Handled = true;
+                break;
+            case Key.Escape:
+                ClearCanvasFilter();
+                e.Handled = true;
+                break;
+        }
+    }
+
+    private void ApplyFilterNow()
+    {
+        if (_filterTimer is { IsEnabled: true })
+        {
+            _filterTimer.Stop();
+            Nested.SetFilter(CanvasFilterBox.Text);
+        }
+    }
+
+    private void ClearCanvasFilter()
+    {
+        CanvasFilterBox.Text = string.Empty;
+        _filterTimer?.Stop();
+        Nested.SetFilter(null);
+        FocusCanvas();
+    }
+
+    private void CanvasFilterPrevious_Click(object sender, RoutedEventArgs e) => Nested.GoToMatch(-1);
+
+    private void CanvasFilterNext_Click(object sender, RoutedEventArgs e) => Nested.GoToMatch(1);
+
+    private void CanvasFilterClear_Click(object sender, RoutedEventArgs e) => ClearCanvasFilter();
+
+    private void FocusCanvasFilter()
+    {
+        CanvasFilterBox.Focus();
+        CanvasFilterBox.SelectAll();
+    }
+
+    /// <summary>
+    /// The count beside the strip, and the matches as beacons: a match deep
+    /// in the tree is a speck, and a speck has to be findable like any mark.
+    /// </summary>
+    private void OnNestedFilterChanged()
+    {
+        var matches = Nested.FilterMatches;
+        var active = Nested.IsFiltering;
+        CanvasFilterCount.Text = !active
+            ? string.Empty
+            : matches.Count == 0
+                ? "No matches among the folders read so far"
+                : Nested.FilterCursor >= 0
+                    ? $"{Nested.FilterCursor + 1:N0} of {matches.Count:N0}"
+                    : matches.Count == 1 ? "1 match" : $"{matches.Count:N0} matches";
+        var navigation = active && matches.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        CanvasFilterPrevious.Visibility = navigation;
+        CanvasFilterNext.Visibility = navigation;
+        CanvasFilterClear.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
+        ScheduleBeacons();
     }
 
     // ---- keyboard --------------------------------------------------------------

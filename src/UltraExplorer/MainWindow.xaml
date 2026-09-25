@@ -699,14 +699,90 @@
                 </Grid>
 
                 <!-- The nested canvas: every folder a cell inside its parent,
-                     the whole of This PC on one screen. -->
-                <controls:NestedCanvas x:Name="Nested"
-                                       AllowDrop="True"
-                                       AutomationProperties.Name="Folders"
-                                       DragOver="Nested_DragOver"
-                                       DragLeave="Nested_DragLeave"
-                                       Drop="Nested_Drop"
-                                       Visibility="{Binding IsNestedLayout, Converter={StaticResource BoolToVisibility}}" />
+                     the whole of This PC on one screen - with a strip above it
+                     that narrows it to names. -->
+                <Grid x:Name="NestedHost"
+                      Visibility="{Binding IsNestedLayout, Converter={StaticResource BoolToVisibility}}">
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+
+                    <Border Grid.Row="0"
+                            Background="{StaticResource SurfaceBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="0,0,0,1"
+                            Padding="10,5">
+                        <StackPanel Orientation="Horizontal">
+                            <Border Width="360"
+                                    CornerRadius="5"
+                                    Background="{StaticResource SurfaceRaisedBrush}"
+                                    BorderBrush="{StaticResource BorderBrush}"
+                                    BorderThickness="1"
+                                    Padding="7,3">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0"
+                                               Text="&#xE71C;"
+                                               Style="{StaticResource IconText}"
+                                               FontSize="11"
+                                               Foreground="{StaticResource TextMutedBrush}"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,6,0" />
+                                    <Grid Grid.Column="1">
+                                        <TextBlock x:Name="CanvasFilterHint"
+                                                   Text="Filter by name  -  report, *.png, a;b  (Ctrl+Shift+F)"
+                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                   FontSize="12"
+                                                   IsHitTestVisible="False"
+                                                   VerticalAlignment="Center" />
+                                        <TextBox x:Name="CanvasFilterBox"
+                                                 Background="Transparent"
+                                                 BorderThickness="0"
+                                                 Foreground="{StaticResource TextBrush}"
+                                                 CaretBrush="{StaticResource TextBrush}"
+                                                 FontSize="12"
+                                                 VerticalContentAlignment="Center"
+                                                 AutomationProperties.Name="Filter the canvas by name"
+                                                 TextChanged="CanvasFilterBox_TextChanged"
+                                                 PreviewKeyDown="CanvasFilterBox_PreviewKeyDown" />
+                                    </Grid>
+                                </Grid>
+                            </Border>
+                            <TextBlock x:Name="CanvasFilterCount"
+                                       Margin="10,0,6,0"
+                                       VerticalAlignment="Center"
+                                       FontSize="12"
+                                       Foreground="{StaticResource TextMutedBrush}" />
+                            <Button x:Name="CanvasFilterPrevious" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                    Click="CanvasFilterPrevious_Click" ToolTip="Previous match (Shift+Enter)" AutomationProperties.Name="Previous match"
+                                    Visibility="Collapsed">
+                                <TextBlock Text="&#xE70E;" Style="{StaticResource IconText}" FontSize="11" />
+                            </Button>
+                            <Button x:Name="CanvasFilterNext" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                    Click="CanvasFilterNext_Click" ToolTip="Next match (Enter)" AutomationProperties.Name="Next match"
+                                    Visibility="Collapsed">
+                                <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="11" />
+                            </Button>
+                            <Button x:Name="CanvasFilterClear" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                    Click="CanvasFilterClear_Click" ToolTip="Clear the filter (Esc)" AutomationProperties.Name="Clear the filter"
+                                    Visibility="Collapsed">
+                                <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="10" />
+                            </Button>
+                        </StackPanel>
+                    </Border>
+
+                    <controls:NestedCanvas x:Name="Nested"
+                                           Grid.Row="1"
+                                           AllowDrop="True"
+                                           AutomationProperties.Name="Folders"
+                                           DragOver="Nested_DragOver"
+                                           DragLeave="Nested_DragLeave"
+                                           Drop="Nested_Drop" />
+                </Grid>
 
                 <!-- The current folder as a plain list.  The canvas answers
                      "what is where"; this answers "where is the one called X",
