@@ -80,6 +80,10 @@ internal static partial class Program
         await FolderColours(fixtureRoot);
         await EverythingSearch();
         await ProgramTargets();
+        await NestedLayoutChecks();
+        await NestedTreeChecks();
+        await NestedReaderChecks(fixtureRoot);
+        await NestedCanvasChecks();
     }
 
     // ---- fixture -----------------------------------------------------------
