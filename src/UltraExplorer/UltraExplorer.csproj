@@ -23,8 +23,26 @@
     <PackageReference Include="Nodify" Version="7.3.0" />
   </ItemGroup>
 
+  <!-- The nested canvas draws on the GPU: Direct3D 11 renders into a texture
+       shared with a Direct3D9Ex surface that WPF shows through D3DImage, and
+       DirectWrite supplies glyph shapes for the text atlas.  Managed bindings
+       only - they call the system's d3d11, dxgi, d3d9 and dwrite.  Pinned. -->
+  <ItemGroup>
+    <PackageReference Include="Vortice.Direct3D11" Version="3.8.3" />
+    <PackageReference Include="Vortice.Direct3D9" Version="3.8.3" />
+    <PackageReference Include="Vortice.D3DCompiler" Version="3.8.3" />
+    <PackageReference Include="Vortice.Direct2D1" Version="3.8.3" />
+  </ItemGroup>
+
   <ItemGroup>
     <Resource Include="Assets\UltraExplorer.ico" />
+  </ItemGroup>
+
+  <!-- The canvas's shaders, compiled at start-up by ShaderCache with the
+       system's d3dcompiler_47.dll and kept in the state folder. -->
+  <ItemGroup>
+    <None Remove="Rendering\Gpu\Shaders\*.hlsl" />
+    <EmbeddedResource Include="Rendering\Gpu\Shaders\*.hlsl" />
   </ItemGroup>
 
   <!-- The headless harness exercises the graph internals directly. -->

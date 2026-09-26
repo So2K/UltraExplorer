@@ -1206,6 +1206,47 @@ public partial class MainWindow : Window
         menu.Items.Add(group);
     }
 
+    /// <summary>
+    /// What draws the nested canvas: automatic (the graphics card where it
+    /// can, the processor elsewhere), the card, or the processor - and, at the
+    /// top, what is drawing it now and why.  When the command line or
+    /// ULTRAEXPLORER_RENDERER chose for this run, the choice is shown and
+    /// cannot be changed here.
+    /// </summary>
+    private void AddRendererItems(ItemsControl menu)
+    {
+        var group = new MenuItem { Header = "Renderer" };
+        var now = Nested.IsSceneOnGpu
+            ? $"Drawn by {Nested.RendererAdapter}"
+            : $"Drawn by the processor: {Nested.RendererReason}";
+        group.Items.Add(new MenuItem { Header = now, IsEnabled = false });
+        group.Items.Add(new Separator());
+
+        var forced = Rendering.Gpu.GpuBootstrap.ExplicitPreference;
+        var current = forced ?? _viewModel.Renderer;
+        foreach (var (choice, name, tip) in new[]
+        {
+            (Rendering.Gpu.RendererPreference.Auto, "Automatic", "The graphics card wherever it can draw the canvas, the processor elsewhere"),
+            (Rendering.Gpu.RendererPreference.Gpu, "Graphics card", "Always the graphics card, even where Windows draws in software"),
+            (Rendering.Gpu.RendererPreference.Cpu, "Processor", "Always the processor: the canvas exactly as it was drawn before the graphics card did it")
+        })
+        {
+            var item = new MenuItem
+            {
+                Header = name,
+                IsCheckable = true,
+                IsChecked = current == choice,
+                IsEnabled = forced is null,
+                ToolTip = forced is null ? tip : "Chosen for this run by --renderer or ULTRAEXPLORER_RENDERER"
+            };
+            var chosen = choice;
+            item.Click += (_, _) => _viewModel.Renderer = chosen;
+            group.Items.Add(item);
+        }
+
+        menu.Items.Add(group);
+    }
+
     /// <summary>The two pictures of the drives, as a pair of radio items.</summary>
     private void AddLayoutItems(ContextMenu menu)
     {
@@ -1270,6 +1311,11 @@ public partial class MainWindow : Window
 
         AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
         AddSortItems(menu);
+        if (IsNested)
+        {
+            AddRendererItems(menu);
+        }
+
         menu.Items.Add(new Separator());
         AddColourItems(menu);
         AddCommandItem(menu, "Note…", "\uE70B", _viewModel.EditNoteCommand);

@@ -84,7 +84,12 @@ internal static partial class Program
         await NestedTreeChecks();
         await NestedReaderChecks(fixtureRoot);
         await NestedCanvasChecks();
+        await GpuDeviceChecks();
         await LightReveal(fixtureRoot);
+        await GpuIconAtlasChecks();
+        await GpuTextChecks();
+        await GpuRectChecks();
+        await GpuLabelChecks();
     }
 
     // ---- fixture -----------------------------------------------------------

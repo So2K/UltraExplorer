@@ -26,6 +26,14 @@ public sealed class WorkspaceState
     public string? CanvasSort { get; set; } = ItemSort.Default.ToSetting();
 
     /// <summary>
+    /// What draws the nested canvas: "Auto" - the GPU wherever it can be
+    /// used, the CPU elsewhere - "Gpu" or "Cpu".  Missing or not understood,
+    /// it is Auto.  The <c>--renderer</c> switch and ULTRAEXPLORER_RENDERER
+    /// win over it for the run they are given to.
+    /// </summary>
+    public string? CanvasRenderer { get; set; }
+
+    /// <summary>
     /// Version 1 stored a colour label and a note per canvas node.  They are
     /// migrated into the path-keyed folder mark store on first load and then
     /// stop being written.

@@ -3,7 +3,9 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
+using System.Windows.Threading;
 using UltraExplorer.Models;
+using UltraExplorer.Rendering.Gpu;
 using UltraExplorer.Services;
 
 namespace UltraExplorer.Controls;
@@ -68,6 +70,9 @@ public readonly record struct NestedHit(NestedFolder Folder, Rect Bounds, bool I
     public string Path => FileName is not null ? System.IO.Path.Combine(Folder.FullPath, FileName) : Folder.FullPath;
 }
 
+/// <summary>Bytes a frame of the nested canvas allocated on the UI thread, by layer (see <see cref="NestedCanvas.LastAllocations"/>).</summary>
+public readonly record struct FrameAllocations(long Scene, long Labels, long Decor, long Present);
+
 /// <summary>
 /// The nested canvas: every folder is a cell and its sub-folders are smaller
 /// cells inside it, all the way down.  See <see cref="NestedLayout"/> for the
@@ -85,13 +90,24 @@ public readonly record struct NestedHit(NestedFolder Folder, Rect Bounds, bool I
 /// middle of the view and is at least half as wide as it, so the numbers in
 /// play always describe things near screen size.</para>
 ///
-/// <para><b>Drawing.</b> The cells themselves are filled into a pixel buffer
-/// by hand (<see cref="NestedRaster"/>): a big folder is tens of thousands of
-/// rectangles, which WPF would charge for one call at a time.  Text, the
-/// selection and the beacons are drawn by WPF on top, where anti-aliasing and
-/// type matter.  Nothing is kept between frames except the camera: a frame is
-/// a walk from the root down through whatever is on screen and big enough to
-/// see, so its cost is what is visible, not what has been read.</para>
+/// <para><b>Drawing.</b> A big folder is tens of thousands of rectangles,
+/// which WPF would charge for one call at a time, so the cells are not WPF's.
+/// In a window whose graphics card is ready they are GPU instances - one
+/// sixty-four byte record per cell or tile, drawn with one instanced call into
+/// a texture WPF shows through a D3DImage (<see cref="GpuSink"/>,
+/// <see cref="NestedGpuRenderer"/>, <see cref="NestedSurface"/>).  Anywhere
+/// else - no window, no usable card, the CPU chosen, the card lost - they are
+/// filled into a pixel buffer by hand (<see cref="NestedRaster"/>), the
+/// picture as it always was and the one the GPU's is measured against.  The
+/// walk that decides what to draw is the same for both.  The names on the
+/// cells follow the cells: on the GPU they are glyphs from a distance-field
+/// atlas and icons from an icon atlas, drawn in the same present
+/// (<see cref="GpuLabelTarget"/>); on the CPU they are WPF's text and images,
+/// as they always were.  The selection, the outlines and the beacons are
+/// WPF's on top either way.  Nothing is kept between frames except the
+/// camera: a frame is a walk from the root down through whatever is on
+/// screen and big enough to see, so its cost is what is visible, not what
+/// has been read.</para>
 ///
 /// <para><b>Reading.</b> A folder is read the first time it is drawn wide
 /// enough for its contents to be worth drawing; the walk asks the tree, and
@@ -125,14 +141,23 @@ public sealed class NestedCanvas : FrameworkElement
     private static readonly Typeface IconFace = new(new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
 
     private static readonly uint CanvasColour = 0xFF111315;
-    private static readonly Brush TextBrush = Frozen(Color.FromRgb(0xF2, 0xF2, 0xF2));
-    private static readonly Brush TextDimBrush = Frozen(Color.FromRgb(0x9A, 0x9A, 0x9A));
-    private static readonly Brush DangerBrush = Frozen(Color.FromRgb(0xEF, 0x5A, 0x68));
+
+    // The colours of the names, as colours for whatever draws them and as the
+    // brushes WPF draws them with.
+    private static readonly Color TextColour = Color.FromRgb(0xF2, 0xF2, 0xF2);
+    private static readonly Color TextDimColour = Color.FromRgb(0x9A, 0x9A, 0x9A);
+    private static readonly Color DangerColour = Color.FromRgb(0xEF, 0x5A, 0x68);
+    private static readonly Color StarColour = Color.FromRgb(0xFF, 0xD6, 0x6B);
+    private static readonly Color FolderColour = Color.FromRgb(0xE3, 0xB3, 0x41);
+    private static readonly Color PillColour = Color.FromArgb(0xD8, 0x14, 0x16, 0x18);
+    private static readonly Brush TextBrush = Frozen(TextColour);
+    private static readonly Brush TextDimBrush = Frozen(TextDimColour);
+    private static readonly Brush DangerBrush = Frozen(DangerColour);
     private static readonly Brush AccentBrush = Frozen(Color.FromRgb(0x60, 0xCD, 0xFF));
-    private static readonly Brush PillBrush = Frozen(Color.FromArgb(0xD8, 0x14, 0x16, 0x18));
+    private static readonly Brush PillBrush = Frozen(PillColour);
     private static readonly Brush TipBrush = Frozen(Color.FromArgb(0xF0, 0x20, 0x22, 0x25));
     private static readonly Brush DropFillBrush = Frozen(Color.FromArgb(0x55, 0x24, 0x3E, 0x4A));
-    private static readonly Brush StarBrush = Frozen(Color.FromRgb(0xFF, 0xD6, 0x6B));
+    private static readonly Brush StarBrush = Frozen(StarColour);
     private static readonly Pen SelectionPen = FrozenPen(Color.FromRgb(0x60, 0xCD, 0xFF), 2);
     private static readonly Pen ActivePen = FrozenPen(Color.FromArgb(0xB0, 0x60, 0xCD, 0xFF), 1.5);
     private static readonly Pen HoverPen = FrozenPen(Color.FromArgb(0x90, 0xFF, 0xFF, 0xFF), 1);
@@ -142,6 +167,16 @@ public sealed class NestedCanvas : FrameworkElement
     private static readonly Pen BeaconHaloPen = FrozenPen(Color.FromArgb(0x70, 0xFF, 0xFF, 0xFF), 1);
 
     private readonly NestedRaster _raster = new();
+    private readonly RasterSink _rasterSink;
+    private readonly WpfLabelTarget _wpfLabels;
+
+    /// <summary>
+    /// Where the walk puts its cells and tiles: the sink <see cref="WalkScene"/>
+    /// was handed for the walk under way (or the last one), and never null, so
+    /// the walk need not ask.
+    /// </summary>
+    private SceneSink _sink;
+
     private readonly Dictionary<NestedFolder, (double X, double Y, double W)> _chain = [];
     private readonly List<LabelJob> _labels = [];
     private readonly List<FileLabelJob> _fileLabels = [];
@@ -150,6 +185,15 @@ public sealed class NestedCanvas : FrameworkElement
     private readonly List<Hotspot> _hotspots = [];
     private Dictionary<TextKey, FormattedText> _textCache = [];
     private Dictionary<TextKey, FormattedText> _oldTextCache = [];
+
+    // What the names are made of, kept from frame to frame: the paths and
+    // marks of the files on screen, and the words for sizes and counts.
+    private const int MaximumKeptFiles = 8192;
+    private Dictionary<(string Folder, string Name), FileFacts> _fileFacts = new(ReferenceKeyComparer.Instance);
+    private Dictionary<(string Folder, string Name), FileFacts> _oldFileFacts = new(ReferenceKeyComparer.Instance);
+    private readonly NumberTexts _sizeTexts = new(8192);
+    private readonly NumberTexts _detailTexts = new(2048);
+    private readonly NumberTexts _noteTexts = new(256);
     private double _minCell = MinimumCellPixels;
 
     private const int FilterSelf = 1;
@@ -191,16 +235,16 @@ public sealed class NestedCanvas : FrameworkElement
     private readonly Dictionary<Color, Brush> _brushes = [];
 
     // The picture is four layers, each redrawn only when what it shows
-    // changed: the cells (a bitmap), the names on them, the marks and outlines
-    // over them, and the pointer's outline and tag on top.  A click that only
-    // moves the selection redraws the third; an icon arriving, the second;
-    // moving the mouse, the fourth.  Only the camera or the tree moving
-    // repaints the cells.
+    // changed: the cells (the GPU's surface, or a bitmap), the names on them,
+    // the marks and outlines over them, and the pointer's outline and tag on
+    // top.  A click that only moves the selection redraws the third; an icon
+    // arriving, the second; moving the mouse, the fourth.  Only the camera or
+    // the tree moving repaints the cells.
     private readonly DrawingVisual _sceneVisual = new();
     private readonly DrawingVisual _labelVisual = new();
     private readonly DrawingVisual _decorVisual = new();
     private readonly DrawingVisual _overlay = new();
-    private readonly List<Hotspot> _labelHotspots = [];
+    private readonly List<LabelGrab> _labelHotspots = [];
     private Layers _dirty = Layers.All;
     private bool _frameHooked;
     private WriteableBitmap? _shownBitmap;
@@ -212,6 +256,35 @@ public sealed class NestedCanvas : FrameworkElement
 
     private NestedTree? _tree;
     private WriteableBitmap? _bitmap;
+
+    // The scene on the GPU (see "the GPU" below): the surface WPF shows in
+    // place of the bitmap, the renderer and instance lists that fill it, and
+    // which surface and texture the scene layer was last recorded with.
+    private NestedSurface? _surface;
+    private NestedGpuRenderer? _renderer;
+    private NestedGpuFrame? _gpuFrame;
+    private GpuSink? _gpuSink;
+    private SurfaceDrawer? _drawSurface;
+    private NestedSurface? _shownSurface;
+    private int _shownSurfaceVersion;
+    private bool _surfaceLost;
+    private bool _presentPending;
+    private bool _gpuHooked;
+
+    // The names on the GPU (see "the names on the GPU" below): the target
+    // that turns the label calls into instances, the atlases it draws from,
+    // whether the last label layer went there, and whether WPF's label layer
+    // still holds a recording to be cleared once the GPU's is on screen.
+    private GpuLabelTarget? _gpuLabels;
+    private LabelAtlases? _labelAtlases;
+    private bool _labelEventsHooked;
+    private bool _labelsOnGpu;
+    private bool _labelVisualRecorded;
+    private int _labelMaterialQueued;
+    private readonly Action _requestLabelsFrame;
+    private Window? _gpuWindow;
+    private DispatcherTimer? _monitorCheck;
+    private DispatcherTimer? _gpuRetry;
     private double _scaleX = 1;
     private double _scaleY = 1;
     private double _viewWidth;
@@ -269,6 +342,10 @@ public sealed class NestedCanvas : FrameworkElement
 
     public NestedCanvas()
     {
+        _rasterSink = new RasterSink(_raster);
+        _sink = _rasterSink;
+        _wpfLabels = new WpfLabelTarget(this);
+        _requestLabelsFrame = RequestLabelsFrame;
         Focusable = true;
         FocusVisualStyle = null;
         ClipToBounds = true;
@@ -283,8 +360,16 @@ public sealed class NestedCanvas : FrameworkElement
         AddVisualChild(_labelVisual);
         AddVisualChild(_decorVisual);
         AddVisualChild(_overlay);
-        Unloaded += (_, _) => UnhookFrame();
-        Loaded += (_, _) => RequestFrame(Layers.All);
+        Unloaded += (_, _) =>
+        {
+            UnhookFrame();
+            UnhookGpu();
+        };
+        Loaded += (_, _) =>
+        {
+            HookGpu();
+            RequestFrame(Layers.All);
+        };
     }
 
     protected override int VisualChildrenCount => 4;
@@ -339,6 +424,7 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 _tree.Changed -= OnTreeChanged;
                 _tree.FolderLoaded -= OnFolderLoadedForFilter;
+                _tree.FolderLoaded -= OnFolderLoadedForGpu;
                 _tree.SortChanged -= OnTreeSortChanged;
             }
 
@@ -348,6 +434,7 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 _tree.Changed += OnTreeChanged;
                 _tree.FolderLoaded += OnFolderLoadedForFilter;
+                _tree.FolderLoaded += OnFolderLoadedForGpu;
                 _tree.SortChanged += OnTreeSortChanged;
             }
 
@@ -448,6 +535,54 @@ public sealed class NestedCanvas : FrameworkElement
 
     /// <summary>Frames built so far; a benchmark tells a new frame from an old one by it.</summary>
     public long RenderCount { get; private set; }
+
+    /// <summary>The whole of the last frame the canvas's loop drew, on the UI thread: scene, names, marks and pointer layers.</summary>
+    public double LastFrameMilliseconds { get; private set; }
+
+    /// <summary>Whether the scene layer shows the GPU's picture (true) or the CPU raster's bitmap.</summary>
+    public bool IsSceneOnGpu => _shownSurface is not null && ReferenceEquals(_shownSurface, _surface);
+
+    /// <summary>Why the last frame drew its scene where it did: the GPU is ready, or why it was not used.</summary>
+    public string RendererReason { get; private set; } = GpuBootstrap.ReasonNotOnScreen;
+
+    /// <summary>The card the scene is drawn on, or empty while it is drawn on the CPU.</summary>
+    public string RendererAdapter => IsSceneOnGpu ? _surface!.Devices.AdapterName : string.Empty;
+
+    /// <summary>How long the last scene's walk took on the UI thread, filling the GPU's instances or the raster's pixels.</summary>
+    public double LastWalkMilliseconds { get; private set; }
+
+    /// <summary>The last GPU frame's present on the UI thread, image lock to unlock (0 on the CPU path).</summary>
+    public double LastPresentMilliseconds { get; private set; }
+
+    /// <summary>How long the last GPU frame waited for WPF's render thread to let go of the previous one (the image lock).</summary>
+    public double LastLockMilliseconds { get; private set; }
+
+    /// <summary>How long the last GPU frame's present waited for the GPU to finish it.</summary>
+    public double LastGpuWaitMilliseconds { get; private set; }
+
+    /// <summary>The GPU's own time for a recent frame, from timestamps; NaN until one has been measured.</summary>
+    public double LastGpuMilliseconds { get; private set; } = double.NaN;
+
+    /// <summary>Instances drawn by the last GPU frame.</summary>
+    public int LastGpuInstances { get; private set; }
+
+    /// <summary>GPU frames skipped because WPF's render thread still held the previous one; they are drawn a frame later.</summary>
+    public int SkippedPresents { get; private set; }
+
+    /// <summary>Whether the names are drawn on the GPU with the cells (true) or by WPF over them.</summary>
+    public bool AreLabelsOnGpu => _labelsOnGpu;
+
+    /// <summary>
+    /// How long the last GPU frame spent sending data to the card on the UI
+    /// thread: the instances into their buffers, arrived icons and new
+    /// glyphs into the atlases' textures.
+    /// </summary>
+    public double LastUploadMilliseconds { get; private set; }
+
+    /// <summary>Glyphs and icons drawn by the last GPU frame's names.</summary>
+    public int LastGpuGlyphs { get; private set; }
+
+    public int LastGpuIcons { get; private set; }
 
     /// <summary>What the rest of the app has selected; drawn with the selection outline.</summary>
     public void SetSelection(IEnumerable<string> paths, string activePath)
@@ -821,7 +956,16 @@ public sealed class NestedCanvas : FrameworkElement
     {
         var layers = _dirty | Layers.All;
         _dirty = Layers.None;
-        RenderLayers(layers, inMotion: false);
+
+        // A snapshot must hold this frame, not the last one: a GPU frame that
+        // found WPF still copying the previous one is tried again at once -
+        // each try waits a moment for the copy - before giving up to the loop.
+        var drawn = RenderLayers(layers, inMotion: false);
+        for (var attempt = 1; !drawn && attempt < 10; attempt++)
+        {
+            _dirty = Layers.None;
+            drawn = RenderLayers(layers, inMotion: false);
+        }
     }
 
     /// <summary>
@@ -1731,6 +1875,7 @@ public sealed class NestedCanvas : FrameworkElement
             // Only a frame of the loop has a next frame to leave work to; a
             // snapshot or a test drawing on demand gets everything placed.
             _inFrameLoop = true;
+            var frameStarted = System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
                 // Between stopping and settling, the frames that are drawn keep
@@ -1740,6 +1885,7 @@ public sealed class NestedCanvas : FrameworkElement
             finally
             {
                 _inFrameLoop = false;
+                LastFrameMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(frameStarted).TotalMilliseconds;
             }
         }
 
@@ -1945,26 +2091,51 @@ public sealed class NestedCanvas : FrameworkElement
         }
     }
 
-    private void RenderLayers(Layers layers, bool inMotion)
+    /// <summary>
+    /// Takes the canvas's DPI scale, from the window or from a test's
+    /// <see cref="DpiOverride"/>; true when it changed, which makes the
+    /// bitmap, the GPU surface and every text layout out of date.
+    /// </summary>
+    private bool UpdateScale()
+    {
+        var dpi = DpiOverride ?? VisualTreeHelper.GetDpi(this);
+        if (dpi.DpiScaleX == _scaleX && dpi.DpiScaleY == _scaleY)
+        {
+            return false;
+        }
+
+        _scaleX = dpi.DpiScaleX;
+        _scaleY = dpi.DpiScaleY;
+        _bitmap = null;
+        _textCache.Clear();
+        _oldTextCache.Clear();
+        return true;
+    }
+
+    /// <summary>
+    /// A DPI scale to draw at instead of the window's: for tests, and for the
+    /// bench's stand-in for a 150 % monitor on a 100 % one (<c>--bench-scale</c>).
+    /// </summary>
+    internal DpiScale? DpiOverride { get; set; }
+
+    /// <summary>
+    /// Draws the layers asked for; false when the frame could not be shown -
+    /// the GPU's previous frame was still being copied - and was left for the
+    /// next tick, which is already asked for.
+    /// </summary>
+    private bool RenderLayers(Layers layers, bool inMotion)
     {
         // Hidden or not laid out yet: draw nothing, and keep the size the
         // camera was set up for rather than forgetting it.
         if (ActualWidth < 1 || ActualHeight < 1 || _tree is null)
         {
-            return;
+            return true;
         }
 
         _viewWidth = ActualWidth;
         _viewHeight = ActualHeight;
-
-        var dpi = VisualTreeHelper.GetDpi(this);
-        if (dpi.DpiScaleX != _scaleX || dpi.DpiScaleY != _scaleY)
+        if (UpdateScale())
         {
-            _scaleX = dpi.DpiScaleX;
-            _scaleY = dpi.DpiScaleY;
-            _bitmap = null;
-            _textCache.Clear();
-            _oldTextCache.Clear();
             layers = Layers.All;
         }
 
@@ -1985,26 +2156,72 @@ public sealed class NestedCanvas : FrameworkElement
             layers |= Layers.Labels | Layers.Decor;
         }
 
+        _presentPending = false;
+        LastUploadMilliseconds = 0;
+        var allocated = GC.GetAllocatedBytesForCurrentThread();
+        var sceneAllocated = 0L;
         if ((layers & Layers.Scene) != 0)
         {
             RenderScene(inMotion);
             layers |= Layers.Labels | Layers.Decor | Layers.Overlay;
+            sceneAllocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
         }
 
+        allocated = GC.GetAllocatedBytesForCurrentThread();
         var layerStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         NewTextLayouts = 0;
         _textBudget = inMotion ? MotionTextBudget : int.MaxValue;
         _textDeferred = false;
-        if ((layers & Layers.Labels) != 0)
+        if ((layers & Layers.Labels) != 0 && !TryDrawLabelsOnGpu(inMotion))
         {
-            _labelHotspots.Clear();
-            using var dc = _labelVisual.RenderOpen();
-            DrawLabels(dc);
-            DrawFileLabels(dc);
+            DrawLabelsWithWpf();
         }
 
         LastLabelsMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(layerStarted).TotalMilliseconds;
-        layerStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        var labelsAllocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+
+        // On the CPU the marks and the pointer's layer are recorded here, as
+        // they always were.  Over the GPU's picture they wait for the present
+        // below: a present WPF's render thread was too late for leaves the
+        // surface showing the previous frame, and outlines, beacons and the
+        // hover recorded for the new camera would sit offset from the cells
+        // under them for a frame.  Recorded only once the frame they belong
+        // to is shown, they never lag the cells or run ahead of them.
+        var decorAfterPresent = _presentPending;
+        var decorAllocated = decorAfterPresent ? 0 : RecordDecorAndOverlay(layers);
+        allocated = GC.GetAllocatedBytesForCurrentThread();
+
+        // The GPU's scene last, once the frame's other CPU work is done: the
+        // image lock waits for WPF's render thread to finish copying the
+        // previous frame, and the walk and the names gave it that time.
+        var shown = !_presentPending || PresentScene();
+        var presentAllocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+        if (decorAfterPresent)
+        {
+            if (shown)
+            {
+                decorAllocated = RecordDecorAndOverlay(layers);
+            }
+            else
+            {
+                LastDecorMilliseconds = 0;
+            }
+        }
+
+        LastAllocations = new FrameAllocations(sceneAllocated, labelsAllocated, decorAllocated, presentAllocated);
+        return shown;
+    }
+
+    /// <summary>
+    /// The frame's marks - filter outlines, selection, drop target, beacons,
+    /// trail - and the pointer's layer, when they are among
+    /// <paramref name="layers"/>; the text cache's generation turned when it
+    /// is full.  Returns what it handed the garbage collector.
+    /// </summary>
+    private long RecordDecorAndOverlay(Layers layers)
+    {
+        var allocated = GC.GetAllocatedBytesForCurrentThread();
+        var layerStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         if ((layers & Layers.Decor) != 0)
         {
             _hotspots.Clear();
@@ -2041,14 +2258,22 @@ public sealed class NestedCanvas : FrameworkElement
             (_oldTextCache, _textCache) = (_textCache, _oldTextCache);
             _textCache.Clear();
         }
+
+        return GC.GetAllocatedBytesForCurrentThread() - allocated;
     }
+
+    /// <summary>What the last frame handed the garbage collector, layer by layer: the scene, the names, the marks and the pointer's layer together, and the present.</summary>
+    public FrameAllocations LastAllocations { get; private set; }
 
     /// <summary>
     /// The cells: one walk from the outermost folder that still covers the
     /// whole view down through everything on screen and big enough to see,
-    /// filling rectangles into the bitmap.
+    /// filling rectangles into the frame's target - the GPU's instances when
+    /// the canvas is in a window whose card is ready, the raster's bitmap
+    /// otherwise, or a test's offscreen texture.  The GPU's frame is
+    /// presented at the end of the frame (<see cref="PresentScene"/>).
     /// </summary>
-    private void RenderScene(bool inMotion)
+    private void RenderScene(bool inMotion, OffscreenScene? offscreen = null)
     {
         using var frame = PerfLog.Measure("nested.frame");
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
@@ -2057,34 +2282,6 @@ public sealed class NestedCanvas : FrameworkElement
         var pixelWidth = Math.Max(1, (int)Math.Ceiling(_viewWidth * _scaleX));
         var pixelHeight = Math.Max(1, (int)Math.Ceiling(_viewHeight * _scaleY));
 
-        // Grown in steps and reused.  Dragging a window edge is a new size on
-        // every step, and a new full-screen bitmap each time - tens of
-        // megabytes of native memory freed only by a full collection - was
-        // what made a live resize stutter.  The part past the control is
-        // simply never drawn into, and clipped away.
-        if (_bitmap is null
-            || _bitmap.PixelWidth < pixelWidth
-            || _bitmap.PixelHeight < pixelHeight
-            || (long)_bitmap.PixelWidth * _bitmap.PixelHeight > 3L * pixelWidth * pixelHeight + 2_000_000)
-        {
-            _bitmap = new WriteableBitmap(
-                (pixelWidth + 255) / 256 * 256,
-                (pixelHeight + 255) / 256 * 256,
-                96 * _scaleX,
-                96 * _scaleY,
-                PixelFormats.Pbgra32,
-                null);
-        }
-
-        if (!ReferenceEquals(_shownBitmap, _bitmap))
-        {
-            // The layer holds the bitmap itself; from then on only its pixels
-            // change, and the layer never has to be recorded again.
-            _shownBitmap = _bitmap;
-            using var dc = _sceneVisual.RenderOpen();
-            dc.DrawImage(_bitmap, new Rect(0, 0, _bitmap.PixelWidth / _scaleX, _bitmap.PixelHeight / _scaleY));
-        }
-
         // Motion LOD, the way a game drops detail it cannot afford in a frame:
         // while the camera moves, cells and file tiles below a size that grows
         // when frames run long are left out; the frame after it stops draws
@@ -2092,36 +2289,20 @@ public sealed class NestedCanvas : FrameworkElement
         var lod = inMotion ? _lod : 1;
         _minCell = MinimumCellPixels * lod;
         _minTile = 2.5 * lod;
-
-        _labels.Clear();
-        _labelled.Clear();
-        _fileLabels.Clear();
-        _filterOutlines.Clear();
-        DrawnCellCount = 0;
-        _foldersDrawn = 0;
-        _tilesDrawn = 0;
         _relayoutAllowance = _inFrameLoop ? DrawRelayoutTicks : long.MaxValue;
-        _relayoutSpent = 0;
-        _drewStale = false;
-        _drawnStale.Clear();
 
-        _bitmap.Lock();
-        try
+        // The one place a frame's target is chosen: the GPU when it can be
+        // used, else the bitmap painted by hand - and if the GPU fails half
+        // way through a frame, the bitmap for that same frame.  Each brings
+        // its own sink to WalkScene; everything before and after is the same
+        // for all.
+        if (offscreen is { } scene)
         {
-            _raster.Attach(_bitmap.BackBuffer, pixelWidth, pixelHeight, _bitmap.BackBufferStride);
-            var (cover, x, y, w, covers) = CoverCell();
-            if (!covers)
-            {
-                _raster.Clear(CanvasColour);
-            }
-
-            DrawCell(cover, x, y, w, labelsAllowed: true);
-            _bitmap.AddDirtyRect(new Int32Rect(0, 0, pixelWidth, pixelHeight));
+            PaintSceneOffscreen(scene, pixelWidth, pixelHeight, inMotion);
         }
-        finally
+        else if (!TryWalkSceneForGpu(pixelWidth, pixelHeight))
         {
-            _raster.Detach();
-            _bitmap.Unlock();
+            PaintSceneIntoBitmap(pixelWidth, pixelHeight);
         }
 
         var elapsed = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
@@ -2151,6 +2332,824 @@ public sealed class NestedCanvas : FrameworkElement
             _drawnStale.Clear();
             RequestFrame(Layers.Scene);
         }
+    }
+
+    /// <summary>
+    /// The scene painted into the bitmap the scene layer shows, through
+    /// <see cref="RasterSink"/>: the canvas's own picture, and the one any
+    /// other target is measured against.
+    /// </summary>
+    private void PaintSceneIntoBitmap(int pixelWidth, int pixelHeight)
+    {
+        // Grown in steps and reused.  Dragging a window edge is a new size on
+        // every step, and a new full-screen bitmap each time - tens of
+        // megabytes of native memory freed only by a full collection - was
+        // what made a live resize stutter.  The part past the control is
+        // simply never drawn into, and clipped away.
+        if (_bitmap is null
+            || _bitmap.PixelWidth < pixelWidth
+            || _bitmap.PixelHeight < pixelHeight
+            || (long)_bitmap.PixelWidth * _bitmap.PixelHeight > 3L * pixelWidth * pixelHeight + 2_000_000)
+        {
+            _bitmap = new WriteableBitmap(
+                (pixelWidth + 255) / 256 * 256,
+                (pixelHeight + 255) / 256 * 256,
+                96 * _scaleX,
+                96 * _scaleY,
+                PixelFormats.Pbgra32,
+                null);
+        }
+
+        if (!ReferenceEquals(_shownBitmap, _bitmap))
+        {
+            // The layer holds the bitmap itself; from then on only its pixels
+            // change, and the layer never has to be recorded again.
+            _shownBitmap = _bitmap;
+            _shownSurface = null;
+            using var dc = _sceneVisual.RenderOpen();
+            dc.DrawImage(_bitmap, new Rect(0, 0, _bitmap.PixelWidth / _scaleX, _bitmap.PixelHeight / _scaleY));
+        }
+
+        _bitmap.Lock();
+        try
+        {
+            _raster.Attach(_bitmap.BackBuffer, pixelWidth, pixelHeight, _bitmap.BackBufferStride);
+            var walkStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            WalkScene(_rasterSink);
+            LastWalkMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(walkStarted).TotalMilliseconds;
+            LastPresentMilliseconds = 0;
+            LastLockMilliseconds = 0;
+            LastGpuWaitMilliseconds = 0;
+            _bitmap.AddDirtyRect(new Int32Rect(0, 0, pixelWidth, pixelHeight));
+        }
+        finally
+        {
+            _raster.Detach();
+            _bitmap.Unlock();
+        }
+    }
+
+    // ---- the GPU -----------------------------------------------------------------
+
+    /// <summary>
+    /// The scene for the GPU, when <see cref="GpuBootstrap.Decide"/> says the
+    /// card that drives the window's monitor is ready: the walk fills the
+    /// frame's instances through <see cref="GpuSink"/>, to be put on the
+    /// texture the scene layer shows - where the bitmap used to be - by
+    /// <see cref="PresentScene"/> at the end of the frame.  The names go to
+    /// the same texture through <see cref="GpuLabelTarget"/> once the atlases
+    /// are ready (<see cref="TryDrawLabelsOnGpu"/>); the marks, outlines,
+    /// trail and pointer's layer above it stay WPF's.
+    ///
+    /// False when the GPU does not draw this frame, and the caller paints the
+    /// bitmap instead: no window, the CPU chosen, or the card not ready yet -
+    /// the canvas moves over at the first frame after it is.  A surface that
+    /// is drawing already keeps drawing while the card for the window's
+    /// monitor is still being prepared - the monitors being matched again
+    /// after a display change, the window just moved onto another card's
+    /// monitor - rather than dropping a working picture to the CPU for the
+    /// moment; the canvas moves to the right set when it is ready.
+    /// </summary>
+    private bool TryWalkSceneForGpu(int pixelWidth, int pixelHeight)
+    {
+        if (_surfaceLost)
+        {
+            ReleaseGpu(lost: true);
+        }
+
+        var decision = GpuBootstrap.Decide(this);
+        RendererReason = decision.Reason;
+        var devices = decision.DeviceSet;
+        if (devices is null
+            && ReferenceEquals(decision.Reason, GpuBootstrap.ReasonWarmingUp)
+            && _surface is { IsLost: false } kept
+            && !kept.Devices.IsDisposed
+            && kept.ScaleX == _scaleX
+            && kept.ScaleY == _scaleY)
+        {
+            devices = kept.Devices;
+            ScheduleGpuRetry();
+        }
+
+        if (devices is null || !EnsureSurface(devices))
+        {
+            if (_surface is not null)
+            {
+                ReleaseGpu(lost: false);
+            }
+
+            if (IsWorthAskingAgain(RendererReason))
+            {
+                ScheduleGpuRetry();
+            }
+
+            return false;
+        }
+
+        var surface = _surface!;
+        surface.EnsureSize(pixelWidth, pixelHeight);
+        if (surface.IsLost)
+        {
+            ReleaseGpu(lost: true);
+            ScheduleGpuRetry();
+            return false;
+        }
+
+        var frame = _gpuFrame ??= new NestedGpuFrame();
+        var sink = _gpuSink ??= new GpuSink();
+        var walkStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        sink.Begin(frame.SceneRects, pixelWidth, pixelHeight, CanvasColour);
+        WalkScene(sink);
+        frame.ClearColour = sink.ClearColour;
+        frame.SceneChanged();
+        LastWalkMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(walkStarted).TotalMilliseconds;
+        _presentPending = true;
+        return true;
+    }
+
+    /// <summary>
+    /// Puts the frame's instances on screen: one present of the surface -
+    /// locked, drawn, waited for, unlocked - in the same WPF batch as the
+    /// layers recorded above it, so the names never lag the cells.  False
+    /// when WPF's render thread still held the previous frame; the whole
+    /// frame is drawn again on the next tick.  A device lost here costs
+    /// nothing on screen: the same frame is painted into the bitmap at once.
+    /// </summary>
+    private bool PresentScene()
+    {
+        _presentPending = false;
+        if (_surface is not { } surface)
+        {
+            return true;
+        }
+
+        var result = surface.Present(_drawSurface ??= DrawSurface);
+        LastPresentMilliseconds = surface.LastPresentMilliseconds;
+        LastLockMilliseconds = surface.LastLockMilliseconds;
+        LastGpuWaitMilliseconds = surface.LastGpuWaitMilliseconds;
+        LastRenderMilliseconds += surface.LastPresentMilliseconds;
+        if (!surface.Devices.IsDisposed)
+        {
+            LastGpuMilliseconds = surface.Devices.Timer.LastGpuMilliseconds;
+        }
+
+        switch (result)
+        {
+            case PresentResult.Presented:
+                LastGpuInstances = _renderer!.LastInstances;
+                LastGpuGlyphs = _renderer.LastGlyphs;
+                LastGpuIcons = _renderer.LastIcons;
+                LastUploadMilliseconds += _renderer.LastUploadMilliseconds;
+                ShowSurface(surface);
+                if (_labelsOnGpu && _labelVisualRecorded)
+                {
+                    // The names are in the GPU's picture from this frame on;
+                    // WPF's recording of them goes in the same batch, so no
+                    // frame shows both or neither.
+                    _labelVisual.RenderOpen().Close();
+                    _labelVisualRecorded = false;
+                }
+
+                return true;
+
+            case PresentResult.Skipped:
+                // The names drawn over this frame are for a camera the cells
+                // do not show yet; the next tick draws both again.
+                SkippedPresents++;
+                RequestFrame(Layers.All);
+                return false;
+
+            case PresentResult.Unavailable:
+                // WPF has no front buffer - the lock screen, a UAC prompt -
+                // so nothing drawn now would be seen.  The surface says when
+                // it is back (ContentLost), and a whole frame follows.
+                return true;
+
+            default:
+                // Lost in the middle of this frame: the same frame goes into
+                // the bitmap - the walk again - and its names to WPF, and the
+                // GPU is tried again once the bootstrap has a new set for the
+                // card.
+                var labelsWereOnGpu = _labelsOnGpu;
+                ReleaseGpu(lost: true);
+                PaintSceneIntoBitmap(ScenePixelWidth, ScenePixelHeight);
+                if (labelsWereOnGpu)
+                {
+                    DrawLabelsWithWpf();
+                }
+
+                ScheduleGpuRetry();
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// A surface on <paramref name="devices"/> at the canvas's DPI, made anew
+    /// when the card or the DPI changed - the window moved to a monitor on
+    /// another card or of another scale - together with the card's renderer.
+    /// False when the card cannot make them, which counts as losing it.
+    /// </summary>
+    private bool EnsureSurface(GpuDeviceSet devices)
+    {
+        if (_surface is { IsLost: false } current
+            && ReferenceEquals(current.Devices, devices)
+            && current.ScaleX == _scaleX
+            && current.ScaleY == _scaleY)
+        {
+            return true;
+        }
+
+        ReleaseGpu(lost: _surface?.IsLost == true);
+        try
+        {
+            _renderer = NestedGpuRenderer.For(devices);
+            _surface = new NestedSurface(devices, _scaleX, _scaleY);
+        }
+        catch (Exception ex) when (ex is SharpGen.Runtime.SharpGenException or GpuUnavailableException or ObjectDisposedException or ArgumentException)
+        {
+            // Shaders that will not load or buffers the card will not make
+            // are as good as a lost device: the bootstrap tries the card
+            // again later, and after three failures a minute leaves the
+            // canvas on the CPU for the session.
+            _renderer = null;
+            RendererReason = GpuBootstrap.ReasonUnavailable;
+            if (!devices.IsDisposed)
+            {
+                GpuBootstrap.ReportDeviceLost(devices);
+            }
+
+            return false;
+        }
+
+        _surface.DeviceLost += OnSurfaceDeviceLost;
+        _surface.ContentLost += OnSurfaceContentLost;
+        return true;
+    }
+
+    /// <summary>
+    /// Records the scene layer with the surface, once per surface and per
+    /// texture it hands WPF - after the present that handed it over, so the
+    /// rectangle drawn is always the texture WPF holds.  The bitmap is not
+    /// drawn while the GPU is, and its tens of megabytes go with it.
+    /// </summary>
+    private void ShowSurface(NestedSurface surface)
+    {
+        if (ReferenceEquals(_shownSurface, surface) && _shownSurfaceVersion == surface.SurfaceVersion)
+        {
+            return;
+        }
+
+        _shownSurface = surface;
+        _shownSurfaceVersion = surface.SurfaceVersion;
+        _shownBitmap = null;
+        _bitmap = null;
+        using var dc = _sceneVisual.RenderOpen();
+        dc.DrawImage(surface, surface.DrawRect);
+    }
+
+    /// <summary>The renderer's part of a present: GPU commands only, the instances filled before the lock.</summary>
+    private void DrawSurface(in SurfaceFrame frame) => _renderer!.Draw(frame.Target, frame.Width, frame.Height, _gpuFrame!);
+
+    /// <summary>
+    /// Gives up the surface: back to the bitmap, which the next CPU frame
+    /// records in the scene layer again.  A lost card is also handed back to
+    /// the bootstrap, which throws its set away and makes a new one.
+    /// </summary>
+    private void ReleaseGpu(bool lost)
+    {
+        var surface = _surface;
+        _surface = null;
+        _renderer = null;
+        _surfaceLost = false;
+        if (surface is null)
+        {
+            return;
+        }
+
+        surface.DeviceLost -= OnSurfaceDeviceLost;
+        surface.ContentLost -= OnSurfaceContentLost;
+        var devices = surface.Devices;
+        surface.Dispose();
+        if (lost && !devices.IsDisposed)
+        {
+            GpuBootstrap.ReportDeviceLost(devices);
+        }
+    }
+
+    /// <summary>The surface's device failed: the next frame lets it go and draws on the CPU.</summary>
+    private void OnSurfaceDeviceLost(object? sender, EventArgs e)
+    {
+        _surfaceLost = true;
+        RequestFrame(Layers.All);
+    }
+
+    /// <summary>WPF's front buffer came back (after the lock screen, say): nothing on the surface can be trusted.</summary>
+    private void OnSurfaceContentLost(object? sender, EventArgs e) => RequestFrame(Layers.All);
+
+    /// <summary>
+    /// Listens, while the canvas is in a window, for what can change where
+    /// its scene is drawn without anything on the canvas changing: a card
+    /// finishing its warm-up, the renderer setting, the window moving to a
+    /// monitor on another card, and the monitors matched to their cards
+    /// again after a display change.
+    /// </summary>
+    private void HookGpu()
+    {
+        if (_gpuHooked)
+        {
+            return;
+        }
+
+        _gpuHooked = true;
+        GpuBootstrap.DeviceSetReady += OnDeviceSetReady;
+        GpuBootstrap.PreferenceChanged += OnRendererPreferenceChanged;
+        GpuBootstrap.MonitorsMatched += OnMonitorsMatched;
+        _gpuWindow = Window.GetWindow(this);
+        if (_gpuWindow is not null)
+        {
+            _gpuWindow.LocationChanged += OnWindowMoved;
+        }
+    }
+
+    private void UnhookGpu()
+    {
+        if (_gpuHooked)
+        {
+            _gpuHooked = false;
+            GpuBootstrap.DeviceSetReady -= OnDeviceSetReady;
+            GpuBootstrap.PreferenceChanged -= OnRendererPreferenceChanged;
+            GpuBootstrap.MonitorsMatched -= OnMonitorsMatched;
+            if (_gpuWindow is not null)
+            {
+                _gpuWindow.LocationChanged -= OnWindowMoved;
+                _gpuWindow = null;
+            }
+        }
+
+        _monitorCheck?.Stop();
+        _gpuRetry?.Stop();
+        UnhookLabelAtlases();
+        ReleaseGpu(lost: false);
+    }
+
+    /// <summary>Whether the GPU may be ready later without anything else happening: a card warming up, or one to be tried again.</summary>
+    private static bool IsWorthAskingAgain(string reason) =>
+        ReferenceEquals(reason, GpuBootstrap.ReasonWarmingUp) || ReferenceEquals(reason, GpuBootstrap.ReasonUnavailable);
+
+    /// <summary>
+    /// Asks again in a moment whether the GPU can draw.  A card still warming
+    /// up says when it is ready, but one that failed or was lost is only made
+    /// again when somebody asks after the bootstrap's wait - and a canvas at
+    /// rest draws no frames to ask in.  Without this, a canvas that lost its
+    /// card while the user was reading would stay on the CPU until the next
+    /// time the view moved.
+    /// </summary>
+    private void ScheduleGpuRetry()
+    {
+        if (_gpuRetry is null)
+        {
+            _gpuRetry = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromSeconds(2) };
+            _gpuRetry.Tick += OnGpuRetry;
+        }
+
+        if (!_gpuRetry.IsEnabled)
+        {
+            _gpuRetry.Start();
+        }
+    }
+
+    private void OnGpuRetry(object? sender, EventArgs e)
+    {
+        _gpuRetry?.Stop();
+        var decision = GpuBootstrap.Decide(this);
+        if (IsSceneOnGpu && ReferenceEquals(decision.DeviceSet, _surface?.Devices))
+        {
+            return;
+        }
+
+        if (decision.UseGpu)
+        {
+            RequestFrame(Layers.All);
+        }
+        else if (IsWorthAskingAgain(decision.Reason))
+        {
+            _gpuRetry?.Start();
+        }
+    }
+
+    /// <summary>
+    /// A card is warm (the warm-up thread says so): a canvas still on the
+    /// CPU, or drawing on another card's set while this one was prepared,
+    /// moves over at its next frame.
+    /// </summary>
+    private void OnDeviceSetReady(GpuDeviceSet devices) =>
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (!IsSceneOnGpu || !ReferenceEquals(GpuBootstrap.Decide(this).DeviceSet, _surface?.Devices))
+            {
+                RequestFrame(Layers.All);
+            }
+        });
+
+    /// <summary>After a display change the monitors have been matched to their cards again: redraw if this one's card is not the one drawing it.</summary>
+    private void OnMonitorsMatched() => Dispatcher.InvokeAsync(() => OnMonitorCheck(null, EventArgs.Empty));
+
+    private void OnRendererPreferenceChanged(object? sender, EventArgs e)
+    {
+        if (Dispatcher.CheckAccess())
+        {
+            RequestFrame(Layers.All);
+        }
+        else
+        {
+            Dispatcher.InvokeAsync(() => RequestFrame(Layers.All));
+        }
+    }
+
+    /// <summary>
+    /// The window moved.  Once it has stayed put for 150 ms, the canvas asks
+    /// whether its monitor is driven by another card than the one drawing it
+    /// and, if so, redraws - on that card's set, made ahead of time.  Not on
+    /// every step of a drag across the boundary between two monitors.
+    /// </summary>
+    private void OnWindowMoved(object? sender, EventArgs e)
+    {
+        if (_monitorCheck is null)
+        {
+            _monitorCheck = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromMilliseconds(150) };
+            _monitorCheck.Tick += OnMonitorCheck;
+        }
+
+        _monitorCheck.Stop();
+        _monitorCheck.Start();
+    }
+
+    private void OnMonitorCheck(object? sender, EventArgs e)
+    {
+        _monitorCheck?.Stop();
+        if (!ReferenceEquals(GpuBootstrap.Decide(this).DeviceSet, _surface?.Devices))
+        {
+            RequestFrame(Layers.All);
+        }
+    }
+
+    // ---- the names on the GPU --------------------------------------------------
+
+    /// <summary>
+    /// The label layer for a frame whose cells are on the GPU: the same
+    /// <see cref="DrawLabelLayer"/> the WPF layer is recorded from, into
+    /// <see cref="GpuLabelTarget"/>, so the names become glyph, icon and
+    /// rectangle instances presented with the cells.  A frame that only
+    /// redraws the names (an icon or a glyph arrived) presents again with the
+    /// scene's instances as they were uploaded.
+    ///
+    /// False - the names go to WPF - when the cells are not on the GPU, or
+    /// the atlases the names are drawn from could not be made.
+    /// </summary>
+    private bool TryDrawLabelsOnGpu(bool inMotion)
+    {
+        if (_surface is not { IsLost: false } surface
+            || _surfaceLost
+            || _renderer is null
+            || _gpuFrame is null
+            || GpuLabelAtlases.Current is not { } atlases)
+        {
+            return false;
+        }
+
+        if (surface.Devices.IsDisposed)
+        {
+            // Handed back as lost by another canvas on the same card: nothing
+            // of it may be touched.  The next frame gives the surface up.
+            _surfaceLost = true;
+            RequestFrame(Layers.All);
+            return false;
+        }
+
+        var target = EnsureGpuLabels(atlases);
+        try
+        {
+            target.Begin(_gpuFrame, surface.Devices, ScenePixelWidth, ScenePixelHeight, _scaleX, _scaleY, snap: !inMotion);
+            DrawLabelLayer(target);
+
+            // The glyphs placed since the last frame go to the card here - and
+            // when the atlas has outgrown its texture, a larger one is made -
+            // so the card can fail here as much as in Begin.
+            target.End();
+        }
+        catch (Exception ex) when (ex is SharpGen.Runtime.SharpGenException or ObjectDisposedException or GpuUnavailableException)
+        {
+            // The card failed making or filling the atlases' textures: as good
+            // as lost.  This frame's names go to WPF over whatever the GPU
+            // shows; the next frame gives the surface up.
+            _surfaceLost = true;
+            RequestFrame(Layers.All);
+            return false;
+        }
+
+        LastUploadMilliseconds += target.LastUploadMilliseconds;
+        if (target.WantsAnotherFrame)
+        {
+            RequestFrame(Layers.Labels);
+        }
+
+        _labelsOnGpu = true;
+        _presentPending = true;
+        return true;
+    }
+
+    /// <summary>
+    /// The label layer recorded by WPF, as the canvas has always drawn it:
+    /// on the CPU path, and on the GPU's cells when the names cannot go to
+    /// the GPU.  Names left in the GPU's frame from before are taken out.
+    /// </summary>
+    private void DrawLabelsWithWpf()
+    {
+        if (_labelsOnGpu)
+        {
+            _labelsOnGpu = false;
+            if (_gpuFrame is not null)
+            {
+                _gpuFrame.ClearLabels();
+                _presentPending |= _surface is not null;
+            }
+        }
+
+        using (var dc = _labelVisual.RenderOpen())
+        {
+            _wpfLabels.Begin(dc);
+            try
+            {
+                DrawLabelLayer(_wpfLabels);
+            }
+            finally
+            {
+                _wpfLabels.End();
+            }
+        }
+
+        _labelVisualRecorded = true;
+    }
+
+    /// <summary>
+    /// The canvas's GPU label target and its text shaper, made the first time
+    /// either is needed, and listening to the atlases for what arrives.
+    /// </summary>
+    private GpuLabelTarget EnsureGpuLabels(LabelAtlases atlases)
+    {
+        if (_gpuLabels is null || !ReferenceEquals(_labelAtlases, atlases))
+        {
+            UnhookLabelAtlases();
+            _labelAtlases = atlases;
+            _gpuLabels = new GpuLabelTarget(atlases.Faces, new TextShaper(atlases.Faces), atlases.Glyphs, atlases.Icons);
+        }
+
+        if (!_labelEventsHooked)
+        {
+            _labelEventsHooked = true;
+            _gpuLabels.Shaper.Arrived += OnLabelMaterialArrived;
+            atlases.Glyphs.GlyphsArrived += OnLabelMaterialArrived;
+            atlases.Icons.ArrivalsPending += OnLabelMaterialArrived;
+        }
+
+        return _gpuLabels;
+    }
+
+    private void UnhookLabelAtlases()
+    {
+        if (!_labelEventsHooked || _labelAtlases is null || _gpuLabels is null)
+        {
+            return;
+        }
+
+        _labelEventsHooked = false;
+        _gpuLabels.Shaper.Arrived -= OnLabelMaterialArrived;
+        _labelAtlases.Glyphs.GlyphsArrived -= OnLabelMaterialArrived;
+        _labelAtlases.Icons.ArrivalsPending -= OnLabelMaterialArrived;
+    }
+
+    /// <summary>
+    /// A name was shaped, a glyph made or an icon found, on one of the
+    /// atlases' threads: one request to redraw the names reaches the UI
+    /// thread, however many arrive before it is served.
+    /// </summary>
+    private void OnLabelMaterialArrived()
+    {
+        if (Interlocked.Exchange(ref _labelMaterialQueued, 1) == 0)
+        {
+            Dispatcher.BeginInvoke(DispatcherPriority.Normal, _requestLabelsFrame);
+        }
+    }
+
+    private void RequestLabelsFrame()
+    {
+        Volatile.Write(ref _labelMaterialQueued, 0);
+        if (_labelsOnGpu)
+        {
+            RequestFrame(Layers.Labels);
+        }
+    }
+
+    /// <summary>
+    /// A folder was read: its files' types go to the icon atlas's workers at
+    /// once, so a zoom into it finds its icons waiting, and so do the names
+    /// the UI font cannot show - Arabic, Hebrew, CJK, emoji - which are shaped
+    /// on the text shaper's worker and would otherwise be left out of the
+    /// frame they first appear in.  Latin, Greek and Cyrillic names, nearly
+    /// all of them, are shaped when first drawn, a few microseconds each:
+    /// measured, that costs the UI thread less than keeping the books on tens
+    /// of thousands of names ahead of time (up to 7 ms for one folder read),
+    /// and the heap does not fill with names nobody zooms to.  Only while the
+    /// GPU draws or may draw the canvas (<see cref="GpuMayDrawNames"/>): on
+    /// the CPU none of it would ever be used.
+    /// </summary>
+    private void OnFolderLoadedForGpu(NestedFolder folder)
+    {
+        if (!GpuMayDrawNames || GpuLabelAtlases.Current is not { } atlases || PresentationSource.FromVisual(this) is null)
+        {
+            return;
+        }
+
+        var files = folder.Files;
+        atlases.Icons.Prefetch(files);
+
+        List<string>? folderNames = null;
+        foreach (var child in folder.Children)
+        {
+            if (NeedsFallbackShaping(child.Name))
+            {
+                (folderNames ??= []).Add(child.Name);
+            }
+        }
+
+        List<string>? fileNames = null;
+        for (var index = 0; index < files.Count; index++)
+        {
+            var name = files[index].Name;
+            if (NeedsFallbackShaping(name))
+            {
+                (fileNames ??= []).Add(name);
+            }
+        }
+
+        if (folderNames is null && fileNames is null)
+        {
+            return;
+        }
+
+        var shaper = EnsureGpuLabels(atlases).Shaper;
+        if (folderNames is not null)
+        {
+            // A drive's name is set in the semibold face, a folder's in the regular.
+            shaper.Prefetch(folderNames, folder.IsComputer ? (byte)LabelFace.SemiBold : (byte)LabelFace.Regular);
+        }
+
+        if (fileNames is not null)
+        {
+            shaper.Prefetch(fileNames, (byte)LabelFace.Regular);
+        }
+    }
+
+    /// <summary>
+    /// Whether the GPU draws this canvas's names or may soon: false when the
+    /// CPU was chosen, when the GPU was lost too often this session, and when
+    /// the last frame's answer was one that does not change by waiting - WPF
+    /// below render tier 2 or in software, a remote session.  A canvas that
+    /// has not drawn a frame yet, or whose card is warming up or being tried
+    /// again, may.
+    /// </summary>
+    private bool GpuMayDrawNames =>
+        GpuBootstrap.Preference != RendererPreference.Cpu
+        && !GpuBootstrap.IsCpuForSession
+        && RendererReason != GpuBootstrap.ReasonCpuChosen
+        && RendererReason != GpuBootstrap.ReasonLostTooOften
+        && RendererReason != GpuBootstrap.ReasonRenderTier
+        && RendererReason != GpuBootstrap.ReasonSoftwareRendering
+        && RendererReason != GpuBootstrap.ReasonRemoteSession;
+
+    /// <summary>Whether a name holds a character past Latin, Greek and Cyrillic, which the shaper's worker lays out.</summary>
+    private static bool NeedsFallbackShaping(string name)
+    {
+        foreach (var character in name)
+        {
+            if (character >= FallbackShapingFrom)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Armenian onwards: the first script past the ones Segoe UI Variable holds.</summary>
+    private const char FallbackShapingFrom = (char)0x0530;
+
+    /// <summary>
+    /// For tests: the current view walked through <see cref="GpuSink"/> into
+    /// <paramref name="frame"/> and drawn by <paramref name="renderer"/> into
+    /// <paramref name="target"/>, which must be at least
+    /// <see cref="ScenePixelWidth"/> x <see cref="ScenePixelHeight"/> - the
+    /// cells, and with <paramref name="labels"/> the names too, drawn through
+    /// that target as a frame at rest (or in motion, with
+    /// <paramref name="inMotion"/>) draws them.  Nothing is shown and no
+    /// window is needed; the same walk the canvas's own frames make, so the
+    /// picture can be held against the raster's <see cref="SceneBitmap"/> and
+    /// WPF's names of the view.
+    /// </summary>
+    internal void RenderOffscreen(NestedGpuRenderer renderer, OffscreenTarget target, NestedGpuFrame frame, GpuLabelTarget? labels = null, bool inMotion = false)
+    {
+        if (ActualWidth < 1 || ActualHeight < 1 || _tree is null)
+        {
+            return;
+        }
+
+        _viewWidth = ActualWidth;
+        _viewHeight = ActualHeight;
+        UpdateScale();
+        EnsureCamera();
+        Normalize();
+        BuildChain();
+        RenderScene(inMotion, new OffscreenScene(renderer, target, frame, labels));
+    }
+
+    private void PaintSceneOffscreen(OffscreenScene offscreen, int pixelWidth, int pixelHeight, bool inMotion)
+    {
+        var sink = _gpuSink ??= new GpuSink();
+        var frame = offscreen.Frame;
+        var walkStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        sink.Begin(frame.SceneRects, pixelWidth, pixelHeight, CanvasColour);
+        WalkScene(sink);
+        frame.ClearColour = sink.ClearColour;
+        frame.SceneChanged();
+        LastWalkMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(walkStarted).TotalMilliseconds;
+        if (offscreen.Labels is { } labels)
+        {
+            var labelsStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            labels.Begin(frame, offscreen.Renderer.Devices, pixelWidth, pixelHeight, _scaleX, _scaleY, snap: !inMotion);
+            DrawLabelLayer(labels);
+            labels.End();
+            LastLabelsMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(labelsStarted).TotalMilliseconds;
+        }
+
+        offscreen.Renderer.Draw(offscreen.Target.RenderTargetView, pixelWidth, pixelHeight, frame);
+        LastGpuInstances = offscreen.Renderer.LastInstances;
+        LastGpuGlyphs = offscreen.Renderer.LastGlyphs;
+        LastGpuIcons = offscreen.Renderer.LastIcons;
+    }
+
+    /// <summary>For tests: the bitmap the raster painted the last CPU frame's scene into, or null.</summary>
+    internal WriteableBitmap? SceneBitmap => _bitmap;
+
+    /// <summary>For tests: the layers the cells and the names are recorded in, to draw the WPF picture of a view without its marks and outlines.</summary>
+    internal Visual SceneLayer => _sceneVisual;
+
+    internal Visual LabelLayer => _labelVisual;
+
+    /// <summary>For tests: the folder names the last label layer drew, by which folders can be grabbed.</summary>
+    internal int LabelGrabCount => _labelHotspots.Count;
+
+    /// <summary>For the bench: the shaper the GPU's names come from, once there is one.</summary>
+    internal TextShaper? GpuTextShaper => _gpuLabels?.Shaper;
+
+    /// <summary>For tests: the scene's size in device pixels, the part of the bitmap or surface a frame draws.</summary>
+    internal int ScenePixelWidth => Math.Max(1, (int)Math.Ceiling(_viewWidth * _scaleX));
+
+    internal int ScenePixelHeight => Math.Max(1, (int)Math.Ceiling(_viewHeight * _scaleY));
+
+    /// <summary>Where a test's offscreen frame goes: the renderer, the texture, the instance lists and, when the names are wanted, their target.</summary>
+    private readonly record struct OffscreenScene(NestedGpuRenderer Renderer, OffscreenTarget Target, NestedGpuFrame Frame, GpuLabelTarget? Labels);
+
+    /// <summary>
+    /// The walk itself, into whichever sink the frame draws with: the bare
+    /// canvas where no folder covers the view, then the covering folder and
+    /// everything on screen inside it.  Besides the shapes it hands the sink,
+    /// it leaves the frame's labels, file labels and filter outlines listed
+    /// for the layers above, and asks the tree for what should be read -
+    /// the same whatever the sink.
+    /// </summary>
+    private void WalkScene(SceneSink sink)
+    {
+        // Everything a walk leaves behind starts empty, so a frame whose GPU
+        // failed half way can be walked again into the bitmap.
+        _labels.Clear();
+        _labelled.Clear();
+        _fileLabels.Clear();
+        _filterOutlines.Clear();
+        DrawnCellCount = 0;
+        _foldersDrawn = 0;
+        _tilesDrawn = 0;
+        _relayoutSpent = 0;
+        _drewStale = false;
+        _drawnStale.Clear();
+
+        _sink = sink;
+        var (cover, x, y, w, covers) = CoverCell();
+        if (!covers)
+        {
+            sink.Clear(CanvasColour);
+        }
+
+        DrawCell(cover, x, y, w, labelsAllowed: true);
     }
 
     /// <summary>
@@ -2186,6 +3185,7 @@ public sealed class NestedCanvas : FrameworkElement
     private bool Covers(double x, double y, double w) =>
         x <= -8 && y <= -8 && x + w >= _viewWidth + 8 && y + w * NestedLayout.CellHeight >= _viewHeight + 8;
 
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
     private void DrawCell(NestedFolder folder, double x, double y, double w, bool labelsAllowed)
     {
         var h = w * NestedLayout.CellHeight;
@@ -2284,6 +3284,7 @@ public sealed class NestedCanvas : FrameworkElement
     /// apart, they are one faint wash over the strip they occupy: the folder
     /// still visibly holds files, without drawing a thousand specks.
     /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
     private void DrawFiles(NestedFolder folder, double x, double y, double w, bool labelsAllowed)
     {
         var grid = folder.FileGrid;
@@ -2305,7 +3306,7 @@ public sealed class NestedCanvas : FrameworkElement
             var usedHeight = Math.Min(
                 NestedLayout.CellHeight - NestedLayout.Padding - grid.Top,
                 grid.Rows * grid.StepY - grid.Gap);
-            _raster.Fill(
+            _sink.Fill(
                 NestedRaster.Px((x + grid.Left * w) * _scaleX),
                 NestedRaster.Px((y + grid.Top * w) * _scaleY),
                 NestedRaster.Px((x + (grid.Left + usedWidth) * w) * _scaleX),
@@ -2328,7 +3329,7 @@ public sealed class NestedCanvas : FrameworkElement
             // detail is what goes, never a whole folder further along.
             var zoneWidth = Math.Min(NestedLayout.ContentWidth, grid.Columns * grid.StepX - grid.Gap);
             var zoneHeight = Math.Min(NestedLayout.CellHeight - NestedLayout.Padding - grid.Top, grid.Rows * grid.StepY - grid.Gap);
-            _raster.Fill(
+            _sink.Fill(
                 NestedRaster.Px((x + grid.Left * w) * _scaleX),
                 NestedRaster.Px((y + grid.Top * w) * _scaleY),
                 NestedRaster.Px((x + (grid.Left + zoneWidth) * w) * _scaleX),
@@ -2393,7 +3394,7 @@ public sealed class NestedCanvas : FrameworkElement
         var bottom = (y + h) * _scaleY;
         if (right - left < 6 || bottom - top < 3)
         {
-            _raster.Fill(
+            _sink.Fill(
                 NestedRaster.PxFloor(left),
                 NestedRaster.PxFloor(top),
                 Math.Max(NestedRaster.PxFloor(left) + 1, NestedRaster.Px(right)),
@@ -2402,17 +3403,21 @@ public sealed class NestedCanvas : FrameworkElement
             return;
         }
 
-        var height = bottom - top;
-        _raster.FillRounded(left, top, right, bottom, Math.Min(3 * _scaleX, height * 0.2), body);
-
         // The coloured edge says what kind of file it is before the name can.
+        var height = bottom - top;
         var stripeWidth = Math.Max(1, Math.Min(3 * _scaleX, height * 0.14));
         var inset = Math.Max(1, height * 0.18);
-        _raster.Fill(
+        _sink.File(
+            left,
+            top,
+            right,
+            bottom,
+            Math.Min(3 * _scaleX, height * 0.2),
             NestedRaster.Px(left + 1),
             NestedRaster.Px(top + inset),
             NestedRaster.Px(left + 1 + stripeWidth),
             NestedRaster.Px(bottom - inset),
+            body,
             stripe);
     }
 
@@ -2442,7 +3447,12 @@ public sealed class NestedCanvas : FrameworkElement
         return palette;
     }
 
-    private void DrawFileLabels(DrawingContext dc)
+    /// <summary>
+    /// The names on file tiles big enough to carry one, into any target: the
+    /// icon, the colour mark and the note sign, the size when there is room
+    /// for it, and the name in what is left.
+    /// </summary>
+    private void DrawFileLabels(LabelTarget target)
     {
         foreach (var job in _fileLabels)
         {
@@ -2455,36 +3465,35 @@ public sealed class NestedCanvas : FrameworkElement
             var font = Math.Clamp(job.H * 0.5, 7.5, 13);
             var cursor = job.X + Math.Min(3, job.H * 0.14) + font * 0.55;
             var right = job.X + job.W - font * 0.5;
-            var path = job.Folder.PathOf(file);
+            var facts = FactsOf(job.Folder, file);
 
             var iconSize = Math.Min(job.H * 0.72, 20);
-            if (iconSize >= 9 && IconLookup?.Invoke(path) is { } icon)
+            if (iconSize >= 9 && target.DrawIcon(facts.Path, file.Extension, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize)))
             {
-                dc.DrawImage(icon, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize));
                 cursor += iconSize + font * 0.4;
             }
 
-            var mark = _markLookup?.Invoke(path) ?? FolderMark.None;
-            if (TryParseColour(mark.AccentHex, out var accent))
+            var mark = MarkOf(facts);
+            if (facts.HasAccent)
             {
-                dc.DrawRectangle(BrushFor(accent), null, new Rect(job.X + 1, job.Y + job.H * 0.12, Math.Max(2, job.H * 0.16), job.H * 0.76));
+                target.FillRect(new Rect(job.X + 1, job.Y + job.H * 0.12, Math.Max(2, job.H * 0.16), job.H * 0.76), facts.Accent);
             }
 
             if (!string.IsNullOrWhiteSpace(mark.Note))
             {
-                var note = Text("\uE70B", font * 0.85, TextDimBrush, double.MaxValue, bold: false, icon: true, scaled: true);
+                var note = target.Text("\uE70B", font * 0.85, TextDimColour, double.MaxValue, LabelFace.Icons, scaled: true);
                 right -= note.Width;
-                DrawTextAt(dc, note, new Point(right, job.Y + (job.H - note.Height) / 2));
+                target.DrawText(note, new Point(right, job.Y + (job.H - note.Height) / 2));
                 right -= font * 0.4;
             }
 
             if (job.W >= 190)
             {
-                var size = Text(FormatSize(file.Length), font * 0.85, TextDimBrush, double.MaxValue, bold: false, scaled: true);
+                var size = target.Text(FormatSize(file.Length), font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
                 if (right - size.Width - cursor > font * 5)
                 {
                     right -= size.Width;
-                    DrawTextAt(dc, size, new Point(right, job.Y + (job.H - size.Height) / 2));
+                    target.DrawText(size, new Point(right, job.Y + (job.H - size.Height) / 2));
                     right -= font * 0.6;
                 }
             }
@@ -2492,24 +3501,103 @@ public sealed class NestedCanvas : FrameworkElement
             if (right - cursor > font)
             {
                 var faded = file.IsHidden || _filter is not null && !_filter(file.Name);
-                var name = Text(file.Name, font, faded ? TextDimBrush : TextBrush, right - cursor, bold: false, scaled: true);
-                DrawTextAt(dc, name, new Point(cursor, job.Y + (job.H - name.Height) / 2));
+                var name = target.Text(file.Name, font, faded ? TextDimColour : TextColour, right - cursor, LabelFace.Regular, scaled: true);
+                target.DrawText(name, new Point(cursor, job.Y + (job.H - name.Height) / 2));
             }
         }
     }
 
-    private static string FormatSize(long bytes)
+    /// <summary>
+    /// What a file's label needs to know besides the file, found once and
+    /// kept while its tile stays in view: its path, joined from its folder's
+    /// and its name, and its mark.  Every name on screen needs both each frame
+    /// - the path for its icon, the mark for its colour and note - and asking
+    /// afresh was new strings per name per frame, both for the join and for
+    /// the mark lookup's own tidying of the path.
+    /// </summary>
+    private sealed class FileFacts(string path)
     {
-        string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
+        public string Path { get; } = path;
+
+        /// <summary>The <see cref="_paletteStamp"/> <see cref="Mark"/> was looked up under, or -1 before it was.</summary>
+        public int MarkStamp { get; set; } = -1;
+
+        public FolderMark Mark { get; set; } = FolderMark.None;
+
+        /// <summary>Whether the mark has a colour, read with it, so the colour is parsed once rather than every frame.</summary>
+        public bool HasAccent { get; set; }
+
+        public Color Accent { get; set; }
+    }
+
+    /// <summary>
+    /// A file's <see cref="FileFacts"/>.  Found by the very strings of the
+    /// folder's path and the file's name, not their text, so a lookup hashes
+    /// no characters, and holds no folder: a folder read again has new names,
+    /// and simply misses.  Two generations, like the text layouts, so it stays
+    /// the size of what is on screen.
+    /// </summary>
+    private FileFacts FactsOf(NestedFolder folder, in NestedFile file)
+    {
+        var key = (folder.FullPath, file.Name);
+        if (_fileFacts.TryGetValue(key, out var facts))
+        {
+            return facts;
+        }
+
+        if (!_oldFileFacts.Remove(key, out facts))
+        {
+            facts = new FileFacts(folder.PathOf(file));
+        }
+
+        if (_fileFacts.Count >= MaximumKeptFiles)
+        {
+            (_oldFileFacts, _fileFacts) = (_fileFacts, _oldFileFacts);
+            _fileFacts.Clear();
+        }
+
+        _fileFacts[key] = facts;
+        return facts;
+    }
+
+    /// <summary>
+    /// A file's mark, looked up again only when marks may have changed: kept
+    /// under the same stamp that keeps a folder's colours, which every change
+    /// of a mark moves on (<see cref="InvalidateMarks"/>), so a file's mark is
+    /// exactly as fresh as its folder's.
+    /// </summary>
+    private FolderMark MarkOf(FileFacts facts)
+    {
+        if (facts.MarkStamp != _paletteStamp)
+        {
+            facts.Mark = _markLookup?.Invoke(facts.Path) ?? FolderMark.None;
+            facts.MarkStamp = _paletteStamp;
+            facts.HasAccent = TryParseColour(facts.Mark.AccentHex, out var accent);
+            facts.Accent = accent;
+        }
+
+        return facts.Mark;
+    }
+
+    private static readonly string[] SizeSuffixes = ["B", "KB", "MB", "GB", "TB"];
+
+    /// <summary>A file's size as its tile and its tag say it, made once per size rather than once per frame.</summary>
+    private string FormatSize(long bytes)
+    {
+        if (_sizeTexts.TryGet(bytes, out var known))
+        {
+            return known;
+        }
+
         double value = bytes;
         var suffix = 0;
-        while (value >= 1024 && suffix < suffixes.Length - 1)
+        while (value >= 1024 && suffix < SizeSuffixes.Length - 1)
         {
             value /= 1024;
             suffix++;
         }
 
-        return suffix == 0 ? $"{bytes:N0} B" : $"{value:0.#} {suffixes[suffix]}";
+        return _sizeTexts.Add(bytes, suffix == 0 ? $"{bytes:N0} B" : $"{value:0.#} {SizeSuffixes[suffix]}");
     }
 
     private static LabelMode LabelModeFor(double w, bool labelsAllowed)
@@ -2539,7 +3627,7 @@ public sealed class NestedCanvas : FrameworkElement
         if (pixelWidth < 4)
         {
             // A speck: one colour, the rim's, which reads against any parent.
-            _raster.Fill(
+            _sink.Fill(
                 NestedRaster.PxFloor(left),
                 NestedRaster.PxFloor(top),
                 Math.Max(NestedRaster.PxFloor(left) + 1, NestedRaster.Px(right)),
@@ -2549,27 +3637,46 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         var radius = pixelWidth >= 40 ? Math.Min(6 * _scaleX, pixelWidth * 0.03) : 0;
-        _raster.FillFramed(left, top, right, bottom, radius, folder.RimColour, folder.BodyColour);
 
+        // The title band, when the cell is tall enough to show one, and on it
+        // the stripe in the folder's own colour: what the stripe on a tree
+        // node was, a sign of whose this is.
+        var headerBottom = double.NaN;
+        var hasStripe = false;
+        int stripeLeft = 0, stripeTop = 0, stripeRight = 0, stripeBottom = 0;
         var header = w * NestedLayout.HeaderHeight * _scaleY;
         if (header >= 2)
         {
-            _raster.FillRounded(left + 1, top + 1, right - 1, top + header, Math.Max(0, radius - 1), folder.HeaderColour, roundBottom: false);
+            headerBottom = top + header;
             if (header >= 6 && pixelWidth >= 30)
             {
-                // The stripe down the title, in the folder's own colour: what
-                // the stripe on a tree node was, a sign of whose this is.
                 var inset = Math.Max(1, header * 0.2);
                 var stripe = Math.Max(2, Math.Min(4 * _scaleX, header * 0.12));
-                var stripeLeft = left + 1 + Math.Max(2 * _scaleX, header * 0.18);
-                _raster.Fill(
-                    NestedRaster.Px(stripeLeft),
-                    NestedRaster.Px(top + inset),
-                    NestedRaster.Px(stripeLeft + stripe),
-                    NestedRaster.Px(top + header - inset),
-                    folder.StripeColour);
+                var stripeStart = left + 1 + Math.Max(2 * _scaleX, header * 0.18);
+                hasStripe = true;
+                stripeLeft = NestedRaster.Px(stripeStart);
+                stripeTop = NestedRaster.Px(top + inset);
+                stripeRight = NestedRaster.Px(stripeStart + stripe);
+                stripeBottom = NestedRaster.Px(top + header - inset);
             }
         }
+
+        _sink.Cell(
+            left,
+            top,
+            right,
+            bottom,
+            radius,
+            headerBottom,
+            hasStripe,
+            stripeLeft,
+            stripeTop,
+            stripeRight,
+            stripeBottom,
+            folder.RimColour,
+            folder.BodyColour,
+            folder.HeaderColour,
+            folder.StripeColour);
     }
 
     /// <summary>
@@ -2646,7 +3753,20 @@ public sealed class NestedCanvas : FrameworkElement
         folder.StripeColour = stripe;
     }
 
-    private void DrawLabels(DrawingContext dc)
+    /// <summary>
+    /// The names on the cells, into any target: folder titles and pills first,
+    /// then the file names over them.  The handles to grab a folder by its
+    /// name are gathered again with them, so what can be grabbed is exactly
+    /// what was drawn, whatever drew it.
+    /// </summary>
+    private void DrawLabelLayer(LabelTarget target)
+    {
+        _labelHotspots.Clear();
+        DrawLabels(target);
+        DrawFileLabels(target);
+    }
+
+    private void DrawLabels(LabelTarget target)
     {
         var pixelsPerDip = _scaleY;
         foreach (var job in _labels)
@@ -2654,15 +3774,15 @@ public sealed class NestedCanvas : FrameworkElement
             var folder = job.Folder;
             if (job.Mode == LabelMode.Pill)
             {
-                var text = Text(folder.Name, PillFontSize, IsFilteredOut(folder) ? TextDimBrush : TextBrush, Math.Max(8, job.W - 10), bold: false);
+                var text = target.Text(folder.Name, PillFontSize, IsFilteredOut(folder) ? TextDimColour : TextColour, Math.Max(8, job.W - 10), LabelFace.Regular, scaled: false);
                 var pill = new Rect(job.X + 2, job.Y + 2, Math.Min(job.W - 4, text.Width + 8), text.Height + 2);
                 if (pill.Width < 12)
                 {
                     continue;
                 }
 
-                dc.DrawRoundedRectangle(PillBrush, null, pill, 3, 3);
-                DrawTextAt(dc, text, new Point(pill.X + 4, pill.Y + 1));
+                target.FillRounded(pill, 3, PillColour);
+                target.DrawText(text, new Point(pill.X + 4, pill.Y + 1));
                 AddGrabHotspot(folder, pill);
                 continue;
             }
@@ -2670,7 +3790,7 @@ public sealed class NestedCanvas : FrameworkElement
             var header = job.W * NestedLayout.HeaderHeight;
             if (job.Y + header < 0 || job.Y > _viewHeight)
             {
-                DrawBodyNote(dc, folder, job);
+                DrawBodyNote(target, folder, job);
                 continue;
             }
 
@@ -2687,11 +3807,11 @@ public sealed class NestedCanvas : FrameworkElement
             var badges = Badges(folder);
             if (badges.Length > 0)
             {
-                var icons = Text(badges, font * 0.82, BadgeBrush(folder), double.MaxValue, bold: false, icon: true, scaled: true);
+                var icons = target.Text(badges, font * 0.82, BadgeColour(folder), double.MaxValue, LabelFace.Icons, scaled: true);
                 right -= icons.Width;
                 if (right - cursor > font * 3)
                 {
-                    DrawTextAt(dc, icons, new Point(right, job.Y + (header - icons.Height) / 2));
+                    target.DrawText(icons, new Point(right, job.Y + (header - icons.Height) / 2));
                     right -= font * 0.4;
                 }
                 else
@@ -2700,39 +3820,39 @@ public sealed class NestedCanvas : FrameworkElement
                 }
             }
 
-            var detail = DetailText(folder);
-            if (detail.Length > 0 && job.W >= 280)
+            if (job.W >= 280 && DetailText(folder) is { Length: > 0 } detail)
             {
-                var info = Text(detail, font * 0.78, TextDimBrush, double.MaxValue, bold: false, scaled: true);
+                var info = target.Text(detail, font * 0.78, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
                 if (right - info.Width - cursor > font * 6)
                 {
                     right -= info.Width;
-                    DrawTextAt(dc, info, new Point(right, job.Y + (header - info.Height) / 2));
+                    target.DrawText(info, new Point(right, job.Y + (header - info.Height) / 2));
                     right -= font * 0.6;
                 }
             }
 
-            var glyph = Text(Glyph(folder), font * 0.9, GlyphBrush(folder), double.MaxValue, bold: false, icon: true, scaled: true);
+            var glyph = target.Text(Glyph(folder), font * 0.9, GlyphColour(folder), double.MaxValue, LabelFace.Icons, scaled: true);
             if (right - cursor > glyph.Width + font)
             {
-                DrawTextAt(dc, glyph, new Point(cursor, job.Y + (header - glyph.Height) / 2 + font * 0.05));
+                target.DrawText(glyph, new Point(cursor, job.Y + (header - glyph.Height) / 2 + font * 0.05));
                 cursor += glyph.Width + font * 0.4;
             }
 
             var available = right - cursor;
             if (available > font)
             {
-                var name = Text(folder.Name, font, IsFilteredOut(folder) ? TextDimBrush : TextBrush, available, bold: folder.Kind != NestedFolderKind.Folder, scaled: true);
-                DrawTextAt(dc, name, new Point(cursor, job.Y + (header - name.Height) / 2));
+                var face = folder.Kind != NestedFolderKind.Folder ? LabelFace.SemiBold : LabelFace.Regular;
+                var name = target.Text(folder.Name, font, IsFilteredOut(folder) ? TextDimColour : TextColour, available, face, scaled: true);
+                target.DrawText(name, new Point(cursor, job.Y + (header - name.Height) / 2));
                 AddGrabHotspot(folder, new Rect(job.X, job.Y, job.W, header));
             }
 
-            DrawBodyNote(dc, folder, job);
+            DrawBodyNote(target, folder, job);
         }
     }
 
     /// <summary>What an empty cell says in its middle, when there is room to say it.</summary>
-    private void DrawBodyNote(DrawingContext dc, NestedFolder folder, LabelJob job)
+    private void DrawBodyNote(LabelTarget target, NestedFolder folder, LabelJob job)
     {
         var h = job.W * NestedLayout.CellHeight;
         var header = job.W * NestedLayout.HeaderHeight;
@@ -2742,7 +3862,7 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         string message;
-        var brush = TextDimBrush;
+        var ink = TextDimColour;
         if (folder.IsReparsePoint)
         {
             message = "Link to another folder";
@@ -2750,7 +3870,7 @@ public sealed class NestedCanvas : FrameworkElement
         else if (folder.LoadState == NestedLoadState.Failed)
         {
             message = string.IsNullOrEmpty(folder.ErrorMessage) ? "Could not be read" : folder.ErrorMessage;
-            brush = DangerBrush;
+            ink = DangerColour;
         }
         else if (folder.LoadState is NestedLoadState.NotLoaded or NestedLoadState.Queued or NestedLoadState.Loading)
         {
@@ -2762,21 +3882,21 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 0 => "Empty folder",
                 1 => "1 hidden file",
-                _ => $"{folder.FileCount:N0} hidden files"
+                _ => NoteText(HiddenFilesNote, folder.FileCount)
             };
         }
         else if (folder.UnlistedFileCount > 0)
         {
-            message = $"{folder.UnlistedFileCount:N0} more files are not drawn";
-            var text = Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimBrush, job.W - 16, bold: false, scaled: true);
-            DrawTextAt(dc, text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
+            message = NoteText(UnlistedFilesNote, folder.UnlistedFileCount);
+            var text = target.Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimColour, job.W - 16, LabelFace.Regular, scaled: true);
+            target.DrawText(text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
             return;
         }
         else if (folder.IsTruncated)
         {
-            message = $"Only the first {NestedTree.MaximumChildren:N0} folders are shown";
-            var text = Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimBrush, job.W - 16, bold: false, scaled: true);
-            DrawTextAt(dc, text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
+            message = NoteText(TruncatedNote, NestedTree.MaximumChildren);
+            var text = target.Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimColour, job.W - 16, LabelFace.Regular, scaled: true);
+            target.DrawText(text, new Point(job.X + (job.W - text.Width) / 2, job.Y + h - text.Height - 4));
             return;
         }
         else
@@ -2790,12 +3910,41 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         var size = Math.Clamp(job.W * 0.03, 9, 18);
-        var formatted = Text(message, size, brush, job.W - 16, bold: false, scaled: true);
+        var formatted = target.Text(message, size, ink, job.W - 16, LabelFace.Regular, scaled: true);
         var bodyTop = job.Y + header;
-        DrawTextAt(dc, formatted, new Point(job.X + (job.W - formatted.Width) / 2, bodyTop + (h - header - formatted.Height) / 2));
+        target.DrawText(formatted, new Point(job.X + (job.W - formatted.Width) / 2, bodyTop + (h - header - formatted.Height) / 2));
     }
 
-    private static string DetailText(NestedFolder folder)
+    private const int HiddenFilesNote = 1;
+    private const int UnlistedFilesNote = 2;
+    private const int TruncatedNote = 3;
+
+    /// <summary>
+    /// One of the notes with a count in it, made once per count rather than
+    /// once per frame.
+    /// </summary>
+    private string NoteText(int note, int count)
+    {
+        var key = (long)note << 32 | (uint)count;
+        if (_noteTexts.TryGet(key, out var known))
+        {
+            return known;
+        }
+
+        return _noteTexts.Add(key, note switch
+        {
+            HiddenFilesNote => $"{count:N0} hidden files",
+            UnlistedFilesNote => $"{count:N0} more files are not drawn",
+            _ => $"Only the first {count:N0} folders are shown"
+        });
+    }
+
+    /// <summary>
+    /// What a title says on its right: a drive's free space, or how many
+    /// folders and files a folder holds.  The counts' words are made once per
+    /// pair of counts rather than once per title per frame.
+    /// </summary>
+    private string DetailText(NestedFolder folder)
     {
         if (folder.IsComputer)
         {
@@ -2819,6 +3968,12 @@ public sealed class NestedCanvas : FrameworkElement
             return string.Empty;
         }
 
+        var key = (long)folders << 32 | (uint)files;
+        if (_detailTexts.TryGet(key, out var known))
+        {
+            return known;
+        }
+
         var parts = new List<string>(2);
         if (folders > 0)
         {
@@ -2830,37 +3985,56 @@ public sealed class NestedCanvas : FrameworkElement
             parts.Add(files == 1 ? "1 file" : $"{files:N0} files");
         }
 
-        return string.Join("  ·  ", parts);
+        return _detailTexts.Add(key, string.Join("  ·  ", parts));
     }
 
-    private string Badges(NestedFolder folder)
+    /// <summary>
+    /// A title's badges for every mix of them, written in the order a title
+    /// shows them - pinned, noted, a link, unreadable - and indexed by those
+    /// four as bits: a title's badges are looked up, not joined anew each frame.
+    /// </summary>
+    private static readonly string[] BadgeTexts = MakeBadgeTexts();
+
+    private static string[] MakeBadgeTexts()
     {
-        var badges = string.Empty;
-        if (IsPinned(folder.FullPath))
+        var texts = new string[16];
+        for (var bits = 0; bits < texts.Length; bits++)
         {
-            badges += "";
+            var badges = string.Empty;
+            if ((bits & 1) != 0)
+            {
+                badges += "\uE735";
+            }
+
+            if ((bits & 2) != 0)
+            {
+                badges += "\uE70B";
+            }
+
+            if ((bits & 4) != 0)
+            {
+                badges += "\uE71B";
+            }
+
+            if ((bits & 8) != 0)
+            {
+                badges += "\uE72E";
+            }
+
+            texts[bits] = badges;
         }
 
-        if (folder.HasNote)
-        {
-            badges += "";
-        }
-
-        if (folder.IsReparsePoint)
-        {
-            badges += "";
-        }
-
-        if (folder.LoadState == NestedLoadState.Failed)
-        {
-            badges += "";
-        }
-
-        return badges;
+        return texts;
     }
 
-    private Brush BadgeBrush(NestedFolder folder) =>
-        folder.LoadState == NestedLoadState.Failed ? DangerBrush : IsPinned(folder.FullPath) ? StarBrush : TextDimBrush;
+    private string Badges(NestedFolder folder) =>
+        BadgeTexts[(IsPinned(folder.FullPath) ? 1 : 0)
+            | (folder.HasNote ? 2 : 0)
+            | (folder.IsReparsePoint ? 4 : 0)
+            | (folder.LoadState == NestedLoadState.Failed ? 8 : 0)];
+
+    private Color BadgeColour(NestedFolder folder) =>
+        folder.LoadState == NestedLoadState.Failed ? DangerColour : IsPinned(folder.FullPath) ? StarColour : TextDimColour;
 
     private static string Glyph(NestedFolder folder) => folder.Kind switch
     {
@@ -2869,11 +4043,11 @@ public sealed class NestedCanvas : FrameworkElement
         _ => folder.IsReparsePoint ? "" : ""
     };
 
-    private Brush GlyphBrush(NestedFolder folder) => folder.Kind switch
+    private static Color GlyphColour(NestedFolder folder) => folder.Kind switch
     {
-        NestedFolderKind.Folder when folder.HasLabel => BrushFor(NestedRaster.Unpack(folder.StripeColour)),
-        NestedFolderKind.Folder => FolderBrush,
-        _ => TextDimBrush
+        NestedFolderKind.Folder when folder.HasLabel => NestedRaster.Unpack(folder.StripeColour),
+        NestedFolderKind.Folder => FolderColour,
+        _ => TextDimColour
     };
 
     private Brush BrushFor(Color colour)
@@ -2887,7 +4061,7 @@ public sealed class NestedCanvas : FrameworkElement
         return brush;
     }
 
-    private static readonly Brush FolderBrush = Frozen(Color.FromRgb(0xE3, 0xB3, 0x41));
+    private static readonly Brush FolderBrush = Frozen(FolderColour);
 
     private void DrawSelection(DrawingContext dc)
     {
@@ -3363,7 +4537,8 @@ public sealed class NestedCanvas : FrameworkElement
             return;
         }
 
-        var trail = new List<NestedFolder>();
+        var trail = _trail;
+        trail.Clear();
         var folder = _tree.Root;
         var (x, y, w) = _chain[folder];
         var probe = new Point(_viewWidth / 2, Math.Min(_viewHeight / 2, 80));
@@ -3413,7 +4588,97 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         // Long trails keep the ends: where it starts and where the view is.
-        var shown = trail.Count <= 5 ? trail : [trail[0], null!, .. trail.Skip(trail.Count - 3)];
+        var shown = _trailShown;
+        shown.Clear();
+        if (trail.Count <= 5)
+        {
+            shown.AddRange(trail);
+        }
+        else
+        {
+            shown.Add(trail[0]);
+            shown.Add(null);
+            for (var index = trail.Count - 3; index < trail.Count; index++)
+            {
+                shown.Add(trail[index]);
+            }
+        }
+
+        if (!_labelsOnGpu)
+        {
+            DrawTrailPieces(dc, shown, _hotspots);
+            return;
+        }
+
+        // With the names on the GPU the trail is the one text a moving frame
+        // still has WPF lay out and draw.  It only changes when the folders
+        // in it do, so it is recorded once and replayed: no text is formatted
+        // again for a frame that shows the same trail.
+        if (_trailDrawing is null || !IsSameTrail(shown))
+        {
+            _trailHotspots.Clear();
+            var drawing = new DrawingGroup();
+
+            // At most seven fixed-size texts, laid out whatever the frame's
+            // budget of new layouts: the beacons before it may have spent it
+            // all, and a trail recorded without its names would be replayed
+            // empty, and unclickable, until the folders in it change.
+            var budget = _textBudget;
+            _textBudget = int.MaxValue;
+            try
+            {
+                using var context = drawing.Open();
+                DrawTrailPieces(context, shown, _trailHotspots);
+            }
+            finally
+            {
+                _textBudget = budget;
+            }
+
+            drawing.Freeze();
+            _trailDrawing = drawing;
+            _trailScale = _scaleY;
+            _trailKey.Clear();
+            foreach (var step in shown)
+            {
+                _trailKey.Add((step, step?.Name));
+            }
+        }
+
+        dc.DrawDrawing(_trailDrawing);
+        _hotspots.AddRange(_trailHotspots);
+    }
+
+    private readonly List<NestedFolder> _trail = [];
+    private readonly List<NestedFolder?> _trailShown = [];
+    private readonly List<(NestedFolder? Folder, string? Name)> _trailKey = [];
+    private readonly List<Hotspot> _trailHotspots = [];
+    private DrawingGroup? _trailDrawing;
+    private double _trailScale;
+
+    /// <summary>Whether the recorded trail shows these folders, by these names, at this scale.</summary>
+    private bool IsSameTrail(List<NestedFolder?> shown)
+    {
+        if (_trailKey.Count != shown.Count || _trailScale != _scaleY)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < shown.Count; index++)
+        {
+            var step = shown[index];
+            if (!ReferenceEquals(_trailKey[index].Folder, step) || !ReferenceEquals(_trailKey[index].Name, step?.Name))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>The trail's pill, names and separators, and a hotspot on each name to fly to its folder.</summary>
+    private void DrawTrailPieces(DrawingContext dc, List<NestedFolder?> shown, List<Hotspot> hotspots)
+    {
         const double pad = 8;
         var cursor = 14 + pad;
         var top = 12.0;
@@ -3436,7 +4701,7 @@ public sealed class NestedCanvas : FrameworkElement
             if (step is not null)
             {
                 var target = step;
-                _hotspots.Add(new Hotspot(new Rect(at, new Size(text.Width, text.Height)), () => FlyTo(target), null));
+                hotspots.Add(new Hotspot(new Rect(at, new Size(text.Width, text.Height)), () => FlyTo(target), null));
             }
 
             cursor += text.Width;
@@ -3562,7 +4827,15 @@ public sealed class NestedCanvas : FrameworkElement
         }
 
         // A small cell's name sits on it as a pill; that pill is its handle.
-        return _labelHotspots.Any(spot => spot.Grab is not null && ReferenceEquals(spot.Grab, hit.Folder) && spot.Bounds.Contains(point));
+        foreach (var spot in _labelHotspots)
+        {
+            if (ReferenceEquals(spot.Folder, hit.Folder) && spot.Bounds.Contains(point))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     protected override void OnMouseLeftButtonUp(MouseButtonEventArgs e)
@@ -3722,9 +4995,9 @@ public sealed class NestedCanvas : FrameworkElement
         for (var index = _labelHotspots.Count - 1; index >= 0; index--)
         {
             var spot = _labelHotspots[index];
-            if (spot.Grab is { } folder && spot.Bounds.Contains(point) && ScreenRect(folder) is { } cell)
+            if (spot.Bounds.Contains(point) && ScreenRect(spot.Folder) is { } cell)
             {
-                return new NestedHit(folder, cell, IsOnHeader: true);
+                return new NestedHit(spot.Folder, cell, IsOnHeader: true);
             }
         }
 
@@ -3745,7 +5018,7 @@ public sealed class NestedCanvas : FrameworkElement
     }
 
     private void AddGrabHotspot(NestedFolder folder, Rect bounds) =>
-        _labelHotspots.Add(new Hotspot(bounds, null, folder));
+        _labelHotspots.Add(new LabelGrab(bounds, folder));
 
     /// <summary>Shows a click as selected at once, before the rest of the window catches up.</summary>
     private void MarkSelected(string path)
@@ -4037,6 +5310,137 @@ public sealed class NestedCanvas : FrameworkElement
     }
 
     /// <summary>
+    /// The names drawn by WPF, as the canvas has always drawn them: laid out
+    /// by <see cref="Text"/> - its ladder of sizes, its budget of new layouts
+    /// while the camera moves, its two generations of layouts - and recorded
+    /// on the label layer's drawing context, with the icons
+    /// <see cref="IconLookup"/> has.  Each call is the drawing call the canvas
+    /// made itself before targets existed, with the same brush, so the layer
+    /// records the same drawing and shows the same pixels.
+    /// </summary>
+    private sealed class WpfLabelTarget(NestedCanvas canvas) : LabelTarget
+    {
+        private DrawingContext? _dc;
+
+        /// <summary>Starts a recording: everything drawn until <see cref="End"/> goes to <paramref name="dc"/>.</summary>
+        public void Begin(DrawingContext dc) => _dc = dc;
+
+        public void End() => _dc = null;
+
+        public override LabelText Text(string text, double size, Color ink, double maxWidth, LabelFace face, bool scaled)
+        {
+            var laidOut = canvas.Text(text, size, BrushOf(ink), maxWidth, bold: face == LabelFace.SemiBold, icon: face == LabelFace.Icons, scaled);
+            return laidOut.Text is null ? default : new LabelText(laidOut.Text, laidOut.Width, laidOut.Height, laidOut.Scale);
+        }
+
+        public override void DrawText(in LabelText text, Point origin) =>
+            DrawTextAt(_dc!, new ScaledText(text.Handle as FormattedText, text.Scale), origin);
+
+        public override void FillRect(Rect bounds, Color colour) =>
+            _dc!.DrawRectangle(BrushOf(colour), null, bounds);
+
+        public override void FillRounded(Rect bounds, double radius, Color colour) =>
+            _dc!.DrawRoundedRectangle(BrushOf(colour), null, bounds, radius, radius);
+
+        public override bool DrawIcon(string path, string extension, Rect bounds)
+        {
+            if (canvas.IconLookup?.Invoke(path) is not { } icon)
+            {
+                return false;
+            }
+
+            _dc!.DrawImage(icon, bounds);
+            return true;
+        }
+
+        /// <summary>
+        /// The brush a colour was always drawn with: the canvas's own for its
+        /// own colours, one shared frozen brush for any other.  The same brush
+        /// is also the same key in the layouts kept, so a name is found laid
+        /// out exactly when it was before.
+        /// </summary>
+        private Brush BrushOf(Color colour) =>
+            colour == TextColour ? TextBrush
+            : colour == TextDimColour ? TextDimBrush
+            : colour == DangerColour ? DangerBrush
+            : colour == StarColour ? StarBrush
+            : colour == FolderColour ? FolderBrush
+            : colour == PillColour ? PillBrush
+            : canvas.BrushFor(colour);
+    }
+
+    /// <summary>
+    /// Strings made from numbers - a size, a pair of counts - kept so that
+    /// drawing the same one every frame does not make it every frame.  Two
+    /// generations, like the text layouts: what is still in use is carried
+    /// over, the rest goes, so it stays the size of what is on screen.  The
+    /// numbers are written in the culture of the moment, and a change of
+    /// culture drops everything kept.
+    /// </summary>
+    private sealed class NumberTexts(int capacity)
+    {
+        private Dictionary<long, string> _current = [];
+        private Dictionary<long, string> _old = [];
+        private CultureInfo? _culture;
+
+        public bool TryGet(long key, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? text)
+        {
+            if (!ReferenceEquals(_culture, CultureInfo.CurrentCulture))
+            {
+                _culture = CultureInfo.CurrentCulture;
+                _current.Clear();
+                _old.Clear();
+                text = null;
+                return false;
+            }
+
+            if (_current.TryGetValue(key, out text))
+            {
+                return true;
+            }
+
+            if (_old.Remove(key, out text))
+            {
+                _current[key] = text;
+                return true;
+            }
+
+            return false;
+        }
+
+        public string Add(long key, string text)
+        {
+            if (_current.Count >= capacity)
+            {
+                (_old, _current) = (_current, _old);
+                _current.Clear();
+            }
+
+            _current[key] = text;
+            return text;
+        }
+    }
+
+    /// <summary>
+    /// Pairs of strings told apart by which strings they are rather than by
+    /// what they say: a file's facts are kept by its folder's path and its
+    /// name, both strings that live as long as the folder's listing, and
+    /// comparing those is two pointers where comparing text is two scans.
+    /// </summary>
+    private sealed class ReferenceKeyComparer : IEqualityComparer<(string Folder, string Name)>
+    {
+        public static readonly ReferenceKeyComparer Instance = new();
+
+        public bool Equals((string Folder, string Name) x, (string Folder, string Name) y) =>
+            ReferenceEquals(x.Folder, y.Folder) && ReferenceEquals(x.Name, y.Name);
+
+        public int GetHashCode((string Folder, string Name) key) =>
+            HashCode.Combine(
+                System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(key.Folder),
+                System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(key.Name));
+    }
+
+    /// <summary>
     /// Only #RRGGBB or #AARRGGBB.  The converter also takes names and 'sc#'
     /// forms, and some of those throw exceptions it does not document - from
     /// inside a frame, where an exception ends the program.  A mark only ever
@@ -4136,4 +5540,11 @@ public sealed class NestedCanvas : FrameworkElement
 
     /// <summary>A clickable spot drawn this frame (a beacon, a trail step) or a handle to grab a folder by.</summary>
     private sealed record Hotspot(Rect Bounds, Action? Click, NestedFolder? Grab, string? Tip = null);
+
+    /// <summary>
+    /// A folder's name drawn this frame, by which the folder can be grabbed:
+    /// a value in a list rebuilt with every label layer, so drawing the names
+    /// hands the garbage collector nothing.
+    /// </summary>
+    private readonly record struct LabelGrab(Rect Bounds, NestedFolder Folder);
 }

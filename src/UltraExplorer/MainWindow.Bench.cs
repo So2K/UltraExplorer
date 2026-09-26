@@ -96,6 +96,52 @@ public partial class MainWindow
         return null;
     }
 
+    /// <summary>
+    /// The diagnostics window's size in DIPs: 1600 x 1000, or what
+    /// <c>--bench-window 1920x1040</c> asks for.
+    /// </summary>
+    private static (double Width, double Height) BenchWindowSize =>
+        SwitchValue("--bench-window") is { } size
+        && size.Split('x', 'X') is [var width, var height]
+        && double.TryParse(width, NumberStyles.Float, CultureInfo.InvariantCulture, out var w)
+        && double.TryParse(height, NumberStyles.Float, CultureInfo.InvariantCulture, out var h)
+        && w >= 200 && h >= 200
+            ? (w, h)
+            : (1600, 1000);
+
+    private static bool BenchWindowAsked => SwitchValue("--bench-window") is not null;
+
+
+    private static double BenchNumber(string name) =>
+        SwitchValue(name) is { } text && double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var value) && value > 0.1 && value < 8
+            ? value
+            : 1;
+
+    /// <summary>
+    /// The user's screen on a small one, for the bench: <c>--bench-scale 1.5</c>
+    /// draws the canvas at 1.5 times the monitor's pixels per DIP, as a 150 %
+    /// monitor would, and <c>--bench-layout 0.742</c> shrinks it on screen by
+    /// a layout transform so a canvas of the user's size in DIPs fits the
+    /// window.  Together with <c>--bench-window 1920x1040</c> on the 100 %
+    /// monitor that is the pixel count of a maximised window at 3840 x 2160
+    /// and 150 % - the size at which the canvas was measured to lag.
+    /// </summary>
+    private void EmulateBenchScale()
+    {
+        var layout = BenchNumber("--bench-layout");
+        if (layout != 1)
+        {
+            Nested.LayoutTransform = new ScaleTransform(layout, layout);
+        }
+
+        var boost = BenchNumber("--bench-scale");
+        if (boost != 1)
+        {
+            var dpi = VisualTreeHelper.GetDpi(this);
+            Nested.DpiOverride = new DpiScale(dpi.DpiScaleX * boost, dpi.DpiScaleY * boost);
+        }
+    }
+
     /// <summary>True when this process was started for a benchmark or snapshot run.</summary>
     private static bool IsDiagnosticsRun =>
         SwitchValue("--nested-bench") is not null || SwitchValue("--nested-snapshots") is not null;
@@ -120,6 +166,35 @@ public partial class MainWindow
     /// </summary>
     private static void PlaceForDiagnostics(IntPtr handle, bool neverActivate)
     {
+        if (DiagnosticsMonitor() is not { } chosen)
+        {
+            return;
+        }
+
+        var (target, work) = chosen;
+
+        // Never the active window: not when it opens, not when it restores
+        // itself from maximised, not if clicked.  The run needs no keyboard.
+        if (neverActivate)
+        {
+            SetWindowLongPtr(handle, ExtendedStyleIndex, GetWindowLongPtr(handle, ExtendedStyleIndex) | NoActivateStyle);
+        }
+
+        var scale = GetDpiForMonitor(target, 0, out var dpi, out _) == 0 ? dpi / 96.0 : 1.0;
+        var (windowWidth, windowHeight) = BenchWindowSize;
+        var inset = BenchWindowAsked ? 0 : 8;
+        var width = Math.Min((int)Math.Round(windowWidth * scale), work.Right - work.Left);
+        var height = Math.Min((int)Math.Round(windowHeight * scale), work.Bottom - work.Top);
+        SetWindowPos(handle, IntPtr.Zero, work.Left + inset, work.Top + inset, width, height, SwpNoZOrder | SwpNoActivate);
+    }
+
+    /// <summary>
+    /// The monitor a diagnostics or test window opens on (see
+    /// <see cref="PlaceForDiagnostics"/>) and its work area; null when
+    /// Windows lists none.
+    /// </summary>
+    private static (IntPtr Monitor, RectL Work)? DiagnosticsMonitor()
+    {
         var monitors = new List<(IntPtr Handle, RectL Work, bool IsPrimary)>();
         EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, (monitor, _, _, _) =>
         {
@@ -134,7 +209,7 @@ public partial class MainWindow
 
         if (monitors.Count == 0)
         {
-            return;
+            return null;
         }
 
         var chosen = monitors.FindIndex(monitor => !monitor.IsPrimary);
@@ -144,18 +219,24 @@ public partial class MainWindow
             chosen = asked;
         }
 
-        // Never the active window: not when it opens, not when it restores
-        // itself from maximised, not if clicked.  The run needs no keyboard.
-        if (neverActivate)
+        var (handle, work, _) = monitors[Math.Max(0, chosen)];
+        return (handle, work);
+    }
+
+    /// <summary>
+    /// The monitor the main window will open on, known before it exists, so
+    /// the GPU warm-up prepares the card that drives it: a diagnostics or
+    /// test window's own monitor, otherwise the one under the mouse, which is
+    /// where WPF centres a window that opens in the middle of the screen.
+    /// </summary>
+    internal static IntPtr StartupMonitor()
+    {
+        if ((IsDiagnosticsRun || IsTestWindow) && DiagnosticsMonitor() is { } chosen)
         {
-            SetWindowLongPtr(handle, ExtendedStyleIndex, GetWindowLongPtr(handle, ExtendedStyleIndex) | NoActivateStyle);
+            return chosen.Monitor;
         }
 
-        var (target, work, _) = monitors[Math.Max(0, chosen)];
-        var scale = GetDpiForMonitor(target, 0, out var dpi, out _) == 0 ? dpi / 96.0 : 1.0;
-        var width = Math.Min((int)Math.Round(1600 * scale), work.Right - work.Left);
-        var height = Math.Min((int)Math.Round(1000 * scale), work.Bottom - work.Top);
-        SetWindowPos(handle, IntPtr.Zero, work.Left + 8, work.Top + 8, width, height, SwpNoZOrder | SwpNoActivate);
+        return GetCursorPos(out var cursor) ? MonitorFromPoint(cursor, MonitorDefaultToNearest) : IntPtr.Zero;
     }
 
     private const int MonitorInfoPrimary = 1;
@@ -171,6 +252,19 @@ public partial class MainWindow
 
     [DllImport("shcore.dll")]
     private static extern int GetDpiForMonitor(IntPtr monitor, int type, out uint dpiX, out uint dpiY);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CursorPoint
+    {
+        public int X;
+        public int Y;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out CursorPoint point);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromPoint(CursorPoint point, int flags);
 
     [DllImport("user32.dll")]
     private static extern bool SetWindowPos(IntPtr window, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
@@ -196,8 +290,8 @@ public partial class MainWindow
         // scale are different pictures and different amounts of work, and
         // could not be compared.
         WindowState = WindowState.Normal;
-        Width = 1600;
-        Height = 1000;
+        (Width, Height) = BenchWindowSize;
+        EmulateBenchScale();
         _viewModel.Layout = CanvasLayout.Nested;
         _viewModel.Tree.FolderList.IsVisible = false;
 
@@ -273,6 +367,45 @@ public partial class MainWindow
 
     private bool _treeChangedRecently;
 
+    /// <summary>
+    /// With a GPU renderer in force, waits - ten seconds at most - for the
+    /// card and the names' atlases to be ready and for the canvas to draw on
+    /// them, so a run's first scenes and phases are not drawn by the CPU
+    /// raster while the rest are on the GPU: a slow warm-up (a cold shader
+    /// cache, a glyph cache miss, a slower card) would otherwise put CPU
+    /// pictures into a GPU baseline with nothing to say so.  Returns what the
+    /// canvas then draws with (<see cref="RendererState"/>).
+    /// </summary>
+    private async Task<string> WaitForRendererAsync()
+    {
+        if (Rendering.Gpu.GpuBootstrap.Preference != Rendering.Gpu.RendererPreference.Cpu && Rendering.Gpu.GpuBootstrap.IsStarted)
+        {
+            var limit = Task.Delay(TimeSpan.FromSeconds(10));
+            await Task.WhenAny(Rendering.Gpu.GpuBootstrap.Ready, limit);
+            if (Rendering.Gpu.GpuLabelAtlases.IsStarted)
+            {
+                await Task.WhenAny(Rendering.Gpu.GpuLabelAtlases.Ready, limit);
+            }
+
+            var watch = Stopwatch.StartNew();
+            var cardReady = Rendering.Gpu.GpuBootstrap.Ready.IsCompletedSuccessfully && Rendering.Gpu.GpuBootstrap.Ready.Result is not null;
+            var atlasesReady = Rendering.Gpu.GpuLabelAtlases.Current is not null;
+            while (cardReady
+                && !(Nested.IsSceneOnGpu && (Nested.AreLabelsOnGpu || !atlasesReady))
+                && watch.Elapsed.TotalSeconds < 5)
+            {
+                Nested.Redraw();
+                await NextFrameAsync();
+            }
+        }
+
+        return RendererState();
+    }
+
+    /// <summary>What the canvas's last frame drew with: the scene's renderer, the names', and why.</summary>
+    private string RendererState() =>
+        $"{(Nested.IsSceneOnGpu ? "gpu" : "cpu")}\t{(Nested.AreLabelsOnGpu ? "gpu" : "wpf")}\t{Nested.RendererReason}";
+
     private void TrackTreeChanges() => _nestedTree.Changed += (_, _) => _treeChangedRecently = true;
 
     private sealed class PhaseStats(string name)
@@ -283,6 +416,41 @@ public partial class MainWindow
         public List<int> Cells { get; } = [];
         public List<double> Labels { get; } = [];
         public List<double> Layouts { get; } = [];
+
+        // What the frame cost the UI thread in all, how the scene's part
+        // splits between the walk and the present, what the GPU did, and
+        // the garbage left - the columns added with the GPU renderer.
+        public List<double> Frame { get; } = [];
+        public List<double> Walk { get; } = [];
+        public List<double> Present { get; } = [];
+        public List<double> Lock { get; } = [];
+        public List<double> GpuWait { get; } = [];
+        public List<double> Gpu { get; } = [];
+        public long AllocatedBytes { get; set; }
+        public int Gen2 { get; set; }
+        public int Skipped { get; set; }
+
+        // The names' part, sending to the card, the other collections, and
+        // the threads' own clocks: how much CPU the UI thread and WPF's
+        // render thread spent per frame of the phase, whoever asked for it.
+        public List<double> Upload { get; } = [];
+        public List<int> Glyphs { get; } = [];
+        public int Gen0 { get; set; }
+        public int Gen1 { get; set; }
+        public double UiCpuPerFrame { get; set; }
+        public double RenderCpuPerFrame { get; set; }
+        public bool LabelsOnGpu { get; set; }
+        public long SceneAllocated { get; set; }
+        public long LabelsAllocated { get; set; }
+        public long DecorAllocated { get; set; }
+        public long PresentAllocated { get; set; }
+        public double GcPauseMilliseconds { get; set; }
+        public long HeapBytes { get; set; }
+
+        // Which renderer drew the phase's frames: a phase that began on the
+        // CPU and moved to the GPU half way says so here.
+        public int SceneGpuFrames { get; set; }
+        public int LabelsGpuFrames { get; set; }
 
         public string Row()
         {
@@ -313,9 +481,171 @@ public partial class MainWindow
                 (Labels.Count == 0 ? 0 : Labels.Average()).ToString("0.00", inv),
                 (Labels.Count == 0 ? 0 : Labels.Max()).ToString("0.00", inv),
                 (Layouts.Count == 0 ? 0 : Layouts.Average()).ToString("0.0", inv),
-                (Layouts.Count == 0 ? 0 : Layouts.Max()).ToString("0", inv));
+                (Layouts.Count == 0 ? 0 : Layouts.Max()).ToString("0", inv),
+                P(Frame, 0.5).ToString("0.00", inv),
+                P(Frame, 0.95).ToString("0.00", inv),
+                P(Walk, 0.5).ToString("0.00", inv),
+                P(Present, 0.5).ToString("0.00", inv),
+                P(Lock, 0.5).ToString("0.00", inv),
+                P(GpuWait, 0.5).ToString("0.00", inv),
+                P(Gpu, 0.5).ToString("0.000", inv),
+                (Render.Count == 0 ? 0 : AllocatedBytes / 1024.0 / Render.Count).ToString("0.0", inv),
+                Gen2.ToString(inv),
+                Skipped.ToString(inv),
+                P(Interval, 0.5).ToString("0.00", inv),
+                P(Labels, 0.5).ToString("0.00", inv),
+                P(Upload, 0.5).ToString("0.00", inv),
+                (Glyphs.Count == 0 ? 0 : Glyphs.Average()).ToString("0", inv),
+                Gen0.ToString(inv),
+                Gen1.ToString(inv),
+                UiCpuPerFrame.ToString("0.00", inv),
+                RenderCpuPerFrame.ToString("0.00", inv),
+                LabelsOnGpu ? "gpu" : "wpf",
+                (Render.Count == 0 ? 0 : SceneAllocated / 1024.0 / Render.Count).ToString("0.0", inv),
+                (Render.Count == 0 ? 0 : LabelsAllocated / 1024.0 / Render.Count).ToString("0.0", inv),
+                (Render.Count == 0 ? 0 : DecorAllocated / 1024.0 / Render.Count).ToString("0.0", inv),
+                (Render.Count == 0 ? 0 : PresentAllocated / 1024.0 / Render.Count).ToString("0.0", inv),
+                GcPauseMilliseconds.ToString("0.0", inv),
+                (HeapBytes / 1024.0 / 1024.0).ToString("0", inv),
+                SceneGpuFrames.ToString(inv),
+                LabelsGpuFrames.ToString(inv));
         }
     }
+
+    /// <summary>
+    /// The CPU time of the UI thread and of WPF's render thread, read from
+    /// the threads' own cycle counters, for the bench: a phase's render-thread
+    /// cost per frame is what the WPF side of a frame costs - composing the
+    /// layers, the D3DImage's copy, the text WPF still draws - and it runs in
+    /// parallel with the UI thread, so neither clock alone says it.  The
+    /// render thread is the one started in wpfgfx (all of them, should WPF
+    /// have more than one).  Cycles become milliseconds by a count taken over
+    /// 50 ms of spinning when the bench starts.
+    /// </summary>
+    private static class BenchThreadClock
+    {
+        private const uint QueryInformation = 0x0040;
+        private const uint QueryLimitedInformation = 0x0800;
+        private static IntPtr _ui;
+        private static readonly List<IntPtr> RenderThreads = [];
+        private static double _cyclesPerMillisecond = 1;
+
+        public readonly record struct Sample(ulong Ui, ulong Render);
+
+        /// <summary>The render threads found, by id, or why none was.</summary>
+        public static string RenderThreadName { get; private set; } = "not looked for";
+
+        public static void Start()
+        {
+            if (_ui != IntPtr.Zero)
+            {
+                return;
+            }
+
+            _ui = OpenThread(QueryLimitedInformation, false, GetCurrentThreadId());
+            var found = new List<string>();
+            using (var process = Process.GetCurrentProcess())
+            {
+                foreach (ProcessThread thread in process.Threads)
+                {
+                    var probe = OpenThread(QueryInformation | QueryLimitedInformation, false, (uint)thread.Id);
+                    if (probe == IntPtr.Zero)
+                    {
+                        continue;
+                    }
+
+                    if (NtQueryInformationThread(probe, 9, out var start, IntPtr.Size, IntPtr.Zero) == 0
+                        && ModuleOf(start).StartsWith("wpfgfx", StringComparison.OrdinalIgnoreCase))
+                    {
+                        RenderThreads.Add(probe);
+                        found.Add(thread.Id.ToString(CultureInfo.InvariantCulture));
+                    }
+                    else
+                    {
+                        CloseHandle(probe);
+                    }
+                }
+            }
+
+            RenderThreadName = found.Count == 0 ? "no wpfgfx thread found" : "wpfgfx thread " + string.Join(", ", found);
+
+            // Cycles per millisecond: this thread spins and both clocks are read.
+            QueryThreadCycleTime(_ui, out var before);
+            var watch = Stopwatch.StartNew();
+            while (watch.Elapsed.TotalMilliseconds < 50)
+            {
+            }
+
+            QueryThreadCycleTime(_ui, out var after);
+            _cyclesPerMillisecond = Math.Max(1, (after - before) / watch.Elapsed.TotalMilliseconds);
+        }
+
+        public static Sample Read()
+        {
+            ulong ui = 0, render = 0;
+            if (_ui != IntPtr.Zero)
+            {
+                QueryThreadCycleTime(_ui, out ui);
+            }
+
+            foreach (var thread in RenderThreads)
+            {
+                if (QueryThreadCycleTime(thread, out var cycles))
+                {
+                    render += cycles;
+                }
+            }
+
+            return new Sample(ui, render);
+        }
+
+        public static double Milliseconds(ulong cycles) => cycles / _cyclesPerMillisecond;
+
+        private static string ModuleOf(IntPtr address)
+        {
+            if (address == IntPtr.Zero || !GetModuleHandleExW(0x4 | 0x2, address, out var module) || module == IntPtr.Zero)
+            {
+                return string.Empty;
+            }
+
+            var name = new StringBuilder(260);
+            GetModuleFileNameW(module, name, name.Capacity);
+            return Path.GetFileName(name.ToString());
+        }
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr OpenThread(uint access, bool inherit, uint id);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("kernel32.dll")]
+        private static extern bool QueryThreadCycleTime(IntPtr thread, out ulong cycles);
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationThread(IntPtr thread, int informationClass, out IntPtr information, int length, IntPtr returned);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetModuleHandleExW(uint flags, IntPtr address, out IntPtr module);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetModuleFileNameW(IntPtr module, StringBuilder name, int size);
+    }
+
+    /// <summary>
+    /// Every frame of the bench, one line each, for looking into the frames a
+    /// summary row cannot explain: written beside the report.  Its room is
+    /// taken when the bench starts, so logging a frame does not add to the
+    /// garbage the frame is measured for.
+    /// </summary>
+    private StringBuilder _benchFrames = new();
+
+    private const string BenchFramesHeader = "phase\tframe\tinterval_ms\trendered\tui_ms\twalk_ms\tlabels_ms\tdecor_ms\tpresent_ms\tlock_ms\tgpu_wait_ms\tupload_ms\tgen0\tgen1\tgen2\talloc_kb\tcells\tglyphs\n";
+
+    private long _benchAllocated;
 
     /// <summary>Runs <paramref name="step"/> once per frame for <paramref name="frames"/> frames, timing each.</summary>
     private Task<PhaseStats> PhaseAsync(string name, int frames, Action<int> step, bool force = true)
@@ -330,6 +660,13 @@ public partial class MainWindow
         var lastTime = TimeSpan.MinValue;
         var lastStamp = 0L;
         var lastCount = Nested.RenderCount;
+        var allocatedAtStart = 0L;
+        var gen0AtStart = 0;
+        var gen1AtStart = 0;
+        var gen2AtStart = 0;
+        var skippedAtStart = 0;
+        var cpuAtStart = default(BenchThreadClock.Sample);
+        var pauseAtStart = TimeSpan.Zero;
         void OnFrame(object? sender, EventArgs e)
         {
             var time = ((RenderingEventArgs)e).RenderingTime;
@@ -340,23 +677,70 @@ public partial class MainWindow
 
             lastTime = time;
             var now = Stopwatch.GetTimestamp();
+            var interval = lastStamp != 0 ? Stopwatch.GetElapsedTime(lastStamp, now).TotalMilliseconds : 0;
             if (lastStamp != 0)
             {
-                stats.Interval.Add(Stopwatch.GetElapsedTime(lastStamp, now).TotalMilliseconds);
+                stats.Interval.Add(interval);
             }
 
             lastStamp = now;
-            if (Nested.RenderCount != lastCount)
+            var rendered = Nested.RenderCount != lastCount;
+            var threadAllocated = GC.GetAllocatedBytesForCurrentThread();
+            _benchFrames.Append(CultureInfo.InvariantCulture,
+                $"{name}\t{frame}\t{interval:0.00}\t{(rendered ? 1 : 0)}\t{Nested.LastFrameMilliseconds:0.00}\t{Nested.LastWalkMilliseconds:0.00}\t{Nested.LastLabelsMilliseconds:0.00}\t{Nested.LastDecorMilliseconds:0.00}\t{Nested.LastPresentMilliseconds:0.00}\t{Nested.LastLockMilliseconds:0.00}\t{Nested.LastGpuWaitMilliseconds:0.00}\t{Nested.LastUploadMilliseconds:0.00}\t{GC.CollectionCount(0)}\t{GC.CollectionCount(1)}\t{GC.CollectionCount(2)}\t{(threadAllocated - _benchAllocated) / 1024.0:0.0}\t{Nested.DrawnCellCount}\t{Nested.LastGpuGlyphs}\n");
+            _benchAllocated = threadAllocated;
+            if (rendered)
             {
                 stats.Render.Add(Nested.LastRenderMilliseconds);
                 stats.Cells.Add(Nested.DrawnCellCount);
                 stats.Labels.Add(Nested.LastLabelsMilliseconds);
                 stats.Layouts.Add(Nested.NewTextLayouts);
+                stats.Frame.Add(Nested.LastFrameMilliseconds);
+                stats.Walk.Add(Nested.LastWalkMilliseconds);
+                stats.Present.Add(Nested.LastPresentMilliseconds);
+                stats.Lock.Add(Nested.LastLockMilliseconds);
+                stats.GpuWait.Add(Nested.LastGpuWaitMilliseconds);
+                stats.Upload.Add(Nested.LastUploadMilliseconds);
+                stats.Glyphs.Add(Nested.LastGpuGlyphs);
+                stats.LabelsOnGpu |= Nested.AreLabelsOnGpu;
+                stats.SceneGpuFrames += Nested.IsSceneOnGpu ? 1 : 0;
+                stats.LabelsGpuFrames += Nested.AreLabelsOnGpu ? 1 : 0;
+                var allocations = Nested.LastAllocations;
+                stats.SceneAllocated += allocations.Scene;
+                stats.LabelsAllocated += allocations.Labels;
+                stats.DecorAllocated += allocations.Decor;
+                stats.PresentAllocated += allocations.Present;
+                if (Nested.IsSceneOnGpu && !double.IsNaN(Nested.LastGpuMilliseconds))
+                {
+                    stats.Gpu.Add(Nested.LastGpuMilliseconds);
+                }
+
                 lastCount = Nested.RenderCount;
+            }
+
+            if (frame == 0)
+            {
+                allocatedAtStart = GC.GetAllocatedBytesForCurrentThread();
+                gen0AtStart = GC.CollectionCount(0);
+                gen1AtStart = GC.CollectionCount(1);
+                gen2AtStart = GC.CollectionCount(2);
+                skippedAtStart = Nested.SkippedPresents;
+                cpuAtStart = BenchThreadClock.Read();
+                pauseAtStart = GC.GetTotalPauseDuration();
             }
 
             if (frame >= frames)
             {
+                stats.AllocatedBytes = GC.GetAllocatedBytesForCurrentThread() - allocatedAtStart;
+                stats.Gen0 = GC.CollectionCount(0) - gen0AtStart;
+                stats.Gen1 = GC.CollectionCount(1) - gen1AtStart;
+                stats.Gen2 = GC.CollectionCount(2) - gen2AtStart;
+                stats.Skipped = Nested.SkippedPresents - skippedAtStart;
+                stats.GcPauseMilliseconds = (GC.GetTotalPauseDuration() - pauseAtStart).TotalMilliseconds;
+                stats.HeapBytes = GC.GetTotalMemory(forceFullCollection: false);
+                var cpu = BenchThreadClock.Read();
+                stats.UiCpuPerFrame = BenchThreadClock.Milliseconds(cpu.Ui - cpuAtStart.Ui) / Math.Max(1, frames);
+                stats.RenderCpuPerFrame = BenchThreadClock.Milliseconds(cpu.Render - cpuAtStart.Render) / Math.Max(1, frames);
                 CompositionTarget.Rendering -= OnFrame;
                 done.TrySetResult(stats);
                 return;
@@ -377,8 +761,13 @@ public partial class MainWindow
     {
         TrackTreeChanges();
         await Task.Delay(300);
+        var rendererAtStart = await WaitForRendererAsync();
         var report = new StringBuilder();
-        report.AppendLine("phase\tframes\tmean_ms\tp50_ms\tp95_ms\tmax_ms\tinterval_ms\tinterval_p95\tcells\thitches_20ms\tworst_gap_ms\tlabels_ms\tlabels_max\tnew_text\tnew_text_max");
+        BenchThreadClock.Start();
+        _benchFrames = new StringBuilder(BenchFramesHeader, 1 << 20);
+        report.AppendLine("phase\tframes\tmean_ms\tp50_ms\tp95_ms\tmax_ms\tinterval_ms\tinterval_p95\tcells\thitches_20ms\tworst_gap_ms\tlabels_ms\tlabels_max\tnew_text\tnew_text_max"
+            + "\tui_p50_ms\tui_p95_ms\twalk_p50_ms\tpresent_p50_ms\tlock_p50_ms\tgpu_wait_p50_ms\tgpu_p50_ms\talloc_kb_per_frame\tgen2\tskipped"
+            + "\tinterval_p50\tlabels_p50_ms\tupload_p50_ms\tglyphs\tgen0\tgen1\tui_cpu_ms\trender_cpu_ms\tlabels_on\tscene_kb\tlabels_kb\tdecor_kb\tpresent_kb\tgc_pause_ms\theap_mb\tscene_gpu_frames\tlabels_gpu_frames");
 
         Nested.FitAll(animated: false);
         var settle = await SettleAsync();
@@ -476,7 +865,33 @@ public partial class MainWindow
         report.AppendLine();
         report.AppendLine($"settle_fit_ms\t{settle.ToString("0", CultureInfo.InvariantCulture)}");
         report.AppendLine($"loaded_folders\t{_nestedTree.LoadedCount}");
+
+        // Where the scene was drawn, on what, and what the GPU's start-up did.
+        var dpi = VisualTreeHelper.GetDpi(Nested);
+        report.AppendLine();
+        report.AppendLine($"renderer\t{(Nested.IsSceneOnGpu ? "gpu" : "cpu")}\t{Nested.RendererReason}\t{Nested.RendererAdapter}\tlabels\t{(Nested.AreLabelsOnGpu ? "gpu" : "wpf")}");
+        report.AppendLine($"renderer_at_start\t{rendererAtStart}");
+        report.AppendLine($"render_thread\t{BenchThreadClock.RenderThreadName}");
+        report.AppendLine($"label_atlases\t{Rendering.Gpu.GpuLabelAtlases.Report}");
+        if (Nested.GpuTextShaper is { } shaper)
+        {
+            report.AppendLine($"text_shaper\t{shaper.Count} names shaped\t{shaper.DirectShapes} of them on the UI thread (not prefetched)\t{shaper.PendingCount} pending");
+        }
+
+        if (Rendering.Gpu.GpuLabelAtlases.Current is { } atlases)
+        {
+            report.AppendLine($"atlases\tglyphs {atlases.Glyphs.EntryCount} on {atlases.Glyphs.PageCount} pages\ticons {atlases.Icons.SlotCount} slots from {atlases.Icons.ExtractionCount} extractions");
+        }
+        report.AppendLine($"text_tuning\tgamma {Rendering.Gpu.GpuTextTuning.Gamma.ToString(CultureInfo.InvariantCulture)}\tcontrast {Rendering.Gpu.GpuTextTuning.Contrast.ToString(CultureInfo.InvariantCulture)}\tbias {Rendering.Gpu.GpuTextTuning.BiasScale.ToString(CultureInfo.InvariantCulture)}");
+        var scale = Nested.DpiOverride ?? dpi;
+        report.AppendLine($"canvas_pixels\t{Math.Ceiling(Nested.ActualWidth * scale.DpiScaleX)}x{Math.Ceiling(Nested.ActualHeight * scale.DpiScaleY)}\tcanvas_dips\t{Nested.ActualWidth:0}x{Nested.ActualHeight:0}\tbench_scale\t{BenchNumber("--bench-scale")}\tbench_layout\t{BenchNumber("--bench-layout")}");
+        foreach (var line in Rendering.Gpu.GpuBootstrap.Events)
+        {
+            report.AppendLine($"gpu_event\t{line.Trim()}");
+        }
+
         File.WriteAllText(output, report.ToString());
+        File.WriteAllText(output + ".frames.tsv", _benchFrames.ToString());
     }
 
     private async Task RunNestedSnapshotsAsync(string folder)
@@ -484,6 +899,11 @@ public partial class MainWindow
         TrackTreeChanges();
         Directory.CreateDirectory(folder);
         await Task.Delay(300);
+        await WaitForRendererAsync();
+
+        // Beside the pictures, what drew each one: a set of GPU pictures with
+        // a CPU one among them says so instead of passing for a baseline.
+        var renderers = new StringBuilder("scene\tcells\tnames\treason\n");
 
         SnapshotScene[] scenes =
         [
@@ -533,8 +953,11 @@ public partial class MainWindow
 
             await SettleAsync();
             Save(Nested, Path.Combine(folder, name + ".png"));
+            renderers.Append(name).Append('\t').Append(RendererState()).Append('\n');
             Save(NestedHost, Path.Combine(withStrip, name + ".png"));
         }
+
+        File.WriteAllText(Path.Combine(folder, "renderer.tsv"), renderers.ToString());
 
         // Written now: the run exits before the window is ever idle enough
         // to write it by itself.
@@ -558,7 +981,10 @@ public partial class MainWindow
         _nestedTree.FlushSortWork();
         element.UpdateLayout();
         Nested.RenderNow();
-        var dpi = VisualTreeHelper.GetDpi(element);
+
+        // At the scale the canvas draws at: with --bench-scale that is the
+        // stand-in for a 150 % monitor, and the picture is kept at its pixels.
+        var dpi = Nested.DpiOverride ?? VisualTreeHelper.GetDpi(element);
         var bitmap = new RenderTargetBitmap(
             (int)Math.Ceiling(element.ActualWidth * dpi.DpiScaleX),
             (int)Math.Ceiling(element.ActualHeight * dpi.DpiScaleY),

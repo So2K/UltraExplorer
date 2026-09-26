@@ -30,6 +30,47 @@ public sealed class WorkspaceStore
         Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
     }
 
+    /// <summary>
+    /// The saved renderer setting (<see cref="WorkspaceState.CanvasRenderer"/>)
+    /// read on its own, synchronously, at the application's start: the GPU is
+    /// prepared from the first moment, before the workspace is loaded, and a
+    /// saved choice of the processor must stop that.  Null when there is no
+    /// workspace, it cannot be read, or it holds no such setting.  Only the
+    /// one property is looked at; nothing else of the file is parsed into
+    /// objects.
+    /// </summary>
+    public static string? PeekCanvasRenderer(string? statePath = null)
+    {
+        var path = statePath ?? AppPaths.State("workspace.json");
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            using var document = JsonDocument.Parse(File.ReadAllBytes(path), new JsonDocumentOptions { AllowTrailingCommas = true });
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            foreach (var property in document.RootElement.EnumerateObject())
+            {
+                if (string.Equals(property.Name, nameof(WorkspaceState.CanvasRenderer), StringComparison.OrdinalIgnoreCase))
+                {
+                    return property.Value.ValueKind == JsonValueKind.String ? property.Value.GetString() : null;
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
     public async Task<WorkspaceState?> LoadAsync(CancellationToken cancellationToken = default)
     {
         if (!File.Exists(_statePath))

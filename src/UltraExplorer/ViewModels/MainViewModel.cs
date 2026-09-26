@@ -54,6 +54,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CanvasLayout _layout = CanvasLayout.Nested;
     private string _savedLayout = nameof(CanvasLayout.Nested);
     private ItemSort _sort = ItemSort.Default;
+    private string? _savedRenderer;
     private bool _sortSavePending;
     private string _nestedZoomLabel = "Fit";
     private readonly bool _isPickerSession;
@@ -255,6 +256,29 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     public bool IsNestedLayout => _layout == CanvasLayout.Nested;
+
+    /// <summary>
+    /// The Canvas options setting for what draws the nested canvas.  Taking
+    /// effect at once: the canvas moves to the renderer chosen at its next
+    /// frame.  The command line and the environment variable still win over
+    /// it (<see cref="Rendering.Gpu.GpuBootstrap.ExplicitPreference"/>).
+    /// </summary>
+    internal Rendering.Gpu.RendererPreference Renderer
+    {
+        get => Rendering.Gpu.GpuBootstrap.ParsePreference(_savedRenderer) ?? Rendering.Gpu.RendererPreference.Auto;
+        set
+        {
+            if (value == Renderer)
+            {
+                return;
+            }
+
+            _savedRenderer = value.ToString();
+            Rendering.Gpu.GpuBootstrap.SetSettingPreference(value);
+            OnPropertyChanged(nameof(Renderer));
+            _ = SaveNowAsync();
+        }
+    }
 
     public bool IsTreeLayout => _layout == CanvasLayout.Tree;
 
@@ -469,6 +493,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(IsMinimapShown));
             }
 
+            _savedRenderer = state.CanvasRenderer;
+            Rendering.Gpu.GpuBootstrap.SetSettingPreference(Renderer);
+
             // Handed to the tree before it builds its first layout, so the
             // drives open already in the remembered order.
             var sort = _isPickerSession ? ItemSort.Default : ItemSort.FromSetting(state.CanvasSort);
@@ -587,10 +614,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // the window.
         var layout = _savedLayout;
         string? sort = (_isPickerSession ? ItemSort.Default : _sort).ToSetting();
+        var renderer = _savedRenderer;
         if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
         {
             layout = current.CanvasLayout;
             sort = current.CanvasSort;
+            renderer = current.CanvasRenderer;
         }
 
         var state = new WorkspaceState
@@ -600,6 +629,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsFolderListVisible = Tree.FolderList.IsVisible,
             CanvasLayout = layout,
             CanvasSort = sort,
+            CanvasRenderer = renderer,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))

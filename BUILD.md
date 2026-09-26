@@ -32,7 +32,10 @@ refresh, truncation, drop-target selection, drag rules and persistence, plus the
 file-dialog rules - file types, legacy flag translation, typed names, validation
 and what the graph is allowed to show - and the nested canvas: its geometry, its
 lazily read tree over a fake disk, the camera, hit testing, sorting by name,
-date, type and size, and the cost of a frame, all without a window. It
+date, type and size, and the cost of a frame, all without a window - plus the GPU
+renderer offscreen on each graphics card and on WARP: device and surface
+lifetime, the rectangle shader against the CPU raster, the icon and glyph
+atlases and text shaping against WPF's own. It
 builds a throwaway fixture under `%TEMP%`, prints one line per check and exits
 non-zero on the first failure. If `%TEMP%` is not writable (a sandboxed shell),
 point `TMP` and `TEMP` at a folder that is.
@@ -98,6 +101,19 @@ z-order. Without the switch the service is never constructed.
 UltraExplorer.exe --capture C:\temp\shot.png
 ```
 
+## Renderer
+
+The nested canvas draws with Direct3D 11 when it can and with the CPU raster
+otherwise (remote desktop, software rendering, no Direct3D 11). Force one with
+`--renderer auto|gpu|cpu`, the variable `ULTRAEXPLORER_RENDERER`, or Canvas options
+→ Renderer. `ULTRAEXPLORER_TEXT_TUNING=gamma=1.8;contrast=1;bias=1` overrides the
+GPU text tuning. Run a Release build to judge speed: Debug turns the JIT
+optimiser off and the canvas is several times slower.
+
+```powershell
+dotnet publish src/UltraExplorer/UltraExplorer.csproj -c Release -r win-x64 --self-contained false -o out\release
+```
+
 ## Nested canvas benchmark and snapshots
 
 Two switches judge a change to the nested canvas by numbers and by pixels
@@ -118,13 +134,17 @@ UltraExplorer.exe --nested-snapshots C:\temp\shots
   flight), timing every frame, then times selecting deep folders until the
   address bar and the list follow. One row per phase: mean and worst frame,
   frames over 20 ms. `sort-switch` clicks through Size, Date, Type and Name
-  on a folder of thousands of files and reports the worst click.
+  on a folder of thousands of files and reports the worst click. Per phase it
+  also reports the UI split (walk, labels, present, GPU wait), GPU time,
+  allocations and collections, and `scene_gpu_frames`/`labels_gpu_frames`.
+  `--bench-window 1920x1040 --bench-scale 1.5 --bench-layout 0.742` emulates a
+  4K 150% screen on a smaller monitor.
 - `--nested-snapshots <folder>` renders a fixed set of views to PNG once
   everything in them has been read. The PNGs of two builds compared pixel
   for pixel say whether a change altered the picture. `with-strip\` beside
   them holds the same views with the strip above the canvas. Scenes 01, 02
   and 12 show live disk data (free space, what was read) and differ between
-  any two runs.
+  any two runs. `renderer.tsv` says which renderer drew each scene.
 
 Run them with `ULTRAEXPLORER_STATE_DIR` pointing at an empty folder, so the
 saved session does not colour the result and the run does not touch it. A
@@ -143,6 +163,7 @@ everyday one.
 | `%LOCALAPPDATA%\UltraExplorer\folder-marks.json` | colour labels and notes, keyed by path |
 | `%LOCALAPPDATA%\UltraExplorer\picker.workspace.json` | canvas layout of file-dialog sessions, kept apart from the user's own |
 | `%LOCALAPPDATA%\UltraExplorer\picker-clients.json` | per caller GUID: last folder, file type, recent names |
+| `%LOCALAPPDATA%\UltraExplorer\gpu\`, `cache\`, `jit\` | compiled shaders, the icon and glyph atlases, the startup JIT profile - all rebuilt when missing |
 
 Deleting them resets the app to its first-run state. The environment variable
 `ULTRAEXPLORER_STATE_DIR` moves the whole folder, so a second copy can run

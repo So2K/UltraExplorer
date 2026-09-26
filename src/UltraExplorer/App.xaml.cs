@@ -1,7 +1,9 @@
+using System.Runtime;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
 using Nodify;
+using UltraExplorer.Infrastructure;
 using UltraExplorer.Picker;
 using UltraExplorer.Picker.Com;
 
@@ -64,6 +66,8 @@ public partial class App : Application
             return;
         }
 
+        StartJitProfile();
+        StartGpu();
         if (FileDialogCommandLine.IsPickerInvocation(e.Args))
         {
             StartPicker(e.Args);
@@ -73,6 +77,90 @@ public partial class App : Application
         var window = new MainWindow();
         MainWindow = window;
         window.Show();
+    }
+
+    /// <summary>
+    /// Gets the nested canvas's GPU ready while the window is still being
+    /// built, on threads of their own: the atlases the names are drawn from
+    /// (glyphs and icons, from their caches on disk), and the card that
+    /// drives the monitor the window opens on - its devices, the shaders
+    /// loaded or compiled, the pipelines, its copies of the atlases, and one
+    /// frame through every pipeline drawn offscreen - so the first frame the
+    /// user sees, and the first zoom, find everything warm.  The canvas draws
+    /// on the CPU until then and moves over at the next frame, and draws on
+    /// the CPU for good when that renderer is chosen (<c>--renderer cpu</c>,
+    /// <c>ULTRAEXPLORER_RENDERER=cpu</c>, or Canvas options, Renderer,
+    /// Processor).  Chosen, nothing of the GPU is made at all - the saved
+    /// setting is read here, before the workspace is, because someone who
+    /// picked the processor may have done so because the graphics path
+    /// misbehaves on their driver - and a later switch back starts it all.
+    /// </summary>
+    private static void StartGpu()
+    {
+        if (Rendering.Gpu.GpuBootstrap.IsStarted)
+        {
+            return;
+        }
+
+        if (Rendering.Gpu.GpuBootstrap.ParsePreference(WorkspaceStore.PeekCanvasRenderer()) is { } saved)
+        {
+            Rendering.Gpu.GpuBootstrap.UseSavedPreference(saved);
+        }
+
+        // In this order: a card's renderer draws its warm-up frame from the
+        // atlases' textures the step before makes on it.  Registered even
+        // for the CPU: choosing the GPU later starts the warm-up with them.
+        Rendering.Gpu.GpuLabelAtlases.RegisterWarmUp();
+        Rendering.Gpu.NestedGpuRenderer.RegisterWarmUp();
+        if (Rendering.Gpu.GpuBootstrap.Preference == Rendering.Gpu.RendererPreference.Cpu)
+        {
+            return;
+        }
+
+        // Where WPF itself does not draw on the card - a remote session, or
+        // software rendering asked for - the automatic choice is the CPU, so
+        // nothing is prepared that would not be used.  Should the session
+        // turn local, the canvas's first frame that could use the GPU starts
+        // it all (GpuBootstrap.Decide).
+        if (Rendering.Gpu.GpuBootstrap.Preference == Rendering.Gpu.RendererPreference.Auto
+            && (SystemParameters.IsRemoteSession || RenderOptions.ProcessRenderMode == System.Windows.Interop.RenderMode.SoftwareOnly))
+        {
+            return;
+        }
+
+        Rendering.Gpu.GpuLabelAtlases.StartWarmUp();
+        Rendering.Gpu.GpuBootstrap.Start(UltraExplorer.MainWindow.StartupMonitor());
+    }
+
+    /// <summary>
+    /// Multicore JIT: the methods this run compiles are recorded in the state
+    /// folder, and the next start compiles them on spare cores before the UI
+    /// thread asks for them - the frame loop, the walk, the label target -
+    /// so the first frames of a session run optimised code, not stubs.
+    /// </summary>
+    private static void StartJitProfile()
+    {
+        try
+        {
+            var folder = AppPaths.State("jit");
+            Directory.CreateDirectory(folder);
+            ProfileOptimization.SetProfileRoot(folder);
+            ProfileOptimization.StartProfile("startup.jitprofile");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Without the folder there is no profile: the JIT compiles as it
+            // always has.
+        }
+    }
+
+    protected override void OnExit(ExitEventArgs e)
+    {
+        // The cards first - their textures read the atlases - then what the
+        // atlases learned this run, for the next start.
+        Rendering.Gpu.GpuBootstrap.Shutdown();
+        Rendering.Gpu.GpuLabelAtlases.Shutdown();
+        base.OnExit(e);
     }
 
     /// <summary>

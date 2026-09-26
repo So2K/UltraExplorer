@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Collections.Concurrent;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Windows.Media;
 using UltraExplorer.Infrastructure;
@@ -40,8 +42,100 @@ public sealed class FolderMarkService
     /// <summary>Raised on the thread that changed the mark; callers marshal.</summary>
     public event Action<string, FolderMark>? MarkChanged;
 
+    /// <summary>
+    /// The mark of <paramref name="path"/>, or <see cref="FolderMark.None"/>.
+    /// The nested canvas asks for every folder it draws - tens of thousands
+    /// in one frame the first time a big folder comes into view - so the
+    /// common case is kept cheap: with nothing marked there is nothing to
+    /// look up, and a path already in the form the keys are kept in
+    /// (<see cref="IsKeyForm"/>) is looked up as it is, rather than
+    /// normalised at a microsecond and a few hundred bytes apiece.
+    /// </summary>
     public FolderMark Get(string path)
-        => _marks.TryGetValue(Key(path), out var mark) ? mark : FolderMark.None;
+    {
+        if (_marks.IsEmpty)
+        {
+            return FolderMark.None;
+        }
+
+        return _marks.TryGetValue(IsKeyForm(path) ? path : Key(path), out var mark) ? mark : FolderMark.None;
+    }
+
+    /// <summary>
+    /// Whether normalising <paramref name="path"/> would hand it back as it
+    /// is: a full local path - a drive letter, a colon, a backslash - with no
+    /// separator at its end unless it is the root, and nothing
+    /// <see cref="Models.ViewAllPath.Normalize"/> would change or Windows
+    /// would read differently: no forward slashes or doubled separators, no
+    /// quotes, environment variables, stream colons or wildcards, no "." or
+    /// ".." and no name ending in a dot or a space (Windows trims those), and
+    /// no name of a device.  Anything else is normalised the long way.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    internal static bool IsKeyForm(string path)
+    {
+        if (path.Length < 3 || !char.IsAsciiLetter(path[0]) || path[1] != ':' || path[2] != Path.DirectorySeparatorChar)
+        {
+            return false;
+        }
+
+        // The characters first, all at once; then name by name.
+        var rest = path.AsSpan(3);
+        if (rest.IndexOfAny(UnsafeCharacters) >= 0)
+        {
+            return false;
+        }
+
+        while (rest.Length > 0)
+        {
+            var end = rest.IndexOf(Path.DirectorySeparatorChar);
+            var name = end < 0 ? rest : rest[..end];
+            if (name.Length == 0 || name[^1] is '.' or ' ' || IsDeviceName(name))
+            {
+                return false;
+            }
+
+            if (end < 0)
+            {
+                return true;
+            }
+
+            rest = rest[(end + 1)..];
+            if (rest.Length == 0)
+            {
+                // A separator at the end, past the root.
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>What <see cref="IsKeyForm"/> never takes as it is: slashes, variables, quotes, stream colons, wildcards and control characters.</summary>
+    private static readonly SearchValues<char> UnsafeCharacters = SearchValues.Create(
+        [.. Enumerable.Range(0, 32).Select(code => (char)code), '/', '%', '"', ':', '<', '>', '|', '?', '*']);
+
+    /// <summary>CON, PRN, AUX, NUL, COM1 to 9 and LPT1 to 9, with or without an extension: names Windows gives to devices.</summary>
+    private static bool IsDeviceName(ReadOnlySpan<char> name)
+    {
+        if (name.Length < 3 || (name[0] | 0x20) is not ('c' or 'p' or 'a' or 'n' or 'l'))
+        {
+            return false;
+        }
+
+        var dot = name.IndexOf('.');
+        var stem = (dot >= 0 ? name[..dot] : name).TrimEnd(' ');
+        return stem.Length switch
+        {
+            3 => stem.Equals("CON", StringComparison.OrdinalIgnoreCase)
+                || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+                || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase)
+                || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase),
+            4 => (stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase))
+                && (char.IsAsciiDigit(stem[3]) || stem[3] is '\u00B9' or '\u00B2' or '\u00B3'),
+            _ => false
+        };
+    }
 
     /// <summary>Every mark there is, for drawing them all at once (the nested canvas's beacons).</summary>
     public IReadOnlyList<KeyValuePair<string, FolderMark>> Snapshot()
