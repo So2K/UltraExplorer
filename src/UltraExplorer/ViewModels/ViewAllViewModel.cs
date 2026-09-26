@@ -45,6 +45,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private bool _isOverviewStale;
     private bool _isCanvasShown = true;
     private bool _graphChangedWhileHidden;
+    private ItemSort _sort = ItemSort.Default;
+
+    /// <summary>The order changed while the tree canvas was away, and the tree is still laid out in the one before.</summary>
+    private bool _isSortBehind;
 
     /// <summary>
     /// Node containers added per pass.  Measured: a container costs about a
@@ -81,7 +85,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
 
         FolderList = new FolderListViewModel(
-            (path, cancellation) => _graph.ReadDirectoryAsync(path, cancellation),
+            (path, sort, cancellation) => _graph.ReadDirectoryAsync(path, cancellation, sort),
             ActivateListItemAsync,
             path => _graph.TryGetNode(path, out _),
             icons);
@@ -250,7 +254,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     ///
     /// Turning it back on catches up in one go: anything opened while the tree
     /// was away is checked against the tree (see
-    /// <see cref="ViewAllGraphService.SettleVisibility"/>), the render set is
+    /// <see cref="ViewAllGraphService.SettleVisibility"/>), an order chosen
+    /// meanwhile is laid out (see <see cref="Sort"/>), the render set is
     /// rebuilt once and <see cref="GraphInvalidated"/> is raised, so the editor,
     /// the harness and the batched overview all come up current.
     /// </summary>
@@ -275,6 +280,20 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             // rebuilds everything below; otherwise it is done here.
             var settled = _graphChangedWhileHidden && !_isDisposed && _graph.SettleVisibility();
             _graphChangedWhileHidden = false;
+
+            // An order chosen while the tree was away is laid out now, before
+            // anything is drawn, and announced like settling.  Held on the node
+            // selected: coming back, that is what the view is brought to.
+            if (_isSortBehind && !_isDisposed)
+            {
+                _isSortBehind = false;
+                if (_graph.Sort != _sort)
+                {
+                    _graph.SetSort(_sort, _activeNode);
+                    settled = true;
+                }
+            }
+
             if (!settled)
             {
                 _isOverviewStale = true;
@@ -718,6 +737,52 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         if (node.IsDirectory)
         {
             ActiveNode = node;
+        }
+    }
+
+    /// <summary>
+    /// The order each folder's children are laid out in on the tree, folders
+    /// before files as always, and the order of the rows in the folder list.
+    /// A change lays the tree out again the way opening a folder does - every
+    /// position the user chose kept, and the view panned by however far the
+    /// folder being looked at was carried, so it stays where it was and its
+    /// children change places beneath it.  The list is reordered without
+    /// reading anything again.
+    ///
+    /// While the tree canvas is not on screen the tree is left as it is and
+    /// laid out in the new order when it comes back (see <see cref="IsCanvasShown"/>):
+    /// a tree opened wide is milliseconds to lay out again, which a click on a
+    /// header over the nested canvas has no business spending on a picture
+    /// nobody can see.
+    /// </summary>
+    public ItemSort Sort
+    {
+        get => _sort;
+        set
+        {
+            if (!SetProperty(ref _sort, value))
+            {
+                return;
+            }
+
+            FolderList.Sort = value;
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            if (!_isCanvasShown)
+            {
+                _isSortBehind = true;
+                return;
+            }
+
+            // The folder in view is the open one selected, or else the folder
+            // the selection sits in: that is what reorders, so that is what
+            // is held still.
+            var held = _activeNode is { IsDirectory: true, IsExpanded: true } open ? open : _activeNode?.Parent ?? _activeNode;
+            _graph.SetSort(value, held);
+            InvalidateCanvas();
         }
     }
 

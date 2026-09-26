@@ -18,6 +18,14 @@ public sealed class WorkspaceState
     public string CanvasLayout { get; set; } = "Nested";
 
     /// <summary>
+    /// The order folders and files are shown in, as <see cref="ItemSort.ToSetting"/>
+    /// writes it - "Name", "Modified-desc" and so on.  Missing or not
+    /// understood, it is names from A, which is what every workspace written
+    /// before there was a choice meant.
+    /// </summary>
+    public string? CanvasSort { get; set; } = ItemSort.Default.ToSetting();
+
+    /// <summary>
     /// Version 1 stored a colour label and a note per canvas node.  They are
     /// migrated into the path-keyed folder mark store on first load and then
     /// stop being written.

@@ -1,4 +1,8 @@
+using System.Buffers;
+using System.Diagnostics;
 using System.IO.Enumeration;
+using System.Runtime.InteropServices;
+using System.Windows.Threading;
 using UltraExplorer.Models;
 
 namespace UltraExplorer.Services;
@@ -20,7 +24,9 @@ public sealed record NestedListing(
     public static NestedListing Failed(string message) => new([], 0, 0, false, message);
 }
 
-public readonly record struct NestedEntry(string Name, bool IsHidden, bool IsReparsePoint);
+/// <summary>A sub-folder as a listing names it.</summary>
+/// <param name="ModifiedTicks">When it was last written, as UTC ticks; zero when the reader did not say.</param>
+public readonly record struct NestedEntry(string Name, bool IsHidden, bool IsReparsePoint, long ModifiedTicks = 0);
 
 /// <summary>A drive or extra root, as the canvas should name it.</summary>
 public sealed record NestedRoot(string FullPath, string Name, NestedFolderKind Kind, string SecondaryText = "");
@@ -39,6 +45,16 @@ public sealed record NestedRoot(string FullPath, string Name, NestedFolderKind K
 /// The tree belongs to the thread that created it.  Only the directory reads
 /// leave it; their results come back through the synchronisation context and
 /// are applied there.
+///
+/// Every folder's sub-folders and files are placed in one order, <see cref="Sort"/>,
+/// row by row.  Changing it re-places nothing at once - a tree read deep can
+/// be tens of thousands of folders, and doing them all in one go would stall
+/// the window.  Instead each folder remembers which order it was placed for,
+/// anything about to be drawn or looked at is placed again first
+/// (<see cref="EnsureLayout"/>), and a pass in small background slices brings
+/// the rest up to date behind it.  The listings themselves stay in name order
+/// for ever, which is what keeps finding a folder or a file by name a binary
+/// search whatever the canvas shows.
 /// </summary>
 public sealed class NestedTree : IDisposable
 {
@@ -71,6 +87,74 @@ public sealed class NestedTree : IDisposable
     private int _knownCount;
     private bool _includeHidden;
 
+    /// <summary>
+    /// Budget for one background slice of re-placing folders after a change of
+    /// order: well inside a frame, so the canvas keeps drawing while it runs.
+    /// Shared with whatever was placed on demand since the slice before (see
+    /// <see cref="_placedOnDemandTicks"/>), so a frame and its slice together
+    /// stay within it.
+    /// </summary>
+    private static readonly long SortSliceTicks = Stopwatch.Frequency * 4 / 1000;
+
+    /// <summary>
+    /// Less than this left of a slice's allowance and the slice waits for the
+    /// next frame instead: a sliver of time places next to nothing, and the
+    /// check it takes to find that out is not free either.
+    /// </summary>
+    private static readonly long MinimumSliceTicks = Stopwatch.Frequency / 2000;
+
+    private ItemSort _sort = ItemSort.Default;
+
+    /// <summary>
+    /// The order each <see cref="SortGeneration"/> stood for, by generation.
+    /// A folder placed for an order that has since come back - names from A,
+    /// after a look at the dates - needs only its stamp brought up to date,
+    /// not placing again.
+    /// </summary>
+    private readonly List<ItemSort> _sortHistory = [ItemSort.Default];
+
+    /// <summary>Folders the background pass after a change of order has still to visit, shallowest first.</summary>
+    private readonly Queue<NestedFolder> _sortSweep = new();
+
+    /// <summary>
+    /// Folders the canvas drew in their previous order because its frame had
+    /// no allowance left to place them: the next slice places these before
+    /// going on down the tree, so what is on screen catches up first and the
+    /// thousands of folders off it wait.
+    /// </summary>
+    private readonly Queue<NestedFolder> _sortFirst = new();
+
+    private bool _sortSlicePosted;
+    private List<TaskCompletionSource>? _sortIdleWaiters;
+
+    /// <summary>
+    /// Whether the pass under way has placed again a folder on the canvas.
+    /// Said once, when the pass is done, rather than after every slice: the
+    /// canvas places for itself whatever it draws, and a slice moving folders
+    /// nobody is looking at is no reason to draw the whole picture again.
+    /// </summary>
+    private bool _sortMovedCanvas;
+
+    /// <summary>
+    /// Time spent placing folders on demand - for the canvas's picture, a
+    /// click, a key - since the last slice of the background pass.  The next
+    /// slice takes it off its own allowance, so a frame that had to place a
+    /// lot for the picture is not given a whole slice on top.
+    /// </summary>
+    private long _placedOnDemandTicks;
+
+    /// <summary>
+    /// Whether reads look up their files' type names before they come back,
+    /// which is while the order is by type: read by the reading threads.
+    /// </summary>
+    private volatile bool _warmTypeNames;
+
+    // Scratch for ordering one folder's files by type, reused from folder to
+    // folder: placing a tree is tens of thousands of folders, each a handful
+    // of kinds, and none of it needs to become garbage.
+    private readonly List<string> _typeKinds = [];
+    private readonly Dictionary<string, int> _typeSlots = new(ReferenceEqualityComparer.Instance);
+
     public NestedTree(Func<string, CancellationToken, NestedListing>? reader = null)
     {
         _reader = reader ?? NestedDirectoryReader.Read;
@@ -81,6 +165,7 @@ public sealed class NestedTree : IDisposable
         {
             LoadState = NestedLoadState.Loaded
         };
+        PostBackground = DefaultPostBackground();
     }
 
     /// <summary>The cell every drive is inside.</summary>
@@ -110,6 +195,39 @@ public sealed class NestedTree : IDisposable
 
     /// <summary>Raised when a folder's listing was applied, including a refresh.</summary>
     public event Action<NestedFolder>? FolderLoaded;
+
+    /// <summary>
+    /// Raised by <see cref="SetSort"/> the moment the order changes, before a
+    /// single folder has been placed for it: every folder is still where the
+    /// last picture showed it, which is when the canvas has to note what it is
+    /// looking at if the view is to stay still while the contents move.
+    /// </summary>
+    public event Action? SortChanged;
+
+    /// <summary>The order sub-folders and files are placed in, row by row, inside every folder but This PC.</summary>
+    public ItemSort Sort => _sort;
+
+    /// <summary>
+    /// Bumped by every change of <see cref="Sort"/>.  A folder whose stamp is
+    /// this number has been placed for the current order; any other stamp
+    /// means it is placed for an earlier one and must be brought up to date,
+    /// by <see cref="EnsureLayout"/>, before anything reads where its
+    /// children are.
+    /// </summary>
+    public int SortGeneration { get; private set; }
+
+    /// <summary>Whether the background pass after a change of order still has folders to visit.</summary>
+    public bool IsSorting => _sortSweep.Count > 0;
+
+    /// <summary>
+    /// How the background pass after a change of order schedules its slices.
+    /// By default a slice is queued on the creating thread's dispatcher below
+    /// input and rendering, or posted to its synchronisation context when it
+    /// has another kind; null runs the whole pass at once, which is what a
+    /// thread with neither gets.  A test can put its own queue here to run
+    /// the slices when and how it likes.
+    /// </summary>
+    public Action<Action>? PostBackground { get; set; }
 
     public bool IncludeHidden
     {
@@ -514,6 +632,9 @@ public sealed class NestedTree : IDisposable
         folder.AllFiles = [];
         folder.Files = [];
         folder.FileGrid = NestedFileGrid.Empty;
+
+        // Nothing left to order: like a folder never read, until it is read again.
+        folder.LayoutSortGeneration = -1;
         folder.LoadState = folder.IsComputer ? NestedLoadState.Loaded : NestedLoadState.NotLoaded;
         folder.ErrorMessage = string.Empty;
         RaiseChanged();
@@ -586,6 +707,231 @@ public sealed class NestedTree : IDisposable
         }
     }
 
+    /// <summary>
+    /// Orders every folder's sub-folders and files by <paramref name="sort"/>
+    /// from now on.  Nothing is placed again here: <see cref="SortChanged"/>
+    /// is raised, and a background pass starts that re-places every folder
+    /// read so far, shallowest first, a few milliseconds at a time, and raises
+    /// <see cref="Changed"/> once at the end if it moved something on the
+    /// canvas.  Whatever is drawn or looked at before the pass gets to it is
+    /// placed on the spot by <see cref="EnsureLayout"/>.  With no
+    /// <see cref="PostBackground"/> - a thread with nothing to post to - the
+    /// whole pass runs here, straight after the event.
+    /// </summary>
+    public void SetSort(ItemSort sort)
+    {
+        if (sort == _sort)
+        {
+            return;
+        }
+
+        _sort = sort;
+        SortGeneration++;
+        _sortHistory.Add(sort);
+        _warmTypeNames = sort.Column == SortColumn.Type;
+
+        // A pass already under way starts again from the top; a slice it has
+        // already queued simply carries on with the new list.  Queued before
+        // the event, so whoever handles it already sees the tree sorting.
+        // What the last picture asked to have placed first was asked for the
+        // order before; the next picture asks again.
+        _sortSweep.Clear();
+        _sortFirst.Clear();
+        _sortMovedCanvas = false;
+        _placedOnDemandTicks = 0;
+        if (!_disposed)
+        {
+            _sortSweep.Enqueue(Root);
+        }
+
+        SortChanged?.Invoke();
+        ScheduleSortSlice();
+    }
+
+    /// <summary>
+    /// Places the folder's sub-folders and files for the current order if they
+    /// are not yet; costs a comparison of two numbers when they are.  Anything
+    /// that reads a folder's <see cref="NestedFolder.Children"/>, grids or
+    /// <see cref="NestedFolder.Files"/>, or its children's places, calls this
+    /// first.  A folder never placed - one not read yet - is left alone: it
+    /// has nothing to order.
+    /// </summary>
+    public void EnsureLayout(NestedFolder folder)
+    {
+        var stamp = folder.LayoutSortGeneration;
+        if (stamp == SortGeneration || stamp < 0)
+        {
+            return;
+        }
+
+        // Timed, because the background pass shares its allowance with
+        // whatever had to be placed on demand since its last slice.
+        var started = Stopwatch.GetTimestamp();
+        if (Relayout(folder))
+        {
+            _placedOnDemandTicks += Stopwatch.GetTimestamp() - started;
+        }
+    }
+
+    /// <summary>
+    /// Has the next slice of the background pass place these folders before
+    /// anything else: the canvas drew them in their previous order, its
+    /// frame's allowance for placing spent.  Replaces what the picture before
+    /// asked for - whatever of that is still out of date and on screen is in
+    /// this list again.
+    /// </summary>
+    internal void PlaceFirst(List<NestedFolder> folders)
+    {
+        _sortFirst.Clear();
+        if (!IsSorting)
+        {
+            return;
+        }
+
+        foreach (var folder in folders)
+        {
+            _sortFirst.Enqueue(folder);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="EnsureLayout"/> for every folder from the top down to this
+    /// one: what a camera fixed to a folder needs before it works out where
+    /// that folder's ancestors, and their other children, are.
+    /// </summary>
+    public void EnsurePathLayout(NestedFolder folder)
+    {
+        // Nearly always every folder on the way is up to date already, and
+        // this is a walk of number comparisons that allocates nothing.
+        var stale = false;
+        for (var current = folder; current is not null; current = current.Parent)
+        {
+            if (current.LayoutSortGeneration >= 0 && current.LayoutSortGeneration != SortGeneration)
+            {
+                stale = true;
+                break;
+            }
+        }
+
+        if (!stale)
+        {
+            return;
+        }
+
+        var path = new List<NestedFolder>(folder.Depth + 1);
+        for (var current = folder; current is not null; current = current.Parent)
+        {
+            path.Add(current);
+        }
+
+        for (var index = path.Count - 1; index >= 0; index--)
+        {
+            EnsureLayout(path[index]);
+        }
+    }
+
+    /// <summary>
+    /// Finishes the background pass after a change of order here and now, for
+    /// a test or a snapshot that wants every folder placed before it looks.
+    /// </summary>
+    public void FlushSortWork()
+    {
+        if (_sortSweep.Count == 0)
+        {
+            return;
+        }
+
+        SweepSort(budgetTicks: 0);
+        FinishSortPass();
+    }
+
+    /// <summary>Completes once the background pass after a change of order has visited every folder.</summary>
+    public Task WhenSortIdleAsync(CancellationToken cancellationToken = default)
+    {
+        if (!IsSorting)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled(cancellationToken);
+        }
+
+        var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        (_sortIdleWaiters ??= []).Add(waiter);
+        if (cancellationToken.CanBeCanceled)
+        {
+            var registration = cancellationToken.Register(() => waiter.TrySetCanceled(cancellationToken));
+            _ = waiter.Task.ContinueWith(
+                _ => registration.Dispose(),
+                CancellationToken.None,
+                TaskContinuationOptions.ExecuteSynchronously,
+                TaskScheduler.Default);
+        }
+
+        return waiter.Task;
+    }
+
+    /// <summary>
+    /// Where one of the folder's files is among its <see cref="NestedFolder.Files"/>,
+    /// or -1 when it is not among them - not listed, or hidden.  A binary
+    /// search by name either way: over the shown files themselves while they
+    /// are in name order, otherwise over every file read, which stays in name
+    /// order, and from there to the tile the current order gave it.  A name
+    /// culture order treats oddly falls back to a plain scan rather than
+    /// being reported missing.
+    /// </summary>
+    public int FindFileIndex(NestedFolder folder, string name)
+    {
+        EnsureLayout(folder);
+        return FileIndexAsPlaced(folder, name);
+    }
+
+    /// <summary>
+    /// <see cref="FindFileIndex"/> among the tiles as the folder is placed
+    /// right now, whichever order that was for, without placing it first:
+    /// for drawing a mark over the tile the picture shows, which is the tile
+    /// the folder had when it was drawn.
+    /// </summary>
+    internal static int FileIndexAsPlaced(NestedFolder folder, string name)
+    {
+        var positions = folder.FilePositions;
+        if (positions is null)
+        {
+            return SearchFiles(folder.Files, name);
+        }
+
+        var all = folder.AllFiles;
+        var found = SearchFiles(all, name);
+        if (found < 0 || positions[found] >= 0)
+        {
+            return found < 0 ? -1 : positions[found];
+        }
+
+        // The name belongs to a file that is not shown.  Only a folder whose
+        // names differ in case alone could also have a shown one it matches,
+        // and in name order that one sits right beside it.
+        var comparer = StringComparer.CurrentCultureIgnoreCase;
+        for (var index = found - 1; index >= 0 && comparer.Compare(all[index].Name, name) == 0; index--)
+        {
+            if (positions[index] >= 0 && string.Equals(all[index].Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return positions[index];
+            }
+        }
+
+        for (var index = found + 1; index < all.Length && comparer.Compare(all[index].Name, name) == 0; index++)
+        {
+            if (positions[index] >= 0 && string.Equals(all[index].Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return positions[index];
+            }
+        }
+
+        return -1;
+    }
+
     public void Dispose()
     {
         if (_disposed)
@@ -598,6 +944,12 @@ public sealed class NestedTree : IDisposable
         // Cancelled but not disposed: reads still in flight observe the token
         // after this, and a disposed source would throw at them instead.
         _lifetime.Cancel();
+
+        // Nobody will look at the folders again; whoever waits for the order
+        // to settle need not wait for ever.
+        _sortSweep.Clear();
+        _sortFirst.Clear();
+        CompleteSortIdle();
     }
 
     private void RaiseChanged()
@@ -716,9 +1068,21 @@ public sealed class NestedTree : IDisposable
         return await Task.Run(() =>
         {
             var listing = _reader(path, token);
-            return string.IsNullOrEmpty(listing.ErrorMessage)
-                ? Prepare(folder, basis, listing)
-                : new Read(listing, basis, [], basis);
+            if (!string.IsNullOrEmpty(listing.ErrorMessage))
+            {
+                return new Read(listing, basis, [], basis);
+            }
+
+            // Ordered by type, placing the folder asks the Shell for the name
+            // of every kind of file in it.  A kind seen for the first time is
+            // asked about here, off the UI thread, so placing it there finds
+            // every answer waiting.
+            if (_warmTypeNames)
+            {
+                FileTypeNames.Warm(listing.Files);
+            }
+
+            return Prepare(folder, basis, listing);
         }, token).ConfigureAwait(true);
     }
 
@@ -759,7 +1123,8 @@ public sealed class NestedTree : IDisposable
                 NestedFolderKind.Folder,
                 folder,
                 entry.IsHidden,
-                entry.IsReparsePoint);
+                entry.IsReparsePoint,
+                modifiedTicks: entry.ModifiedTicks);
         }
 
         NestedFolder[] removed = existing is null ? [] : [.. existing.Values, .. replaced ?? []];
@@ -804,6 +1169,16 @@ public sealed class NestedTree : IDisposable
         }
 
         _knownCount += read.Children.Length - read.Basis.Length;
+
+        // A folder still there keeps its object, with everything read below
+        // it, but its date is whatever the new listing says.  Set here on the
+        // UI thread, which owns the folders, rather than while preparing.
+        var entries = listing.Folders;
+        for (var index = 0; index < read.Children.Length; index++)
+        {
+            read.Children[index].ModifiedTicks = entries[index].ModifiedTicks;
+        }
+
         folder.AllChildren = read.Children;
         folder.AllFiles = listing.Files as NestedFile[] ?? [.. listing.Files];
         folder.FileCount = listing.FileCount;
@@ -872,7 +1247,12 @@ public sealed class NestedTree : IDisposable
         }
     }
 
-    /// <summary>Decides which children are cells and where each one goes.</summary>
+    /// <summary>
+    /// Decides which children are cells and where each one goes, in the
+    /// current <see cref="Sort"/>, and stamps the folder as placed for it.
+    /// Under names from A this is exactly what it always was: the listing's
+    /// own order, and the listing itself as the files whenever none is hidden.
+    /// </summary>
     private void ApplyVisibleChildren(NestedFolder folder)
     {
         // Only folders with a hidden or forced child look paths up; the rest
@@ -912,20 +1292,44 @@ public sealed class NestedTree : IDisposable
 
         // A hidden file someone marked or searched for is shown like a hidden
         // folder on the way to one: asking for it by name outranks the filter.
-        NestedFile[] files;
-        if (_includeHidden || folder.HiddenFileCount == 0)
+        bool IsShown(NestedFile file) => !file.IsHidden || hasRules && _forcedVisible.Contains(folder.PathOf(file));
+
+        // This PC's drives keep the order they were given in; everywhere else
+        // the chosen order applies.  Names from A is the order the listings
+        // already have, so it asks for nothing at all.
+        IReadOnlyList<NestedFolder> children = visible;
+        IReadOnlyList<NestedFile> files;
+        if (!_sort.IsDefault && !folder.IsComputer)
+        {
+            // Only which cell and which tile each one gets changes: the grids
+            // depend on how many there are, not on which is which.  A folder
+            // with no sub-folders shares one empty list: re-placing a tree is
+            // mostly such folders, and every object kept is one more for the
+            // garbage collector to carry.
+            OrderFolders(visible);
+            if (visible.Count == 0)
+            {
+                children = [];
+            }
+
+            files = OrderFiles(
+                folder.AllFiles,
+                _includeHidden || folder.HiddenFileCount == 0 ? null : ShownIndices(folder.AllFiles, IsShown));
+        }
+        else if (_includeHidden || folder.HiddenFileCount == 0)
         {
             files = folder.AllFiles;
         }
         else
         {
-            files = [.. folder.AllFiles.Where(file => !file.IsHidden || hasRules && _forcedVisible.Contains(folder.PathOf(file)))];
+            NestedFile[] shown = [.. folder.AllFiles.Where(IsShown)];
+            files = shown;
         }
 
         // Sub-folders take the top of the cell and files what is left under
         // them: the folder grid is fitted into its share first, then the files
         // get every bit of height the folders did not actually use.
-        var (folderHeight, _) = NestedLayout.Split(visible.Count, files.Length);
+        var (folderHeight, _) = NestedLayout.Split(visible.Count, files.Count);
         var grid = NestedLayout.GridFor(visible.Count, folderHeight);
         for (var index = 0; index < visible.Count; index++)
         {
@@ -939,13 +1343,550 @@ public sealed class NestedTree : IDisposable
 
         var used = grid.IsEmpty ? 0 : grid.Height + NestedLayout.ZoneGap;
         folder.Grid = grid;
-        folder.Children = visible;
+        folder.Children = children;
         folder.Files = files;
         folder.FileGrid = NestedLayout.FileGridFor(
-            files.Length,
+            files.Count,
             NestedLayout.HeaderHeight + used,
             NestedLayout.ContentHeight - used);
         folder.UnlistedFileCount = Math.Max(0, folder.FileCount - folder.AllFiles.Length);
+        folder.LayoutSortGeneration = SortGeneration;
+    }
+
+    // ---- ordering ------------------------------------------------------------
+
+    /// <summary>
+    /// The default poster for the background pass: the creating thread's
+    /// dispatcher, below input and rendering, when that thread is running
+    /// one; otherwise its synchronisation context; otherwise none, and the
+    /// pass runs at once.  A dispatcher only counts when it is the context
+    /// too - a thread can have a dispatcher that nobody runs, and a slice
+    /// queued there would wait for ever.
+    /// </summary>
+    private static Action<Action>? DefaultPostBackground()
+    {
+        var context = SynchronizationContext.Current;
+        if (context is DispatcherSynchronizationContext && Dispatcher.FromThread(Thread.CurrentThread) is { } dispatcher)
+        {
+            return action => dispatcher.InvokeAsync(action, DispatcherPriority.Background);
+        }
+
+        if (context is not null)
+        {
+            return action => context.Post(static state => ((Action)state!).Invoke(), action);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Places a folder for the current order if it is not yet; true when it
+    /// actually had to be placed again, rather than being up to date or only
+    /// needing its stamp moved on.
+    /// </summary>
+    private bool Relayout(NestedFolder folder)
+    {
+        var stamp = folder.LayoutSortGeneration;
+        if (stamp == SortGeneration || stamp < 0)
+        {
+            return false;
+        }
+
+        // Placed for an order that is the current one again, or with too
+        // little in it for any order to differ - one sub-folder and one file
+        // go where they go - or This PC, whose drives are never reordered:
+        // the places are right, only the stamp is old.
+        if (_sortHistory[stamp] == _sort
+            || folder.IsComputer
+            || folder.Children.Count < 2 && folder.Files.Count < 2)
+        {
+            folder.LayoutSortGeneration = SortGeneration;
+            return false;
+        }
+
+        ApplyVisibleChildren(folder);
+        return true;
+    }
+
+    private void ScheduleSortSlice()
+    {
+        if (_sortSlicePosted || _sortSweep.Count == 0)
+        {
+            return;
+        }
+
+        if (PostBackground is not { } post)
+        {
+            FlushSortWork();
+            return;
+        }
+
+        _sortSlicePosted = true;
+        post(RunSortSlice);
+    }
+
+    /// <summary>
+    /// One slice of the background pass: a few milliseconds of folders, less
+    /// whatever was placed on demand since the slice before, then the rest
+    /// queued again.  A slice with next to nothing left of its allowance
+    /// leaves its turn to the next frame.
+    /// </summary>
+    private void RunSortSlice()
+    {
+        _sortSlicePosted = false;
+        if (_disposed)
+        {
+            _sortSweep.Clear();
+            _sortFirst.Clear();
+            CompleteSortIdle();
+            return;
+        }
+
+        // Flushed meanwhile: nothing left for this slice to do.
+        if (_sortSweep.Count == 0)
+        {
+            return;
+        }
+
+        // Taken, not just read: the placing it counts is charged to this
+        // slice alone, and the next one starts again from what happens after.
+        var budget = SortSliceTicks - _placedOnDemandTicks;
+        _placedOnDemandTicks = 0;
+        if (budget >= MinimumSliceTicks)
+        {
+            SweepSort(budget);
+        }
+
+        if (_sortSweep.Count > 0)
+        {
+            ScheduleSortSlice();
+        }
+        else
+        {
+            FinishSortPass();
+        }
+    }
+
+    /// <summary>
+    /// The pass has visited every folder: the one announcement it makes, if
+    /// it moved anything on the canvas, and whoever waits for it let go.
+    /// </summary>
+    private void FinishSortPass()
+    {
+        _sortFirst.Clear();
+        if (_sortMovedCanvas)
+        {
+            _sortMovedCanvas = false;
+            RaiseChanged();
+        }
+
+        CompleteSortIdle();
+    }
+
+    /// <summary>
+    /// Visits folders of the background pass until the budget is spent (none:
+    /// until there are none left): first those the canvas asked to have placed
+    /// first (see <see cref="PlaceFirst"/>), then the tree shallowest first.
+    /// Notes whether one it placed again is on the canvas, for the
+    /// announcement at the end of the pass.
+    /// </summary>
+    private void SweepSort(long budgetTicks)
+    {
+        var started = Stopwatch.GetTimestamp();
+        bool Spent() => budgetTicks > 0 && Stopwatch.GetTimestamp() - started >= budgetTicks;
+
+        // Only placed here, not walked from: the pass reaches their children
+        // in its own time, and anything of theirs on screen is on the list too.
+        while (_sortFirst.TryDequeue(out var first))
+        {
+            if (!first.IsForgotten && Relayout(first))
+            {
+                _sortMovedCanvas = true;
+            }
+
+            if (Spent())
+            {
+                return;
+            }
+        }
+
+        while (_sortSweep.TryDequeue(out var folder))
+        {
+            // Dropped by a refresh since it was queued: nobody can reach it.
+            if (folder.IsForgotten)
+            {
+                continue;
+            }
+
+            if (Relayout(folder) && !_sortMovedCanvas)
+            {
+                _sortMovedCanvas = IsOnCanvas(folder);
+            }
+
+            // Hidden ones too: showing hidden items should not find them in
+            // an old order.  A child never placed was never read, and neither
+            // was anything below it, so it has nothing to visit.
+            foreach (var child in folder.AllChildren)
+            {
+                if (child.LayoutSortGeneration >= 0)
+                {
+                    _sortSweep.Enqueue(child);
+                }
+            }
+
+            if (Spent())
+            {
+                break;
+            }
+        }
+    }
+
+    private void CompleteSortIdle()
+    {
+        if (_sortIdleWaiters is not { Count: > 0 } waiters)
+        {
+            return;
+        }
+
+        _sortIdleWaiters = null;
+        foreach (var waiter in waiters)
+        {
+            waiter.TrySetResult();
+        }
+    }
+
+    /// <summary>
+    /// Puts the shown sub-folders in the current order.  Only names from Z
+    /// and dates move folders: a folder has no size and every folder has the
+    /// same type, so under those two they tie, and ties stay in name order.
+    /// </summary>
+    private void OrderFolders(List<NestedFolder> visible)
+    {
+        var count = visible.Count;
+        if (count < 2)
+        {
+            return;
+        }
+
+        if (_sort.Column == SortColumn.Name)
+        {
+            // Only names from Z get here, and they are the listing backwards.
+            visible.Reverse();
+            return;
+        }
+
+        if (_sort.Column != SortColumn.Modified)
+        {
+            return;
+        }
+
+        var keys = ArrayPool<long>.Shared.Rent(count);
+        var order = ArrayPool<int>.Shared.Rent(count);
+        try
+        {
+            for (var index = 0; index < count; index++)
+            {
+                keys[index] = KeyOf(visible[index].ModifiedTicks);
+            }
+
+            if (!SortByKeys(keys, order, count))
+            {
+                return;
+            }
+
+            var before = ArrayPool<NestedFolder>.Shared.Rent(count);
+            visible.CopyTo(before);
+            for (var position = 0; position < count; position++)
+            {
+                visible[position] = before[order[position]];
+            }
+
+            // Cleared on the way back: a pool holding folders would keep a
+            // tree that was let go of alive.
+            ArrayPool<NestedFolder>.Shared.Return(before, clearArray: true);
+        }
+        finally
+        {
+            ArrayPool<long>.Shared.Return(keys);
+            ArrayPool<int>.Shared.Return(order);
+        }
+    }
+
+    /// <summary>The indices among <paramref name="files"/> of the ones shown.</summary>
+    private static int[] ShownIndices(NestedFile[] files, Func<NestedFile, bool> isShown)
+    {
+        var buffer = ArrayPool<int>.Shared.Rent(files.Length);
+        var count = 0;
+        for (var index = 0; index < files.Length; index++)
+        {
+            if (isShown(files[index]))
+            {
+                buffer[count++] = index;
+            }
+        }
+
+        var shown = buffer.AsSpan(0, count).ToArray();
+        ArrayPool<int>.Shared.Return(buffer);
+        return shown;
+    }
+
+    /// <summary>
+    /// The shown files in the current order: the listing itself when every
+    /// file is shown and the order comes out as name order anyway - every
+    /// file the same type, or the same date - and otherwise the listing with
+    /// the order to walk it in.  An index per file rather than a copy of every
+    /// file: re-placing a whole tree makes one of these per folder, and the
+    /// garbage collector has a tenth as much to carry.
+    /// </summary>
+    /// <param name="all">Every file the folder read, in name order.</param>
+    /// <param name="shownFrom">The indices of the shown ones, in name order; null when all of them are.</param>
+    private IReadOnlyList<NestedFile> OrderFiles(NestedFile[] all, int[]? shownFrom)
+    {
+        var count = shownFrom?.Length ?? all.Length;
+        int[]? order = null;
+        if (count >= 2)
+        {
+            switch (_sort.Column)
+            {
+                case SortColumn.Name:
+                    // Only names from Z get here, and they are the listing backwards.
+                    order = new int[count];
+                    for (var position = 0; position < count; position++)
+                    {
+                        order[position] = count - 1 - position;
+                    }
+
+                    break;
+
+                case SortColumn.Modified:
+                case SortColumn.Size:
+                    var byDate = _sort.Column == SortColumn.Modified;
+                    var keys = ArrayPool<long>.Shared.Rent(count);
+                    order = new int[count];
+                    for (var index = 0; index < count; index++)
+                    {
+                        var file = all[shownFrom is null ? index : shownFrom[index]];
+                        keys[index] = KeyOf(byDate ? file.ModifiedTicks : file.Length);
+                    }
+
+                    if (!SortByKeys(keys, order, count))
+                    {
+                        order = null;
+                    }
+
+                    ArrayPool<long>.Shared.Return(keys);
+                    break;
+
+                default:
+                    order = TypeOrder(all, shownFrom, count);
+                    break;
+            }
+        }
+
+        if (order is null)
+        {
+            // Name order after all: the listing, or the part of it shown.
+            return shownFrom is null ? all : new NestedFileOrder(all, shownFrom, isNameOrder: true);
+        }
+
+        if (shownFrom is not null)
+        {
+            // From places among the shown files to places in the listing.
+            for (var position = 0; position < count; position++)
+            {
+                order[position] = shownFrom[order[position]];
+            }
+        }
+
+        return new NestedFileOrder(all, order, isNameOrder: false);
+    }
+
+    /// <summary>A key that sorts the current way round: largest first by flipping every bit, which cannot overflow.</summary>
+    private long KeyOf(long value) => _sort.Descending ? ~value : value;
+
+    /// <summary>
+    /// Fills <paramref name="order"/> with the first <paramref name="count"/>
+    /// indices smallest key first, equal keys in index order, which is name
+    /// order; false when that is the order they were in already.  The keys
+    /// are sorted in place.
+    /// </summary>
+    private static bool SortByKeys(long[] keys, int[] order, int count)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            order[index] = index;
+        }
+
+        // Sorting plain numbers with their indices riding along never calls a
+        // comparer; that sort does not keep ties in order, so each run of
+        // equal keys has its indices put back in order afterwards.
+        Array.Sort(keys, order, 0, count);
+        var start = 0;
+        while (start < count)
+        {
+            var end = start + 1;
+            while (end < count && keys[end] == keys[start])
+            {
+                end++;
+            }
+
+            if (end - start > 1)
+            {
+                Array.Sort(order, start, end - start);
+            }
+
+            start = end;
+        }
+
+        return !IsIdentity(order, count);
+    }
+
+    /// <summary>
+    /// The order of the shown files by type name, ties by name, as places
+    /// among the shown files; null when that is name order.  Each kind of file
+    /// is named and ranked once - a folder of fifty thousand files is a
+    /// handful of kinds - and then the files are sorted by rank and index
+    /// packed into one number, so no string is compared per file at all.
+    /// </summary>
+    private int[]? TypeOrder(NestedFile[] all, int[]? shownFrom, int count)
+    {
+        var kinds = _typeKinds;
+        var slots = _typeSlots;
+        var slotOf = ArrayPool<int>.Shared.Rent(count);
+        try
+        {
+            // Extensions are shared strings, so a kind is found by reference,
+            // and a run of the same kind skips even that.
+            string? lastExtension = null;
+            var lastSlot = -1;
+            for (var index = 0; index < count; index++)
+            {
+                var extension = all[shownFrom is null ? index : shownFrom[index]].Extension ?? string.Empty;
+                if (!ReferenceEquals(extension, lastExtension))
+                {
+                    ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(slots, extension, out var exists);
+                    if (!exists)
+                    {
+                        slot = kinds.Count;
+                        kinds.Add(extension);
+                    }
+
+                    lastExtension = extension;
+                    lastSlot = slot;
+                }
+
+                slotOf[index] = lastSlot;
+            }
+
+            if (kinds.Count < 2)
+            {
+                return null;
+            }
+
+            // Two extensions can share a name - "jpg" and "jpeg" are both a
+            // JPEG image - and then they share a rank too.
+            var names = new string[kinds.Count];
+            var byName = new int[kinds.Count];
+            for (var kind = 0; kind < kinds.Count; kind++)
+            {
+                names[kind] = FileTypeNames.Of(kinds[kind]);
+                byName[kind] = kind;
+            }
+
+            var comparer = StringComparer.CurrentCultureIgnoreCase;
+            Array.Sort(names, byName, comparer);
+            var ranks = new int[kinds.Count];
+            var rank = 0;
+            for (var position = 0; position < names.Length; position++)
+            {
+                if (position > 0 && comparer.Compare(names[position - 1], names[position]) != 0)
+                {
+                    rank++;
+                }
+
+                ranks[byName[position]] = rank;
+            }
+
+            if (rank == 0)
+            {
+                return null;
+            }
+
+            var keys = ArrayPool<long>.Shared.Rent(count);
+            var descending = _sort.Descending;
+            for (var index = 0; index < count; index++)
+            {
+                var kindRank = ranks[slotOf[index]];
+                keys[index] = ((long)(descending ? rank - kindRank : kindRank) << 32) | (uint)index;
+            }
+
+            Array.Sort(keys, 0, count);
+            var order = new int[count];
+            for (var position = 0; position < count; position++)
+            {
+                order[position] = (int)(keys[position] & 0xFFFF_FFFF);
+            }
+
+            ArrayPool<long>.Shared.Return(keys);
+            return IsIdentity(order, count) ? null : order;
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(slotOf);
+            kinds.Clear();
+            slots.Clear();
+        }
+    }
+
+    private static bool IsIdentity(int[] order, int count)
+    {
+        for (var index = 0; index < count; index++)
+        {
+            if (order[index] != index)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// A file by name among files in name order: a binary search, and a plain
+    /// scan for a name culture order and the file system disagree about.
+    /// </summary>
+    private static int SearchFiles(IReadOnlyList<NestedFile> files, string name)
+    {
+        var low = 0;
+        var high = files.Count - 1;
+        while (low <= high)
+        {
+            var middle = (low + high) / 2;
+            var order = StringComparer.CurrentCultureIgnoreCase.Compare(files[middle].Name, name);
+            if (order == 0)
+            {
+                return middle;
+            }
+
+            if (order < 0)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle - 1;
+            }
+        }
+
+        for (var index = 0; index < files.Count; index++)
+        {
+            if (string.Equals(files[index].Name, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return index;
+            }
+        }
+
+        return -1;
     }
 
     // ---- paths ---------------------------------------------------------------
@@ -1057,12 +1998,15 @@ public static class NestedDirectoryReader
 
         try
         {
-            var entries = new FileSystemEnumerable<(string Name, FileAttributes Attributes, long Length, bool IsDirectory, bool IsLink)>(
+            // The date is in the same buffer as the name and attributes: taking
+            // it costs no further call to the file system.
+            var entries = new FileSystemEnumerable<(string Name, FileAttributes Attributes, long Length, long ModifiedTicks, bool IsDirectory, bool IsLink)>(
                 ExtendedLength(path),
                 static (ref FileSystemEntry entry) => (
                     entry.FileName.ToString(),
                     entry.Attributes,
                     entry.IsDirectory ? 0 : entry.Length,
+                    entry.LastWriteTimeUtc.UtcTicks,
                     entry.IsDirectory,
                     entry.IsDirectory && (entry.Attributes & FileAttributes.ReparsePoint) != 0 && IsLink(ref entry)),
                 options)
@@ -1086,13 +2030,13 @@ public static class NestedDirectoryReader
                 }
             };
 
-            foreach (var (name, attributes, length, isDirectory, isLink) in entries)
+            foreach (var (name, attributes, length, modifiedTicks, isDirectory, isLink) in entries)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var isHidden = (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
                 if (!isDirectory)
                 {
-                    listed.Add(new NestedFile(name, isHidden, length));
+                    listed.Add(new NestedFile(name, isHidden, length, modifiedTicks));
                     continue;
                 }
 
@@ -1102,7 +2046,7 @@ public static class NestedDirectoryReader
                     continue;
                 }
 
-                folders.Add(new NestedEntry(name, isHidden, isLink));
+                folders.Add(new NestedEntry(name, isHidden, isLink, modifiedTicks));
             }
         }
         catch (UnauthorizedAccessException)

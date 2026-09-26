@@ -70,6 +70,15 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = _viewModel;
 
+        // A benchmark or snapshot run, or a copy started to try a build, opens
+        // on a monitor nobody is using and must not take the keyboard from
+        // whatever the user is doing.
+        if (IsDiagnosticsRun || IsTestWindow)
+        {
+            ShowActivated = false;
+            WindowStartupLocation = WindowStartupLocation.Manual;
+        }
+
         ConfigureFigmaGestures();
 
         _viewModel.FitAllRequested += FitAll;
@@ -117,6 +126,11 @@ public partial class MainWindow : Window
             .AddValueChanged(Editor, OnViewportLocationChanged);
 
         var handle = new WindowInteropHelper(this).Handle;
+        if (IsDiagnosticsRun || IsTestWindow)
+        {
+            PlaceForDiagnostics(handle, neverActivate: IsDiagnosticsRun);
+        }
+
         var darkMode = 1;
         var cornerPreference = 2;
         _ = DwmSetWindowAttribute(handle, 20, ref darkMode, sizeof(int));
@@ -1127,6 +1141,7 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
         if (IsNested)
         {
+            AddSortItems(menu);
             AddHiddenFolderItems(menu);
             AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
             AddLayoutItems(menu);
@@ -1137,11 +1152,58 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
+        AddSortItems(menu);
         AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         AddLayoutItems(menu);
         menu.IsOpen = true;
+    }
+
+    /// <summary>
+    /// Explorer's "Sort by": the four columns, then which way round, each a
+    /// checkable item showing the current choice.  Picking another column
+    /// starts it its own way - names and types from A, dates and sizes from
+    /// the newest and largest - as a click on its header would.
+    /// </summary>
+    private void AddSortItems(ItemsControl menu)
+    {
+        var sort = _viewModel.Sort;
+        var group = new MenuItem { Header = "Sort by" };
+        foreach (var column in Enum.GetValues<SortColumn>())
+        {
+            var item = new MenuItem
+            {
+                Header = ItemSort.Describe(column),
+                IsCheckable = true,
+                IsChecked = sort.Column == column
+            };
+            var chosen = column;
+            item.Click += (_, _) =>
+            {
+                if (_viewModel.Sort.Column != chosen)
+                {
+                    _viewModel.Sort = _viewModel.Sort.Click(chosen);
+                }
+            };
+            group.Items.Add(item);
+        }
+
+        group.Items.Add(new Separator());
+        foreach (var descending in new[] { false, true })
+        {
+            var item = new MenuItem
+            {
+                Header = descending ? "Descending" : "Ascending",
+                IsCheckable = true,
+                IsChecked = sort.Descending == descending
+            };
+            var way = descending;
+            item.Click += (_, _) => _viewModel.Sort = _viewModel.Sort with { Descending = way };
+            group.Items.Add(item);
+        }
+
+        menu.Items.Add(group);
     }
 
     /// <summary>The two pictures of the drives, as a pair of radio items.</summary>
@@ -1207,6 +1269,7 @@ public partial class MainWindow : Window
         }
 
         AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
+        AddSortItems(menu);
         menu.Items.Add(new Separator());
         AddColourItems(menu);
         AddCommandItem(menu, "Note…", "\uE70B", _viewModel.EditNoteCommand);

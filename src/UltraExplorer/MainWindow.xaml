@@ -45,6 +45,58 @@
         <converters:ZeroCountToVisibilityConverter x:Key="ZeroCountToVisibility" />
         <infra:BindingProxy x:Key="Shell" Data="{Binding}" />
 
+        <!-- A column header like the ones over Explorer's details view: flat,
+             lit on hover, and never taking the keyboard - focus stays on the
+             canvas or the filter box, so Enter, Delete and Space keep meaning
+             what they mean there.  The sort arrow sits centred above the
+             label, where Windows 11 puts it. -->
+        <Style x:Key="SortHeaderButton" TargetType="Button">
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Padding" Value="12,0" />
+            <Setter Property="MinWidth" Value="58" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Cursor" Value="Arrow" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Chrome"
+                                Background="{TemplateBinding Background}"
+                                CornerRadius="4"
+                                Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                                <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Chrome" Property="Background" Value="#252525" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- The arrow over a header: there on every header so the labels line
+             up, seen only on the one the canvas is ordered by. -->
+        <Style x:Key="SortHeaderArrow" TargetType="TextBlock" BasedOn="{StaticResource IconText}">
+            <Setter Property="FontSize" Value="8" />
+            <Setter Property="Height" Value="9" />
+            <Setter Property="Margin" Value="0,0,0,1" />
+            <Setter Property="Text" Value="&#xE70E;" />
+            <Setter Property="Visibility" Value="Hidden" />
+        </Style>
+
+        <Style x:Key="SortHeaderLabel" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="Margin" Value="0,0,0,3" />
+        </Style>
+
         <!-- One row of an address suggestion, used both under the line and
              behind a crumb's chevron. -->
         <DataTemplate x:Key="AddressSuggestionTemplate" DataType="{x:Type models:AddressSuggestion}">
@@ -700,7 +752,8 @@
 
                 <!-- The nested canvas: every folder a cell inside its parent,
                      the whole of This PC on one screen - with a strip above it
-                     that narrows it to names. -->
+                     that narrows it to names and orders it like Explorer's
+                     column headers. -->
                 <Grid x:Name="NestedHost"
                       Visibility="{Binding IsNestedLayout, Converter={StaticResource BoolToVisibility}}">
                     <Grid.RowDefinitions>
@@ -708,71 +761,136 @@
                         <RowDefinition Height="*" />
                     </Grid.RowDefinitions>
 
-                    <Border Grid.Row="0"
+                    <Border x:Name="NestedStrip"
+                            Grid.Row="0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
                             BorderThickness="0,0,0,1"
                             Padding="10,5">
-                        <StackPanel Orientation="Horizontal">
-                            <Border Width="360"
-                                    CornerRadius="5"
-                                    Background="{StaticResource SurfaceRaisedBrush}"
-                                    BorderBrush="{StaticResource BorderBrush}"
-                                    BorderThickness="1"
-                                    Padding="7,3">
-                                <Grid>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="Auto" />
-                                        <ColumnDefinition Width="*" />
-                                    </Grid.ColumnDefinitions>
-                                    <TextBlock Grid.Column="0"
-                                               Text="&#xE71C;"
-                                               Style="{StaticResource IconText}"
-                                               FontSize="11"
-                                               Foreground="{StaticResource TextMutedBrush}"
-                                               VerticalAlignment="Center"
-                                               Margin="0,0,6,0" />
-                                    <Grid Grid.Column="1">
-                                        <TextBlock x:Name="CanvasFilterHint"
-                                                   Text="Filter by name  -  report, *.png, a;b  (Ctrl+Shift+F)"
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+
+                            <!-- The box gives way before anything else does: it is 360
+                                 wide while there is room, and narrows - down to 120 -
+                                 when the window does, so the count and the arrows
+                                 through the matches stay whole beside it, and the
+                                 headers keep their own column.  The star column after
+                                 the buttons takes whatever is spare. -->
+                            <Grid ClipToBounds="True">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="1000*" MinWidth="120" MaxWidth="360" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Border Grid.Column="0"
+                                        CornerRadius="5"
+                                        Background="{StaticResource SurfaceRaisedBrush}"
+                                        BorderBrush="{StaticResource BorderBrush}"
+                                        BorderThickness="1"
+                                        Padding="7,3">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="Auto" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <TextBlock Grid.Column="0"
+                                                   Text="&#xE71C;"
+                                                   Style="{StaticResource IconText}"
+                                                   FontSize="11"
                                                    Foreground="{StaticResource TextMutedBrush}"
-                                                   FontSize="12"
-                                                   IsHitTestVisible="False"
-                                                   VerticalAlignment="Center" />
-                                        <TextBox x:Name="CanvasFilterBox"
-                                                 Background="Transparent"
-                                                 BorderThickness="0"
-                                                 Foreground="{StaticResource TextBrush}"
-                                                 CaretBrush="{StaticResource TextBrush}"
-                                                 FontSize="12"
-                                                 VerticalContentAlignment="Center"
-                                                 AutomationProperties.Name="Filter the canvas by name"
-                                                 TextChanged="CanvasFilterBox_TextChanged"
-                                                 PreviewKeyDown="CanvasFilterBox_PreviewKeyDown" />
+                                                   VerticalAlignment="Center"
+                                                   Margin="0,0,6,0" />
+                                        <Grid Grid.Column="1">
+                                            <TextBlock x:Name="CanvasFilterHint"
+                                                       Text="Filter by name  -  report, *.png, a;b  (Ctrl+Shift+F)"
+                                                       Foreground="{StaticResource TextMutedBrush}"
+                                                       FontSize="12"
+                                                       TextTrimming="CharacterEllipsis"
+                                                       IsHitTestVisible="False"
+                                                       VerticalAlignment="Center" />
+                                            <TextBox x:Name="CanvasFilterBox"
+                                                     Background="Transparent"
+                                                     BorderThickness="0"
+                                                     Foreground="{StaticResource TextBrush}"
+                                                     CaretBrush="{StaticResource TextBrush}"
+                                                     FontSize="12"
+                                                     VerticalContentAlignment="Center"
+                                                     AutomationProperties.Name="Filter the canvas by name"
+                                                     TextChanged="CanvasFilterBox_TextChanged"
+                                                     PreviewKeyDown="CanvasFilterBox_PreviewKeyDown" />
+                                        </Grid>
                                     </Grid>
-                                </Grid>
-                            </Border>
-                            <TextBlock x:Name="CanvasFilterCount"
-                                       Margin="10,0,6,0"
-                                       VerticalAlignment="Center"
-                                       FontSize="12"
-                                       Foreground="{StaticResource TextMutedBrush}" />
-                            <Button x:Name="CanvasFilterPrevious" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
-                                    Click="CanvasFilterPrevious_Click" ToolTip="Previous match (Shift+Enter)" AutomationProperties.Name="Previous match"
-                                    Visibility="Collapsed">
-                                <TextBlock Text="&#xE70E;" Style="{StaticResource IconText}" FontSize="11" />
-                            </Button>
-                            <Button x:Name="CanvasFilterNext" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
-                                    Click="CanvasFilterNext_Click" ToolTip="Next match (Enter)" AutomationProperties.Name="Next match"
-                                    Visibility="Collapsed">
-                                <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="11" />
-                            </Button>
-                            <Button x:Name="CanvasFilterClear" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
-                                    Click="CanvasFilterClear_Click" ToolTip="Clear the filter (Esc)" AutomationProperties.Name="Clear the filter"
-                                    Visibility="Collapsed">
-                                <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="10" />
-                            </Button>
-                        </StackPanel>
+                                </Border>
+                                <TextBlock x:Name="CanvasFilterCount"
+                                           Grid.Column="1"
+                                           Margin="10,0,6,0"
+                                           VerticalAlignment="Center"
+                                           FontSize="12"
+                                           Foreground="{StaticResource TextMutedBrush}" />
+                                <Button x:Name="CanvasFilterPrevious" Grid.Column="2" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                        Click="CanvasFilterPrevious_Click" ToolTip="Previous match (Shift+Enter)" AutomationProperties.Name="Previous match"
+                                        Visibility="Collapsed">
+                                    <TextBlock Text="&#xE70E;" Style="{StaticResource IconText}" FontSize="11" />
+                                </Button>
+                                <Button x:Name="CanvasFilterNext" Grid.Column="3" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                        Click="CanvasFilterNext_Click" ToolTip="Next match (Enter)" AutomationProperties.Name="Next match"
+                                        Visibility="Collapsed">
+                                    <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="11" />
+                                </Button>
+                                <Button x:Name="CanvasFilterClear" Grid.Column="4" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                        Click="CanvasFilterClear_Click" ToolTip="Clear the filter (Esc)" AutomationProperties.Name="Clear the filter"
+                                        Visibility="Collapsed">
+                                    <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="10" />
+                                </Button>
+                            </Grid>
+
+                            <!-- The order of every cell's contents, left to right and
+                                 top to bottom: a click sorts by the column, a second
+                                 click turns it round. -->
+                            <StackPanel x:Name="SortHeaders"
+                                        Grid.Column="1"
+                                        Orientation="Horizontal"
+                                        VerticalAlignment="Center"
+                                        Margin="12,0,0,0">
+                                <Button x:Name="SortByName" Tag="Name" Style="{StaticResource SortHeaderButton}" Click="SortHeader_Click"
+                                        ToolTip="Sort by Name (click again to reverse)" AutomationProperties.Name="Sort by Name">
+                                    <StackPanel>
+                                        <TextBlock x:Name="SortByNameArrow" Style="{StaticResource SortHeaderArrow}" />
+                                        <TextBlock Text="Name" Style="{StaticResource SortHeaderLabel}" />
+                                    </StackPanel>
+                                </Button>
+                                <Border Width="1" Height="16" Margin="1,0" VerticalAlignment="Center" Background="{StaticResource BorderStrongBrush}" />
+                                <Button x:Name="SortByModified" Tag="Modified" Style="{StaticResource SortHeaderButton}" Click="SortHeader_Click"
+                                        ToolTip="Sort by Date modified (click again to reverse)" AutomationProperties.Name="Sort by Date modified">
+                                    <StackPanel>
+                                        <TextBlock x:Name="SortByModifiedArrow" Style="{StaticResource SortHeaderArrow}" />
+                                        <TextBlock Text="Date modified" Style="{StaticResource SortHeaderLabel}" />
+                                    </StackPanel>
+                                </Button>
+                                <Border Width="1" Height="16" Margin="1,0" VerticalAlignment="Center" Background="{StaticResource BorderStrongBrush}" />
+                                <Button x:Name="SortByType" Tag="Type" Style="{StaticResource SortHeaderButton}" Click="SortHeader_Click"
+                                        ToolTip="Sort by Type (click again to reverse)" AutomationProperties.Name="Sort by Type">
+                                    <StackPanel>
+                                        <TextBlock x:Name="SortByTypeArrow" Style="{StaticResource SortHeaderArrow}" />
+                                        <TextBlock Text="Type" Style="{StaticResource SortHeaderLabel}" />
+                                    </StackPanel>
+                                </Button>
+                                <Border Width="1" Height="16" Margin="1,0" VerticalAlignment="Center" Background="{StaticResource BorderStrongBrush}" />
+                                <Button x:Name="SortBySize" Tag="Size" Style="{StaticResource SortHeaderButton}" Click="SortHeader_Click"
+                                        ToolTip="Sort by Size (click again to reverse)" AutomationProperties.Name="Sort by Size">
+                                    <StackPanel>
+                                        <TextBlock x:Name="SortBySizeArrow" Style="{StaticResource SortHeaderArrow}" />
+                                        <TextBlock Text="Size" Style="{StaticResource SortHeaderLabel}" />
+                                    </StackPanel>
+                                </Button>
+                            </StackPanel>
+                        </Grid>
                     </Border>
 
                     <controls:NestedCanvas x:Name="Nested"

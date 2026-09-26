@@ -53,6 +53,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CanvasMode _mode = CanvasMode.ViewAll;
     private CanvasLayout _layout = CanvasLayout.Nested;
     private string _savedLayout = nameof(CanvasLayout.Nested);
+    private ItemSort _sort = ItemSort.Default;
+    private bool _sortSavePending;
     private string _nestedZoomLabel = "Fit";
     private readonly bool _isPickerSession;
     private string? _dialogTitle;
@@ -256,6 +258,63 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public bool IsTreeLayout => _layout == CanvasLayout.Tree;
 
+    /// <summary>
+    /// The one order every picture of the drives shares - the sub-folders and
+    /// files inside each cell of the nested canvas, each folder's children on
+    /// the tree, and the rows of the folder list - chosen like Explorer's
+    /// column headers and remembered with the rest of the workspace.  The tree
+    /// and the list are ordered from here; the nested canvas has a tree of its
+    /// own, which the window keeps in step through this property's change.
+    ///
+    /// A file dialog starts from names from A and never writes its choice
+    /// back: being somebody else's dialog is no reason to rearrange the
+    /// user's own window.
+    /// </summary>
+    public ItemSort Sort
+    {
+        get => _sort;
+        set
+        {
+            if (!SetProperty(ref _sort, value))
+            {
+                return;
+            }
+
+            Tree.Sort = value;
+            SaveSortWhenIdle();
+        }
+    }
+
+    /// <summary>
+    /// Writes the workspace once the window has nothing better to do.  A click
+    /// on a header is followed by frames of the canvas reordering, and the
+    /// first save of a session is milliseconds of serialiser warming up that
+    /// have no business in any of them; clicking through the headers is also
+    /// one write, not one per click.
+    /// </summary>
+    private void SaveSortWhenIdle()
+    {
+        if (_sortSavePending)
+        {
+            return;
+        }
+
+        if (Application.Current?.Dispatcher is not { } dispatcher)
+        {
+            _ = SaveNowAsync();
+            return;
+        }
+
+        _sortSavePending = true;
+        dispatcher.InvokeAsync(
+            async () =>
+            {
+                _sortSavePending = false;
+                await SaveNowAsync();
+            },
+            System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+    }
+
     /// <summary>The zoom shown on the canvas controls, from whichever canvas is showing.</summary>
     public string ZoomLabel => IsNestedLayout ? _nestedZoomLabel : Tree.ZoomLabel;
 
@@ -409,6 +468,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(ZoomLabel));
                 OnPropertyChanged(nameof(IsMinimapShown));
             }
+
+            // Handed to the tree before it builds its first layout, so the
+            // drives open already in the remembered order.
+            var sort = _isPickerSession ? ItemSort.Default : ItemSort.FromSetting(state.CanvasSort);
+            if (sort != _sort)
+            {
+                _sort = sort;
+                Tree.Sort = sort;
+                OnPropertyChanged(nameof(Sort));
+            }
+
             foreach (var legacy in state.Nodes)
             {
                 _marks.Seed(legacy.Path, legacy.AccentHex, legacy.Note);
@@ -512,12 +582,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        // A file dialog never changes the layout, and must not put back the
-        // one it read at its start over a choice made meanwhile in the window.
+        // A file dialog never changes the layout or the order, and must not put
+        // back the ones it read at its start over a choice made meanwhile in
+        // the window.
         var layout = _savedLayout;
+        string? sort = (_isPickerSession ? ItemSort.Default : _sort).ToSetting();
         if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
         {
             layout = current.CanvasLayout;
+            sort = current.CanvasSort;
         }
 
         var state = new WorkspaceState
@@ -526,6 +599,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsMinimapVisible = IsMinimapVisible,
             IsFolderListVisible = Tree.FolderList.IsVisible,
             CanvasLayout = layout,
+            CanvasSort = sort,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))

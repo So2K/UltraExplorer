@@ -41,6 +41,17 @@ public sealed class ViewAllGraphService : IDisposable
     private bool _layoutPending;
     private bool _disposed;
 
+    /// <summary>The node the layout pass under way is to keep in view, if any (see <see cref="ReflowAnchoredOn"/>).</summary>
+    private ViewAllNodeViewModel? _reflowAnchor;
+
+    /// <summary>
+    /// The node to keep in view when the tree is arranged again because some
+    /// files were ordered by type by a stand-in for a name not looked up yet,
+    /// and whether that is already waiting for the names.
+    /// </summary>
+    private ViewAllNodeViewModel? _typeNamesAnchor;
+    private bool _typeNamesWaiting;
+
     public ViewAllGraphService(
         ViewAllGraphOptions? options = null,
         ViewAllFileSystemService? fileSystem = null,
@@ -213,6 +224,12 @@ public sealed class ViewAllGraphService : IDisposable
             _arranging = false;
         }
 
+        if (_layout.TypeNamesPending)
+        {
+            _typeNamesAnchor = _reflowAnchor ?? _typeNamesAnchor;
+            _ = ReflowWhenTypeNamesArriveAsync();
+        }
+
         RebuildIndex();
 
         // Which links the harness covers depends on where the children ended up,
@@ -232,7 +249,16 @@ public sealed class ViewAllGraphService : IDisposable
     private void ReflowAnchoredOn(ViewAllNodeViewModel? anchor)
     {
         var before = anchor?.Location ?? default;
-        Reflow();
+        _reflowAnchor = anchor;
+        try
+        {
+            Reflow();
+        }
+        finally
+        {
+            _reflowAnchor = null;
+        }
+
         if (anchor is null)
         {
             return;
@@ -243,6 +269,47 @@ public sealed class ViewAllGraphService : IDisposable
         {
             LayoutShifted?.Invoke(shift);
         }
+    }
+
+    /// <summary>
+    /// Arranges the tree again once the Shell has named every kind of file
+    /// the last arrangement had to order by a stand-in (see
+    /// <see cref="ViewAllLayoutService.TypeNamesPending"/>): a click on the
+    /// Type header, or a folder opened while ordered by type, never waits on
+    /// the Shell, and the few files whose kind was new move to their places a
+    /// moment later.  The node that was being kept in view is kept in view
+    /// again.  Only on a thread that can be come back to - the window's - so
+    /// the tree is never touched from anywhere else.
+    /// </summary>
+    private async Task ReflowWhenTypeNamesArriveAsync()
+    {
+        if (_typeNamesWaiting || SynchronizationContext.Current is null)
+        {
+            return;
+        }
+
+        _typeNamesWaiting = true;
+        try
+        {
+            // Never straight back into the arrangement that asked: the names
+            // may all be in already, and a layout pass inside a layout pass
+            // would lay out a tree half way through being laid out.
+            await Task.Yield();
+            await FileTypeNames.WhenPrefetchedAsync();
+        }
+        finally
+        {
+            _typeNamesWaiting = false;
+        }
+
+        var anchor = _typeNamesAnchor;
+        _typeNamesAnchor = null;
+        if (_disposed || _layout.Sort.Column != SortColumn.Type)
+        {
+            return;
+        }
+
+        ReflowAnchoredOn(anchor);
     }
 
     /// <summary>
@@ -343,7 +410,7 @@ public sealed class ViewAllGraphService : IDisposable
 
         try
         {
-            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, Options, loadCancellation.Token);
+            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, Options, loadCancellation.Token, _layout.Sort);
             loadCancellation.Token.ThrowIfCancellationRequested();
 
             var added = new List<ViewAllNodeViewModel>(snapshot.Entries.Count);
@@ -444,7 +511,7 @@ public sealed class ViewAllGraphService : IDisposable
 
         try
         {
-            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, pageOptions, loadCancellation.Token);
+            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, pageOptions, loadCancellation.Token, _layout.Sort);
             var added = new List<ViewAllNodeViewModel>();
             ApplySnapshot(node, snapshot, added);
             node.ChildLoadLimit = nextLimit;
@@ -941,10 +1008,16 @@ public sealed class ViewAllGraphService : IDisposable
     /// options the graph uses - so the folder list hides what the canvas hides
     /// and the picker's file filter applies to both.
     /// </summary>
+    /// <param name="shownIn">
+    /// The order the entries are to be shown in, which decides which of them
+    /// are kept when there are more than the options allow (see
+    /// <see cref="ViewAllFileSystemService.GetChildrenAsync"/>).
+    /// </param>
     public Task<ViewAllDirectorySnapshot> ReadDirectoryAsync(
         string directoryPath,
-        CancellationToken cancellationToken = default)
-        => _fileSystem.GetChildrenAsync(directoryPath, Options, cancellationToken);
+        CancellationToken cancellationToken = default,
+        ItemSort shownIn = default)
+        => _fileSystem.GetChildrenAsync(directoryPath, Options, cancellationToken, shownIn, keepFirstShown: true);
 
     public bool TryGetNode(string path, out ViewAllNodeViewModel node)
     {
@@ -1010,6 +1083,35 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         Reflow();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>The order each folder's children are laid out in, folders before files.</summary>
+    public ItemSort Sort => _layout.Sort;
+
+    /// <summary>
+    /// Orders every folder's children by <paramref name="sort"/> from now on
+    /// and lays the tree out again.  Unlike <see cref="Relayout"/> nothing the
+    /// user placed by hand is let go of: a change of order moves children
+    /// within their blocks, it does not tidy the canvas.  The layout is the
+    /// same deterministic pass as ever, so going back to names from A puts
+    /// every node back exactly where it was.
+    /// </summary>
+    /// <param name="anchor">
+    /// The node the view is on, if any: how far the new layout carried it is
+    /// raised through <see cref="LayoutShifted"/>, so the canvas can follow
+    /// and it stays where the user was looking.
+    /// </param>
+    public void SetSort(ItemSort sort, ViewAllNodeViewModel? anchor = null)
+    {
+        ThrowIfDisposed();
+        if (_layout.Sort == sort)
+        {
+            return;
+        }
+
+        _layout.Sort = sort;
+        ReflowAnchoredOn(anchor);
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 

@@ -39,6 +39,10 @@ internal static partial class Program
             await NestedPerformanceChecks();
         });
 
+        // A run of its own: ordering swaps the process-wide type names for a
+        // test table, and anything that stops it half way is reported by name.
+        RunOnSta("nested sort", NestedSortChecks);
+
         if (ShotsWritten.Count > 0)
         {
             Console.WriteLine();

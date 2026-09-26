@@ -44,11 +44,12 @@ internal sealed class FakeDisk
         }
     }
 
-    public void AddFile(string folder, string name, long length = 0, bool hidden = false)
+    /// <param name="modified">When the file was last written; none leaves the date at zero, as a reader that does not say.</param>
+    public void AddFile(string folder, string name, long length = 0, bool hidden = false, DateTime? modified = null)
     {
         lock (_gate)
         {
-            Folder(folder).Files.Add(new NestedFile(name, hidden, length));
+            Folder(folder).Files.Add(new NestedFile(name, hidden, length, TicksOf(modified)));
         }
     }
 
@@ -107,7 +108,7 @@ internal sealed class FakeDisk
             // canvas find a file by binary search.
             var folders = directory.Children
                 .Select(name => _directories[Path.Combine(path, name)])
-                .Select(child => new NestedEntry(child.Name, child.IsHidden, child.IsReparsePoint))
+                .Select(child => new NestedEntry(child.Name, child.IsHidden, child.IsReparsePoint, TicksOf(child.Modified)))
                 .OrderBy(entry => entry.Name, StringComparer.CurrentCultureIgnoreCase)
                 .ToList();
             var files = directory.Files
@@ -123,6 +124,18 @@ internal sealed class FakeDisk
             };
         }
     }
+
+    /// <summary>
+    /// A date as the real reader reports it: UTC ticks, and zero for none.  A
+    /// date given in local time is turned round to UTC first; one of no stated
+    /// kind is taken to be UTC already, which is what the tests write.
+    /// </summary>
+    internal static long TicksOf(DateTime? modified) => modified switch
+    {
+        null => 0,
+        { Kind: DateTimeKind.Local } local => local.ToUniversalTime().Ticks,
+        { } date => date.Ticks
+    };
 }
 
 internal sealed class FakeDirectory(string path)
@@ -142,6 +155,9 @@ internal sealed class FakeDirectory(string path)
 
     /// <summary>Files counted in the listing but not named in it.</summary>
     public int UnlistedFiles { get; set; }
+
+    /// <summary>When the folder was last written, as its parent's listing reports it; none is a date of zero.</summary>
+    public DateTime? Modified { get; set; }
 
     public List<string> Children { get; } = [];
 

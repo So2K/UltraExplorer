@@ -311,10 +311,30 @@ public sealed class ViewAllFileSystemService
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool FindClose(IntPtr findHandle);
 
+    /// <summary>
+    /// One folder's entries, folders before files, each by name - up to the
+    /// options' cap, past which the snapshot says it was cut short.
+    /// </summary>
+    /// <param name="shownIn">
+    /// The order the caller shows the entries in.  Ordered by type, every
+    /// kind of file among them is named here, off the UI thread, so ordering
+    /// them there never has to ask the Shell; in any order, a kind met for
+    /// the first time is queued to be named in the background.
+    /// </param>
+    /// <param name="keepFirstShown">
+    /// When there are more entries than the cap, keep the first ones in
+    /// <paramref name="shownIn"/> rather than the first ones read, which is
+    /// what the file system hands out first - roughly names from A.  A list
+    /// ordered newest first has to start with the newest entry of all, not
+    /// the newest of the first few thousand names; that takes reading all of
+    /// them, up to <see cref="ViewAllGraphOptions.MaximumChildrenCeiling"/>.
+    /// </param>
     public Task<ViewAllDirectorySnapshot> GetChildrenAsync(
         string directoryPath,
         ViewAllGraphOptions options,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        ItemSort shownIn = default,
+        bool keepFirstShown = false)
         => Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -325,6 +345,7 @@ public sealed class ViewAllFileSystemService
             }
 
             var maximum = options.SafeMaximumChildren;
+            var limit = keepFirstShown && !shownIn.IsDefault ? ViewAllGraphOptions.MaximumChildrenCeiling : maximum;
             var entries = new List<ViewAllEntryDescriptor>(Math.Min(maximum, 512));
             var isTruncated = false;
             var enumerationOptions = new EnumerationOptions
@@ -369,7 +390,7 @@ public sealed class ViewAllFileSystemService
                         }
                     }
 
-                    if (entries.Count >= maximum)
+                    if (entries.Count >= limit)
                     {
                         isTruncated = true;
                         break;
@@ -396,6 +417,19 @@ public sealed class ViewAllFileSystemService
                 {
                     // Entries can vanish while the directory is being enumerated.
                 }
+            }
+
+            FileTypeNames.WarmNames(
+                entries.Where(entry => entry.Kind == ViewAllEntryKind.File).Select(entry => entry.DisplayName),
+                lookUpNow: shownIn.Column == SortColumn.Type);
+
+            if (entries.Count > maximum)
+            {
+                // Read past the cap to keep the first ones in the order shown:
+                // the rest are dropped, and the snapshot says it is cut short.
+                entries = ViewAllEntryOrder.Sort(entries, static entry => entry, shownIn);
+                entries.RemoveRange(maximum, entries.Count - maximum);
+                isTruncated = true;
             }
 
             entries.Sort(static (left, right) =>

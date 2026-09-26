@@ -30,10 +30,16 @@ public readonly record struct NestedFile
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Extensions = new(StringComparer.Ordinal);
 
     public NestedFile(string name, bool isHidden, long length)
+        : this(name, isHidden, length, 0)
+    {
+    }
+
+    public NestedFile(string name, bool isHidden, long length, long modifiedTicks)
     {
         Name = name;
         IsHidden = isHidden;
         Length = length;
+        ModifiedTicks = modifiedTicks;
         Extension = ExtensionOf(name);
     }
 
@@ -42,6 +48,13 @@ public readonly record struct NestedFile
     public bool IsHidden { get; }
 
     public long Length { get; }
+
+    /// <summary>
+    /// When the file was last written, as UTC ticks; zero when the reader did
+    /// not say.  Kept as a number rather than a date because ordering a folder
+    /// by it compares fifty thousand of them.
+    /// </summary>
+    public long ModifiedTicks { get; }
 
     /// <summary>
     /// Lower-case extension without the dot, or empty.  Worked out once, when
@@ -67,8 +80,92 @@ public readonly record struct NestedFile
         }
 
         var extension = lower.ToString();
-        return Extensions.GetOrAdd(extension, extension);
+        var added = Extensions.GetOrAdd(extension, extension);
+        if (ReferenceEquals(added, extension))
+        {
+            // The first file of its kind anyone has read: have the Shell name
+            // the type now, in the background, rather than on the UI thread
+            // the first time the canvas is ordered by type.
+            FileTypeNames.Prefetch(extension);
+        }
+
+        return added;
     }
+}
+
+/// <summary>
+/// A folder's shown files in an order of their own - by date, size, type or
+/// names from Z, or only some of them in name order - kept as the listing
+/// and the order to walk it in rather than as a copy of every file.  Placing
+/// a whole tree again after a change of order makes one of these for nearly
+/// every folder, and an index per file is a tenth of what a copy would leave
+/// the garbage collector to carry.  Never changed once made; a folder read
+/// or placed again gets a new one.
+/// </summary>
+internal sealed class NestedFileOrder : IReadOnlyList<NestedFile>
+{
+    private readonly NestedFile[] _files;
+    private readonly int[] _order;
+    private readonly bool _isNameOrder;
+    private int[]? _positions;
+
+    /// <param name="files">Every file the folder read, in name order.</param>
+    /// <param name="order">For each place, the index among <paramref name="files"/> of the file shown there.</param>
+    /// <param name="isNameOrder">Whether <paramref name="order"/> only leaves files out and never reorders them.</param>
+    public NestedFileOrder(NestedFile[] files, int[] order, bool isNameOrder)
+    {
+        _files = files;
+        _order = order;
+        _isNameOrder = isNameOrder;
+    }
+
+    public NestedFile this[int index] => _files[_order[index]];
+
+    public int Count => _order.Length;
+
+    /// <summary>
+    /// For each of the listing's files, its place here, or -1 when it is not
+    /// shown; null when the places are in name order and a binary search over
+    /// this list itself finds a file.  Worked out on first use.
+    /// </summary>
+    public int[]? Positions
+    {
+        get
+        {
+            if (_isNameOrder)
+            {
+                return null;
+            }
+
+            if (_positions is null)
+            {
+                var positions = new int[_files.Length];
+                if (_order.Length < _files.Length)
+                {
+                    Array.Fill(positions, -1);
+                }
+
+                for (var place = 0; place < _order.Length; place++)
+                {
+                    positions[_order[place]] = place;
+                }
+
+                _positions = positions;
+            }
+
+            return _positions;
+        }
+    }
+
+    public IEnumerator<NestedFile> GetEnumerator()
+    {
+        for (var index = 0; index < _order.Length; index++)
+        {
+            yield return _files[_order[index]];
+        }
+    }
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
 }
 
 public enum NestedLoadState
@@ -100,7 +197,8 @@ public sealed class NestedFolder
         NestedFolder? parent,
         bool isHidden = false,
         bool isReparsePoint = false,
-        string secondaryText = "")
+        string secondaryText = "",
+        long modifiedTicks = 0)
     {
         FullPath = fullPath;
         Name = name;
@@ -110,6 +208,7 @@ public sealed class NestedFolder
         IsHidden = isHidden;
         IsReparsePoint = isReparsePoint;
         SecondaryText = secondaryText;
+        ModifiedTicks = modifiedTicks;
         Hue = HueFor(fullPath);
     }
 
@@ -132,6 +231,14 @@ public sealed class NestedFolder
     /// <summary>Free space for a drive; empty for a folder.</summary>
     public string SecondaryText { get; internal set; }
 
+    /// <summary>
+    /// When the folder was last written, as UTC ticks, from its parent's
+    /// listing; zero for a drive or when the reader did not say.  Settable
+    /// because a folder that is still there after its parent is read again
+    /// keeps its object - with everything read below it - but not its date.
+    /// </summary>
+    public long ModifiedTicks { get; internal set; }
+
     public bool IsComputer => Kind == NestedFolderKind.Computer;
 
     /// <summary>Whether the canvas may read this folder's contents when it comes into view.</summary>
@@ -152,23 +259,47 @@ public sealed class NestedFolder
 
     public string ErrorMessage { get; internal set; } = string.Empty;
 
-    /// <summary>Every sub-folder that was read, hidden ones included.</summary>
+    /// <summary>
+    /// Every sub-folder that was read, hidden ones included, in name order
+    /// whatever order the canvas shows them in: finding one by name is a
+    /// binary search over this.
+    /// </summary>
     internal NestedFolder[] AllChildren { get; set; } = None;
 
-    /// <summary>The sub-folders on the canvas, in order; empty until read.</summary>
+    /// <summary>The sub-folders on the canvas, in the order they are shown, row by row; empty until read.</summary>
     public IReadOnlyList<NestedFolder> Children { get; internal set; } = None;
 
     /// <summary>Where <see cref="Children"/> sit inside this cell.</summary>
     public NestedGrid Grid { get; internal set; } = NestedGrid.Empty;
 
-    /// <summary>Every file that was read, hidden ones included, in order.</summary>
+    /// <summary>Every file that was read, hidden ones included, in name order.</summary>
     internal NestedFile[] AllFiles { get; set; } = [];
 
-    /// <summary>The files on the canvas, in order; empty until read.</summary>
+    /// <summary>The files on the canvas, in the order they are shown, row by row; empty until read.</summary>
     public IReadOnlyList<NestedFile> Files { get; internal set; } = [];
 
     /// <summary>Where <see cref="Files"/> sit inside this cell, below the sub-folders.</summary>
     public NestedFileGrid FileGrid { get; internal set; } = NestedFileGrid.Empty;
+
+    /// <summary>
+    /// Where each of <see cref="AllFiles"/> ended up in <see cref="Files"/>,
+    /// or -1 for one that is not shown; null while <see cref="Files"/> is in
+    /// name order, the order of <see cref="AllFiles"/> itself.  Finding a file
+    /// by name is a binary search over the names, which only name order
+    /// allows; under any other order this is how the search's answer is
+    /// turned into the tile that holds the file.  Worked out the first time
+    /// it is asked for, which is seldom - placing a folder does not need it.
+    /// </summary>
+    internal int[]? FilePositions => Files is NestedFileOrder order ? order.Positions : null;
+
+    /// <summary>
+    /// The <see cref="NestedTree.SortGeneration"/> this folder's children and
+    /// files were last placed for, or -1 before they have been placed at all.
+    /// A change of order only bumps the generation; each folder is placed
+    /// again when something is about to look at it, or when the background
+    /// pass over the whole tree reaches it, whichever comes first.
+    /// </summary>
+    internal int LayoutSortGeneration { get; set; } = -1;
 
     /// <summary>Files that were counted but not listed, past <see cref="NestedTree.MaximumFiles"/>.</summary>
     public int UnlistedFileCount { get; internal set; }

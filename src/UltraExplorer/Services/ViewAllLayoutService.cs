@@ -78,6 +78,22 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
     private readonly Dictionary<ViewAllNodeViewModel, Extent> _extents = new(ReferenceComparer.Instance);
     private readonly List<Rect> _pinnedIslands = [];
 
+    /// <summary>
+    /// The order a folder's children are laid out in, row by row: folders
+    /// before files whatever it is, then by <see cref="ViewAllEntryOrder"/>.
+    /// Drives, the roots, keep their own order.  Takes effect on the next
+    /// <see cref="Arrange"/>.
+    /// </summary>
+    public ItemSort Sort { get; set; } = ItemSort.Default;
+
+    /// <summary>
+    /// Whether the last <see cref="Arrange"/> ordered some files by type by a
+    /// stand-in for a name the Shell had not given yet (see
+    /// <see cref="ViewAllEntryOrder.Sort{T}(IEnumerable{T}, Func{T, ViewAllEntryDescriptor}, ItemSort, out bool)"/>):
+    /// the tree is to be arranged again once the names are in.
+    /// </summary>
+    public bool TypeNamesPending { get; private set; }
+
     /// <summary>The space one node's whole subtree needs, and how it is divided.</summary>
     private sealed class Extent
     {
@@ -119,6 +135,7 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
     {
         _extents.Clear();
         _pinnedIslands.Clear();
+        TypeNamesPending = false;
 
         var visible = roots
             .Where(root => !root.IsUserHidden)
@@ -387,12 +404,16 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
         return Math.Min(line, target);
     }
 
-    private static List<ViewAllNodeViewModel> VisibleChildren(ViewAllNodeViewModel node) =>
-        node.Children
-            .Where(child => child is { IsUserHidden: false, IsTreeVisible: true })
-            .OrderBy(child => child.Kind)
-            .ThenBy(child => child.DisplayName, StringComparer.CurrentCultureIgnoreCase)
-            .ToList();
+    private List<ViewAllNodeViewModel> VisibleChildren(ViewAllNodeViewModel node)
+    {
+        var children = ViewAllEntryOrder.Sort(
+            node.Children.Where(child => child is { IsUserHidden: false, IsTreeVisible: true }),
+            child => child.Entry,
+            Sort,
+            out var pending);
+        TypeNamesPending |= pending;
+        return children;
+    }
 
     // ---- arranging ---------------------------------------------------------
 
@@ -478,4 +499,241 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
         public int GetHashCode(ViewAllNodeViewModel node) =>
             System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(node);
     }
+}
+
+/// <summary>
+/// How the tree canvas and the folder list put a folder's entries in an
+/// <see cref="ItemSort"/>: the same rules the nested canvas follows, applied
+/// to what the directory listing says about each entry.
+///
+/// Folders always come before files - they are separate blocks on the tree
+/// and separate halves of the list, as they are separate zones in a nested
+/// cell.  Inside each, names from A is exactly the order everything had
+/// before there was a choice.  Dates order folders and files alike; sizes
+/// and types only order files, since a folder has no size and every folder
+/// is a "File folder", so under those two folders stay in name order.  A type
+/// is what Explorer's Type column says (<see cref="FileTypeNames"/>), worked
+/// out from the extension the way the nested canvas works it out.  Whatever
+/// the column and direction, entries that tie are in name order from A, so
+/// the result never depends on the order they came in.
+/// </summary>
+public static class ViewAllEntryOrder
+{
+    /// <summary>The entries of <paramref name="items"/> in <paramref name="sort"/>, as a new list.</summary>
+    public static List<T> Sort<T>(IEnumerable<T> items, Func<T, ViewAllEntryDescriptor> entryOf, ItemSort sort) =>
+        Sort(items, entryOf, sort, out _);
+
+    /// <summary>
+    /// The entries of <paramref name="items"/> in <paramref name="sort"/>, as a
+    /// new list, without ever waiting for the Shell: ordered by type, a kind of
+    /// file whose name has not been looked up yet is ordered by the name it
+    /// would have if the Shell knew nothing better, and <paramref name="typeNamesPending"/>
+    /// says so - the caller orders again once <see cref="FileTypeNames.WhenPrefetchedAsync"/>
+    /// has the real one.  On the UI thread a first lookup is a millisecond or
+    /// more a kind, which a click on a header has no business spending.
+    /// </summary>
+    public static List<T> Sort<T>(IEnumerable<T> items, Func<T, ViewAllEntryDescriptor> entryOf, ItemSort sort, out bool typeNamesPending)
+    {
+        typeNamesPending = false;
+        var comparer = StringComparer.CurrentCultureIgnoreCase;
+        if (sort.IsDefault)
+        {
+            // Word for word the order the tree always had, so the default
+            // lays out exactly as it did.
+            return items
+                .OrderBy(item => entryOf(item).Kind)
+                .ThenBy(item => entryOf(item).DisplayName, comparer)
+                .ToList();
+        }
+
+        // Every other order starts from names from A, which is what settles
+        // ties.  Nearly always the entries are in it already - a listing is
+        // read that way and the list keeps its rows that way - and one look
+        // at each pair of neighbours says so; only when they are not are they
+        // put in it first.  From then on an entry's index is its place among
+        // the names, so ordering compares numbers and never a name again: a
+        // folder of five thousand files ordered by comparing names pair by
+        // pair was milliseconds of a header click spent on the list alone.
+        var source = items.ToList();
+        if (!IsInNameOrder(source, entryOf, comparer))
+        {
+            source = Sort(source, entryOf, ItemSort.Default);
+        }
+
+        var count = source.Count;
+        var order = new int[count];
+        var keys = new long[count];
+        var start = 0;
+        while (start < count)
+        {
+            // Each kind is a block of its own - drives, then folders, then
+            // files - ordered inside itself.
+            var kind = entryOf(source[start]).Kind;
+            var end = start + 1;
+            while (end < count && entryOf(source[end]).Kind == kind)
+            {
+                end++;
+            }
+
+            OrderBlock(source, entryOf, sort, kind == ViewAllEntryKind.File, start, end, keys, order, ref typeNamesPending);
+            start = end;
+        }
+
+        var sorted = new List<T>(count);
+        foreach (var index in order)
+        {
+            sorted.Add(source[index]);
+        }
+
+        return sorted;
+    }
+
+    /// <summary>Whether <paramref name="items"/> are already folders before files, each by name from A.</summary>
+    private static bool IsInNameOrder<T>(List<T> items, Func<T, ViewAllEntryDescriptor> entryOf, StringComparer comparer)
+    {
+        for (var index = 1; index < items.Count; index++)
+        {
+            var previous = entryOf(items[index - 1]);
+            var current = entryOf(items[index]);
+            var byKind = previous.Kind.CompareTo(current.Kind);
+            if (byKind > 0 || byKind == 0 && comparer.Compare(previous.DisplayName, current.DisplayName) > 0)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Fills <paramref name="order"/> from <paramref name="start"/> to
+    /// <paramref name="end"/> with the indices of one kind's entries in the
+    /// sort, the entries being in name order already.  Names from Z are that
+    /// order turned round, ties and all.  Anything else is a number per entry
+    /// - a date, a size, the rank of a type name - with equal numbers left in
+    /// name order from A whichever way round the sort runs.
+    /// </summary>
+    private static void OrderBlock<T>(
+        List<T> source,
+        Func<T, ViewAllEntryDescriptor> entryOf,
+        ItemSort sort,
+        bool isFile,
+        int start,
+        int end,
+        long[] keys,
+        int[] order,
+        ref bool typeNamesPending)
+    {
+        if (sort.Column == SortColumn.Name)
+        {
+            for (var index = start; index < end; index++)
+            {
+                order[index] = sort.Descending ? start + end - 1 - index : index;
+            }
+
+            return;
+        }
+
+        var ranks = sort.Column == SortColumn.Type && isFile ? TypeRanks(source, entryOf, start, end, ref typeNamesPending) : null;
+        for (var index = start; index < end; index++)
+        {
+            order[index] = index;
+            var entry = entryOf(source[index]);
+            var key = sort.Column switch
+            {
+                SortColumn.Modified => entry.ModifiedUtc.Ticks,
+
+                // A folder has no size, and every folder is a "File folder":
+                // under these two they all tie, and so stay in name order.
+                SortColumn.Size => isFile ? entry.SizeBytes ?? 0 : 0,
+                _ => ranks?[index - start] ?? 0
+            };
+
+            // Flipping every bit turns the order round and cannot overflow.
+            keys[index] = sort.Descending ? ~key : key;
+        }
+
+        // Sorting plain numbers with their indices riding along never calls a
+        // comparer; that sort does not keep ties in order, so each run of
+        // equal keys has its indices put back in name order afterwards.
+        Array.Sort(keys, order, start, end - start);
+        var run = start;
+        while (run < end)
+        {
+            var next = run + 1;
+            while (next < end && keys[next] == keys[run])
+            {
+                next++;
+            }
+
+            if (next - run > 1)
+            {
+                Array.Sort(order, run, next - run);
+            }
+
+            run = next;
+        }
+    }
+
+    /// <summary>
+    /// Each file's type as a rank among the type names in the block: every
+    /// kind of file is named and ranked once - a folder of five thousand
+    /// files is a few dozen kinds - and two extensions that share a name, as
+    /// "jpg" and "jpeg" share "JPEG image", share a rank too.  A kind whose
+    /// name is not known yet is ranked by its stand-in, and said to be.
+    /// </summary>
+    private static long[] TypeRanks<T>(List<T> source, Func<T, ViewAllEntryDescriptor> entryOf, int start, int end, ref bool typeNamesPending)
+    {
+        var slots = new Dictionary<string, int>(StringComparer.Ordinal);
+        var names = new List<string>();
+        var slotOf = new int[end - start];
+        for (var index = start; index < end; index++)
+        {
+            var extension = ExtensionOf(entryOf(source[index]).DisplayName);
+            if (!slots.TryGetValue(extension, out var slot))
+            {
+                slot = names.Count;
+                slots.Add(extension, slot);
+                if (!FileTypeNames.TryGet(extension, out var name))
+                {
+                    typeNamesPending = true;
+                }
+
+                names.Add(name);
+            }
+
+            slotOf[index - start] = slot;
+        }
+
+        var comparer = StringComparer.CurrentCultureIgnoreCase;
+        var sortedNames = names.ToArray();
+        var bySlot = Enumerable.Range(0, names.Count).ToArray();
+        Array.Sort(sortedNames, bySlot, comparer);
+        var rankOfSlot = new long[names.Count];
+        var rank = 0L;
+        for (var position = 0; position < sortedNames.Length; position++)
+        {
+            if (position > 0 && comparer.Compare(sortedNames[position - 1], sortedNames[position]) != 0)
+            {
+                rank++;
+            }
+
+            rankOfSlot[bySlot[position]] = rank;
+        }
+
+        var ranks = new long[slotOf.Length];
+        for (var index = 0; index < slotOf.Length; index++)
+        {
+            ranks[index] = rankOfSlot[slotOf[index]];
+        }
+
+        return ranks;
+    }
+
+    /// <summary>
+    /// A file name's extension exactly as the nested canvas reads it - lower
+    /// case, no dot, none for a name like ".gitignore" - so a type orders the
+    /// same file the same way in every view.
+    /// </summary>
+    private static string ExtensionOf(string name) => new NestedFile(name, false, 0).Extension;
 }

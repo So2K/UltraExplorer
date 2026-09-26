@@ -14,10 +14,20 @@ public sealed class WorkspaceStore
 
     private readonly string _statePath;
 
-    public WorkspaceStore()
+    /// <summary>
+    /// One save at a time.  Every save goes through the same temporary file,
+    /// and two in flight at once - a save put off until the window is idle,
+    /// and the one made on closing - would have the second fail on the first's
+    /// open file and be dropped, although it holds the newer state.  Taking
+    /// turns, the one started last is also the one written last.
+    /// </summary>
+    private readonly SemaphoreSlim _saving = new(1, 1);
+
+    /// <param name="statePath">Where the workspace is kept; the user's state folder unless a test says otherwise.</param>
+    public WorkspaceStore(string? statePath = null)
     {
-        Directory.CreateDirectory(AppPaths.StateDirectory);
-        _statePath = AppPaths.State("workspace.json");
+        _statePath = statePath ?? AppPaths.State("workspace.json");
+        Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
     }
 
     public async Task<WorkspaceState?> LoadAsync(CancellationToken cancellationToken = default)
@@ -40,12 +50,20 @@ public sealed class WorkspaceStore
 
     public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
     {
-        var tempPath = _statePath + ".tmp";
-        await using (var stream = File.Create(tempPath))
+        await _saving.WaitAsync(cancellationToken);
+        try
         {
-            await JsonSerializer.SerializeAsync(stream, state, JsonOptions, cancellationToken);
-        }
+            var tempPath = _statePath + ".tmp";
+            await using (var stream = File.Create(tempPath))
+            {
+                await JsonSerializer.SerializeAsync(stream, state, JsonOptions, cancellationToken);
+            }
 
-        File.Move(tempPath, _statePath, true);
+            File.Move(tempPath, _statePath, true);
+        }
+        finally
+        {
+            _saving.Release();
+        }
     }
 }

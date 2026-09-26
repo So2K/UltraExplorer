@@ -1,4 +1,6 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
@@ -24,7 +26,7 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>Rows that get a real Shell icon; the rest keep the glyph.</summary>
     private const int IconBudget = 300;
 
-    private readonly Func<string, CancellationToken, Task<ViewAllDirectorySnapshot>> _read;
+    private readonly Func<string, ItemSort, CancellationToken, Task<ViewAllDirectorySnapshot>> _read;
     private readonly Func<string, bool, Task> _activate;
     private readonly Func<string, bool> _isOnCanvas;
     private readonly ShellIconService _icons;
@@ -48,9 +50,29 @@ public sealed class FolderListViewModel : ObservableObject
     private bool _isLoading;
     private bool _isTruncated;
     private FolderListItem? _selected;
+    private ItemSort _sort = ItemSort.Default;
+
+    /// <summary>The order the rows were read for: which of them were kept, when the folder had more than a read holds.</summary>
+    private ItemSort _readSort = ItemSort.Default;
+
+    private bool _typeNamesWaiting;
 
     public FolderListViewModel(
         Func<string, CancellationToken, Task<ViewAllDirectorySnapshot>> read,
+        Func<string, bool, Task> activate,
+        Func<string, bool> isOnCanvas,
+        ShellIconService icons)
+        : this((path, _, cancellation) => read(path, cancellation), activate, isOnCanvas, icons)
+    {
+    }
+
+    /// <param name="read">
+    /// Reads a folder for the list, given the order the rows are shown in:
+    /// a folder with more entries than one read holds is to keep the first
+    /// ones in that order (see <see cref="ViewAllFileSystemService.GetChildrenAsync"/>).
+    /// </param>
+    public FolderListViewModel(
+        Func<string, ItemSort, CancellationToken, Task<ViewAllDirectorySnapshot>> read,
         Func<string, bool, Task> activate,
         Func<string, bool> isOnCanvas,
         ShellIconService icons)
@@ -70,7 +92,9 @@ public sealed class FolderListViewModel : ObservableObject
     }
 
     /// <summary>Rows that survive the current filter, best match first.</summary>
-    public ObservableCollection<FolderListItem> Items { get; } = [];
+    public ObservableCollection<FolderListItem> Items => _rows;
+
+    private readonly RowCollection _rows = [];
 
     public System.Windows.Input.ICommand ActivateCommand { get; }
     public System.Windows.Input.ICommand RevealCommand { get; }
@@ -147,6 +171,98 @@ public sealed class FolderListViewModel : ObservableObject
             {
                 ApplyFilter();
             }
+        }
+    }
+
+    /// <summary>
+    /// The order of the rows while nothing is typed: folders, then files, each
+    /// in this order (see <see cref="ViewAllEntryOrder"/>).  What is typed
+    /// orders by how well each name answers it, whatever this is - the best
+    /// match first is the point of typing.  Changing it reorders the rows
+    /// already read and keeps the highlighted one; nothing is read again -
+    /// unless the folder had more entries than one read holds, when the rows
+    /// read were the first ones in the order before, and the first ones in
+    /// this order are read to replace them.
+    /// </summary>
+    public ItemSort Sort
+    {
+        get => _sort;
+        set
+        {
+            // Nothing read, nothing to reorder - and refilling would put "empty"
+            // where the list says nothing is selected.  A read under way
+            // orders what it brings in by this when it lands.
+            if (!SetProperty(ref _sort, value) || _all.Count == 0)
+            {
+                return;
+            }
+
+            Reorder();
+            if (_isTruncated && _readSort != value)
+            {
+                _ = RereadKeepingHighlightAsync();
+            }
+        }
+    }
+
+    /// <summary>The rows read, put in the current order again, the highlighted one kept.</summary>
+    private void Reorder()
+    {
+        // The list box keeps its highlighted row through a refill; this one
+        // is announced again all the same, so a row highlighted from here
+        // alone is lit in its new place too.
+        var highlighted = _selected;
+        ApplyFilter();
+        if (highlighted is not null && Items.Contains(highlighted))
+        {
+            _selected = highlighted;
+            OnPropertyChanged(nameof(Selected));
+        }
+    }
+
+    /// <summary>Reads the folder again, for another order's first rows, and lights the row that was lit if it is still among them.</summary>
+    private async Task RereadKeepingHighlightAsync()
+    {
+        var highlighted = _selected?.FullPath;
+        await ReloadAsync();
+        var match = highlighted is null
+            ? null
+            : Items.FirstOrDefault(item => string.Equals(item.FullPath, highlighted, StringComparison.OrdinalIgnoreCase));
+        if (highlighted is not null && !ReferenceEquals(_selected, match))
+        {
+            _selected = match;
+            OnPropertyChanged(nameof(Selected));
+        }
+    }
+
+    /// <summary>
+    /// Orders the rows again once the Shell has named every kind of file the
+    /// last ordering by type had to rank by a stand-in (see
+    /// <see cref="ViewAllEntryOrder.Sort{T}(IEnumerable{T}, Func{T, ViewAllEntryDescriptor}, ItemSort, out bool)"/>).
+    /// Only on a thread that can be come back to - the window's.
+    /// </summary>
+    private async Task ReorderWhenTypeNamesArriveAsync()
+    {
+        if (_typeNamesWaiting || SynchronizationContext.Current is null)
+        {
+            return;
+        }
+
+        _typeNamesWaiting = true;
+        try
+        {
+            // Never straight back into the refill that asked.
+            await Task.Yield();
+            await FileTypeNames.WhenPrefetchedAsync();
+        }
+        finally
+        {
+            _typeNamesWaiting = false;
+        }
+
+        if (_sort.Column == SortColumn.Type && _all.Count > 0 && _filter.Trim().Length == 0)
+        {
+            Reorder();
         }
     }
 
@@ -366,11 +482,14 @@ public sealed class FolderListViewModel : ObservableObject
 
         try
         {
-            var snapshot = await _read(FolderPath, cancellation.Token);
+            var sort = _sort;
+            var snapshot = await _read(FolderPath, sort, cancellation.Token);
             if (cancellation.IsCancellationRequested)
             {
                 return;
             }
+
+            _readSort = sort;
 
             _all.Clear();
             foreach (var entry in snapshot.Entries)
@@ -383,6 +502,13 @@ public sealed class FolderListViewModel : ObservableObject
             EmptyText = _all.Count == 0 ? "This folder is empty." : string.Empty;
             ApplyFilter();
             SelectExisting(select);
+
+            // The order changed while this was being read, and the folder is
+            // bigger than a read: these are the first rows of the order before.
+            if (_isTruncated && _readSort != _sort)
+            {
+                _ = RereadKeepingHighlightAsync();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -434,8 +560,11 @@ public sealed class FolderListViewModel : ObservableObject
     {
         var query = _filter.Trim();
 
+        // Read as folders then files, each by name from A: the default order
+        // is the listing as it came.
+        var typeNamesPending = false;
         IEnumerable<FolderListItem> matched = query.Length == 0
-            ? _all
+            ? _sort.IsDefault ? _all : ViewAllEntryOrder.Sort(_all, item => item.Entry, _sort, out typeNamesPending)
             : _all
                 .Select(item => (Item: item, Score: FolderListMatch.Score(item.DisplayName, query)))
                 .Where(pair => pair.Score != FolderListMatch.NoMatch)
@@ -444,28 +573,57 @@ public sealed class FolderListViewModel : ObservableObject
                 .ThenBy(pair => pair.Item.DisplayName, StringComparer.CurrentCultureIgnoreCase)
                 .Select(pair => pair.Item);
 
-        Items.Clear();
-        var shown = 0;
+        var rows = new List<FolderListItem>(_all.Count);
         foreach (var item in matched)
         {
             item.IsOnCanvas = _isOnCanvas(item.FullPath);
-            Items.Add(item);
+            rows.Add(item);
 
-            if (shown < IconBudget && item.Icon is null)
+            if (rows.Count <= IconBudget && item.Icon is null)
             {
                 // Answers synchronously when the icon is already known, so a
                 // folder that has been looked at once fills in with no flicker.
                 _icons.Request(item.FullPath, item.IsDirectory, icon => item.Icon = icon);
             }
-
-            shown++;
         }
 
+        _rows.ReplaceAll(rows);
         EmptyText = Items.Count == 0
             ? _all.Count == 0 ? "This folder is empty." : $"Nothing matches “{query}”."
             : string.Empty;
+
+        if (typeNamesPending)
+        {
+            _ = ReorderWhenTypeNamesArriveAsync();
+        }
     }
 
     private Task Activate(FolderListItem? item, bool open)
         => item is null ? Task.CompletedTask : _activate(item.FullPath, open);
+
+    /// <summary>
+    /// The rows, refilled in one go.  Row by row, an observable collection
+    /// tells the list box about every row it gains, and the list box does work
+    /// for each: refilling a folder of five thousand files that way - a new
+    /// filter, a new order - was twenty milliseconds before a single row was
+    /// drawn.  Refilled here, the list box hears once that everything changed
+    /// and makes rows only for what is on screen.  A row still there keeps
+    /// its highlight, as it would have kept its place in the list.
+    /// </summary>
+    private sealed class RowCollection : ObservableCollection<FolderListItem>
+    {
+        public void ReplaceAll(List<FolderListItem> rows)
+        {
+            CheckReentrancy();
+            Items.Clear();
+            foreach (var row in rows)
+            {
+                Items.Add(row);
+            }
+
+            OnPropertyChanged(new PropertyChangedEventArgs(nameof(Count)));
+            OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+            OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+        }
+    }
 }

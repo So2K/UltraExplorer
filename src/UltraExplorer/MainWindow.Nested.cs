@@ -42,6 +42,11 @@ public partial class MainWindow
     private bool _nestedCameraRestored;
     private readonly HashSet<string> _iconsAsked = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>Slices of the nested tree's background pass, waiting for frames to run in (see <see cref="PostSortSlice"/>).</summary>
+    private readonly Queue<Action> _sortSlices = new();
+    private bool _sortSlicesHooked;
+    private TimeSpan _lastSortSliceFrame = TimeSpan.MinValue;
+
     private bool IsNested => _viewModel.IsNestedLayout;
 
     /// <summary>The canvas that is showing, for keyboard focus.</summary>
@@ -59,6 +64,7 @@ public partial class MainWindow
 
     private void AttachNested()
     {
+        _nestedTree.PostBackground = PostSortSlice;
         Nested.Tree = _nestedTree;
         Nested.MarkLookup = _viewModel.Marks.Get;
         Nested.IconLookup = LookUpFileIcon;
@@ -98,6 +104,7 @@ public partial class MainWindow
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.SearchResults.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
+        UpdateSortHeaders();
     }
 
     private void DetachNested()
@@ -111,7 +118,94 @@ public partial class MainWindow
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.SearchResults.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.Marks.MarkChanged -= OnMarkChangedForNested;
+        _sortSlices.Clear();
+        UnhookSortSlices();
         _nestedTree.Dispose();
+    }
+
+    /// <summary>
+    /// How the nested tree's background pass after a change of order runs in
+    /// the window: one slice per frame, straight after the frame is drawn,
+    /// rather than in whatever time is left between frames.  A slice queued
+    /// below rendering fills every gap there is, so when a frame falls due
+    /// one is often half way through, and the frame waits for it: over the
+    /// bench's clicks through the headers on System32 that made about twenty
+    /// of its hundred and twenty frames late by a whole refresh.  Right after
+    /// a frame, a slice of a few milliseconds is done long before the next
+    /// one is due.
+    ///
+    /// After the frame rather than inside it, because the frame places what
+    /// it draws itself (see <see cref="NestedCanvas"/>): the slice then comes
+    /// second every time, and the tree takes what the frame spent placing off
+    /// the slice's allowance, so the two together stay within one slice's
+    /// worth.  Inside the frame they ran in whichever order their handlers
+    /// happened to be hooked, and a slice that came first was a whole slice
+    /// on top of the frame's own placing.
+    ///
+    /// While the nested canvas is not on screen the slices wait: nothing is
+    /// drawn from the tree then, and whatever is drawn when it comes back is
+    /// placed as it is drawn.  A pass of a few dozen slices takes that many
+    /// frames; nobody waits for it.
+    /// </summary>
+    private void PostSortSlice(Action slice)
+    {
+        _sortSlices.Enqueue(slice);
+        HookSortSlices();
+    }
+
+    /// <summary>Starts running waiting slices, one a frame, if the nested canvas is on screen to run them for.</summary>
+    private void HookSortSlices()
+    {
+        if (!_sortSlicesHooked && IsNested && _sortSlices.Count > 0)
+        {
+            _sortSlicesHooked = true;
+            CompositionTarget.Rendering += OnSortSliceFrame;
+        }
+    }
+
+    private void UnhookSortSlices()
+    {
+        if (_sortSlicesHooked)
+        {
+            _sortSlicesHooked = false;
+            CompositionTarget.Rendering -= OnSortSliceFrame;
+        }
+    }
+
+    private void OnSortSliceFrame(object? sender, EventArgs e)
+    {
+        // WPF raises Rendering more than once a frame when asked to: one
+        // slice per real frame, told apart by the frame's time.
+        if (e is RenderingEventArgs { RenderingTime: var time })
+        {
+            if (time == _lastSortSliceFrame)
+            {
+                return;
+            }
+
+            _lastSortSliceFrame = time;
+        }
+
+        // Gone to the tree canvas: the rest waits for the nested one to be back.
+        if (!IsNested)
+        {
+            UnhookSortSlices();
+            return;
+        }
+
+        if (_sortSlices.TryDequeue(out var slice))
+        {
+            // Queued at render priority from inside the frame, it runs as soon
+            // as the frame has been drawn and handed to the screen, before
+            // anything else waiting.  Queues the next slice itself while there
+            // is work left.
+            Dispatcher.InvokeAsync(slice, DispatcherPriority.Render);
+        }
+
+        if (_sortSlices.Count == 0)
+        {
+            UnhookSortSlices();
+        }
     }
 
     /// <summary>
@@ -134,6 +228,9 @@ public partial class MainWindow
             .Where(root => root.IsDrive)
             .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
 
+        // The remembered order before the first drive goes in, so nothing is
+        // ever placed in name order only to be placed again.
+        _nestedTree.SetSort(_viewModel.Sort);
         SyncNestedRoots();
         _nestedTree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
         _nestedTree.SetUserHidden(_viewModel.Tree.HiddenPaths);
@@ -311,6 +408,10 @@ public partial class MainWindow
                     _viewModel.Tree.PreferLightReveal = true;
                     _viewModel.Tree.IsCanvasShown = false;
                     EnterNested(fromStartup: false);
+
+                    // An order chosen while the tree canvas was showing: its
+                    // pass over the nested tree waited, and goes on now.
+                    HookSortSlices();
                 }
                 else
                 {
@@ -321,8 +422,69 @@ public partial class MainWindow
             case nameof(MainViewModel.IsSearchOpen):
                 ScheduleBeacons();
                 break;
+            case nameof(MainViewModel.Sort):
+                // The canvas keeps what it is looking at where it is; the tree
+                // places what is on screen at once and the rest behind it.
+                _nestedTree.SetSort(_viewModel.Sort);
+                UpdateSortHeaders();
+                break;
         }
     }
+
+    // ---- the order ---------------------------------------------------------------
+
+    /// <summary>A header over the canvas: sort by its column, or turn the order round if it already is.</summary>
+    private void SortHeader_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is FrameworkElement { Tag: string tag } && Enum.TryParse<SortColumn>(tag, out var column))
+        {
+            _viewModel.Sort = _viewModel.Sort.Click(column);
+        }
+    }
+
+    /// <summary>
+    /// Lights the header the canvas is ordered by and points its arrow the way
+    /// the order runs - up for A to Z, oldest or smallest first; down for the
+    /// other way - as Explorer's column headers do.
+    /// </summary>
+    private void UpdateSortHeaders()
+    {
+        var sort = _viewModel.Sort;
+        (Button Header, TextBlock Arrow, SortColumn Column)[] headers =
+        [
+            (SortByName, SortByNameArrow, SortColumn.Name),
+            (SortByModified, SortByModifiedArrow, SortColumn.Modified),
+            (SortByType, SortByTypeArrow, SortColumn.Type),
+            (SortBySize, SortBySizeArrow, SortColumn.Size)
+        ];
+
+        foreach (var (header, arrow, column) in headers)
+        {
+            var name = ItemSort.Describe(column);
+            if (column == sort.Column)
+            {
+                header.Foreground = (Brush)FindResource("TextBrush");
+                arrow.Text = sort.Descending ? "\uE70D" : "\uE70E";
+                arrow.Visibility = Visibility.Visible;
+                header.ToolTip = $"Sorted by {name}, {DirectionText(column, sort.Descending)} (click to reverse)";
+            }
+            else
+            {
+                // Back to the style's muted text, which its hover can light.
+                header.ClearValue(ForegroundProperty);
+                arrow.Visibility = Visibility.Hidden;
+                header.ToolTip = $"Sort by {name} (click again to reverse)";
+            }
+        }
+    }
+
+    /// <summary>Which way an order runs, in the words its column would use.</summary>
+    private static string DirectionText(SortColumn column, bool descending) => column switch
+    {
+        SortColumn.Modified => descending ? "newest first" : "oldest first",
+        SortColumn.Size => descending ? "largest first" : "smallest first",
+        _ => descending ? "Z to A" : "A to Z"
+    };
 
     /// <summary>
     /// Back to the tree: what is selected was only brought in by name, so it

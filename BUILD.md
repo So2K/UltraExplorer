@@ -31,8 +31,8 @@ incremental layout, viewport culling and mip levels, depth scaling, branch
 refresh, truncation, drop-target selection, drag rules and persistence, plus the
 file-dialog rules - file types, legacy flag translation, typed names, validation
 and what the graph is allowed to show - and the nested canvas: its geometry, its
-lazily read tree over a fake disk, the camera, hit testing, the name filter and
-the cost of a frame, all without a window. It
+lazily read tree over a fake disk, the camera, hit testing, sorting by name,
+date, type and size, and the cost of a frame, all without a window. It
 builds a throwaway fixture under `%TEMP%`, prints one line per check and exits
 non-zero on the first failure. If `%TEMP%` is not writable (a sandboxed shell),
 point `TMP` and `TEMP` at a folder that is.
@@ -101,8 +101,11 @@ UltraExplorer.exe --capture C:\temp\shot.png
 ## Nested canvas benchmark and snapshots
 
 Two switches judge a change to the nested canvas by numbers and by pixels
-instead of by feel. Both put the window on the primary monitor at 1600×1000,
-switch to the nested canvas, do their run and exit.
+instead of by feel. Both open the window at 1600×1000 on the first monitor
+that is not the primary one (or the one `ULTRAEXPLORER_DIAGNOSTICS_MONITOR`
+names by index), never activate it, switch to the nested canvas, do their
+run and exit. Compare only runs made on the same monitor: another scale is
+another picture.
 
 ```powershell
 $env:ULTRAEXPLORER_STATE_DIR = "$env:TEMP\ue-bench"
@@ -114,21 +117,29 @@ UltraExplorer.exe --nested-snapshots C:\temp\shots
   system folder, a pan, back out, a folder of thousands of files, a long
   flight), timing every frame, then times selecting deep folders until the
   address bar and the list follow. One row per phase: mean and worst frame,
-  frames over 20 ms.
+  frames over 20 ms. `sort-switch` clicks through Size, Date, Type and Name
+  on a folder of thousands of files and reports the worst click.
 - `--nested-snapshots <folder>` renders a fixed set of views to PNG once
   everything in them has been read. The PNGs of two builds compared pixel
-  for pixel say whether a change altered the picture.
+  for pixel say whether a change altered the picture. `with-strip\` beside
+  them holds the same views with the strip above the canvas. Scenes 01, 02
+  and 12 show live disk data (free space, what was read) and differ between
+  any two runs.
 
 Run them with `ULTRAEXPLORER_STATE_DIR` pointing at an empty folder, so the
 saved session does not colour the result and the run does not touch it. A
 failure is written next to the output as `*.error.txt`.
+
+`ULTRAEXPLORER_TEST_WINDOW=1` opens an ordinary copy the same way — on the
+other monitor, without taking the keyboard — to try a build beside the
+everyday one.
 
 ## Where state lives
 
 | File | Contents |
 |---|---|
 | `%LOCALAPPDATA%\UltraExplorer\view-all.workspace.json` | expanded branches, node positions, viewport, active path, extra roots, nested canvas camera |
-| `%LOCALAPPDATA%\UltraExplorer\workspace.json` | pinned folders, navigation pane width, minimap toggle, nested or tree canvas |
+| `%LOCALAPPDATA%\UltraExplorer\workspace.json` | pinned folders, navigation pane width, minimap toggle, nested or tree canvas, sort order |
 | `%LOCALAPPDATA%\UltraExplorer\folder-marks.json` | colour labels and notes, keyed by path |
 | `%LOCALAPPDATA%\UltraExplorer\picker.workspace.json` | canvas layout of file-dialog sessions, kept apart from the user's own |
 | `%LOCALAPPDATA%\UltraExplorer\picker-clients.json` | per caller GUID: last folder, file type, recent names |

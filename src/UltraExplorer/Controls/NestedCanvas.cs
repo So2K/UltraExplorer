@@ -161,6 +161,16 @@ public sealed class NestedCanvas : FrameworkElement
     private string _filterText = string.Empty;
     private int _filterStamp;
     private int _filterCursor = -1;
+
+    /// <summary>
+    /// The <see cref="NestedTree.SortGeneration"/> the matches are listed in
+    /// the order of, or -1 when they were gathered from folders placed for
+    /// different orders - while the tree's pass after a change was still
+    /// going.  Anything else and stepping through them would jump around a
+    /// picture the user has just had put in another order.
+    /// </summary>
+    private int _filterOrderGeneration = -1;
+    private bool _filterReorderWaiting;
     private readonly List<string> _filterMatches = [];
     private readonly HashSet<string> _filterMatchSet = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<Rect> _filterOutlines = [];
@@ -214,6 +224,32 @@ public sealed class NestedCanvas : FrameworkElement
     private double _aw;
     private bool _hasCamera;
     private bool _cameraTouched;
+
+    /// <summary>
+    /// How long one frame may spend placing folders again for a new order
+    /// before it draws the rest as they were.  A change of order leaves every
+    /// folder on screen to be placed again, and at an overview that is
+    /// thousands of them; the frame that does them all at once is the hitch
+    /// the change must not have.  What is left over is drawn in its previous
+    /// order - still a whole, consistent picture - and handed to the tree to
+    /// place first in its background pass; the next frame places the next
+    /// few milliseconds' worth.
+    ///
+    /// Only the placing itself counts, never the drawing around it.  Counted
+    /// from the start of the frame, a scene that took longer than this to
+    /// paint before its walk reached a folder would never place that folder
+    /// at all - and the next frame, walking the same way, would not either.
+    /// </summary>
+    private static readonly long DrawRelayoutTicks = System.Diagnostics.Stopwatch.Frequency * 3 / 1000;
+
+    /// <summary>At most this many folders drawn out of date are handed to the tree to place first; the rest wait their turn in its pass.</summary>
+    private const int MaximumPlacedFirst = 20_000;
+
+    private long _relayoutAllowance = long.MaxValue;
+    private long _relayoutSpent;
+    private bool _drewStale;
+    private bool _inFrameLoop;
+    private readonly List<NestedFolder> _drawnStale = [];
 
     private Flight? _flight;
 
@@ -303,6 +339,7 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 _tree.Changed -= OnTreeChanged;
                 _tree.FolderLoaded -= OnFolderLoadedForFilter;
+                _tree.SortChanged -= OnTreeSortChanged;
             }
 
             _tree = value;
@@ -311,10 +348,23 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 _tree.Changed += OnTreeChanged;
                 _tree.FolderLoaded += OnFolderLoadedForFilter;
+                _tree.SortChanged += OnTreeSortChanged;
             }
 
             RequestFrame(Layers.All);
         }
+    }
+
+    /// <summary>
+    /// The order sub-folders and files are placed in, row by row, in every
+    /// folder; the tree's, which is where it lives.  Setting it keeps the
+    /// folder being looked at where it is on screen and reorders what is
+    /// inside it.
+    /// </summary>
+    public ItemSort Sort
+    {
+        get => _tree?.Sort ?? ItemSort.Default;
+        set => _tree?.SetSort(value);
     }
 
     /// <summary>Space is held: a left drag pans whatever it starts on.</summary>
@@ -390,6 +440,12 @@ public sealed class NestedCanvas : FrameworkElement
     /// <summary>Texts laid out afresh in the last frame, rather than found already laid out.</summary>
     public int NewTextLayouts { get; private set; }
 
+    /// <summary>How long the last frame that drew the cells spent placing folders for a new order, drawing aside.</summary>
+    public double LastPlacingMilliseconds { get; private set; }
+
+    /// <summary>Whether the last frame that drew the cells drew some in an order since replaced, its allowance for placing spent.</summary>
+    public bool DrewOutOfDate { get; private set; }
+
     /// <summary>Frames built so far; a benchmark tells a new frame from an old one by it.</summary>
     public long RenderCount { get; private set; }
 
@@ -463,6 +519,15 @@ public sealed class NestedCanvas : FrameworkElement
         if (matcher is not null && _tree is not null)
         {
             Evaluate(_tree.Root);
+
+            // Gathered while the tree was still placing folders for a new
+            // order, the list is in a mixture of orders: it is put in the
+            // current one when the placing is done.
+            _filterOrderGeneration = _tree.IsSorting ? -1 : _tree.SortGeneration;
+            if (_tree.IsSorting)
+            {
+                _ = ReorderFilterWhenPlacedAsync();
+            }
         }
 
         _paletteStamp++;
@@ -475,7 +540,11 @@ public sealed class NestedCanvas : FrameworkElement
 
     public bool IsFiltering => _filter is not null;
 
-    /// <summary>Paths of everything matching the filter among what has been read, in walking order.</summary>
+    /// <summary>
+    /// Paths of everything matching the filter among what has been read, in
+    /// walking order: each folder, then its files and sub-folders as the
+    /// current order shows them, left to right and top to bottom.
+    /// </summary>
     public IReadOnlyList<string> FilterMatches => _filterMatches;
 
     /// <summary>Which match the last step went to, or -1.</summary>
@@ -483,13 +552,19 @@ public sealed class NestedCanvas : FrameworkElement
 
     /// <summary>
     /// Goes to the next match (or the previous one), selects it and flies to
-    /// where it can be read.  False when nothing matches.
+    /// where it can be read.  False when nothing matches.  Next is next in
+    /// the order on screen, even straight after the order changed.
     /// </summary>
     public bool GoToMatch(int direction)
     {
         if (_filterMatches.Count == 0)
         {
             return false;
+        }
+
+        if (_tree is not null && _filterOrderGeneration != _tree.SortGeneration)
+        {
+            ReorderFilterMatches();
         }
 
         _filterCursor = ((_filterCursor < 0 && direction < 0 ? 0 : _filterCursor) + direction + _filterMatches.Count) % _filterMatches.Count;
@@ -619,6 +694,115 @@ public sealed class NestedCanvas : FrameworkElement
         }
     }
 
+    /// <summary>
+    /// Puts the matches in walking order for the current order, keeping the
+    /// step the user is on.  Only folders that match or hold a match are
+    /// walked - what the filter already found out about each folder says
+    /// which - and each is placed for the current order before its files and
+    /// sub-folders are read, so this is right even while the tree is still
+    /// placing the rest.  A match the walk no longer reaches - its folder
+    /// hidden since - keeps its place at the end, as it would have before.
+    /// </summary>
+    private void ReorderFilterMatches()
+    {
+        if (_tree is null || _filter is null)
+        {
+            return;
+        }
+
+        var current = _filterCursor >= 0 && _filterCursor < _filterMatches.Count ? _filterMatches[_filterCursor] : null;
+        var ordered = new List<string>(_filterMatches.Count);
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CollectMatches(_tree.Root, ordered, seen);
+        foreach (var path in _filterMatches)
+        {
+            if (seen.Add(path))
+            {
+                ordered.Add(path);
+            }
+        }
+
+        _filterMatches.Clear();
+        _filterMatches.AddRange(ordered);
+        _filterMatchSet.Clear();
+        _filterMatchSet.UnionWith(ordered);
+        _filterCursor = current is null ? -1 : _filterMatches.FindIndex(path => string.Equals(path, current, StringComparison.OrdinalIgnoreCase));
+        _filterOrderGeneration = _tree.SortGeneration;
+    }
+
+    /// <summary>The matches in and under one folder, in the order <see cref="Evaluate"/> walks it.</summary>
+    private void CollectMatches(NestedFolder folder, List<string> into, HashSet<string> seen)
+    {
+        var state = FilterStateOf(folder);
+        if (!folder.IsComputer && (state & FilterSelf) != 0 && seen.Add(folder.FullPath))
+        {
+            into.Add(folder.FullPath);
+        }
+
+        if ((state & FilterInside) == 0)
+        {
+            return;
+        }
+
+        Ensure(folder);
+        foreach (var file in folder.Files)
+        {
+            if (_filter!(file.Name))
+            {
+                var path = folder.PathOf(file);
+                if (seen.Add(path))
+                {
+                    into.Add(path);
+                }
+            }
+        }
+
+        foreach (var child in folder.Children)
+        {
+            if ((FilterStateOf(child) & (FilterSelf | FilterInside)) != 0)
+            {
+                CollectMatches(child, into, seen);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Once the tree has placed every folder for its current order, puts the
+    /// matches in that order - the list the window shows marks for, and
+    /// counts through, then follows what is on screen.  One wait at a time;
+    /// an order changed again meanwhile is simply waited for too.
+    /// </summary>
+    private async Task ReorderFilterWhenPlacedAsync()
+    {
+        if (_filterReorderWaiting)
+        {
+            return;
+        }
+
+        _filterReorderWaiting = true;
+        try
+        {
+            while (_tree is { } tree && _filter is not null && _filterOrderGeneration != tree.SortGeneration)
+            {
+                await tree.WhenSortIdleAsync();
+                if (!ReferenceEquals(_tree, tree) || _filter is null || tree.IsSorting)
+                {
+                    continue;
+                }
+
+                if (_filterOrderGeneration != tree.SortGeneration)
+                {
+                    ReorderFilterMatches();
+                    FilterChanged?.Invoke();
+                }
+            }
+        }
+        finally
+        {
+            _filterReorderWaiting = false;
+        }
+    }
+
     private int FilterStateOf(NestedFolder folder) =>
         folder.FilterStamp == _filterStamp ? folder.FilterState : FilterUnknown;
 
@@ -638,6 +822,25 @@ public sealed class NestedCanvas : FrameworkElement
         var layers = _dirty | Layers.All;
         _dirty = Layers.None;
         RenderLayers(layers, inMotion: false);
+    }
+
+    /// <summary>
+    /// Draws everything as one frame of the canvas's own loop draws it - with
+    /// the loop's allowance for placing folders after a change of order, and
+    /// whatever it leaves over drawn as it was - for a test, which has no loop.
+    /// </summary>
+    internal void RenderAsFrame()
+    {
+        _dirty = Layers.None;
+        _inFrameLoop = true;
+        try
+        {
+            RenderLayers(Layers.All, inMotion: false);
+        }
+        finally
+        {
+            _inFrameLoop = false;
+        }
     }
 
     // ---- camera --------------------------------------------------------------
@@ -721,6 +924,14 @@ public sealed class NestedCanvas : FrameworkElement
     /// </summary>
     private void FlyToReadable(NestedFolder folder, int fileIndex)
     {
+        // The tile comes from the folder's own placing and the cell from its
+        // parent's: both for the current order.
+        Ensure(folder);
+        if (folder.Parent is { } holder)
+        {
+            Ensure(holder);
+        }
+
         if (fileIndex >= 0 && fileIndex < folder.Files.Count && folder.FileGrid is { IsEmpty: false } files)
         {
             var width = 2 * FileLabelPixels / files.TileHeight;
@@ -887,6 +1098,8 @@ public sealed class NestedCanvas : FrameworkElement
 
         while (true)
         {
+            // What is hit is what the current order puts there, drawn or not.
+            Ensure(folder);
             var grid = folder.Grid;
             if (grid.IsEmpty || w * grid.Scale < MinimumCellPixels * 2)
             {
@@ -934,8 +1147,9 @@ public sealed class NestedCanvas : FrameworkElement
 
     /// <summary>
     /// The folder a path names, or the folder and index of the file it names,
-    /// if that folder has been read.  Files are sorted as the reader sorted
-    /// them, so finding one is a binary search, not a scan.
+    /// if that folder has been read.  The index is the file's tile in the
+    /// current order; the tree finds it by a binary search over the names,
+    /// which stay in name order whatever order the tiles are in.
     /// </summary>
     public (NestedFolder Folder, int FileIndex)? Resolve(string path)
     {
@@ -955,51 +1169,45 @@ public sealed class NestedCanvas : FrameworkElement
             return null;
         }
 
-        var index = FindFile(parent, Path.GetFileName(path));
+        var index = _tree.FindFileIndex(parent, Path.GetFileName(path));
         return index >= 0 ? (parent, index) : null;
     }
 
-    private static int FindFile(NestedFolder folder, string name)
+    /// <summary>
+    /// <see cref="Resolve"/> without placing anything for the current order:
+    /// the tile a file has in its folder as the folder is placed right now.
+    /// For marks drawn over the picture, which has to show them where it shows
+    /// the tiles; placing every marked folder's contents for them would also
+    /// be work without an allowance, dozens of big folders in the one frame
+    /// after a click.
+    /// </summary>
+    private (NestedFolder Folder, int FileIndex)? ResolveAsPlaced(string path)
     {
-        var files = folder.Files;
-        var low = 0;
-        var high = files.Count - 1;
-        while (low <= high)
+        if (_tree is null || string.IsNullOrEmpty(path))
         {
-            var middle = (low + high) / 2;
-            var order = StringComparer.CurrentCultureIgnoreCase.Compare(files[middle].Name, name);
-            if (order == 0)
-            {
-                return middle;
-            }
-
-            if (order < 0)
-            {
-                low = middle + 1;
-            }
-            else
-            {
-                high = middle - 1;
-            }
+            return null;
         }
 
-        // Culture order and the file system can disagree about odd names; a
-        // miss is checked the slow way rather than reported as absent.
-        for (var index = 0; index < files.Count; index++)
+        if (_tree.Find(path) is { } folder)
         {
-            if (string.Equals(files[index].Name, name, StringComparison.OrdinalIgnoreCase))
-            {
-                return index;
-            }
+            return (folder, -1);
         }
 
-        return -1;
+        var parentPath = Path.GetDirectoryName(path);
+        if (string.IsNullOrEmpty(parentPath) || _tree.Find(parentPath) is not { } parent)
+        {
+            return null;
+        }
+
+        var index = NestedTree.FileIndexAsPlaced(parent, Path.GetFileName(path));
+        return index >= 0 ? (parent, index) : null;
     }
 
     /// <summary>A folder's cell or a file's tile on screen.</summary>
-    private Rect? TargetRect(NestedFolder folder, int fileIndex)
+    /// <param name="place">Whether what it reads is placed for the current order first (see <see cref="RectOf"/>).</param>
+    private Rect? TargetRect(NestedFolder folder, int fileIndex, bool place = true)
     {
-        if (RectOf(folder) is not { } r)
+        if (RectOf(folder, place) is not { } r)
         {
             return null;
         }
@@ -1007,6 +1215,11 @@ public sealed class NestedCanvas : FrameworkElement
         if (fileIndex < 0)
         {
             return new Rect(r.X, r.Y, r.W, r.W * NestedLayout.CellHeight);
+        }
+
+        if (place)
+        {
+            Ensure(folder);
         }
 
         var files = folder.FileGrid;
@@ -1129,6 +1342,10 @@ public sealed class NestedCanvas : FrameworkElement
             return;
         }
 
+        // Walking up divides by the anchor's own place in its parent, and
+        // walking down reads its children's: all of them for the current order.
+        EnsureAnchorPath();
+
         // A folder that was refreshed away or filtered out cannot be the anchor.
         // Filtered out, or inside something that was: hiding a folder the
         // view is deep inside must take the view out of it.
@@ -1148,6 +1365,7 @@ public sealed class NestedCanvas : FrameworkElement
                 continue;
             }
 
+            Ensure(_anchor);
             var grid = _anchor.Grid;
             if (!grid.IsEmpty)
             {
@@ -1206,6 +1424,7 @@ public sealed class NestedCanvas : FrameworkElement
         // Nothing further in: an empty folder need not fill more than the
         // screen.  A folder of files goes as far in as it takes for its
         // smallest names to be read and picked up.
+        Ensure(_anchor);
         var isDeadEnd = _anchor.Children.Count == 0
             && (_anchor.LoadState is NestedLoadState.Loaded or NestedLoadState.Failed || _anchor.IsReparsePoint);
         var maximum = !isDeadEnd
@@ -1252,6 +1471,7 @@ public sealed class NestedCanvas : FrameworkElement
             return null;
         }
 
+        EnsureAnchorPath();
         var (x, y, w) = (_ax, _ay, _aw);
         for (var folder = _anchor; folder.Parent is not null; folder = folder.Parent)
         {
@@ -1266,6 +1486,18 @@ public sealed class NestedCanvas : FrameworkElement
 
     /// <summary>The anchor and every folder above it, each with its exact rectangle.</summary>
     private void BuildChain()
+    {
+        EnsureAnchorPath();
+        BuildChainAsPlaced();
+    }
+
+    /// <summary>
+    /// <see cref="BuildChain"/> from wherever the folders on the way happen to
+    /// be placed, without placing any for the current order first: the chain
+    /// as the last frame drew it, which is what a change of order has to take
+    /// its bearings from before anything moves.
+    /// </summary>
+    private void BuildChainAsPlaced()
     {
         _chain.Clear();
         if (_anchor is null)
@@ -1287,7 +1519,14 @@ public sealed class NestedCanvas : FrameworkElement
         }
     }
 
-    private (double X, double Y, double W)? RectOf(NestedFolder folder)
+    /// <param name="place">
+    /// Whether each folder on the way is placed for the current order first.
+    /// What the user acts on is found where the current order puts it; what
+    /// is only drawn over the picture - a mark, the selection's outline - is
+    /// drawn where the picture has it, which for a folder the frame had no
+    /// allowance left to place is where it was.
+    /// </param>
+    private (double X, double Y, double W)? RectOf(NestedFolder folder, bool place = true)
     {
         var path = new List<NestedFolder>();
         var current = folder;
@@ -1305,12 +1544,98 @@ public sealed class NestedCanvas : FrameworkElement
 
         for (var index = path.Count - 1; index >= 0; index--)
         {
+            // Each step's place is its parent's placing, taken from the top
+            // down so every offset is for the current order.
             var step = path[index];
+            if (place)
+            {
+                Ensure(step.Parent!);
+            }
+
             rect = (rect.X + step.OffsetX * rect.W, rect.Y + step.OffsetY * rect.W, rect.W * step.Scale);
         }
 
         return rect;
     }
+
+    /// <summary>
+    /// Has the tree place a folder for the current order before its children,
+    /// grids or files are read.  Nearly always it already is, and this is one
+    /// comparison; a folder never read has nothing to place.
+    /// </summary>
+    private void Ensure(NestedFolder folder)
+    {
+        var stamp = folder.LayoutSortGeneration;
+        if (stamp >= 0 && _tree is { } tree && stamp != tree.SortGeneration)
+        {
+            tree.EnsureLayout(folder);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="Ensure"/> for the anchor and every folder above it, from the
+    /// top down: the camera divides its way up through their places, so a
+    /// chain placed for two different orders would put the view somewhere
+    /// neither of them has it.
+    /// </summary>
+    private void EnsureAnchorPath()
+    {
+        if (_anchor is not null && _tree is not null)
+        {
+            _tree.EnsurePathLayout(_anchor);
+        }
+    }
+
+    /// <summary>
+    /// The order changed, and nothing has moved yet.  The folder being looked
+    /// at is held where it is on screen - at the rectangle it has right now -
+    /// and only then is its way up placed for the new order, so its contents
+    /// reorder inside it and whatever moves above it moves around it.
+    ///
+    /// Which folder that is: the anchor when it fills most of the view, which
+    /// is what flying into a folder leaves - the folder at nine tenths of the
+    /// screen, its parent covering the rest.  Holding the parent there instead
+    /// would put a sibling in the folder's place, in front of the user, the
+    /// moment they clicked a header.  Otherwise the view is a look over a
+    /// folder's grid rather than into one of its cells, and the deepest folder
+    /// covering the view is held, its cells trading places inside it.  Only an
+    /// overview covered by nothing is held on This PC, whose drives never
+    /// change places.
+    /// </summary>
+    private void OnTreeSortChanged()
+    {
+        // A hover names a tile by its index, and the tile it names is about to
+        // hold another file.
+        _hover = null;
+        if (_tree is { } tree && _hasCamera && _anchor is not null && _flight is null && _viewWidth > 0)
+        {
+            BuildChainAsPlaced();
+            var (cover, x, y, w, _) = CoverCell();
+            if (_aw < _viewWidth * FillsViewShare && !ReferenceEquals(cover, _anchor))
+            {
+                _anchor = cover;
+                _ax = x;
+                _ay = y;
+                _aw = w;
+            }
+
+            tree.EnsurePathLayout(_anchor);
+            BuildChainAsPlaced();
+        }
+
+        // The matches were listed in the order before: stepping through them
+        // follows the new one at once (see GoToMatch), and the list itself is
+        // put in it once the tree has placed everything.
+        if (_filter is not null)
+        {
+            _ = ReorderFilterWhenPlacedAsync();
+        }
+
+        RequestFrame(Layers.All);
+    }
+
+    /// <summary>How much of the view's width a folder takes up for a change of order to hold it, rather than the folder around it, still.</summary>
+    private const double FillsViewShare = 0.75;
 
     private void AfterCameraMove()
     {
@@ -1402,9 +1727,20 @@ public sealed class NestedCanvas : FrameworkElement
         {
             var layers = _dirty;
             _dirty = Layers.None;
-            // Between stopping and settling, the frames that are drawn keep
-            // the motion look, so nothing flips back and forth.
-            RenderLayers(layers, moving || !settled && (_lodDegraded || _textAnimated));
+
+            // Only a frame of the loop has a next frame to leave work to; a
+            // snapshot or a test drawing on demand gets everything placed.
+            _inFrameLoop = true;
+            try
+            {
+                // Between stopping and settling, the frames that are drawn keep
+                // the motion look, so nothing flips back and forth.
+                RenderLayers(layers, moving || !settled && (_lodDegraded || _textAnimated));
+            }
+            finally
+            {
+                _inFrameLoop = false;
+            }
         }
 
         if (_dirty == Layers.None && _flight is null && !_lodDegraded && !_textAnimated && !moving)
@@ -1764,6 +2100,10 @@ public sealed class NestedCanvas : FrameworkElement
         DrawnCellCount = 0;
         _foldersDrawn = 0;
         _tilesDrawn = 0;
+        _relayoutAllowance = _inFrameLoop ? DrawRelayoutTicks : long.MaxValue;
+        _relayoutSpent = 0;
+        _drewStale = false;
+        _drawnStale.Clear();
 
         _bitmap.Lock();
         try
@@ -1799,7 +2139,18 @@ public sealed class NestedCanvas : FrameworkElement
         _lodDegraded = lod > 1.0001;
         PerfLog.Value("nested.cells", DrawnCellCount);
         LastRenderMilliseconds = elapsed;
+        LastPlacingMilliseconds = _relayoutSpent * 1000.0 / System.Diagnostics.Stopwatch.Frequency;
+        DrewOutOfDate = _drewStale;
         RenderCount++;
+        if (_drewStale)
+        {
+            // Some folders were drawn in their previous order: the tree's pass
+            // places those first, and the next frame places the next few
+            // milliseconds' worth itself.
+            _tree.PlaceFirst(_drawnStale);
+            _drawnStale.Clear();
+            RequestFrame(Layers.Scene);
+        }
     }
 
     /// <summary>
@@ -1847,6 +2198,28 @@ public sealed class NestedCanvas : FrameworkElement
         if (++_foldersDrawn > MaximumCellsPerFrame)
         {
             return;
+        }
+
+        // Placed for the current order before its children and files are
+        // walked - within the frame's allowance for placing; past it, as it
+        // was placed, and noted for the tree to place first.
+        var stamp = folder.LayoutSortGeneration;
+        if (stamp >= 0 && stamp != _tree!.SortGeneration)
+        {
+            if (_relayoutSpent < _relayoutAllowance)
+            {
+                var placing = System.Diagnostics.Stopwatch.GetTimestamp();
+                _tree.EnsureLayout(folder);
+                _relayoutSpent += System.Diagnostics.Stopwatch.GetTimestamp() - placing;
+            }
+            else
+            {
+                _drewStale = true;
+                if (_drawnStale.Count < MaximumPlacedFirst)
+                {
+                    _drawnStale.Add(folder);
+                }
+            }
         }
 
         EnsurePalette(folder);
@@ -2525,7 +2898,7 @@ public sealed class NestedCanvas : FrameworkElement
 
         foreach (var path in _selected)
         {
-            if (Resolve(path) is not { } target || TargetRect(target.Folder, target.FileIndex) is not { } rect || rect.Width < 3)
+            if (ResolveAsPlaced(path) is not { } target || TargetRect(target.Folder, target.FileIndex, place: false) is not { } rect || rect.Width < 3)
             {
                 continue;
             }
@@ -2538,7 +2911,7 @@ public sealed class NestedCanvas : FrameworkElement
 
     private void DrawDropTarget(DrawingContext dc)
     {
-        if (_dropTarget is null || ScreenRect(_dropTarget) is not { } rect)
+        if (_dropTarget is null || ScreenRect(_dropTarget, place: false) is not { } rect)
         {
             return;
         }
@@ -2571,7 +2944,7 @@ public sealed class NestedCanvas : FrameworkElement
 
     private void DrawHover(DrawingContext dc)
     {
-        if (_hover is not { } hover || _press != PressKind.None || TargetRect(hover.Folder, hover.FileIndex) is not { } rect || rect.Width < 3)
+        if (_hover is not { } hover || _press != PressKind.None || TargetRect(hover.Folder, hover.FileIndex, place: false) is not { } rect || rect.Width < 3)
         {
             return;
         }
@@ -2671,7 +3044,7 @@ public sealed class NestedCanvas : FrameworkElement
             {
                 var pending = _beacons
                     .Select(beacon => beacon.Path)
-                    .Where(path => !_unresolvable.Contains(path) && (Resolve(path) is not { } found || !NestedTree.IsOnCanvas(found.Folder)))
+                    .Where(path => !_unresolvable.Contains(path) && (ResolveAsPlaced(path) is not { } found || !NestedTree.IsOnCanvas(found.Folder)))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .ToList();
                 if (pending.Count == 0)
@@ -2691,7 +3064,7 @@ public sealed class NestedCanvas : FrameworkElement
                         // A folder resolves to itself; a file to the folder it
                         // is in, once that folder's listing has it.
                         await _tree.RevealAsync(path);
-                        if (Resolve(path) is null)
+                        if (ResolveAsPlaced(path) is null)
                         {
                             _unresolvable.Add(path);
                         }
@@ -2726,7 +3099,7 @@ public sealed class NestedCanvas : FrameworkElement
         var offscreen = new List<Pin>();
         foreach (var beacon in _beacons)
         {
-            if (Resolve(beacon.Path) is not { } target || TargetRect(target.Folder, target.FileIndex) is not { } rect)
+            if (ResolveAsPlaced(beacon.Path) is not { } target || TargetRect(target.Folder, target.FileIndex, place: false) is not { } rect)
             {
                 continue;
             }
@@ -2801,7 +3174,7 @@ public sealed class NestedCanvas : FrameworkElement
             }
 
             var hit = new Rect(centre.X - 10, centre.Y - 10, 20, 20);
-            var members = cluster.Select(pin => (pin.Folder, pin.FileIndex)).ToList();
+            var members = cluster.ToList();
             _hotspots.Add(new Hotspot(hit, () => OnBeaconClicked(members), null));
 
             // A label beside it, if it does not run into one already placed.
@@ -2899,16 +3272,28 @@ public sealed class NestedCanvas : FrameworkElement
                 DrawTextAt(dc, count, new Point(at.X - count.Width / 2, at.Y - count.Height / 2));
             }
 
-            var targets = members.Select(pin => (pin.Folder, pin.FileIndex)).ToList();
-            _hotspots.Add(new Hotspot(new Rect(at.X - 11, at.Y - 11, 22, 22), () => OnBeaconClicked(targets), null, EdgeTip(members)));
+            _hotspots.Add(new Hotspot(new Rect(at.X - 11, at.Y - 11, 22, 22), () => OnBeaconClicked(members), null, EdgeTip(members)));
         }
     }
 
     private static string EdgeTip(List<Pin> members) =>
         members.Count == 1 ? members[0].Beacon.Label : $"{members[0].Beacon.Label} and {members.Count - 1} more";
 
-    private void OnBeaconClicked(IReadOnlyList<(NestedFolder Folder, int FileIndex)> targets)
+    private void OnBeaconClicked(IReadOnlyList<Pin> pins)
     {
+        // Found again by path, for the current order: a mark is drawn where
+        // the picture had its folder, and the folder may have been placed
+        // again since - the tile a file's mark was drawn on can hold another
+        // file by the time it is clicked.
+        var targets = new List<(NestedFolder Folder, int FileIndex)>(pins.Count);
+        foreach (var pin in pins)
+        {
+            if (Resolve(pin.Beacon.Path) is { } target)
+            {
+                targets.Add(target);
+            }
+        }
+
         if (targets.Count == 0)
         {
             return;
@@ -2989,6 +3374,9 @@ public sealed class NestedCanvas : FrameworkElement
                 trail.Add(folder);
             }
 
+            // As placed, not placed here: the trail names the folders the
+            // picture shows under the probe, and a folder the frame drew in
+            // its previous order is still in its previous place there.
             var grid = folder.Grid;
             if (grid.IsEmpty)
             {
@@ -3374,10 +3762,26 @@ public sealed class NestedCanvas : FrameworkElement
     /// </summary>
     private (NestedFolder Folder, int FileIndex)? Neighbour((NestedFolder Folder, int FileIndex)? active, Key key)
     {
+        // Next along is next in the order on screen: the folders whose grids
+        // are walked are placed for it first.
+        if (active is { } placed)
+        {
+            Ensure(placed.Folder);
+            if (placed.Folder.Parent is { } holder)
+            {
+                Ensure(holder);
+            }
+        }
+
         if (active is not { } current || current.FileIndex < 0 && (current.Folder.Parent is null || current.Folder.Index < 0))
         {
             // Nothing selected yet: start at the first folder in the one in
             // view, or its first file if it holds only files.
+            if (_anchor is not null)
+            {
+                Ensure(_anchor);
+            }
+
             return _anchor switch
             {
                 { Children.Count: > 0 } anchor => (anchor.Children[0], -1),
@@ -3492,9 +3896,9 @@ public sealed class NestedCanvas : FrameworkElement
         return high > size - margin ? size - margin - high : 0;
     }
 
-    private Rect? ScreenRect(NestedFolder folder)
+    private Rect? ScreenRect(NestedFolder folder, bool place = true)
     {
-        var result = RectOf(folder);
+        var result = RectOf(folder, place);
         return result is { } r ? new Rect(r.X, r.Y, r.W, r.W * NestedLayout.CellHeight) : null;
     }
 
