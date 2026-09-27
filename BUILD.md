@@ -216,6 +216,8 @@ everyday one. `ViewAllSmoke --only <Group,...>` runs only the named check groups
 | `%LOCALAPPDATA%\UltraExplorer\picker.workspace.json` | canvas layout of file-dialog sessions, kept apart from the user's own |
 | `%LOCALAPPDATA%\UltraExplorer\picker-clients.json` | per caller GUID: last folder, file type, recent names |
 | `%LOCALAPPDATA%\UltraExplorer\gpu\`, `cache\`, `jit\` | compiled shaders, the icon and glyph atlases, the startup JIT profile - all rebuilt when missing |
+| `%LOCALAPPDATA%\UltraExplorer\crash.log` | every exception nothing else caught, with its stack; `crash.old.log` holds the previous megabyte |
+| `%LOCALAPPDATA%\UltraExplorer\*.json.corrupt-<time>` | a state file that could not be read, set aside rather than overwritten by the next save, to be mended by hand |
 
 Deleting them resets the app to its first-run state. The environment variable
 `ULTRAEXPLORER_STATE_DIR` moves the whole folder, so a second copy can run
