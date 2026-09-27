@@ -625,19 +625,84 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Enter in the folder-list filter opens the best match, which is what makes
-    /// the list a way of getting somewhere rather than only of looking.
+    /// A tilt wheel or a touchpad's sideways swipe pans the canvas the pointer
+    /// is over, as Shift+wheel does - the other way round, because tilting
+    /// right means "show me what is to the right", which is Shift+wheel down.
+    /// It goes where the upright wheel would: to the canvas only when the
+    /// canvas is what is under the pointer, so over the folder list, a panel
+    /// or another program it is left to them.
     /// </summary>
-    private void FolderListFilter_KeyDown(object sender, KeyEventArgs e)
+    partial void OnHorizontalWheelMessage(IntPtr wParam, IntPtr lParam, ref bool handled)
     {
-        if (e.Key == Key.Enter)
+        // The distance is the signed high word of wParam, positive for right;
+        // the pointer is in screen pixels in lParam, as for the upright wheel.
+        var delta = (short)((wParam.ToInt64() >> 16) & 0xFFFF);
+        var packed = lParam.ToInt64();
+        var screenPoint = new Point((short)(packed & 0xFFFF), (short)((packed >> 16) & 0xFFFF));
+        if (delta == 0)
+        {
+            return;
+        }
+
+        Point local;
+        try
+        {
+            local = PointFromScreen(screenPoint);
+        }
+        catch (InvalidOperationException)
+        {
+            return;
+        }
+
+        // What is under the pointer can be a run of text inside a node rather
+        // than an element, so the canvas is looked for among its ancestors.
+        var over = InputHitTest(local) as DependencyObject;
+        var overCanvas = IsNested
+            ? ReferenceEquals(FindAncestor<NestedCanvas>(over), Nested)
+            : ReferenceEquals(FindAncestor<NodifyEditor>(over), Editor);
+        if (!overCanvas)
+        {
+            return;
+        }
+
+        if (IsNested)
+        {
+            // The canvas's own Shift+wheel, turned round.
+            Nested.PointerWheel(Nested.PointFromScreen(screenPoint), -delta, ModifierKeys.Shift);
+        }
+        else
+        {
+            // Nodify's Shift+wheel moves a notch's worth of 60 pixels on screen
+            // whatever the notch says; here the distance follows the delta, so a
+            // touchpad's small steps stay small and a tilt notch of 120 comes to
+            // the same 60 pixels.
+            var zoom = Math.Max(Editor.ViewportZoom, 0.001);
+            Editor.UpdatePanning(new Vector(-delta / 2.0 / zoom, 0));
+        }
+
+        handled = true;
+    }
+
+    /// <summary>
+    /// Enter in the folder-list filter opens the best match, which is what makes
+    /// the list a way of getting somewhere rather than only of looking.  On the
+    /// preview, because the text box keeps the arrow keys for its caret and
+    /// they never bubble up to a KeyDown handler.
+    /// </summary>
+    private void FolderListFilter_PreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        // Every Alt combination arrives as Key.System with the real key in
+        // SystemKey, so reading e.Key alone never sees Alt+Up or Alt+Left.
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+
+        if (key == Key.Enter)
         {
             _viewModel.Tree.FolderList.OpenFirstMatchCommand.Execute(null);
             e.Handled = true;
             return;
         }
 
-        if (e.Key == Key.Escape)
+        if (key == Key.Escape)
         {
             _viewModel.Tree.FolderList.ClearFilterCommand.Execute(null);
             e.Handled = true;
@@ -645,7 +710,7 @@ public partial class MainWindow : Window
         }
 
         // Down arrow moves into the list, so typing and picking is one gesture.
-        if (e.Key == Key.Down && Keyboard.Modifiers == ModifierKeys.None && FolderListItems.Items.Count > 0)
+        if (key == Key.Down && Keyboard.Modifiers == ModifierKeys.None && FolderListItems.Items.Count > 0)
         {
             NoteListInput();
             FolderListItems.SelectedIndex = 0;
@@ -656,14 +721,14 @@ public partial class MainWindow : Window
 
         // Explorer's own shortcuts, so the muscle memory carries over.  Backspace
         // is deliberately not one of them: it belongs to the text being typed.
-        if (Keyboard.Modifiers == ModifierKeys.Alt && e.Key == Key.Up)
+        if (Keyboard.Modifiers == ModifierKeys.Alt && key == Key.Up)
         {
             _viewModel.Tree.FolderList.UpCommand.Execute(null);
             e.Handled = true;
             return;
         }
 
-        if (Keyboard.Modifiers == ModifierKeys.Alt && e.Key == Key.Left)
+        if (Keyboard.Modifiers == ModifierKeys.Alt && key == Key.Left)
         {
             _viewModel.Tree.FolderList.BackCommand.Execute(null);
             e.Handled = true;
@@ -1736,9 +1801,18 @@ public partial class MainWindow : Window
             return;
         }
 
+        // The keys that act on the selection only do so from where the
+        // selection is shown - either canvas, the folder list, or nowhere in
+        // particular.  Anything else holding the keyboard has keys of its own:
+        // Enter and Space press a button, Enter takes a search result, and
+        // Delete over a search result must never reach a selection the user is
+        // not even looking at.  Going places, zooming and refreshing work from
+        // anywhere, as they always have.
+        var onSelection = IsSelectionSurfaceFocused();
+
         switch (modifiers, key)
         {
-            case (ModifierKeys.Control, Key.H):
+            case (ModifierKeys.Control, Key.H) when onSelection:
                 _viewModel.HideSelectedCommand.Execute(null);
                 break;
 
@@ -1746,22 +1820,25 @@ public partial class MainWindow : Window
                 _viewModel.ShowAllHiddenCommand.Execute(null);
                 break;
 
-            case (ModifierKeys.Control, Key.C):
+            case (ModifierKeys.Control, Key.C) when onSelection:
                 _viewModel.CopyCommand.Execute(null);
                 break;
-            case (ModifierKeys.Control, Key.X):
+            case (ModifierKeys.Control, Key.X) when onSelection:
                 _viewModel.CutCommand.Execute(null);
                 break;
-            case (ModifierKeys.Control, Key.V):
+
+            // Paste goes into the folder selected on the canvas, which is not
+            // where a search result or a button is.
+            case (ModifierKeys.Control, Key.V) when onSelection:
                 _viewModel.PasteCommand.Execute(null);
                 break;
-            case (ModifierKeys.Control | ModifierKeys.Shift, Key.C):
+            case (ModifierKeys.Control | ModifierKeys.Shift, Key.C) when onSelection:
                 _viewModel.CopyPathCommand.Execute(null);
                 break;
             case (ModifierKeys.Control | ModifierKeys.Shift, Key.N):
                 _viewModel.NewFolderCommand.Execute(null);
                 break;
-            case (ModifierKeys.Control | ModifierKeys.Shift, Key.D):
+            case (ModifierKeys.Control | ModifierKeys.Shift, Key.D) when onSelection:
                 _viewModel.DuplicateCommand.Execute(null);
                 break;
             case (ModifierKeys.Alt, Key.Left):
@@ -1773,7 +1850,7 @@ public partial class MainWindow : Window
             case (ModifierKeys.Alt, Key.Up):
                 _viewModel.UpCommand.Execute(null);
                 break;
-            case (ModifierKeys.Alt, Key.Enter):
+            case (ModifierKeys.Alt, Key.Enter) when onSelection:
                 _viewModel.PropertiesCommand.Execute(null);
                 break;
             // Figma's viewport shortcuts, plus Ctrl+0 as a familiar alias.
@@ -1799,33 +1876,44 @@ public partial class MainWindow : Window
             case (ModifierKeys.Control, Key.Subtract):
                 _viewModel.ZoomOutCommand.Execute(null);
                 break;
-            case (ModifierKeys.None, Key.Space):
+            // Space is a button's own key too; the grab hand is for the canvas.
+            case (ModifierKeys.None, Key.Space) when onSelection:
                 SetSpacePanArmed(true);
                 break;
-            case (ModifierKeys.Shift, Key.F10):
+
+            // The Menu key is the other way Windows has always had to ask for
+            // the menu of what has the keyboard.
+            case (ModifierKeys.Shift, Key.F10) when onSelection:
+            case (ModifierKeys.None, Key.Apps) when onSelection:
                 ShowContextMenuForSelection();
                 break;
-            case (ModifierKeys.None, Key.F2):
+            case (ModifierKeys.None, Key.F2) when onSelection:
                 _viewModel.RenameCommand.Execute(null);
                 break;
             case (ModifierKeys.None, Key.F5):
                 _viewModel.RefreshCommand.Execute(null);
                 break;
-            case (ModifierKeys.None, Key.Delete):
+            case (ModifierKeys.None, Key.Delete) when onSelection:
                 _viewModel.DeleteCommand.Execute(null);
                 break;
-            case (ModifierKeys.Shift, Key.Delete):
+            case (ModifierKeys.Shift, Key.Delete) when onSelection:
                 _viewModel.PermanentDeleteCommand.Execute(null);
                 break;
-            case (ModifierKeys.None, Key.Enter):
+            case (ModifierKeys.None, Key.Enter) when onSelection:
                 _viewModel.OpenCommand.Execute(null);
                 break;
-            case (ModifierKeys.None, Key.Right) when _viewModel.Tree.ActiveNode is { IsDirectory: true, IsExpanded: false } expand:
-                await _viewModel.Tree.ToggleAsync(expand);
-                break;
-            case (ModifierKeys.None, Key.Left) when _viewModel.Tree.ActiveNode is { IsDirectory: true, IsExpanded: true } collapse:
-                await _viewModel.Tree.ToggleAsync(collapse);
-                break;
+
+            // Claimed before the wait, not after it: an async handler goes back
+            // to its caller at the first await, and a key still unhandled then
+            // goes on to Nodify, which moves the selection with it as well.
+            case (ModifierKeys.None, Key.Right) when onSelection && _viewModel.Tree.ActiveNode is { IsDirectory: true, IsExpanded: false } expand:
+                e.Handled = true;
+                await ToggleFromKeyboardAsync(expand);
+                return;
+            case (ModifierKeys.None, Key.Left) when onSelection && _viewModel.Tree.ActiveNode is { IsDirectory: true, IsExpanded: true } collapse:
+                e.Handled = true;
+                await ToggleFromKeyboardAsync(collapse);
+                return;
             case (ModifierKeys.None, Key.Escape):
                 // A crumb's list of folders is the nearest thing to a menu the
                 // bar has, and Escape closes menus.
@@ -1842,6 +1930,39 @@ public partial class MainWindow : Window
         }
 
         e.Handled = true;
+    }
+
+    /// <summary>
+    /// Whether the keyboard is on something that shows the one selection -
+    /// either canvas or the folder list - or on nothing in particular, which
+    /// is the window itself.  A search result, a button, a drop-down: each of
+    /// those is a choice of its own, and not what the selection's keys are for.
+    /// </summary>
+    private bool IsSelectionSurfaceFocused()
+    {
+        var focused = Keyboard.FocusedElement;
+        return focused is null
+            || ReferenceEquals(focused, this)
+            || Editor.IsKeyboardFocusWithin
+            || Nested.IsKeyboardFocusWithin
+            || FolderListItems.IsKeyboardFocusWithin;
+    }
+
+    /// <summary>
+    /// Opens or closes a folder from the arrow keys.  Nothing above an async
+    /// key handler would catch a folder that could not be read, and an
+    /// exception there ends the program, so the failure is said instead.
+    /// </summary>
+    private async Task ToggleFromKeyboardAsync(ViewAllNodeViewModel node)
+    {
+        try
+        {
+            await _viewModel.Tree.ToggleAsync(node);
+        }
+        catch (Exception exception)
+        {
+            _viewModel.Toast.ShowError(exception.Message);
+        }
     }
 
     private void Window_Activated(object? sender, EventArgs e)

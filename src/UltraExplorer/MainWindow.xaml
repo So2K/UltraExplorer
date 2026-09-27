@@ -1045,7 +1045,7 @@
                                              CaretBrush="{StaticResource TextBrush}"
                                              FontSize="12"
                                              VerticalContentAlignment="Center"
-                                             KeyDown="FolderListFilter_KeyDown" />
+                                             PreviewKeyDown="FolderListFilter_PreviewKeyDown" />
                                 </Grid>
                             </Grid>
                         </Border>
