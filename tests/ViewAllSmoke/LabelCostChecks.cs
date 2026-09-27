@@ -33,8 +33,44 @@ internal static partial class Program
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// The ladder of sizes names are laid out at: a step along it from any
+    /// size a name is drawn at lands bit for bit on the level a layout made
+    /// there is kept under.  The cache compares levels exactly, and a near
+    /// size it misses is a name that blinks out during a zoom.
+    /// </summary>
+    private static void LabelLevelChecks()
+    {
+        Section("label levels");
+        var cases = 0;
+        var misses = 0;
+        var multipliedMisses = 0;
+        string? first = null;
+        for (var size = 1.0; size <= 400; size *= 1.0137)
+        {
+            var level = NestedCanvas.LevelFor(size);
+            for (var rungs = -3; rungs <= 3; rungs++)
+            {
+                // Well inside the rung that many steps away, found as a name finds its level.
+                var there = NestedCanvas.LevelFor(level * Math.Pow(2, rungs / 4.0) * 1.02);
+                var stepped = NestedCanvas.LevelAway(level, rungs);
+                cases++;
+                multipliedMisses += (level * Math.Pow(2, rungs / 4.0)).Equals(there) ? 0 : 1;
+                if (!stepped.Equals(there))
+                {
+                    misses++;
+                    first ??= $"size {size:R}, {rungs} rungs: {stepped:R} for {there:R}";
+                }
+            }
+        }
+
+        Check($"a step along the ladder is exactly the level kept for that rung, in all {cases:N0} cases (multiplying the level would miss {multipliedMisses:N0}){(first is null ? string.Empty : $"; first miss {first}")}",
+            misses == 0);
+    }
+
     private static async Task LabelCostChecksAsync()
     {
+        LabelLevelChecks();
         Section("label cost");
         var disk = new FakeDisk();
         string[] extensions = ["txt", "png", "cs", "mp3", "pdf", "zip", "json", "md", "dll", "xml"];
@@ -84,6 +120,7 @@ internal static partial class Program
             LabelCostNormaliseChecks(canvas, tree, marks);
             LabelCostGpuChecks(canvas);
             await LabelCostFilterChecksAsync();
+            await FilterRereadChecksAsync();
             LabelCostBudgetChecks(tree, many, LookUpIcon);
             LabelCostPlacingChecks(tree);
         }
@@ -381,6 +418,48 @@ internal static partial class Program
             canvas.RunFrameForTests(TimeSpan.FromMilliseconds(1_008));
             Check($"and their {canvas.FilterMatches.Count - matchesBefore} new matches are said once, at the end of the frame's intake ({heldBack} before the frame, {changes} after two)",
                 heldBack == 0 && changes == 1 && canvas.FilterMatches.Count - matchesBefore == 4);
+        }
+        finally
+        {
+            canvas.SetFilter(null);
+            canvas.Tree = null;
+        }
+    }
+
+    /// <summary>
+    /// A folder read again under the filter: a match renamed - to a name the
+    /// filter still takes - is one match under its new name, not two, and a
+    /// match deleted is gone, from the count and from the steps through them.
+    /// </summary>
+    private static async Task FilterRereadChecksAsync()
+    {
+        Section("label cost: the filter over a folder read again");
+        var disk = new FakeDisk();
+        disk.AddFile(@"Q:\photos", "a.png", 10);
+        disk.AddFile(@"Q:\photos", "b.png", 20);
+        disk.AddFile(@"Q:\photos", "c.txt", 30);
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await LoadEverythingAsync(tree, _ => true);
+        var canvas = new NestedCanvas { Tree = tree };
+        canvas.Measure(new Size(1200, 800));
+        canvas.Arrange(new Rect(0, 0, 1200, 800));
+        canvas.UpdateLayout();
+        try
+        {
+            canvas.SetFilter("*.png");
+            var photos = tree.Find(@"Q:\photos")!;
+            var before = canvas.FilterMatches.Count;
+            var files = disk.Folder(@"Q:\photos").Files;
+            files.RemoveAll(file => file.Name is "a.png" or "b.png");
+            disk.AddFile(@"Q:\photos", "renamed.png", 10);
+            await tree.RefreshAsync(photos);
+            var renamed = Path.Combine(photos.FullPath, "renamed.png");
+            var after = canvas.FilterMatches.ToList();
+            Check($"one match renamed and one deleted leave one match, under the new name ({before} before, then {string.Join(", ", after)})",
+                before == 2 && after.Count == 1 && string.Equals(after[0], renamed, StringComparison.OrdinalIgnoreCase));
+            Check("and a step goes to it, never to one that is gone",
+                canvas.GoToMatch(1) && canvas.FilterCursor == 0 && canvas.GoToMatch(1) && canvas.FilterCursor == 0);
         }
         finally
         {

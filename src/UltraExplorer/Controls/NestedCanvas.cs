@@ -373,6 +373,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             HookGpu();
             RequestFrame(Layers.All);
         };
+        IsVisibleChanged += OnIsVisibleChanged;
     }
 
     protected override int VisualChildrenCount => 4;

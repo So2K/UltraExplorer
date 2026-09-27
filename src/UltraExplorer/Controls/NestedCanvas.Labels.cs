@@ -1217,13 +1217,20 @@ public sealed partial class NestedCanvas
     };
 
     /// <summary>
+    /// The first moment a FILETIME can say, 1 January 1601 UTC, in ticks.  A
+    /// file system that keeps no date hands over a FILETIME of zero, which
+    /// arrives as exactly this - a time nobody gave, not one to show.
+    /// </summary>
+    private static readonly long FileTimeEpochTicks = DateTime.FromFileTimeUtc(0).Ticks;
+
+    /// <summary>
     /// A time in UTC ticks as the culture writes a date and a time, or only
     /// the date, in local time; nothing for a time nobody gave.  Kept by the
     /// minute, which is all the text shows.
     /// </summary>
     internal string DateText(long utcTicks, bool dateOnly)
     {
-        if (utcTicks <= 0 || utcTicks > DateTime.MaxValue.Ticks)
+        if (utcTicks <= FileTimeEpochTicks || utcTicks > DateTime.MaxValue.Ticks)
         {
             return string.Empty;
         }
@@ -1235,8 +1242,20 @@ public sealed partial class NestedCanvas
             return known;
         }
 
+        // A culture whose calendar spans only some years - Saudi Arabia's
+        // Umm al-Qura, 1900 to 2077 - throws for a date outside them, and
+        // this is made inside a frame, so such a date is written the
+        // invariant way instead: a file from 1850 or 2100 still says when it
+        // is from rather than taking the window down.
         var local = new DateTime(utcTicks, DateTimeKind.Utc).ToLocalTime();
-        return texts.Add(minute, local.ToString(dateOnly ? "d" : "g", CultureInfo.CurrentCulture));
+        var culture = CultureInfo.CurrentCulture;
+        var calendar = culture.DateTimeFormat.Calendar;
+        if (local < calendar.MinSupportedDateTime || local > calendar.MaxSupportedDateTime)
+        {
+            culture = CultureInfo.InvariantCulture;
+        }
+
+        return texts.Add(minute, local.ToString(dateOnly ? "d" : "g", culture));
     }
 
     /// <summary>
@@ -1733,9 +1752,7 @@ public sealed partial class NestedCanvas
     private ScaledText Text(string text, double size, Brush brush, double maxWidth, bool bold, bool icon = false, bool scaled = false)
     {
         size = Math.Clamp(size, 1, 400);
-        var level = scaled
-            ? Math.Pow(2, Math.Round(Math.Log2(size) * LevelsPerOctave) / LevelsPerOctave)
-            : Math.Round(size * 4) / 4;
+        var level = scaled ? LevelFor(size) : Math.Round(size * 4) / 4;
 
         // The whole name first.  Most names fit, and a name that fits does
         // not depend on the room it has - so it is the same layout at every
@@ -1750,6 +1767,22 @@ public sealed partial class NestedCanvas
         var trimmed = Layout(text, level, size, maxWidth, brush, bold, icon, scaled);
         return trimmed.Text is null ? default : trimmed;
     }
+
+    /// <summary>The level of the ladder a scaled text of <paramref name="size"/> is laid out at: the nearest fourth root of two.</summary>
+    internal static double LevelFor(double size) =>
+        Math.Pow(2, Math.Round(Math.Log2(size) * LevelsPerOctave) / LevelsPerOctave);
+
+    /// <summary>
+    /// The level <paramref name="rungs"/> steps up the ladder from
+    /// <paramref name="level"/> (down, for a negative count), worked out from
+    /// the rung's number exactly as <see cref="LevelFor"/> works it out, so it
+    /// is bit for bit the level a layout made there is kept under.  A level
+    /// multiplied by a power of the fourth root of two mostly is not, and the
+    /// cache compares its levels exactly: the nearest size already laid out
+    /// was then missed, and names blinked out during a zoom.
+    /// </summary>
+    internal static double LevelAway(double level, int rungs) =>
+        Math.Pow(2, (Math.Round(Math.Log2(level) * LevelsPerOctave) + rungs) / LevelsPerOctave);
 
     /// <summary>
     /// One layout, from the cache or made now.  Past the frame's allowance
@@ -1776,7 +1809,7 @@ public sealed partial class NestedCanvas
                 {
                     foreach (var direction in (ReadOnlySpan<int>)[-1, 1])
                     {
-                        var near = level * Math.Pow(2, direction * step / (double)LevelsPerOctave);
+                        var near = LevelAway(level, direction * step);
                         var nearScale = size / near;
                         if (TryCached(KeyFor(text, near, nearScale, maxWidth, brush, bold, icon, scaled: true), out var neighbour))
                         {
@@ -2518,7 +2551,7 @@ public sealed partial class NestedCanvas
             var job = _fileLabels[index];
             var name = job.Folder.Files[job.Index].Name;
             var size = Math.Clamp(job.H * 0.5, 7.5, 13);
-            var level = Math.Pow(2, Math.Round(Math.Log2(size) * LevelsPerOctave) / LevelsPerOctave);
+            var level = LevelFor(size);
             var dx = job.X + job.W / 2 - _viewWidth / 2;
             var dy = job.Y + job.H / 2 - _viewHeight / 2;
             states.Add((index, name, Math.Sqrt(dx * dx + dy * dy), laidOut.Contains((name, level))));

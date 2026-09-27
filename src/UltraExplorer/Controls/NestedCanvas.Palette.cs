@@ -169,9 +169,17 @@ public sealed partial class NestedCanvas
             if (part.IndexOfAny(['*', '?']) >= 0)
             {
                 var pattern = "^" + System.Text.RegularExpressions.Regex.Escape(part).Replace(@"\*", ".*").Replace(@"\?", ".") + "$";
+
+                // Without backtracking: "*a*a*a*a*a*b" against a long name
+                // would otherwise try every way of splitting it, on the UI
+                // thread, for every name read.  The pattern is only literals,
+                // "." and ".*" between two anchors, all of which this engine
+                // takes, in time that grows with the name alone.
                 var regex = new System.Text.RegularExpressions.Regex(
                     pattern,
-                    System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+                    System.Text.RegularExpressions.RegexOptions.IgnoreCase
+                    | System.Text.RegularExpressions.RegexOptions.CultureInvariant
+                    | System.Text.RegularExpressions.RegexOptions.NonBacktracking);
                 tests.Add(regex.IsMatch);
             }
             else
@@ -250,6 +258,68 @@ public sealed partial class NestedCanvas
         {
             _filterMatches.Add(path);
         }
+        else
+        {
+            _filterUnconfirmed?.Remove(path);
+        }
+    }
+
+    /// <summary>
+    /// While a folder read again is judged (<see cref="OnFolderLoadedForFilter"/>):
+    /// the matches at or under it from before, each crossed off as the
+    /// judging finds it again.  What is left went with the read - deleted, or
+    /// renamed to another name - and is taken out.  Null the rest of the time.
+    /// </summary>
+    private HashSet<string>? _filterUnconfirmed;
+
+    /// <summary>The matches at or under the folder <paramref name="root"/>; null when there are none.</summary>
+    private HashSet<string>? MatchesAtOrUnder(string root)
+    {
+        HashSet<string>? found = null;
+        foreach (var path in _filterMatches)
+        {
+            if (IsAtOrUnder(path, root))
+            {
+                (found ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(path);
+            }
+        }
+
+        return found;
+    }
+
+    /// <summary>
+    /// Takes <paramref name="gone"/> out of the matches, in one pass, keeping
+    /// the step the user is on - or, when that is one of them, the step
+    /// before it, so that Next goes on to the match that followed it.
+    /// </summary>
+    private void RemoveMatches(HashSet<string> gone)
+    {
+        var kept = 0;
+        var cursor = -1;
+        for (var index = 0; index < _filterMatches.Count; index++)
+        {
+            var path = _filterMatches[index];
+            if (gone.Contains(path))
+            {
+                _filterMatchSet.Remove(path);
+                if (index == _filterCursor)
+                {
+                    cursor = kept - 1;
+                }
+
+                continue;
+            }
+
+            if (index == _filterCursor)
+            {
+                cursor = kept;
+            }
+
+            _filterMatches[kept++] = path;
+        }
+
+        _filterMatches.RemoveRange(kept, _filterMatches.Count - kept);
+        _filterCursor = _filterCursor < 0 ? -1 : cursor;
     }
 
     /// <summary>
@@ -269,8 +339,38 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // Read again, a folder may have lost matches it had: a file deleted,
+        // or renamed - to a name the filter still takes, which is a new match
+        // and would otherwise be counted beside the old one.  What it held is
+        // noted and whatever the judging does not find again goes.  Only a
+        // folder that held a match inside it can lose one: its own name, the
+        // only other match it can be, does not change while it is the same
+        // folder - so a folder's first read, which has nothing inside it to
+        // lose, never looks through the matches.
         var before = _filterMatches.Count;
-        if (Evaluate(folder))
+        _filterUnconfirmed = folder.FilterStamp == _filterStamp && (folder.FilterState & FilterInside) != 0
+            ? MatchesAtOrUnder(folder.FullPath)
+            : null;
+        bool matched;
+        HashSet<string>? gone;
+        try
+        {
+            matched = Evaluate(folder);
+        }
+        finally
+        {
+            gone = _filterUnconfirmed;
+            _filterUnconfirmed = null;
+        }
+
+        var lost = false;
+        if (gone is { Count: > 0 })
+        {
+            RemoveMatches(gone);
+            lost = true;
+        }
+
+        if (matched)
         {
             for (var parent = folder.Parent; parent is not null; parent = parent.Parent)
             {
@@ -282,7 +382,7 @@ public sealed partial class NestedCanvas
             }
         }
 
-        if (_filterMatches.Count != before)
+        if (_filterMatches.Count != before || lost)
         {
             RaiseFilterChangedWithFrame();
         }
@@ -358,7 +458,10 @@ public sealed partial class NestedCanvas
         CollectMatches(_tree.Root, ordered, seen);
         foreach (var path in _filterMatches)
         {
-            if (seen.Add(path))
+            // Not reached, but still there - its folder hidden since, say -
+            // it keeps a place at the end; gone, it goes, so a step never
+            // lands on something that is not there.
+            if (seen.Add(path) && ResolveAsPlaced(path) is not null)
             {
                 ordered.Add(path);
             }

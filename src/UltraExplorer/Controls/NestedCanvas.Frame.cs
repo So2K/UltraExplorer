@@ -119,6 +119,17 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // A canvas in a window that cannot be seen - collapsed, or inside
+        // something that is - has nothing to draw into: a frame would walk
+        // the whole scene and ask for reads of folders nobody is looking at.
+        // What went out of date waits in _dirty, and is drawn when the canvas
+        // is shown again (OnIsVisibleChanged).  One in no window at all is a
+        // test's or a snapshot's, which draws its frames by hand.
+        if (!IsVisible && PresentationSource.FromVisual(this) is not null)
+        {
+            return;
+        }
+
         _frameHooked = true;
         if (!FramesByHandForTests)
         {
@@ -164,6 +175,24 @@ public sealed partial class NestedCanvas
         if (Interlocked.Exchange(ref _wakePosted, 0) != 0)
         {
             HandOffWake();
+        }
+    }
+
+    /// <summary>
+    /// The canvas was hidden - its own panel collapsed, or one around it - or
+    /// shown again.  Hidden, the loop stops as it does when the canvas leaves
+    /// the screen, and frames asked for meanwhile only mark what they would
+    /// have drawn (<see cref="RequestFrame"/>); shown, all of it is drawn.
+    /// </summary>
+    private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (IsVisible)
+        {
+            RequestFrame(Layers.All);
+        }
+        else if (PresentationSource.FromVisual(this) is not null)
+        {
+            StopFrames();
         }
     }
 
@@ -252,8 +281,60 @@ public sealed partial class NestedCanvas
 
     // ---- the frame -----------------------------------------------------------
 
-    private void OnFrame(object? sender, EventArgs e) =>
-        RunFrame(e is RenderingEventArgs rendering ? rendering.RenderingTime : _clock.Now);
+    /// <summary>Frames of the loop in a row that ended in an exception; nought after any that did not.</summary>
+    private int _failedFrames;
+
+    /// <summary>After this many frames in a row fail, the loop stops trying until something asks for a frame again.</summary>
+    private const int MaximumFailedFrames = 3;
+
+    /// <summary>
+    /// WPF's Rendering: one frame of the loop.  Nothing above this catches
+    /// what a frame throws - it would end the app - so a frame that fails is
+    /// contained here (<see cref="ContainFailedFrame"/>) rather than taking
+    /// the window down with it.  Tests run <see cref="RunFrame"/> directly,
+    /// and see every exception.
+    /// </summary>
+    private void OnFrame(object? sender, EventArgs e)
+    {
+        try
+        {
+            RunFrame(e is RenderingEventArgs rendering ? rendering.RenderingTime : _clock.Now);
+            _failedFrames = 0;
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            ContainFailedFrame(ex);
+        }
+    }
+
+    /// <summary>
+    /// A frame of the loop threw part way through.  It is written to the
+    /// trace and dropped, and what it left half done is put straight: the
+    /// flags only a frame being drawn holds are cleared, and since the layers
+    /// it had taken to draw were taken off <see cref="_dirty"/> before it
+    /// failed, everything is marked to be drawn again on the next frame.  A
+    /// failure that comes back every frame would spin the loop at the
+    /// display's rate, throwing each time: after a few in a row the loop
+    /// lets go instead, and the inboxes' fallback drivers take in what the
+    /// frames would have, until something asks for a frame and it is tried
+    /// once more.
+    /// </summary>
+    private void ContainFailedFrame(Exception ex)
+    {
+        System.Diagnostics.Trace.WriteLine($"UltraExplorer: a frame of the nested canvas failed and was dropped ({_failedFrames + 1} in a row): {ex}");
+        _inFrameLoop = false;
+        _sceneChangedArea = Rect.Empty;
+        _dirty |= Layers.All;
+        if (++_failedFrames < MaximumFailedFrames)
+        {
+            RequestFrame(Layers.All);
+            return;
+        }
+
+        UnhookFrame();
+        _loadRedrawTimer?.Stop();
+        HandOffWake();
+    }
 
     /// <summary>For tests: one frame of the loop at <paramref name="renderingTime"/>, as WPF's Rendering would run it.</summary>
     internal void RunFrameForTests(TimeSpan renderingTime) => RunFrame(renderingTime);
@@ -712,9 +793,16 @@ public sealed partial class NestedCanvas
 
         var now = _clock.Now.TotalMilliseconds;
         var wholeScene = (_dirty & Layers.Scene) != 0;
+
+        // Never held from a frame that draws the names of folders just read:
+        // the names are drawn from the last walk's tiles, which point into
+        // the files as they were before the read - held, the frame would
+        // write a neighbour's name and icon on a tile.  Joined, the walk is
+        // done again first.
         if (!moving
             && !_transitionsActive
             && !wholeScene
+            && (_dirty & _loadDirty & Layers.Labels) == 0
             && (_loadDirty & ~_dirty) != 0
             && now - _lastLoadRedrawMilliseconds < FrameBudgets.LoadRedrawMinMs)
         {
@@ -978,9 +1066,22 @@ public sealed partial class NestedCanvas
     private bool RenderLayers(Layers layers, bool inMotion, bool scoped = false)
     {
         // Hidden or not laid out yet: draw nothing, and keep the size the
-        // camera was set up for rather than forgetting it.
+        // camera was set up for rather than forgetting it.  Nothing is left
+        // drawn with less detail or with text set for motion either: the
+        // loop waits for a frame at full quality before it lets go
+        // (IsIdleWith), and with nothing drawn that frame would never come -
+        // the loop would stay hooked to every frame WPF draws.
         if (ActualWidth < 1 || ActualHeight < 1 || _tree is null)
         {
+            _lod = 1;
+            _lodDegraded = false;
+            if (_textAnimated)
+            {
+                _textAnimated = false;
+                TextOptions.SetTextHintingMode(_labelVisual, TextHintingMode.Auto);
+                TextOptions.SetTextHintingMode(_decorVisual, TextHintingMode.Auto);
+            }
+
             return true;
         }
 

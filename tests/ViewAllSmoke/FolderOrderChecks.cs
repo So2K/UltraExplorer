@@ -772,6 +772,10 @@ internal static partial class Program
             && ReferenceEquals(type, canvas.FileDetailText(SortColumn.Type, file, dateOnly: false))
             && ReferenceEquals(size, canvas.FileDetailText(SortColumn.Size, file, dateOnly: false)));
         Check("a file with no date says none", canvas.FileDetailText(SortColumn.Modified, new NestedFile("x.txt", false, 1), dateOnly: false).Length == 0);
+        Check("nor does one the file system kept no date for - a FILETIME of zero, 1 January 1601",
+            canvas.DateText(DateTime.FromFileTimeUtc(0).Ticks, dateOnly: false).Length == 0);
+        Check("a date outside the calendar of the culture - Umm al-Qura spans 1900 to 2077 - is still written, never thrown inside a frame",
+            DatesOutsideCalendarWritten(canvas));
 
         var child = p.Children[0];
         var folderDate = canvas.DateText(child.ModifiedTicks, dateOnly: false);
@@ -785,5 +789,32 @@ internal static partial class Program
             && inDated.StartsWith(plain, StringComparison.Ordinal));
         Check("but not where only its own contents are, which would leave the date behind a write inside it",
             p.ModifiedTicks == 0 || !ownDated.Contains(canvas.DateText(p.ModifiedTicks, false), StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// Whether dates on either side of what Saudi Arabia's calendar can say
+    /// come out as text under that culture, rather than as the exception its
+    /// calendar throws for them.  The culture of the moment is put back after.
+    /// </summary>
+    private static bool DatesOutsideCalendarWritten(NestedCanvas canvas)
+    {
+        var culture = CultureInfo.CurrentCulture;
+        try
+        {
+            CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("ar-SA");
+            var early = new DateTime(1850, 3, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
+            var late = new DateTime(2100, 6, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
+            var inside = new DateTime(2020, 6, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
+            return canvas.DateText(early, dateOnly: false).Length > 0 && canvas.DateText(late, dateOnly: true).Length > 0
+                && canvas.DateText(inside, dateOnly: false).Length > 0;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return false;
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = culture;
+        }
     }
 }

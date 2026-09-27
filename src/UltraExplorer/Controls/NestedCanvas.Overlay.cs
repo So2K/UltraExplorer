@@ -768,65 +768,90 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// Reads the folders on the way to every beacon, one path at a time, so a
     /// marked folder deep in the tree has a place before anyone zooms to it.
+    /// One run at a time: asked for again while one runs - new beacons, or
+    /// the files shown again - that run goes round once more when it is
+    /// done, with the beacons as they are then, rather than the ask being
+    /// lost.
     /// </summary>
     private async Task ResolveBeaconsAsync()
     {
-        if (_beaconResolverRunning || _tree is null)
+        if (_tree is null)
         {
+            return;
+        }
+
+        if (_beaconResolverRunning)
+        {
+            _beaconResolveAgain = true;
             return;
         }
 
         _beaconResolverRunning = true;
         try
         {
-            for (var pass = 0; pass < 4; pass++)
+            do
             {
-                var pending = _beacons
-                    .Where(IsShown)
-                    .Select(beacon => beacon.Path)
-                    .Where(path => !_unresolvable.Contains(path) && (ResolveAsPlaced(path) is not { } found || !NestedTree.IsOnCanvas(found.Folder)))
-                    .Distinct(StringComparer.OrdinalIgnoreCase)
-                    .ToList();
-                if (pending.Count == 0)
+                _beaconResolveAgain = false;
+                for (var pass = 0; pass < 4; pass++)
                 {
-                    break;
-                }
-
-                foreach (var path in pending)
-                {
-                    if (!_resolving.Add(path))
+                    var pending = _beacons
+                        .Where(IsShown)
+                        .Select(beacon => beacon.Path)
+                        .Where(path => !_unresolvable.Contains(path) && (ResolveAsPlaced(path) is not { } found || !NestedTree.IsOnCanvas(found.Folder)))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    if (pending.Count == 0)
                     {
-                        continue;
+                        break;
                     }
 
-                    try
+                    foreach (var path in pending)
                     {
-                        // A folder resolves to itself; a file to the folder it
-                        // is in, once that folder's listing has it.
-                        await _tree.RevealAsync(path);
-                        if (ResolveAsPlaced(path) is null)
+                        // The canvas may have let go of its tree while the
+                        // last folder was read.
+                        if (_tree is not { } tree)
+                        {
+                            return;
+                        }
+
+                        if (!_resolving.Add(path))
+                        {
+                            continue;
+                        }
+
+                        try
+                        {
+                            // A folder resolves to itself; a file to the folder it
+                            // is in, once that folder's listing has it.
+                            await tree.RevealAsync(path);
+                            if (ResolveAsPlaced(path) is null)
+                            {
+                                _unresolvable.Add(path);
+                            }
+                        }
+                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or OperationCanceledException)
                         {
                             _unresolvable.Add(path);
                         }
+                        finally
+                        {
+                            _resolving.Remove(path);
+                        }
                     }
-                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or OperationCanceledException)
-                    {
-                        _unresolvable.Add(path);
-                    }
-                    finally
-                    {
-                        _resolving.Remove(path);
-                    }
-                }
 
-                RequestFrame(Layers.Decor);
+                    RequestFrame(Layers.Decor);
+                }
             }
+            while (_beaconResolveAgain && _tree is not null);
         }
         finally
         {
             _beaconResolverRunning = false;
         }
     }
+
+    /// <summary>Set when <see cref="ResolveBeaconsAsync"/> is asked for while it runs: the run goes round again.</summary>
+    private bool _beaconResolveAgain;
 
     /// <summary>The beacons the last picture of the marks placed, on the view or at its edges.</summary>
     internal int BeaconsPlaced { get; private set; }
