@@ -10,6 +10,8 @@ namespace UltraExplorer.Services;
 /// live visual tree to a PNG.  It writes once after the window settles and then
 /// again whenever a sibling <c>&lt;path&gt;.request</c> file appears, which lets a
 /// test harness snapshot any UI state without fighting DPI or window z-order.
+/// Each window the main one owns that is open - Settings, say - is written
+/// beside it, named after its title: <c>shot-Settings.png</c> for <c>shot.png</c>.
 /// </summary>
 public sealed class WindowCaptureService : IDisposable
 {
@@ -86,20 +88,35 @@ public sealed class WindowCaptureService : IDisposable
 
     private void Capture(string path)
     {
+        Capture(_window, path);
+        foreach (Window owned in _window.OwnedWindows)
+        {
+            if (owned.IsVisible)
+            {
+                var name = string.Concat(owned.Title.Split(Path.GetInvalidFileNameChars()));
+                Capture(owned, Path.Combine(
+                    Path.GetDirectoryName(path) ?? string.Empty,
+                    $"{Path.GetFileNameWithoutExtension(path)}-{name}{Path.GetExtension(path)}"));
+            }
+        }
+    }
+
+    private static void Capture(Window window, string path)
+    {
         try
         {
-            var source = PresentationSource.FromVisual(_window);
+            var source = PresentationSource.FromVisual(window);
             var scaleX = source?.CompositionTarget?.TransformToDevice.M11 ?? 1;
             var scaleY = source?.CompositionTarget?.TransformToDevice.M22 ?? 1;
-            var width = (int)Math.Ceiling(_window.ActualWidth * scaleX);
-            var height = (int)Math.Ceiling(_window.ActualHeight * scaleY);
+            var width = (int)Math.Ceiling(window.ActualWidth * scaleX);
+            var height = (int)Math.Ceiling(window.ActualHeight * scaleY);
             if (width <= 0 || height <= 0)
             {
                 return;
             }
 
             var target = new RenderTargetBitmap(width, height, 96 * scaleX, 96 * scaleY, PixelFormats.Pbgra32);
-            target.Render(_window);
+            target.Render(window);
 
             var encoder = new PngBitmapEncoder();
             encoder.Frames.Add(BitmapFrame.Create(target));

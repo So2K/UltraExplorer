@@ -598,6 +598,9 @@
                     <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="LayoutButton_Click" ToolTip="Canvas options" AutomationProperties.Name="Canvas options">
                         <TextBlock Text="&#xE8A9;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>
+                    <Button x:Name="SettingsButton" Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
+                        <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="13" />
+                    </Button>
                     <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="PaneToggleButton_Click" ToolTip="Toggle the navigation pane" AutomationProperties.Name="Toggle the navigation pane">
                         <TextBlock Text="&#xE8A4;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>

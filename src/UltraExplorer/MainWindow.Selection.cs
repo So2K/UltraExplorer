@@ -122,7 +122,7 @@ public partial class MainWindow
 
         _viewModel.LeftDragHintShown = true;
         _ = _viewModel.Toast.ShowSuccessAsync(
-            "Left-drag now selects. Pan with the right or middle button, Space+drag or the wheel — Canvas options ▸ Left drag.");
+            "Left-drag now selects. Pan with the right or middle button, Space+drag or the wheel — Settings (Ctrl+,) ▸ Mouse.");
     }
 
     private void OnShellPropertyChangedForSelection(object? sender, PropertyChangedEventArgs e)

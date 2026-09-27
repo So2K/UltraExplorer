@@ -574,7 +574,7 @@ public partial class MainWindow
                 header.Foreground = (Brush)FindResource("TextBrush");
                 arrow.Text = sort.Descending ? "\uE70D" : "\uE70E";
                 arrow.Visibility = Visibility.Visible;
-                header.ToolTip = $"Sorted by {name}, {DirectionText(column, sort.Descending)}{where} (click to reverse)";
+                header.ToolTip = $"Sorted by {name}, {ItemSort.DescribeDirection(column, sort.Descending)}{where} (click to reverse)";
             }
             else
             {
@@ -589,14 +589,6 @@ public partial class MainWindow
     /// <summary>A folder's name as a menu or a tip says it: its own name, or the whole of a drive's.</summary>
     private static string FolderName(string path) =>
         Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } name ? name : path;
-
-    /// <summary>Which way an order runs, in the words its column would use.</summary>
-    private static string DirectionText(SortColumn column, bool descending) => column switch
-    {
-        SortColumn.Modified => descending ? "newest first" : "oldest first",
-        SortColumn.Size => descending ? "largest first" : "smallest first",
-        _ => descending ? "Z to A" : "A to Z"
-    };
 
     /// <summary>
     /// Back to the tree: what is selected was only brought in by name, so it

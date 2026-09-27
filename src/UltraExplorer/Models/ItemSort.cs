@@ -57,6 +57,14 @@ public readonly record struct ItemSort(SortColumn Column, bool Descending)
         _ => "Name"
     };
 
+    /// <summary>Which way an order runs, in the words its column would use: "newest first", "A to Z".</summary>
+    public static string DescribeDirection(SortColumn column, bool descending) => column switch
+    {
+        SortColumn.Modified => descending ? "newest first" : "oldest first",
+        SortColumn.Size => descending ? "largest first" : "smallest first",
+        _ => descending ? "Z to A" : "A to Z"
+    };
+
     /// <summary>
     /// The order as stable text for the workspace file: the column's
     /// identifier, with "-desc" when it runs backwards.  Plain words rather

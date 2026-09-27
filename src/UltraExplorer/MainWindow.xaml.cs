@@ -131,7 +131,7 @@ public partial class MainWindow : Window
         var handle = new WindowInteropHelper(this).Handle;
         if (IsDiagnosticsRun || IsTestWindow)
         {
-            PlaceForDiagnostics(handle, neverActivate: IsDiagnosticsRun);
+            PlaceForDiagnostics(handle, neverActivate: true);
         }
 
         var darkMode = 1;
@@ -1280,7 +1280,7 @@ public partial class MainWindow : Window
             {
                 Header = "Reset this folder to the default order",
                 IsEnabled = folder is not null && orders.HasOwnOrder(folder),
-                ToolTip = $"Back to {ItemSort.Describe(orders.Default.Column)}, {DirectionText(orders.Default.Column, orders.Default.Descending)}, as every folder without its own order"
+                ToolTip = $"Back to {ItemSort.Describe(orders.Default.Column)}, {ItemSort.DescribeDirection(orders.Default.Column, orders.Default.Descending)}, as every folder without its own order"
             };
             reset.Click += (_, _) =>
             {
@@ -1420,9 +1420,13 @@ public partial class MainWindow : Window
         menu.IsOpen = true;
     }
 
-    private void LayoutButton_Click(object sender, RoutedEventArgs e)
+    private void LayoutButton_Click(object sender, RoutedEventArgs e) =>
+        BuildCanvasOptionsMenu((UIElement)sender).IsOpen = true;
+
+    /// <summary>Canvas options: the canvas's commands, the choices of how it looks and behaves, and the way to all of them in Settings.</summary>
+    internal ContextMenu BuildCanvasOptionsMenu(UIElement target)
     {
-        var menu = new ContextMenu { PlacementTarget = (UIElement)sender, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        var menu = new ContextMenu { PlacementTarget = target, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
         if (!IsNested)
         {
@@ -1452,18 +1456,26 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Note…", "\uE70B", _viewModel.EditNoteCommand);
         AddCommandItem(menu, "Pin to Home", "\uE718", _viewModel.AddToFavoritesCommand);
         AddLayoutItems(menu);
-        menu.IsOpen = true;
+        menu.Items.Add(new Separator());
+        AddCommandItem(menu, "Settings…", "\uE713", OpenSettingsCommand, "Ctrl+,");
+        return menu;
     }
 
-    private void OverflowButton_Click(object sender, RoutedEventArgs e)
+    private void OverflowButton_Click(object sender, RoutedEventArgs e) =>
+        BuildOverflowMenu((UIElement)sender).IsOpen = true;
+
+    /// <summary>The More menu: Settings first, where Windows' own apps keep it, then the commands with no button of their own.</summary>
+    internal ContextMenu BuildOverflowMenu(UIElement target)
     {
-        var menu = new ContextMenu { PlacementTarget = (UIElement)sender, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        var menu = new ContextMenu { PlacementTarget = target, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        AddCommandItem(menu, "Settings", "\uE713", OpenSettingsCommand, "Ctrl+,");
+        menu.Items.Add(new Separator());
         AddCommandItem(menu, "Pin to Home", "\uE718", _viewModel.AddToFavoritesCommand);
         AddCommandItem(menu, "Show in File Explorer", "\uEC50", _viewModel.ShowInExplorerCommand);
         AddCommandItem(menu, "Refresh", "\uE72C", _viewModel.RefreshCommand, "F5");
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Properties", "\uE946", _viewModel.PropertiesCommand, "Alt+Enter");
-        menu.IsOpen = true;
+        return menu;
     }
 
     /// <summary>
@@ -1862,6 +1874,14 @@ public partial class MainWindow : Window
         {
             SearchBox.Focus();
             SearchBox.SelectAll();
+            e.Handled = true;
+            return;
+        }
+
+        // Before the text boxes keep their keys: a comma typed with Ctrl is
+        // nothing a text box does anything with.
+        if (TryOpenSettingsFromKey(key, modifiers))
+        {
             e.Handled = true;
             return;
         }

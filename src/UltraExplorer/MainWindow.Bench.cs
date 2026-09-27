@@ -153,7 +153,9 @@ public partial class MainWindow
     /// <summary>
     /// True for a copy started beside the everyday one to try a build
     /// (<c>ULTRAEXPLORER_TEST_WINDOW=1</c>): it opens where a diagnostics run
-    /// would, without taking the keyboard, but is an ordinary window after that.
+    /// would and, like it, never becomes the active window - the start-up path
+    /// activated it more than once otherwise, and a test copy is driven by
+    /// its own hooks, never by the user's keyboard.
     /// </summary>
     private static bool IsTestWindow =>
         Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1";
@@ -166,7 +168,6 @@ public partial class MainWindow
     /// <c>ULTRAEXPLORER_DIAGNOSTICS_MONITOR</c> names by its position in
     /// Windows' list - and only falls back to the primary monitor when there
     /// is no other.  Always the same corner and size, so runs stay comparable.
-    /// A test window goes to the same place but can still be clicked into.
     /// </summary>
     private static void PlaceForDiagnostics(IntPtr handle, bool neverActivate)
     {

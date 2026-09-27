@@ -1,0 +1,507 @@
+<Window x:Class="UltraExplorer.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
+        xmlns:controls="clr-namespace:UltraExplorer.Controls"
+        Title="Settings"
+        Icon="Assets/UltraExplorer.ico"
+        Width="720"
+        Height="780"
+        MinWidth="560"
+        MinHeight="520"
+        WindowStartupLocation="CenterOwner"
+        WindowStyle="None"
+        ResizeMode="CanResize"
+        ShowInTaskbar="False"
+        Style="{StaticResource AppWindow}"
+        PreviewKeyDown="Window_PreviewKeyDown">
+    <shell:WindowChrome.WindowChrome>
+        <shell:WindowChrome CaptionHeight="40"
+                            ResizeBorderThickness="6"
+                            CornerRadius="0"
+                            GlassFrameThickness="0"
+                            UseAeroCaptionButtons="False" />
+    </shell:WindowChrome.WindowChrome>
+
+    <Window.Resources>
+        <!-- A heading over a group of cards. -->
+        <Style x:Key="SectionHeading" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="Margin" Value="2,28,0,10" />
+        </Style>
+
+        <!-- A card as Windows 11's Settings draws one: the glyph, the name and
+             what the option does on the left, its control on the right - or
+             under the words when the window is too narrow for both. -->
+        <Style TargetType="controls:SettingCard">
+            <Setter Property="Margin" Value="0,0,0,4" />
+            <Setter Property="Focusable" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="controls:SettingCard">
+                        <Border Background="{StaticResource SurfaceRaisedBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                MinHeight="68"
+                                Padding="18,12,16,12">
+                            <controls:SettingCardPanel StackedIndent="38" VerticalAlignment="Center">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="38" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="{TemplateBinding Glyph}"
+                                               Style="{StaticResource IconText}"
+                                               FontSize="18"
+                                               Foreground="{StaticResource TextMutedBrush}"
+                                               HorizontalAlignment="Left" />
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="{TemplateBinding Header}"
+                                                   FontSize="13"
+                                                   Foreground="{StaticResource TextBrush}"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock x:Name="DescriptionText"
+                                                   Text="{TemplateBinding Description}"
+                                                   Margin="0,3,0,0"
+                                                   FontSize="12"
+                                                   Foreground="{StaticResource TextDimBrush}"
+                                                   TextWrapping="Wrap" />
+                                        <TextBlock x:Name="StatusText"
+                                                   Text="{TemplateBinding Status}"
+                                                   Margin="0,5,0,0"
+                                                   FontSize="12"
+                                                   Foreground="{StaticResource TextMutedBrush}"
+                                                   TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </Grid>
+                                <ContentPresenter />
+                            </controls:SettingCardPanel>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="Description" Value="">
+                                <Setter TargetName="DescriptionText" Property="Visibility" Value="Collapsed" />
+                            </Trigger>
+                            <Trigger Property="Status" Value="">
+                                <Setter TargetName="StatusText" Property="Visibility" Value="Collapsed" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- The frame the choices of a segmented control sit in. -->
+        <Style x:Key="SegmentGroup" TargetType="Border">
+            <Setter Property="CornerRadius" Value="5" />
+            <Setter Property="Padding" Value="2" />
+            <Setter Property="Background" Value="{StaticResource WindowBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="HorizontalAlignment" Value="Left" />
+        </Style>
+
+        <!-- The command bar's segment, as a radio button: clicking the chosen
+             one again leaves it chosen, and the arrows move along a group. -->
+        <Style x:Key="SegmentRadio" TargetType="RadioButton" BasedOn="{StaticResource SegmentButton}">
+            <Setter Property="Padding" Value="14,0" />
+        </Style>
+
+        <!-- Windows 11's toggle switch, with its On / Off beside it. -->
+        <Style x:Key="ToggleSwitch" TargetType="CheckBox">
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+            <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusVisual}" />
+            <Setter Property="Cursor" Value="Arrow" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="CheckBox">
+                        <Grid Background="Transparent">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock x:Name="StateText"
+                                       Text="Off"
+                                       MinWidth="24"
+                                       Margin="0,0,12,0"
+                                       FontSize="12"
+                                       TextAlignment="Right"
+                                       VerticalAlignment="Center" />
+                            <Border x:Name="Track"
+                                    Grid.Column="1"
+                                    Width="40"
+                                    Height="20"
+                                    CornerRadius="10"
+                                    BorderThickness="1"
+                                    BorderBrush="{StaticResource TextDimBrush}"
+                                    Background="Transparent">
+                                <Ellipse x:Name="Knob"
+                                         Width="12"
+                                         Height="12"
+                                         Margin="4,0"
+                                         HorizontalAlignment="Left"
+                                         VerticalAlignment="Center"
+                                         Fill="{StaticResource TextMutedBrush}" />
+                            </Border>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Track" Property="Background" Value="#2F2F2F" />
+                                <Setter TargetName="Knob" Property="Width" Value="14" />
+                                <Setter TargetName="Knob" Property="Height" Value="14" />
+                                <Setter TargetName="Knob" Property="Margin" Value="3,0" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="StateText" Property="Text" Value="On" />
+                                <Setter TargetName="Track" Property="Background" Value="{StaticResource AccentBrush}" />
+                                <Setter TargetName="Track" Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                                <Setter TargetName="Knob" Property="Fill" Value="#0A0A0A" />
+                                <Setter TargetName="Knob" Property="HorizontalAlignment" Value="Right" />
+                            </Trigger>
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsChecked" Value="True" />
+                                    <Condition Property="IsMouseOver" Value="True" />
+                                </MultiTrigger.Conditions>
+                                <Setter TargetName="Track" Property="Background" Value="{StaticResource AccentBrightBrush}" />
+                                <Setter TargetName="Track" Property="BorderBrush" Value="{StaticResource AccentBrightBrush}" />
+                            </MultiTrigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.4" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- A choice drawn as a small picture of what it does: the fill order's
+             two grids, numbered in the order their items come. -->
+        <Style x:Key="PictureTile" TargetType="RadioButton">
+            <Setter Property="Foreground" Value="{StaticResource TextMutedBrush}" />
+            <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusVisual}" />
+            <Setter Property="Cursor" Value="Arrow" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="Chrome"
+                                Background="{StaticResource WindowBrush}"
+                                BorderBrush="{StaticResource BorderStrongBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="12,10,12,8">
+                            <ContentPresenter HorizontalAlignment="Center" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Chrome" Property="Background" Value="#262626" />
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="#4A4A4A" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                                <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.45" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- One numbered cell of a fill-order picture: lit when its choice is. -->
+        <Style x:Key="PictureCell" TargetType="Border">
+            <Setter Property="Width" Value="22" />
+            <Setter Property="Height" Value="17" />
+            <Setter Property="Margin" Value="2" />
+            <Setter Property="CornerRadius" Value="3" />
+            <Setter Property="Background" Value="#333333" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsChecked, RelativeSource={RelativeSource AncestorType=RadioButton}}" Value="True">
+                    <Setter Property="Background" Value="{StaticResource AccentSoftBrush}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="PictureNumber" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="10" />
+            <Setter Property="HorizontalAlignment" Value="Center" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Foreground" Value="{StaticResource TextDimBrush}" />
+            <Style.Triggers>
+                <DataTrigger Binding="{Binding IsChecked, RelativeSource={RelativeSource AncestorType=RadioButton}}" Value="True">
+                    <Setter Property="Foreground" Value="{StaticResource AccentBrightBrush}" />
+                </DataTrigger>
+            </Style.Triggers>
+        </Style>
+
+        <Style x:Key="CardButton" TargetType="Button" BasedOn="{StaticResource DialogButton}">
+            <Setter Property="MinWidth" Value="88" />
+            <Setter Property="Background" Value="#333333" />
+            <Setter Property="BorderBrush" Value="#404040" />
+        </Style>
+    </Window.Resources>
+
+    <Grid KeyboardNavigation.TabNavigation="Cycle">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="40" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Title bar -->
+        <Grid Grid.Row="0">
+            <StackPanel Orientation="Horizontal" Margin="16,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="14" Foreground="{StaticResource AccentBrush}" />
+                <TextBlock Text="Settings" Margin="10,0,0,1" FontSize="12" VerticalAlignment="Center" />
+            </StackPanel>
+            <Button x:Name="CloseButton"
+                    HorizontalAlignment="Right"
+                    VerticalAlignment="Top"
+                    Style="{StaticResource CloseCaptionButton}"
+                    Click="CloseButton_Click"
+                    IsTabStop="False"
+                    ToolTip="Close (Esc)"
+                    AutomationProperties.Name="Close"
+                    shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                <TextBlock Text="&#xE8BB;" Style="{StaticResource IconText}" FontSize="10" />
+            </Button>
+        </Grid>
+
+        <ScrollViewer x:Name="PageScroll"
+                      Grid.Row="1"
+                      Focusable="False"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled">
+            <StackPanel Margin="28,2,28,28" MaxWidth="880">
+                <TextBlock Text="{Binding Intro}"
+                           Margin="2,0,0,0"
+                           FontSize="12"
+                           TextWrapping="Wrap"
+                           Foreground="{StaticResource TextDimBrush}" />
+
+                <!-- Canvas -->
+                <TextBlock Text="Canvas" Style="{StaticResource SectionHeading}" Margin="2,20,0,10" />
+
+                <controls:SettingCard Glyph="&#xE8A9;"
+                                      Header="View"
+                                      Description="Every folder inside its parent, the whole disk on one screen; or a tree opened a folder at a time.">
+                    <Border Style="{StaticResource SegmentGroup}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="NestedLayoutChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="View"
+                                         Content="Nested canvas"
+                                         IsChecked="{Binding IsNestedLayout}"
+                                         IsEnabled="{Binding CanChooseLayout}" />
+                            <RadioButton x:Name="TreeLayoutChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="View"
+                                         Content="Tree canvas"
+                                         IsChecked="{Binding IsTreeLayout}"
+                                         IsEnabled="{Binding CanChooseLayout}" />
+                        </StackPanel>
+                    </Border>
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE7F4;"
+                                      Header="Renderer"
+                                      Description="{Binding RendererDescription}"
+                                      Status="{Binding RendererStatus}">
+                    <Border Style="{StaticResource SegmentGroup}" IsEnabled="{Binding CanChooseRenderer}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="RendererAutoChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="Renderer"
+                                         Content="Automatic"
+                                         IsChecked="{Binding IsRendererAuto}" />
+                            <RadioButton x:Name="RendererGpuChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="Renderer"
+                                         Content="Graphics card"
+                                         IsChecked="{Binding IsRendererGpu}" />
+                            <RadioButton x:Name="RendererCpuChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="Renderer"
+                                         Content="Processor"
+                                         IsChecked="{Binding IsRendererCpu}" />
+                        </StackPanel>
+                    </Border>
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE890;"
+                                      Header="Hidden items"
+                                      Description="Show the files and folders Windows marks as hidden.">
+                    <CheckBox x:Name="HiddenItemsSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowHiddenItems}"
+                              AutomationProperties.Name="Hidden items" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE81E;"
+                                      Header="Minimap"
+                                      Description="{Binding MinimapDescription}">
+                    <CheckBox x:Name="MinimapSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding IsMinimapVisible}"
+                              IsEnabled="{Binding CanShowMinimap}"
+                              AutomationProperties.Name="Minimap" />
+                </controls:SettingCard>
+
+                <!-- Sorting and order -->
+                <TextBlock Text="Sorting and order" Style="{StaticResource SectionHeading}" />
+
+                <controls:SettingCard Glyph="&#xE8CB;"
+                                      Header="Default order"
+                                      Description="How every folder without an order of its own is sorted.">
+                    <StackPanel Orientation="Horizontal">
+                        <ComboBox x:Name="DefaultColumnBox"
+                                  Width="140"
+                                  Height="32"
+                                  ItemsSource="{Binding SortColumns}"
+                                  SelectedIndex="{Binding DefaultColumnIndex}"
+                                  AutomationProperties.Name="Default order column" />
+                        <Border Style="{StaticResource SegmentGroup}" Margin="8,0,0,0">
+                            <StackPanel Orientation="Horizontal">
+                                <RadioButton x:Name="AscendingChoice"
+                                             Style="{StaticResource SegmentRadio}"
+                                             GroupName="Direction"
+                                             Content="Ascending"
+                                             IsChecked="{Binding IsAscending}" />
+                                <RadioButton x:Name="DescendingChoice"
+                                             Style="{StaticResource SegmentRadio}"
+                                             GroupName="Direction"
+                                             Content="Descending"
+                                             IsChecked="{Binding IsDescending}" />
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8B7;"
+                                      Header="Sort applies to"
+                                      Description="What a column header or Sort by changes: the folder it is used on, or every folder at once.">
+                    <Border Style="{StaticResource SegmentGroup}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="PerFolderChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="Scope"
+                                         Content="Each folder separately"
+                                         IsChecked="{Binding IsPerFolder}" />
+                            <RadioButton x:Name="AllFoldersChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="Scope"
+                                         Content="All folders the same"
+                                         IsChecked="{Binding IsAllFolders}" />
+                        </StackPanel>
+                    </Border>
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xECA5;"
+                                      Header="Fill order"
+                                      Description="Which way a folder's items fill its grid, read in the order they are sorted.">
+                    <StackPanel Orientation="Horizontal">
+                        <RadioButton x:Name="DownThenAcrossChoice"
+                                     Style="{StaticResource PictureTile}"
+                                     GroupName="Flow"
+                                     IsChecked="{Binding IsDownThenAcross}"
+                                     AutomationProperties.Name="Down, then across">
+                            <StackPanel>
+                                <UniformGrid Rows="2" Columns="3" HorizontalAlignment="Center">
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="1" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="3" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="5" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="2" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="4" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="6" Style="{StaticResource PictureNumber}" /></Border>
+                                </UniformGrid>
+                                <TextBlock Text="Down, then across" Margin="0,7,0,0" FontSize="12" HorizontalAlignment="Center" />
+                            </StackPanel>
+                        </RadioButton>
+                        <RadioButton x:Name="AcrossThenDownChoice"
+                                     Style="{StaticResource PictureTile}"
+                                     GroupName="Flow"
+                                     Margin="8,0,0,0"
+                                     IsChecked="{Binding IsAcrossThenDown}"
+                                     AutomationProperties.Name="Across, then down">
+                            <StackPanel>
+                                <UniformGrid Rows="2" Columns="3" HorizontalAlignment="Center">
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="1" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="2" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="3" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="4" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="5" Style="{StaticResource PictureNumber}" /></Border>
+                                    <Border Style="{StaticResource PictureCell}"><TextBlock Text="6" Style="{StaticResource PictureNumber}" /></Border>
+                                </UniformGrid>
+                                <TextBlock Text="Across, then down" Margin="0,7,0,0" FontSize="12" HorizontalAlignment="Center" />
+                            </StackPanel>
+                        </RadioButton>
+                    </StackPanel>
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE81C;"
+                                      Header="{Binding OwnOrdersTitle}"
+                                      Description="{Binding OwnOrdersDescription}">
+                    <Button x:Name="ResetOrdersButton"
+                            Style="{StaticResource CardButton}"
+                            Content="Reset all"
+                            Command="{Binding ResetOwnOrdersCommand}"
+                            ToolTip="Every folder back on the default order"
+                            AutomationProperties.Name="Reset every folder's own order" />
+                </controls:SettingCard>
+
+                <!-- Mouse -->
+                <TextBlock Text="Mouse" Style="{StaticResource SectionHeading}" />
+
+                <controls:SettingCard Glyph="&#xE7C9;"
+                                      Header="Left drag on empty space"
+                                      Description="{Binding LeftDragDescription}">
+                    <Border Style="{StaticResource SegmentGroup}">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton x:Name="SelectAreaChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="LeftDrag"
+                                         Content="Select an area"
+                                         IsChecked="{Binding IsLeftDragSelect}" />
+                            <RadioButton x:Name="PanChoice"
+                                         Style="{StaticResource SegmentRadio}"
+                                         GroupName="LeftDrag"
+                                         Content="Move the canvas"
+                                         IsChecked="{Binding IsLeftDragPan}" />
+                        </StackPanel>
+                    </Border>
+                </controls:SettingCard>
+
+                <!-- About -->
+                <TextBlock Text="About" Style="{StaticResource SectionHeading}" />
+
+                <controls:SettingCard Glyph="&#xE946;"
+                                      Header="UltraExplorer"
+                                      Description="{Binding Version}" />
+
+                <controls:SettingCard Glyph="&#xE838;"
+                                      Header="Installed in"
+                                      Description="{Binding InstallFolder}">
+                    <Button Style="{StaticResource CardButton}"
+                            Content="Open"
+                            Command="{Binding OpenInstallFolderCommand}"
+                            ToolTip="{Binding InstallFolder}"
+                            AutomationProperties.Name="Open the program's folder" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8F1;"
+                                      Header="Settings and state"
+                                      Description="{Binding StateFolder}">
+                    <Button x:Name="OpenStateFolderButton"
+                            Style="{StaticResource CardButton}"
+                            Content="Open"
+                            Command="{Binding OpenStateFolderCommand}"
+                            ToolTip="{Binding StateFolder}"
+                            AutomationProperties.Name="Open the settings and state folder" />
+                </controls:SettingCard>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</Window>
