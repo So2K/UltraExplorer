@@ -38,7 +38,15 @@ public sealed class ViewAllWorkspaceStore
                 useAsync: true);
             return await JsonSerializer.DeserializeAsync<ViewAllWorkspaceState>(stream, JsonOptions, cancellationToken);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        catch (JsonException)
+        {
+            // The canvas starts afresh, and the first save of the session would
+            // write that over the damaged file; it is set aside first, so the
+            // arrangement in it can still be recovered by hand.
+            StateFiles.Quarantine(StatePath);
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return null;
         }
@@ -79,6 +87,30 @@ public sealed class ViewAllWorkspaceStore
             {
                 // A stale temp file is harmless and can be overwritten next run.
             }
+        }
+    }
+}
+
+/// <summary>What the state files kept in the user's profile have in common.</summary>
+internal static class StateFiles
+{
+    /// <summary>
+    /// Moves a state file that could not be understood out of the way, to
+    /// <c>&lt;name&gt;.corrupt-yyyyMMdd-HHmmss</c> beside it.  Starting empty
+    /// is right - a damaged file must never stop the app from opening - but the
+    /// next save would then replace it, and whatever the user kept in it would
+    /// be lost for good.  Set aside, it can still be mended by hand.  A move
+    /// that fails is let go: this is a precaution, not a step anything
+    /// depends on.
+    /// </summary>
+    public static void Quarantine(string path)
+    {
+        try
+        {
+            File.Move(path, $"{path}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}");
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
         }
     }
 }

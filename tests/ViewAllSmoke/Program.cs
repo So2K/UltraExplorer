@@ -747,6 +747,35 @@ internal static partial class Program
                 restored.TryGetNode(alpha.FullPath, out var placed) && placed.Location == new Point(999, 555));
             Check("restore does not scan unopened folders",
                 restored.TryGetNode(Path.Combine(root, "wide"), out var wide) && wide.Children.Count == 0);
+
+            // A share that is offline for one session is still there for the next.
+            var offline = Path.Combine(root, $"offline-share-{Guid.NewGuid():N}");
+            using var once = new ViewAllGraphService();
+            await once.InitializeAsync(new ViewAllWorkspaceState { ExtraRoots = [offline] });
+            Check("a root out of reach at startup is written back, to be tried again",
+                once.CaptureState(new ViewAllViewportState(new Point(0, 0), 1)).ExtraRoots
+                    .Contains(offline, StringComparer.OrdinalIgnoreCase));
+
+            // Nulls where lists and paths belong, as a file edited by hand can
+            // have them, are passed over rather than stopping the canvas.
+            using var sparse = new ViewAllGraphService();
+            await sparse.InitializeAsync(new ViewAllWorkspaceState
+            {
+                Nodes = [null!, new ViewAllNodeState(null!, 0, 0, false, true)],
+                ExtraRoots = null!,
+                HiddenPaths = null!
+            });
+            Check("a workspace holding nulls still opens", sparse.Roots.Count > 0);
+
+            // A damaged file is set aside before the first save can write over it.
+            File.WriteAllText(statePath, "{ this is not json");
+            Check("a damaged workspace file loads as none", await store.LoadAsync() is null);
+            var setAside = Directory.GetFiles(Path.GetDirectoryName(statePath)!, Path.GetFileName(statePath) + ".corrupt-*");
+            Check("and is set aside rather than written over", setAside.Length == 1 && !File.Exists(statePath));
+            foreach (var file in setAside)
+            {
+                TryDelete(file);
+            }
         }
         finally
         {
@@ -779,6 +808,24 @@ internal static partial class Program
             reloaded.SetAccent(root, null);
             Check("clearing the accent falls back", reloaded.GetAccentHex(root, "#123456") == "#123456");
             Check("clearing the accent keeps the note", reloaded.Get(root).Note == "keep");
+
+            // Nulls in a file edited by hand are no marks, not a crash.
+            File.WriteAllText(statePath, """{ "C:\\nothing": null, "C:\\half": { "accentHex": null, "note": "kept" } }""");
+            var edited = new FolderMarkService(statePath);
+            await edited.LoadAsync();
+            Check("a null mark in the file is passed over", edited.Get(@"C:\nothing").IsEmpty && edited.Get(@"C:\half").Note == "kept");
+
+            // A damaged file is set aside: the next save would otherwise write
+            // an empty set over every note in it.
+            File.WriteAllText(statePath, "{ this is not json");
+            var damaged = new FolderMarkService(statePath);
+            await damaged.LoadAsync();
+            var setAside = Directory.GetFiles(Path.GetDirectoryName(statePath)!, Path.GetFileName(statePath) + ".corrupt-*");
+            Check("a damaged marks file is set aside rather than written over", setAside.Length == 1 && !File.Exists(statePath));
+            foreach (var file in setAside)
+            {
+                TryDelete(file);
+            }
         }
         finally
         {

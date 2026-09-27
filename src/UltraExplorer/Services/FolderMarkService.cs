@@ -41,6 +41,13 @@ public sealed class FolderMarkService
     private volatile HashSet<string> _markedFolders = new(StringComparer.OrdinalIgnoreCase);
     private static long _pathsNormalised;
 
+    /// <summary>
+    /// One save at a time.  The debounced save and the one made on closing can
+    /// overlap, and the one that started with the older snapshot must not be
+    /// the one that lands last.
+    /// </summary>
+    private readonly SemaphoreSlim _saving = new(1, 1);
+
     public FolderMarkService(string? statePath = null)
     {
         StatePath = statePath ?? AppPaths.State("folder-marks.json");
@@ -290,29 +297,67 @@ public sealed class FolderMarkService
             return;
         }
 
+        Dictionary<string, FolderMark>? stored;
         try
         {
             await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
-            var stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
-            if (stored is null)
-            {
-                return;
-            }
-
-            foreach (var pair in stored.Where(pair => !pair.Value.IsEmpty))
-            {
-                _marks[Key(pair.Key)] = pair.Value;
-            }
-
-            IndexMarkedFolders();
+            stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
+        catch (JsonException)
         {
-            // A damaged marks file must never stop the app from opening.
+            // A damaged marks file must never stop the app from opening - but
+            // the next save, a second or so into the session, would write the
+            // empty set over it, and every note in it would be gone for good.
+            // It is set aside instead, where it can still be recovered by hand.
+            StateFiles.Quarantine(StatePath);
+            return;
         }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // A marks file that cannot be read must never stop the app from opening.
+            return;
+        }
+
+        if (stored is null)
+        {
+            return;
+        }
+
+        // A file edited by hand can hold a null for a mark, or for either half
+        // of one; it counts as no mark rather than a crash on the way in.
+        foreach (var (path, mark) in stored)
+        {
+            if (string.IsNullOrWhiteSpace(path) || mark is null)
+            {
+                continue;
+            }
+
+            var complete = new FolderMark(mark.AccentHex ?? string.Empty, mark.Note ?? string.Empty);
+            if (!complete.IsEmpty)
+            {
+                _marks[Key(path)] = complete;
+            }
+        }
+
+        IndexMarkedFolders();
     }
 
     public async Task SaveAsync(CancellationToken cancellationToken = default)
+    {
+        // One save at a time, and the one started last is the one written last:
+        // it takes its snapshot only once the one before has finished.
+        await _saving.WaitAsync(cancellationToken);
+        try
+        {
+            await SaveSnapshotAsync(cancellationToken);
+        }
+        finally
+        {
+            _saving.Release();
+        }
+    }
+
+    private async Task SaveSnapshotAsync(CancellationToken cancellationToken)
     {
         var directory = Path.GetDirectoryName(StatePath)!;
         Directory.CreateDirectory(directory);
@@ -321,7 +366,11 @@ public sealed class FolderMarkService
 
         try
         {
-            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.Asynchronous))
+            // Written through to the disk before it replaces the old file: a
+            // move that reaches the disk ahead of the data it names leaves an
+            // empty or torn file behind after a power cut, where the old one
+            // would at least have been whole.
+            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
             {
                 await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions, cancellationToken);
                 await stream.FlushAsync(cancellationToken);

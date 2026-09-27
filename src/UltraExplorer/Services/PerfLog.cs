@@ -37,8 +37,10 @@ public static class PerfLog
             {
                 File.WriteAllText(_path, "ms\tspan\tvalue\n");
             }
-            catch (IOException)
+            catch (Exception ex) when (IsUnwritable(ex))
             {
+                // An empty, malformed or protected path turns the log off; it
+                // is a development aid, not a reason for the app not to start.
                 IsEnabled = false;
             }
 
@@ -83,7 +85,7 @@ public static class PerfLog
             {
                 File.AppendAllText(_path!, Buffer.ToString());
             }
-            catch (IOException)
+            catch (Exception ex) when (IsUnwritable(ex))
             {
                 // A log that cannot be written is not worth a crash.
             }
@@ -91,6 +93,11 @@ public static class PerfLog
             Buffer.Clear();
         }
     }
+
+    /// <summary>Every way a log file can refuse to be written: in use, read-only or protected, or not a path at all.</summary>
+    private static bool IsUnwritable(Exception exception)
+        => exception is IOException or UnauthorizedAccessException or ArgumentException
+            or NotSupportedException or System.Security.SecurityException;
 
     public readonly struct Scope : IDisposable
     {
