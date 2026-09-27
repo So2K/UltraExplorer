@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace UltraExplorer.Rendering.Gpu;
@@ -10,25 +11,45 @@ namespace UltraExplorer.Rendering.Gpu;
 /// and Cyrillic glyph at every tier.
 ///
 /// Layout, little-endian:
-/// - magic "UXGA", format version, font hash (length-prefixed UTF-8), page
-///   size, tier count and each tier's em and spread - anything that differs
-///   from this build's atlas and the file is ignored;
+/// - magic "UXGA", the file's layout version, format version, font hash
+///   (length-prefixed UTF-8), page size, tier count and each tier's em and
+///   spread - anything that differs from this build's atlas and the file is
+///   ignored;
 /// - page count, then per page its used height and shelves (top, height,
 ///   filled width), so placing continues after the loaded glyphs;
 /// - entry count, then per entry face, tier, glyph index, page, texel
 ///   rectangle and the em box;
-/// - per page, its used rows of texels.
+/// - per page, its used rows of texels;
+/// - a SHA-256 of everything before it.
 /// Only the three fixed faces' entries are kept: fallback faces get their
 /// ids in the order a run meets them, so their ids mean nothing next time.
 ///
-/// Written to a temporary file and moved over the old one, so a crash
-/// mid-write never leaves half a file to be read.  Any read error, short
-/// file or mismatch means "no cache": the atlas is rasterised as if the
-/// file were not there.
+/// Written to a temporary file, flushed to the disk and moved over the old
+/// one, so a crash mid-write never leaves half a file to be read.  Read
+/// whole and checked - the hash, then every number against the page it
+/// describes - before anything goes into the atlas: a shelf off its page
+/// would have the next glyph written outside the page's memory.  Any read
+/// error, short file, mismatch or bad hash means "no cache": the atlas is
+/// untouched and rasterised as if the file were not there.
 /// </summary>
 internal static class GlyphCacheFile
 {
     private const uint Magic = 0x41475855; // "UXGA"
+
+    /// <summary>
+    /// The file's own layout, apart from what the texels mean
+    /// (<see cref="GlyphAtlas.FormatVersion"/>).  2 added the hash; a file
+    /// without one reads as another version and is made again.
+    /// </summary>
+    private const int LayoutVersion = 2;
+
+    private const int HashBytes = 32;
+
+    /// <summary>
+    /// More than any file this build writes - sixteen full pages, a million
+    /// entries - so a bigger one is not even read into memory.
+    /// </summary>
+    private const long MaximumFileBytes = 128L << 20;
 
     /// <summary>Loads <paramref name="path"/> into a fresh atlas; false when there is no usable file.</summary>
     public static unsafe bool TryLoad(GlyphAtlas atlas, string path)
@@ -40,9 +61,27 @@ internal static class GlyphCacheFile
                 return false;
             }
 
-            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16);
-            using var reader = new BinaryReader(stream, Encoding.UTF8);
+            byte[] file;
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 16))
+            {
+                if (stream.Length <= HashBytes || stream.Length > MaximumFileBytes)
+                {
+                    return false;
+                }
+
+                file = new byte[stream.Length];
+                stream.ReadExactly(file);
+            }
+
+            var payloadLength = file.Length - HashBytes;
+            if (!SHA256.HashData(file.AsSpan(0, payloadLength)).AsSpan().SequenceEqual(file.AsSpan(payloadLength)))
+            {
+                return false;
+            }
+
+            using var reader = new BinaryReader(new MemoryStream(file, 0, payloadLength, writable: false), Encoding.UTF8);
             if (reader.ReadUInt32() != Magic
+                || reader.ReadInt32() != LayoutVersion
                 || reader.ReadInt32() != GlyphAtlas.FormatVersion
                 || reader.ReadString() != atlas.Faces.FontHash
                 || reader.ReadInt32() != GlyphAtlas.PageSize
@@ -76,10 +115,31 @@ internal static class GlyphCacheFile
                     return false;
                 }
 
+                // The shelves as the packer makes them: one under the other
+                // from the top row down to the used height, none filled past
+                // the page's width.  The packer places the next glyphs on
+                // them, so one that is not would put texels off the page.
                 shelves[page] = new List<ShelfPacker.Shelf>(shelfCount);
-                for (var shelf = 0; shelf < shelfCount; shelf++)
+                var bottom = 0;
+                for (var index = 0; index < shelfCount; index++)
                 {
-                    shelves[page].Add(new ShelfPacker.Shelf(reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32()));
+                    var shelf = new ShelfPacker.Shelf(reader.ReadInt32(), reader.ReadInt32(), reader.ReadInt32());
+                    if (shelf.Top != bottom
+                        || shelf.Height <= 0
+                        || shelf.Height > usedHeights[page] - bottom
+                        || shelf.Used < 0
+                        || shelf.Used > GlyphAtlas.PageSize)
+                    {
+                        return false;
+                    }
+
+                    bottom += shelf.Height;
+                    shelves[page].Add(shelf);
+                }
+
+                if (bottom != usedHeights[page])
+                {
+                    return false;
                 }
             }
 
@@ -111,14 +171,29 @@ internal static class GlyphCacheFile
                 entries.Add((key, entry));
             }
 
+            // The texels fill the rest of the file exactly; restoring then
+            // only copies, so the atlas takes all of the file or none of it.
+            var pageStarts = new int[pageCount];
+            var texelsAt = (int)reader.BaseStream.Position;
+            for (var page = 0; page < pageCount; page++)
+            {
+                pageStarts[page] = texelsAt;
+                texelsAt += usedHeights[page] * GlyphAtlas.PageSize;
+            }
+
+            if (texelsAt != payloadLength)
+            {
+                return false;
+            }
+
             return atlas.Restore(pageCount, shelves, entries, (page, pointer) =>
             {
                 var bytes = usedHeights[page] * GlyphAtlas.PageSize;
-                var span = new Span<byte>((void*)pointer, bytes);
-                return stream.ReadAtLeast(span, bytes, throwOnEndOfStream: false) == bytes;
+                file.AsSpan(pageStarts[page], bytes).CopyTo(new Span<byte>((void*)pointer, bytes));
+                return true;
             });
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or EndOfStreamException or InvalidDataException or ArgumentException or NotSupportedException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or EndOfStreamException or InvalidDataException or ArgumentException or NotSupportedException or FormatException)
         {
             Debug.WriteLine($"The glyph cache {path} could not be read: {ex.Message}");
             return false;
@@ -133,10 +208,11 @@ internal static class GlyphCacheFile
         {
             var snapshot = atlas.Snapshot();
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 16))
+            using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.ReadWrite, FileShare.None, 1 << 16))
             using (var writer = new BinaryWriter(stream, Encoding.UTF8))
             {
                 writer.Write(Magic);
+                writer.Write(LayoutVersion);
                 writer.Write(GlyphAtlas.FormatVersion);
                 writer.Write(atlas.Faces.FontHash);
                 writer.Write(GlyphAtlas.PageSize);
@@ -183,6 +259,14 @@ internal static class GlyphCacheFile
                     var bytes = snapshot.UsedHeights[page] * GlyphAtlas.PageSize;
                     stream.Write(new ReadOnlySpan<byte>((void*)atlas.PagePointer(page), bytes));
                 }
+
+                // The hash of what was written, read back from the cache the
+                // system has just filled, closes the file; then all of it
+                // goes to the disk before the move makes it the one read.
+                stream.Position = 0;
+                var hash = SHA256.HashData(stream);
+                stream.Write(hash);
+                stream.Flush(flushToDisk: true);
             }
 
             File.Move(temporary, path, overwrite: true);

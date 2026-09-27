@@ -443,6 +443,15 @@ public sealed partial class NestedCanvas
 
         _surface.DeviceLost += OnSurfaceDeviceLost;
         _surface.ContentLost += OnSurfaceContentLost;
+        if (_labelsOnGpu && !ReferenceEquals(_gpuFrame?.LabelDevices, devices))
+        {
+            // The names on the GPU were drawn for another card, whose atlas
+            // views the renderer will not sample here; a frame that draws
+            // only the scene (a folder read) would leave their icons and
+            // glyphs out until something else drew the names again.
+            RequestFrame(Layers.Labels);
+        }
+
         return true;
     }
 

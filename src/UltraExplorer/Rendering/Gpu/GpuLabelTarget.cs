@@ -131,9 +131,11 @@ internal sealed class GpuLabelTarget : LabelTarget
         _icons?.ProcessArrivals(_iconTexture, devices.Context);
         _uploadTicks = Stopwatch.GetTimestamp() - started;
 
-        frame.LabelRects.Clear();
-        frame.Icons.Clear();
-        frame.Glyphs.Clear();
+        // Emptied as a new version of the lists, views let go: should the
+        // frame fail before End, the renderer uploads what was filled and
+        // samples no atlas, rather than draw the last upload's instances or
+        // views that may be another card's.
+        frame.ClearLabels();
         _frame = frame;
         _sink = new GlyphListSink(frame.Glyphs);
         _scaleX = scaleX;
@@ -170,6 +172,7 @@ internal sealed class GpuLabelTarget : LabelTarget
         _shaper.PostDeferred();
         frame.IconView = _iconTexture is { IsDisposed: false } icons ? icons.View : null;
         frame.GlyphView = _glyphTexture?.View;
+        frame.LabelDevices = _devices;
         frame.LabelsChanged();
         WantsAnotherFrame = _icons is { HasPendingArrivals: true };
         _frame = null;

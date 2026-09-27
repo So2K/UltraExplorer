@@ -173,6 +173,15 @@ internal static partial class Program
             Check("a damaged cache file is compiled over, not trusted",
                 !third.FromCache && ShaderCache.Entries.All(entry => first[entry.Name].AsSpan().SequenceEqual(third[entry.Name]))
                 && ShaderCache.Load(folder).FromCache);
+
+            // The first name's length made no number at all (magic, version
+            // and count come before it): BinaryReader's FormatException is
+            // damage like any other, not an error that leaves the GPU unused.
+            bytes = File.ReadAllBytes(file);
+            bytes.AsSpan(12, 5).Fill(0xFF);
+            File.WriteAllBytes(file, bytes);
+            var fourth = ShaderCache.Load(folder);
+            Check("a cache file whose names cannot be read is compiled over too", !fourth.FromCache && ShaderCache.Load(folder).FromCache);
             Check("nothing is left behind but the cache file", Directory.GetFiles(folder).Length == 1);
         }
         finally

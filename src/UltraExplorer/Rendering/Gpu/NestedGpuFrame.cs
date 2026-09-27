@@ -47,6 +47,16 @@ internal sealed class NestedGpuFrame : IDisposable
     /// <summary>The glyph atlas on the same card (<see cref="GlyphAtlasTexture.View"/>), likewise.</summary>
     public ID3D11ShaderResourceView? GlyphView { get; set; }
 
+    /// <summary>
+    /// The device set <see cref="IconView"/> and <see cref="GlyphView"/> were
+    /// taken from, set with them.  A view is only good on the card it was
+    /// made on: after the canvas moves to another card, a frame that draws
+    /// the scene but not the names again still holds the old card's views,
+    /// and the renderer leaves the icons and glyphs out rather than bind them
+    /// on a device they do not belong to.
+    /// </summary>
+    public GpuDeviceSet? LabelDevices { get; set; }
+
     /// <summary>The colour the frame starts from: the bare canvas where no folder covers the view.</summary>
     public uint ClearColour { get; set; } = 0xFF111315;
 
@@ -62,12 +72,21 @@ internal sealed class NestedGpuFrame : IDisposable
     /// <summary>Says <see cref="LabelRects"/>, <see cref="Icons"/> and <see cref="Glyphs"/> hold a new frame's labels.</summary>
     public void LabelsChanged() => LabelVersion++;
 
-    /// <summary>Empties the three label lists, for a frame whose names are drawn some other way (or not at all).</summary>
+    /// <summary>
+    /// Empties the three label lists and lets go of the atlases' views: for a
+    /// frame whose names are drawn some other way (or not at all), and at the
+    /// start of every frame's names, so lists left half filled by a frame
+    /// that failed are uploaded as they are rather than taken for the last
+    /// upload.
+    /// </summary>
     public void ClearLabels()
     {
         LabelRects.Clear();
         Icons.Clear();
         Glyphs.Clear();
+        IconView = null;
+        GlyphView = null;
+        LabelDevices = null;
         LabelsChanged();
     }
 

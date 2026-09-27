@@ -487,6 +487,21 @@ internal static partial class Program
             Check($"gpu text: the atlas is saved on a miss ({written.Saving.TotalMilliseconds:F1} ms, {new FileInfo(path).Length / 1024} KB) and read back the same next time in {read.Elapsed.TotalMilliseconds:F1} ms",
                 !written.FromCache && File.Exists(path) && identical);
 
+            // One texel changed, or the file cut short: only the hash can tell
+            // the first, and both are turned away before anything is restored.
+            var good = File.ReadAllBytes(path);
+            var changed = (byte[])good.Clone();
+            changed[changed.Length / 2] ^= 0x40;
+            File.WriteAllBytes(path, changed);
+            using var altered = new GlyphAtlas(faces);
+            var alteredRead = altered.WarmUp(path);
+            File.WriteAllBytes(path, good[..(good.Length / 2)]);
+            using var shortened = new GlyphAtlas(faces);
+            var shortenedRead = shortened.WarmUp(path);
+            Check("gpu text: a cache file with one byte changed, or cut short, is ignored and the glyphs made again",
+                alteredRead is { FromCache: false } && alteredRead.Glyphs == result.Glyphs
+                && shortenedRead is { FromCache: false } && shortenedRead.Glyphs == result.Glyphs);
+
             File.WriteAllBytes(path, [1, 2, 3]);
             using var damaged = new GlyphAtlas(faces);
             Check("gpu text: a damaged cache file is ignored and the glyphs made again", damaged.WarmUp(path) is { FromCache: false } again && again.Glyphs == result.Glyphs);

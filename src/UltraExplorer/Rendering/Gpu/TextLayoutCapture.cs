@@ -59,44 +59,54 @@ internal sealed class TextLayoutCapture : TextRendererBase
 
     public override void DrawGlyphRun(nint clientDrawingContext, float baselineOriginX, float baselineOriginY, MeasuringMode measuringMode, GlyphRun glyphRun, GlyphRunDescription glyphRunDescription, IUnknown clientDrawingEffect)
     {
-        var indices = glyphRun.Indices;
-        if (indices is null || indices.Length == 0 || glyphRun.FontFace is null)
+        // Vortice hands the run over with a reference of its own on the font
+        // face, which nothing else releases; the registry keeps its own
+        // (TryRegister queries the face again), so it goes when the call ends.
+        try
         {
-            return;
-        }
-
-        if (!_faces.TryRegister(glyphRun.FontFace, out var faceId))
-        {
-            _failed = true;
-            return;
-        }
-
-        var count = indices.Length;
-        var advances = glyphRun.Advances is { Length: > 0 } given ? (float[])given.Clone() : new float[count];
-        var offsets = glyphRun.Offsets is { Length: > 0 } offsetsGiven ? (GlyphOffset[])offsetsGiven.Clone() : new GlyphOffset[count];
-
-        // The cluster map (character to first glyph) lives only for the call.
-        var textLength = glyphRunDescription.Text?.Length ?? 0;
-        var clusterMap = new ushort[textLength];
-        if (textLength > 0 && glyphRunDescription.ClusterMap != IntPtr.Zero)
-        {
-            unsafe
+            var indices = glyphRun.Indices;
+            if (indices is null || indices.Length == 0 || glyphRun.FontFace is null)
             {
-                new ReadOnlySpan<ushort>((void*)glyphRunDescription.ClusterMap, textLength).CopyTo(clusterMap);
+                return;
             }
-        }
 
-        _runs.Add(new CapturedRun(
-            baselineOriginX,
-            (glyphRun.BidiLevel & 1) != 0,
-            faceId,
-            glyphRun.FontEmSize,
-            (ushort[])indices.Clone(),
-            advances,
-            offsets,
-            (int)glyphRunDescription.TextPosition,
-            glyphRunDescription.Text ?? string.Empty,
-            clusterMap));
+            if (!_faces.TryRegister(glyphRun.FontFace, out var faceId))
+            {
+                _failed = true;
+                return;
+            }
+
+            var count = indices.Length;
+            var advances = glyphRun.Advances is { Length: > 0 } given ? (float[])given.Clone() : new float[count];
+            var offsets = glyphRun.Offsets is { Length: > 0 } offsetsGiven ? (GlyphOffset[])offsetsGiven.Clone() : new GlyphOffset[count];
+
+            // The cluster map (character to first glyph) lives only for the call.
+            var textLength = glyphRunDescription.Text?.Length ?? 0;
+            var clusterMap = new ushort[textLength];
+            if (textLength > 0 && glyphRunDescription.ClusterMap != IntPtr.Zero)
+            {
+                unsafe
+                {
+                    new ReadOnlySpan<ushort>((void*)glyphRunDescription.ClusterMap, textLength).CopyTo(clusterMap);
+                }
+            }
+
+            _runs.Add(new CapturedRun(
+                baselineOriginX,
+                (glyphRun.BidiLevel & 1) != 0,
+                faceId,
+                glyphRun.FontEmSize,
+                (ushort[])indices.Clone(),
+                advances,
+                offsets,
+                (int)glyphRunDescription.TextPosition,
+                glyphRunDescription.Text ?? string.Empty,
+                clusterMap));
+        }
+        finally
+        {
+            glyphRun.Dispose();
+        }
     }
 
     /// <summary>

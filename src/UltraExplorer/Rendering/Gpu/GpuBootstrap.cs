@@ -73,6 +73,7 @@ internal static class GpuBootstrap
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
 
     private static IDirect3D9Ex? _direct3D;
+    private static bool _direct3DFailed;
     private static Thread? _worker;
     private static RendererPreference _settingPreference;
     private static volatile bool _cpuForSession;
@@ -493,36 +494,47 @@ internal static class GpuBootstrap
 
     private static void WarmFirst(IntPtr monitor)
     {
-        // Made even for the CPU renderer: it is not a device, and with it
-        // made here a later switch to the GPU never makes it on the UI thread.
-        var target = monitor != IntPtr.Zero ? monitor : PrimaryMonitor;
-        Luid? luid;
-        lock (Gate)
+        try
         {
-            EnsureDirect3D();
-            luid = TryMapMonitor(target, out var found) ? found : null;
-        }
+            // Made even for the CPU renderer: it is not a device, and with it
+            // made here a later switch to the GPU never makes it on the UI thread.
+            var target = monitor != IntPtr.Zero ? monitor : PrimaryMonitor;
+            Luid? luid;
+            lock (Gate)
+            {
+                EnsureDirect3D();
+                luid = TryMapMonitor(target, out var found) ? found : null;
+            }
 
-        if (Preference == RendererPreference.Cpu)
+            if (Preference == RendererPreference.Cpu)
+            {
+                Note("CPU renderer chosen; no device made");
+                ReadySource.TrySetResult(null);
+                return;
+            }
+
+            GpuDeviceSet? set = null;
+            if (luid is { } first)
+            {
+                set = CreateAndPublish(first);
+            }
+            else
+            {
+                _lastFailure = "Direct3D 9 names no adapter for the window's monitor.";
+                Note(_lastFailure);
+            }
+
+            ReadySource.TrySetResult(set);
+            _ = Task.Delay(OtherAdaptersDelay).ContinueWith(_ => AddWork(WarmOthers), TaskScheduler.Default);
+        }
+        finally
         {
-            Note("CPU renderer chosen; no device made");
+            // Direct3D 9 or the monitor's adapter failing above (the job's
+            // error goes to LastFailure) still ends the start: whoever waits
+            // for the first set hears there is none rather than wait for ever.
+            // After a set was handed out this does nothing.
             ReadySource.TrySetResult(null);
-            return;
         }
-
-        GpuDeviceSet? set = null;
-        if (luid is { } first)
-        {
-            set = CreateAndPublish(first);
-        }
-        else
-        {
-            _lastFailure = "Direct3D 9 names no adapter for the window's monitor.";
-            Note(_lastFailure);
-        }
-
-        ReadySource.TrySetResult(set);
-        _ = Task.Delay(OtherAdaptersDelay).ContinueWith(_ => AddWork(WarmOthers), TaskScheduler.Default);
     }
 
     /// <summary>Makes the sets of the cards that drive the other monitors, so a move between monitors finds them ready.</summary>
@@ -675,8 +687,31 @@ internal static class GpuBootstrap
         MonitorsMatched?.Invoke();
     }
 
-    /// <summary>Caller holds <see cref="Gate"/>.</summary>
-    private static void EnsureDirect3D() => _direct3D ??= Direct3D9Bridge.CreateDirect3D();
+    /// <summary>
+    /// Caller holds <see cref="Gate"/>.  A failure is remembered, so that
+    /// <see cref="Decide"/> says the GPU cannot be used instead of that it is
+    /// still being prepared - which, with nothing left to prepare it, it would
+    /// say for the rest of the session.  A display change makes it again
+    /// (<see cref="MatchMonitorsAgain"/>).
+    /// </summary>
+    private static void EnsureDirect3D()
+    {
+        if (_direct3D is not null)
+        {
+            return;
+        }
+
+        try
+        {
+            _direct3D = Direct3D9Bridge.CreateDirect3D();
+            _direct3DFailed = false;
+        }
+        catch
+        {
+            _direct3DFailed = true;
+            throw;
+        }
+    }
 
     /// <summary>Caller holds <see cref="Gate"/> and has made the Direct3D9Ex object.</summary>
     private static bool TryMapMonitor(IntPtr monitor, out Luid luid)
@@ -702,6 +737,11 @@ internal static class GpuBootstrap
     {
         lock (Gate)
         {
+            if (_direct3D is null)
+            {
+                return _direct3DFailed;
+            }
+
             return MonitorAdapters.TryGetValue(monitor, out var luid) && FailedRecently(luid);
         }
     }

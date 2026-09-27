@@ -105,10 +105,18 @@ internal sealed class FaceRegistry
             }
 
             var font = TryGetFont(face);
+            var familyName = string.Empty;
+            if (font is not null)
+            {
+                // The family comes with a reference of its own, let go here.
+                using var family = font.FontFamily;
+                familyName = FamilyNameOf(family);
+            }
+
             var info = new FaceInfo(
                 (byte)_count,
                 face.QueryInterface<IDWriteFontFace1>(),
-                font is null ? string.Empty : FamilyNameOf(font.FontFamily),
+                familyName,
                 font?.Weight ?? FontWeight.Normal,
                 font?.Style ?? FontStyle.Normal,
                 font?.Stretch ?? FontStretch.Normal,

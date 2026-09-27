@@ -93,8 +93,13 @@ internal sealed class TextureReadback : IDisposable
             || _stagingDescription.Height != description.Height
             || _stagingDescription.Format != description.Format)
         {
+            // Let go before the new one is made, and the description kept
+            // only with a texture made from it: a card that refuses the new
+            // texture leaves none, so the next capture tries again rather
+            // than copy into the released one.
             _staging?.Dispose();
-            _stagingDescription = new Texture2DDescription
+            _staging = null;
+            var stagingDescription = new Texture2DDescription
             {
                 Width = description.Width,
                 Height = description.Height,
@@ -107,7 +112,8 @@ internal sealed class TextureReadback : IDisposable
                 CPUAccessFlags = CpuAccessFlags.Read,
                 MiscFlags = ResourceOptionFlags.None
             };
-            _staging = _devices.Device.CreateTexture2D(in _stagingDescription);
+            _staging = _devices.Device.CreateTexture2D(in stagingDescription);
+            _stagingDescription = stagingDescription;
         }
 
         _devices.Context.CopyResource(_staging, source);

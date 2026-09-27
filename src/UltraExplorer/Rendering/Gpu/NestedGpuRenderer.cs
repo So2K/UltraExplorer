@@ -192,8 +192,9 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
     /// top-left <paramref name="width"/> x <paramref name="height"/> pixels.
     /// Copies a list to the GPU only when it changed since the last frame
     /// drawn from it.  Icons and glyphs are drawn only when the frame names
-    /// the atlas views to sample.  GPU commands only; nothing waits for the
-    /// GPU here, and nothing is allocated.
+    /// the atlas views to sample, and names them on this renderer's set
+    /// (<see cref="NestedGpuFrame.LabelDevices"/>).  GPU commands only;
+    /// nothing waits for the GPU here, and nothing is allocated.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public void Draw(ID3D11RenderTargetView target, int width, int height, NestedGpuFrame frame)
@@ -238,7 +239,12 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
             context.DrawInstanced(4, (uint)labels, 0, 0);
         }
 
-        var icons = frame.IconView is null ? 0 : frame.Icons.Count;
+        // The atlases' views are good only on the card they were made on: a
+        // frame whose names were drawn for another set - the canvas moved to
+        // this card and only the scene has been drawn since - leaves its
+        // icons and glyphs out until the names are drawn again here.
+        var labelViewsHere = ReferenceEquals(frame.LabelDevices, _devices);
+        var icons = !labelViewsHere || frame.IconView is null ? 0 : frame.Icons.Count;
         if (icons > 0)
         {
             context.IASetInputLayout(_iconLayout);
@@ -250,7 +256,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
             context.DrawInstanced(4, (uint)icons, 0, 0);
         }
 
-        var glyphs = frame.GlyphView is null ? 0 : frame.Glyphs.Count;
+        var glyphs = !labelViewsHere || frame.GlyphView is null ? 0 : frame.Glyphs.Count;
         if (glyphs > 0)
         {
             context.IASetInputLayout(_glyphLayout);
@@ -297,6 +303,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
         pill.Kind = (uint)RectKind.Rounded;
         pill.Body = 0xD8141618;
 
+        frame.LabelDevices = _devices;
         if (_devices.TryGetAttached<IconAtlasTexture>(out var icons) && icons is { IsDisposed: false })
         {
             frame.IconView = icons.View;
@@ -416,6 +423,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
     {
         private object? _frame;
         private int _version = int.MinValue;
+        private long _bytes = -1;
 
         public ID3D11Buffer Buffer { get; private set; } = Create(device, initialBytes);
 
@@ -424,7 +432,11 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
         /// <summary>Copies <paramref name="list"/> in if it changed; the bytes copied.</summary>
         public long Upload<T>(ID3D11DeviceContext context, object frame, InstanceList<T> list, int version) where T : unmanaged
         {
-            if (ReferenceEquals(frame, _frame) && version == _version)
+            // The draw trusts the list's count, so a list whose count moved
+            // without its version - filled by a frame that failed before it
+            // said so - is copied again: the GPU never reads instances past
+            // those written, which a discarded buffer holds nothing sure in.
+            if (ReferenceEquals(frame, _frame) && version == _version && list.ByteCount == _bytes)
             {
                 return 0;
             }
@@ -458,6 +470,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
 
             _frame = frame;
             _version = version;
+            _bytes = bytes;
             return bytes;
         }
 

@@ -27,7 +27,11 @@ internal static class ShaderCache
 {
     private const string ResourceSuffix = "Rendering.Gpu.Shaders.Nested.hlsl";
     private const uint Magic = 0x48535855; // "UXSH"
-    private const int FormatVersion = 1;
+    // Version 2: the bytecode is compiled at Flags.  Version 1's went through
+    // an overload that takes no flags and compiles at optimisation level 1
+    // whatever Flags said; the new version gives the file a new name, so that
+    // bytecode is compiled again rather than read.
+    private const int FormatVersion = 2;
     private const ShaderFlags Flags = ShaderFlags.OptimizationLevel3;
 
     /// <summary>Every entry point compiled from the source, with its profile.</summary>
@@ -101,7 +105,11 @@ internal static class ShaderCache
         var compiled = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var entry in Entries)
         {
-            var result = Compiler.Compile(source, entry.Name, "Nested.hlsl", entry.Profile, out var blob, out var errors);
+            // The overload that takes flags: the shorter one compiles at
+            // optimisation level 1 whatever Flags asks for.  No macros and
+            // no include handler - the source is one file; the parameter is
+            // not marked nullable, but D3DCompile takes null for none.
+            var result = Compiler.Compile(source, [], null!, entry.Name, "Nested.hlsl", entry.Profile, Flags, out var blob, out var errors);
             try
             {
                 if (result.Failure || blob is null)
@@ -165,9 +173,13 @@ internal static class ShaderCache
 
             return Entries.All(entry => read.ContainsKey(entry.Name)) ? read : null;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or EndOfStreamException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or EndOfStreamException or FormatException)
         {
-            // A damaged or unreadable file is only a lost cache; compile again.
+            // A damaged or unreadable file is only a lost cache; compile again
+            // (and the compiled shaders are written over it).  A name's length
+            // that is no number (FormatException) is damage too: escaping, it
+            // would be kept by Shared's Lazy and leave the GPU unused on every
+            // start while the file stayed.
             return null;
         }
     }
