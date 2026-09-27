@@ -148,6 +148,10 @@ public partial class MainWindow : Window
         await ApplyPickerRulesAsync();
         await _viewModel.InitializeAsync(_pickerStartFolder);
         Nested.LeftDrag = _viewModel.LeftDrag;
+
+        // Before the drives go in, so a canvas without its files is never
+        // placed with them first.
+        Nested.ShownLayers = _viewModel.Layers;
         await InitializeNestedAsync();
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
@@ -1140,21 +1144,36 @@ public partial class MainWindow : Window
         ShowFolderAreaMenu(Editor, _viewModel.Tree.FolderAt(graphPoint));
     }
 
-    /// <summary>The menu for the open space of a folder: what can be made or put in it, and the canvas's own commands.</summary>
+    /// <summary>
+    /// The menu for the open space of a folder: what can be made or put in
+    /// it, the folder's own settings, and the canvas's own commands.
+    /// </summary>
     private void ShowFolderAreaMenu(FrameworkElement placementTarget, ViewAllNodeViewModel? area)
     {
         // The folder the menu names is the folder its commands act on: New
         // folder, New text file and Paste go to the selection, so the folder
         // clicked in becomes the selection - as a click on empty space in an
         // Explorer window does.
+        string? folder = null;
         if (area is { IsDirectory: true })
         {
             _viewModel.Tree.SelectOnly(area);
+            folder = area.FullPath;
         }
 
-        var where = _viewModel.Tree.ActiveNode is { IsDirectory: true } folder
-            ? folder.DisplayName
-            : null;
+        BuildFolderAreaMenu(placementTarget, folder).IsOpen = true;
+    }
+
+    /// <summary>
+    /// <see cref="ShowFolderAreaMenu"/>'s menu for the open space of
+    /// <paramref name="folder"/> - or, for none, of the canvas outside every
+    /// folder - not yet open.
+    /// </summary>
+    internal ContextMenu BuildFolderAreaMenu(FrameworkElement placementTarget, string? folder)
+    {
+        var where = folder is not null
+            ? FolderDisplayName(folder)
+            : _viewModel.Tree.ActiveNode is { IsDirectory: true } active ? active.DisplayName : null;
 
         var menu = new ContextMenu { PlacementTarget = placementTarget };
         AddCommandItem(
@@ -1175,41 +1194,93 @@ public partial class MainWindow : Window
             _viewModel.PasteCommand,
             "Ctrl+V");
         menu.Items.Add(new Separator());
+        if (folder is not null)
+        {
+            AddFolderItems(menu, folder, where!);
+            menu.Items.Add(new Separator());
+        }
+
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
-        // Sort by orders the folder clicked in; outside every folder, all of them.
-        var sortFolder = area is { IsDirectory: true } ? area.FullPath : null;
         if (IsNested)
         {
-            AddSortItems(menu, sortFolder);
+            // Outside every folder, Sort by orders all of them.
+            if (folder is null)
+            {
+                AddSortItems(menu, null);
+            }
+
             AddHiddenFolderItems(menu);
             AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
             AddLayoutItems(menu);
-            menu.IsOpen = true;
-            return;
+            return menu;
         }
 
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
-        AddSortItems(menu, sortFolder);
+        if (folder is null)
+        {
+            AddSortItems(menu, null);
+        }
+
         AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         AddLayoutItems(menu);
-        menu.IsOpen = true;
+        return menu;
     }
 
     /// <summary>
-    /// Explorer's "Sort by" for <paramref name="folder"/> - every folder when
-    /// there is none, or when folders are all sorted the same: the four
-    /// columns, then which way round, each a checkable item showing the
-    /// current choice.  Picking another column starts it its own way - names
-    /// and types from A, dates and sizes from the newest and largest - as a
-    /// click on its header would.  While each folder has its own order, the
-    /// folder's order can be made every folder's, or let go of for the
-    /// default.
+    /// A folder's own settings, in the menu of its open space: how its
+    /// contents are sorted, its colour, its note, its pin on Home, and the
+    /// folder in File Explorer and in Windows' properties sheet.  Each acts
+    /// on this folder by its path, whatever else is selected.
     /// </summary>
-    private void AddSortItems(ItemsControl menu, string? folder)
+    private void AddFolderItems(ItemsControl menu, string folder, string name)
+    {
+        AddSortItems(menu, folder, name);
+        AddColourItems(menu, folder);
+        var hasNote = !string.IsNullOrWhiteSpace(_viewModel.Marks.Get(folder).Note);
+        AddActionItem(menu, hasNote ? "Edit note\u2026" : "Add note\u2026", "\uE70B", () => _viewModel.EditNoteOf(folder, name));
+        if (!IsPickerMode)
+        {
+            if (_viewModel.IsPinned(folder))
+            {
+                AddActionItem(menu, "Unpin from Home", "\uE77A", () => _viewModel.UnpinPath(folder));
+            }
+            else
+            {
+                AddActionItem(menu, "Pin to Home", "\uE718", () => _viewModel.PinPath(folder));
+            }
+        }
+
+        AddActionItem(menu, "Show in File Explorer", "\uEC50", () => _viewModel.ShowInExplorer(folder));
+
+        // Alt+Enter shows the selection's properties: the same sheet only
+        // while the folder is all that is selected, as the right-click that
+        // opened this menu leaves it.
+        var selected = _viewModel.Tree.SelectedOrActivePaths;
+        var gesture = selected.Count == 1 && ViewAllPath.Equals(selected[0], folder) ? "Alt+Enter" : string.Empty;
+        AddActionItem(menu, "Properties", "\uE946", () => _viewModel.ShowPropertiesOf(folder), gesture);
+    }
+
+    /// <summary>A folder's name as its own menu says it: as the tree shows it when it is the folder the tree has, else its own name.</summary>
+    private string FolderDisplayName(string folder) =>
+        _viewModel.Tree.ActiveNode is { } node && ViewAllPath.Equals(node.FullPath, folder) && node.DisplayName.Length > 0
+            ? node.DisplayName
+            : FolderName(folder);
+
+    /// <summary>
+    /// Explorer's "Sort by" for <paramref name="folder"/>, named after it -
+    /// every folder when there is none, or when folders are all sorted the
+    /// same: the four columns, then which way round, each a checkable item
+    /// showing the current choice.  Picking another column starts it its own
+    /// way - names and types from A, dates and sizes from the newest and
+    /// largest - as a click on its header would.  While each folder has its
+    /// own order, the folder's order can be let go of for the default, or
+    /// made every folder's.
+    /// </summary>
+    private void AddSortItems(ItemsControl menu, string? folder, string? name = null)
     {
         var orders = _viewModel.Orders;
         var perFolder = orders.Scope == SortScope.PerFolder;
@@ -1219,14 +1290,10 @@ public partial class MainWindow : Window
         }
 
         var sort = orders.SortOf(folder);
-        var group = new MenuItem { Header = "Sort by" };
-        if (perFolder)
+        var group = new MenuItem { Header = folder is null ? "Sort by" : $"Sort {name ?? FolderName(folder)} by" };
+        if (perFolder && folder is null)
         {
-            group.Items.Add(new MenuItem
-            {
-                Header = folder is null ? "Every folder without its own order" : $"This folder: {FolderName(folder)}",
-                IsEnabled = false
-            });
+            group.Items.Add(new MenuItem { Header = "Every folder without its own order", IsEnabled = false });
             group.Items.Add(new Separator());
         }
 
@@ -1267,18 +1334,9 @@ public partial class MainWindow : Window
         if (perFolder)
         {
             group.Items.Add(new Separator());
-            var everywhere = new MenuItem
-            {
-                Header = "Use this order for all folders",
-                IsEnabled = orders.Count > 0 || sort != orders.Default,
-                ToolTip = "Every folder in this order, and every folder's own order let go of"
-            };
-            everywhere.Click += (_, _) => orders.UseEverywhere(orders.SortOf(folder));
-            group.Items.Add(everywhere);
-
             var reset = new MenuItem
             {
-                Header = "Reset this folder to the default order",
+                Header = "Reset to the default order",
                 IsEnabled = folder is not null && orders.HasOwnOrder(folder),
                 ToolTip = $"Back to {ItemSort.Describe(orders.Default.Column)}, {ItemSort.DescribeDirection(orders.Default.Column, orders.Default.Descending)}, as every folder without its own order"
             };
@@ -1290,6 +1348,15 @@ public partial class MainWindow : Window
                 }
             };
             group.Items.Add(reset);
+
+            var everywhere = new MenuItem
+            {
+                Header = "Use this order for all folders",
+                IsEnabled = orders.Count > 0 || sort != orders.Default,
+                ToolTip = "Every folder in this order, and every folder's own order let go of"
+            };
+            everywhere.Click += (_, _) => orders.UseEverywhere(orders.SortOf(folder));
+            group.Items.Add(everywhere);
         }
 
         menu.Items.Add(group);
@@ -1442,7 +1509,9 @@ public partial class MainWindow : Window
             AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
         }
 
-        AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
+        var layers = new MenuItem { Header = "Layers" };
+        AddLayerItems(layers, includeMinimap: false);
+        menu.Items.Add(layers);
         AddSortItems(menu, SortFolder());
         AddArrangeItems(menu);
         if (IsNested)
@@ -1494,9 +1563,15 @@ public partial class MainWindow : Window
         ("Violet", "#A979FF")
     ];
 
-    private void AddColourItems(ItemsControl menu)
+    /// <summary>
+    /// The colour palette as a submenu: for the selection, or for one
+    /// <paramref name="path"/> whatever is selected - its present colour
+    /// said beside it.
+    /// </summary>
+    private void AddColourItems(ItemsControl menu, string? path = null)
     {
         var colours = CanvasColours;
+        var current = path is null ? null : _viewModel.Marks.Get(path).AccentHex;
 
         var parent = new MenuItem { Header = "Colour" };
         foreach (var colour in colours)
@@ -1514,14 +1589,28 @@ public partial class MainWindow : Window
             };
             var item = new MenuItem { Header = colour.Name, Icon = swatch };
             var hex = colour.Hex;
-            item.Click += (_, _) => _viewModel.SetAccentCommand.Execute(hex);
+            if (path is null)
+            {
+                item.Click += (_, _) => _viewModel.SetAccentCommand.Execute(hex);
+            }
+            else
+            {
+                if (string.Equals(current, hex, StringComparison.OrdinalIgnoreCase))
+                {
+                    item.InputGestureText = "Current";
+                }
+
+                item.Click += (_, _) => _viewModel.Tree.ApplyAccent([path], string.IsNullOrEmpty(hex) ? null : hex);
+            }
+
             parent.Items.Add(item);
         }
 
         menu.Items.Add(parent);
     }
 
-    private static void AddCheckableItem(ItemsControl menu, string header, bool isChecked, ICommand command)
+    /// <summary>A switch that runs a command, showing whether it is on; handed back for anything more it needs.</summary>
+    private static MenuItem AddCheckableItem(ItemsControl menu, string header, bool isChecked, ICommand command)
     {
         var item = new MenuItem
         {
@@ -1532,7 +1621,12 @@ public partial class MainWindow : Window
         };
 
         menu.Items.Add(item);
+        return item;
     }
+
+    /// <summary>An item that runs <paramref name="action"/>, with a glyph as the command items have.</summary>
+    private static void AddActionItem(ItemsControl menu, string header, string glyph, Action action, string gesture = "") =>
+        AddCommandItem(menu, header, glyph, new Infrastructure.RelayCommand(action), gesture);
 
     private static Brush MenuGlyphBrush =>
         Application.Current?.TryFindResource("TextBrush") as Brush ?? Brushes.White;

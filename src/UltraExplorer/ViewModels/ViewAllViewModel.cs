@@ -1376,9 +1376,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         ScheduleSave();
     }
 
-    public void ApplyNote(ViewAllNodeViewModel node, string? note)
+    public void ApplyNote(ViewAllNodeViewModel node, string? note) => ApplyNote(node.FullPath, note);
+
+    /// <summary>Keeps a note on a path, which need not be on the canvas: a folder's own menu writes one for the folder it names.</summary>
+    public void ApplyNote(string path, string? note)
     {
-        _marks.SetNote(node.FullPath, note);
+        _marks.SetNote(path, note);
         ScheduleSave();
     }
 

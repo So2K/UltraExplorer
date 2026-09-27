@@ -853,10 +853,10 @@
                                 </Button>
                             </Grid>
 
-                            <!-- The order of the current folder's contents - the one
-                                 the selection is in, or the one in view - or every folder's, as
-                                 Canvas options says: a click sorts by the column, a
-                                 second click turns it round. -->
+                            <!-- The order of the folder being worked with - the folder
+                                 selected, or the one the selected file is in, else the one
+                                 in view - or every folder's, as Canvas options says: a
+                                 click sorts by the column, a second click turns it round. -->
                             <StackPanel x:Name="SortHeaders"
                                         Grid.Column="1"
                                         Orientation="Horizontal"
@@ -1293,8 +1293,11 @@
                         <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all (Shift+1) — Shift+2 fits the selection" AutomationProperties.Name="Fit all">
                             <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ToggleMinimapCommand}" ToolTip="Toggle minimap" AutomationProperties.Name="Toggle minimap">
+                        <Button x:Name="CanvasLayersButton" Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Click="LayersButton_Click" ToolTip="Layers: files, icons, details, counts, hidden items, marks" AutomationProperties.Name="Layers">
                             <TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" FontSize="12" />
+                        </Button>
+                        <Button x:Name="CanvasSettingsButton" Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
+                            <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
                     </StackPanel>
                 </Border>
@@ -1423,8 +1426,11 @@
                     <Button Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all" AutomationProperties.Name="Fit all">
                         <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="10" />
                     </Button>
-                    <Button Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ToggleMinimapCommand}" ToolTip="Minimap" AutomationProperties.Name="Minimap">
+                    <Button x:Name="StatusLayersButton" Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Click="LayersButton_Click" ToolTip="Layers" AutomationProperties.Name="Layers">
                         <TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" FontSize="10" />
+                    </Button>
+                    <Button x:Name="StatusSettingsButton" Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
+                        <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="10" />
                     </Button>
                 </StackPanel>
             </Grid>

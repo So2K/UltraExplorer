@@ -36,11 +36,15 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private static readonly string[] LeftDragProperties =
         [nameof(IsLeftDragSelect), nameof(IsLeftDragPan), nameof(LeftDragDescription)];
 
+    private static readonly string[] LayerProperties =
+        [nameof(ShowFiles), nameof(ShowIcons), nameof(ShowDetails), nameof(ShowFolderCounts), nameof(ShowMarks), nameof(CanShowAllLayers)];
+
     private readonly MainViewModel _main;
     private readonly Func<string>? _rendererNow;
     private readonly Func<string, string, string, bool> _confirm;
     private readonly Action<string> _openFolder;
     private readonly RelayCommand _resetOwnOrdersCommand;
+    private readonly RelayCommand _showAllLayersCommand;
     private string _rendererStatus = string.Empty;
     private bool? _hiddenWanted;
     private bool _isApplyingHidden;
@@ -64,6 +68,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         _confirm = confirm;
         _openFolder = openFolder ?? NativeShellService.ShowInExplorer;
         _resetOwnOrdersCommand = new RelayCommand(ResetOwnOrders, () => CanResetOwnOrders);
+        _showAllLayersCommand = new RelayCommand(() => _main.Layers = CanvasLayer.All, () => CanShowAllLayers);
         OpenInstallFolderCommand = new RelayCommand(() => OpenFolder(InstallFolder));
         OpenStateFolderCommand = new RelayCommand(() => OpenFolder(StateFolder));
         _rendererStatus = _rendererNow?.Invoke() ?? string.Empty;
@@ -88,7 +93,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     /// </summary>
     public string Intro => CanChooseLayout
         ? "Every change applies at once and is remembered."
-        : "Every change applies at once. A file dialog does not remember sorting and order, the renderer or left drag.";
+        : "Every change applies at once. A file dialog does not remember sorting and order, layers, the renderer or left drag.";
 
     public bool IsNestedLayout
     {
@@ -232,6 +237,48 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     public string MinimapDescription => CanShowMinimap
         ? "A small map of the whole tree in the corner of the canvas."
         : "Only on the tree canvas: the nested canvas is its own overview.";
+
+    // ---- Layers ----------------------------------------------------------------
+    //
+    // The switches of the layers menu, each reading and writing the window's
+    // own setting (MainViewModel.Layers); hidden items, shown among them, are
+    // ShowHiddenItems above.
+
+    public bool ShowFiles
+    {
+        get => _main.IsLayerShown(CanvasLayer.Files);
+        set => _main.SetLayer(CanvasLayer.Files, value);
+    }
+
+    public bool ShowIcons
+    {
+        get => _main.IsLayerShown(CanvasLayer.Icons);
+        set => _main.SetLayer(CanvasLayer.Icons, value);
+    }
+
+    public bool ShowDetails
+    {
+        get => _main.IsLayerShown(CanvasLayer.Details);
+        set => _main.SetLayer(CanvasLayer.Details, value);
+    }
+
+    public bool ShowFolderCounts
+    {
+        get => _main.IsLayerShown(CanvasLayer.FolderCounts);
+        set => _main.SetLayer(CanvasLayer.FolderCounts, value);
+    }
+
+    public bool ShowMarks
+    {
+        get => _main.IsLayerShown(CanvasLayer.Marks);
+        set => _main.SetLayer(CanvasLayer.Marks, value);
+    }
+
+    /// <summary>Whether any layer is switched off, for Show all.</summary>
+    public bool CanShowAllLayers => _main.Layers != CanvasLayer.All;
+
+    /// <summary>Every layer back on, as the layers menu's Show all layers does; hidden items stay as they are.</summary>
+    public ICommand ShowAllLayersCommand => _showAllLayersCommand;
 
     // ---- Sorting and order -----------------------------------------------------------
 
@@ -507,6 +554,10 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 break;
             case nameof(MainViewModel.LeftDrag):
                 Raise(LeftDragProperties);
+                break;
+            case nameof(MainViewModel.Layers):
+                Raise(LayerProperties);
+                _showAllLayersCommand.RaiseCanExecuteChanged();
                 break;
         }
     }

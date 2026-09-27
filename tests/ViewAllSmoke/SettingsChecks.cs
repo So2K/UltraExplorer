@@ -21,11 +21,13 @@ namespace ViewAllSmoke;
 
 /// <summary>
 /// The Settings window, built and laid out but never shown: every way in
-/// opens it (the gear, the More menu, Canvas options and Ctrl+,), each of its
-/// controls shows the setting the menus and headers use and changes it, a
-/// change made elsewhere shows in it at once, and Reset all asks before it
-/// lets every folder's own order go.  Set SETTINGS_SHOTS to a folder to keep
-/// its pictures.
+/// opens it (the gears, the More menu, Canvas options and Ctrl+,), each of
+/// its controls shows the setting the menus and headers use and changes it,
+/// a change made elsewhere shows in it at once, and Reset all asks before it
+/// lets every folder's own order go.  With it, the menus built but never
+/// opened: the layers menu against the Layers section, and a folder's own
+/// menu; and which folder the headers sort.  Set SETTINGS_SHOTS to a folder
+/// to keep its pictures.
 ///
 /// Runs last: the window needs the app's theme, and so the app itself, of
 /// which a process can only ever have one.
@@ -54,8 +56,12 @@ internal static partial class Program
             if (settings is not null)
             {
                 await SettingsControlChecks(main, shell, settings);
+                await LayerMenuChecks(main, shell, settings);
                 settings.Settings.Dispose();
             }
+
+            SortFolderChecks(main, shell);
+            FolderMenuChecks(main, shell);
 
             await SettingsResetChecks(shell);
             SettingsWordsChecks();
@@ -108,6 +114,23 @@ internal static partial class Program
             && !main.TryOpenSettingsFromKey(Key.OemPeriod, ModifierKeys.Control)
             && shown.Count == 4);
         Check("asked again, the one window open is brought back, not a second one", shown.Distinct().Count() == 1);
+
+        // The bottom corner: the canvas's own buttons and the status bar's.
+        foreach (var corner in new[] { main.CanvasSettingsButton, main.StatusSettingsButton })
+        {
+            var before = shown.Count;
+            Check($"the {(corner == main.CanvasSettingsButton ? "canvas's" : "status bar's")} bottom-right corner has the gear too, and it opens Settings",
+                corner.ToolTip as string == "Settings (Ctrl+,)"
+                && System.Windows.Automation.AutomationProperties.GetName(corner) == "Settings"
+                && corner.Content is TextBlock { Text: "\uE713" }
+                && Click(corner) && shown.Count == before + 1);
+        }
+
+        Check("beside each, the layers button says what it is",
+            new[] { main.CanvasLayersButton, main.StatusLayersButton }.All(button =>
+                System.Windows.Automation.AutomationProperties.GetName(button) == "Layers"
+                && button.Content is TextBlock { Text: "\uE81E" }
+                && (button.ToolTip as string)?.StartsWith("Layers", StringComparison.Ordinal) == true));
 
         return shown.FirstOrDefault();
     }
@@ -242,6 +265,217 @@ internal static partial class Program
         ScrollPage(window, 0);
     }
 
+    // ---- layers ------------------------------------------------------------------------
+
+    /// <summary>The layers menu and the Layers section: each switch in one shows in the other, and in the canvas.</summary>
+    private static async Task LayerMenuChecks(MainWindow main, MainViewModel shell, SettingsWindow window)
+    {
+        Section("settings: layers");
+        MenuItem? Item(ItemsControl menu, string header) => menu.Items.OfType<MenuItem>().FirstOrDefault(item => item.Header as string == header);
+        string?[] Headers(ItemsControl menu) => [.. menu.Items.OfType<MenuItem>().Select(item => item.Header as string)];
+        string[] switches = ["Files", "Icons", "Details", "Folder counts", "Hidden items", "Marks and notes"];
+
+        var menu = main.BuildLayersMenu(main.CanvasLayersButton);
+        Check("the layers button's menu is a switch for every layer, hidden items among them, then the minimap and Show all layers",
+            Headers(menu).SequenceEqual([.. switches, "Minimap", "Show all layers"])
+            && switches.Where(name => name != "Hidden items").All(name => Item(menu, name) is { IsCheckable: true, IsChecked: true, StaysOpenOnClick: true })
+            && Item(menu, "Hidden items")?.IsChecked == shell.Tree.ShowHiddenItems
+            && Item(menu, "Minimap") is { IsEnabled: false }
+            && Item(menu, "Show all layers") is { IsEnabled: false }
+            && menu.Placement == System.Windows.Controls.Primitives.PlacementMode.Top);
+        Check("and every layer switch says what it shows", switches.All(name => Item(menu, name)?.ToolTip is string { Length: > 0 }));
+
+        var files = Item(menu, "Files")!;
+        files.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent, files));
+        await SettingsSettle();
+        Check("Files off from the menu: the canvas, the switch in the menu and the one in Settings all say so at once",
+            !shell.IsLayerShown(CanvasLayer.Files) && (main.Nested.ShownLayers & CanvasLayer.Files) == 0
+            && files.IsChecked == false && window.FilesLayerSwitch.IsChecked == false && Item(menu, "Show all layers")!.IsEnabled);
+
+        Toggle(window.IconsLayerSwitch);
+        await SettingsSettle();
+        var again = main.BuildLayersMenu(main.StatusLayersButton);
+        Check("Icons off in Settings: the canvas and the menu show it",
+            !shell.IsLayerShown(CanvasLayer.Icons) && (main.Nested.ShownLayers & CanvasLayer.Icons) == 0
+            && Item(again, "Icons")?.IsChecked == false && Item(again, "Files")?.IsChecked == false);
+
+        Toggle(window.DetailsLayerSwitch);
+        Toggle(window.FolderCountsLayerSwitch);
+        Toggle(window.MarksLayerSwitch);
+        await SettingsSettle();
+        Check("each of the other switches in Settings takes its layer off",
+            shell.Layers == CanvasLayer.None && main.Nested.ShownLayers == CanvasLayer.None && window.ShowAllLayersButton.IsEnabled);
+
+        var options = main.BuildCanvasOptionsMenu(main.SettingsButton);
+        var layers = Item(options, "Layers");
+        Check("Canvas options has the same switches under Layers, without the minimap",
+            layers is not null && Headers(layers).SequenceEqual([.. switches, "Show all layers"])
+            && Item(layers, "Marks and notes")?.IsChecked == false && Item(options, "Hidden items") is null);
+
+        Invoke(window.ShowAllLayersButton);
+        await SettingsSettle();
+        Check("Show all in Settings brings every layer back, and the switches and the menus with it",
+            shell.Layers == CanvasLayer.All && main.Nested.ShownLayers == CanvasLayer.All
+            && new[] { window.FilesLayerSwitch, window.IconsLayerSwitch, window.DetailsLayerSwitch, window.FolderCountsLayerSwitch, window.MarksLayerSwitch }.All(toggle => toggle.IsChecked == true)
+            && !window.ShowAllLayersButton.IsEnabled && Item(main.BuildLayersMenu(main.CanvasLayersButton), "Show all layers")?.IsEnabled == false);
+
+        shell.SetLayer(CanvasLayer.Details, false);
+        var menuShowAll = main.BuildLayersMenu(main.CanvasLayersButton);
+        var showAll = Item(menuShowAll, "Show all layers")!;
+        showAll.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent, showAll));
+        Check("the menu's Show all layers does the same", shell.Layers == CanvasLayer.All && Item(menuShowAll, "Details")?.IsChecked == true);
+
+        shell.Layout = CanvasLayout.Tree;
+        await SettingsSettle();
+        var onTree = main.BuildLayersMenu(main.CanvasLayersButton);
+        Check("on the tree canvas the menu says whose layers they are, and the minimap can be switched",
+            onTree.Items[0] is MenuItem { Header: "Shown on the nested canvas", IsEnabled: false } && Item(onTree, "Minimap")?.IsEnabled == true);
+        shell.Layout = CanvasLayout.Nested;
+        await SettingsSettle();
+
+        // The section itself, scrolled to, for the pictures.
+        if (window.PageScroll.Content is UIElement page)
+        {
+            window.PageScroll.ScrollToVerticalOffset(window.FilesLayerSwitch.TranslatePoint(new Point(0, 0), page).Y - 90);
+            SaveSettingsShot(LayOutWindow(window, 720, 780), "settings-layers.png");
+            ScrollPage(window, 0);
+        }
+    }
+
+    // ---- which folder the headers sort --------------------------------------------------
+
+    private static void SortFolderChecks(MainWindow main, MainViewModel shell)
+    {
+        Section("settings: the folder the headers sort");
+        Check("a sub-folder selected in the folder in view is the one sorted, not the folder around it",
+            MainWindow.NestedSortFolder(@"C:\a\b", @"C:\a") == @"C:\a\b");
+        Check("the folder in view, selected, is itself sorted", MainWindow.NestedSortFolder(@"C:\a", @"C:\a") == @"C:\a");
+        Check("a selection outside the folder in view - or above it, a drive picked at the start - leaves the folder in view sorted",
+            MainWindow.NestedSortFolder(@"C:\x", @"C:\a") == @"C:\a" && MainWindow.NestedSortFolder(@"C:\", @"C:\a") == @"C:\a"
+            && MainWindow.NestedSortFolder(@"C:\ab", @"C:\a") == @"C:\a");
+        Check("nothing selected, the folder in view; nothing in view, the selection; neither, every folder",
+            MainWindow.NestedSortFolder(null, @"C:\a") == @"C:\a" && MainWindow.NestedSortFolder(@"C:\a", null) == @"C:\a"
+            && MainWindow.NestedSortFolder(null, null) is null);
+
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerSortFolder", Guid.NewGuid().ToString("N"));
+        var inner = Path.Combine(root, "Inner");
+        var file = Path.Combine(root, "note.txt");
+        var orders = shell.Orders;
+        try
+        {
+            Directory.CreateDirectory(inner);
+            File.WriteAllText(file, "x");
+            var selection = shell.Tree.Selection;
+            orders.SetFolder(inner, new ItemSort(SortColumn.Modified, true));
+            selection.ReplaceSingle(inner, true, 0, SelectionSource.Navigation);
+            Check("on the nested canvas a selected folder is what the headers sort, and they show its own order at once",
+                main.SortFolder() == inner && main.SortByModifiedArrow.Visibility == Visibility.Visible
+                && main.SortByModified.ToolTip is string tip && tip.StartsWith("Sorted by Date modified", StringComparison.Ordinal) && tip.Contains("in Inner", StringComparison.Ordinal));
+
+            selection.ReplaceSingle(file, false, 1, SelectionSource.Navigation);
+            Check("a selected file's folder is what they sort",
+                main.SortFolder() == root && main.SortByNameArrow.Visibility == Visibility.Visible
+                && main.SortByName.ToolTip is string nameTip && nameTip.Contains($"in {Path.GetFileName(root)}", StringComparison.Ordinal));
+
+            selection.ReplaceSingle(inner, true, 0, SelectionSource.Navigation);
+            main.SortByName.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent, main.SortByName));
+            Check("and a header click sorts the selected folder, not the one it is in",
+                orders.SortOf(inner).Column == SortColumn.Name && !orders.HasOwnOrder(root));
+            selection.Clear(SelectionSource.Navigation);
+        }
+        finally
+        {
+            orders.ResetFolder(inner);
+            orders.ResetFolder(root);
+            TryDelete(root);
+        }
+    }
+
+    // ---- a folder's own menu ------------------------------------------------------------
+
+    private static void FolderMenuChecks(MainWindow main, MainViewModel shell)
+    {
+        Section("settings: a folder's own menu");
+        MenuItem? Item(ItemsControl menu, string header) => menu.Items.OfType<MenuItem>().FirstOrDefault(item => item.Header as string == header);
+        // A click as the item makes one: its command where it has one, its handlers otherwise.
+        void Choose(MenuItem item)
+        {
+            if (item.Command is { } command)
+            {
+                command.Execute(item.CommandParameter);
+                return;
+            }
+
+            item.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent, item));
+        }
+
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerFolderMenu", Guid.NewGuid().ToString("N"));
+        var docs = Path.Combine(root, "Docs");
+        var orders = shell.Orders;
+        try
+        {
+            Directory.CreateDirectory(docs);
+            var menu = main.BuildFolderAreaMenu(main.SettingsButton, docs);
+            string?[] headers = [.. menu.Items.OfType<MenuItem>().Select(item => item.Header as string)];
+            Check("a right-click in a folder names it, and offers its own settings between what goes in it and the canvas's commands",
+                headers.Take(9).SequenceEqual(
+                [
+                    "New folder in Docs", "New text file in Docs", "Paste into Docs",
+                    "Sort Docs by", "Colour", "Add note\u2026", "Pin to Home", "Show in File Explorer", "Properties"
+                ])
+                && headers.Contains("Fit all") && headers.Contains("Folder list") && !headers.Contains("Sort by"));
+
+            var sortBy = Item(menu, "Sort Docs by")!;
+            string?[] sortHeaders = [.. sortBy.Items.OfType<MenuItem>().Select(item => item.Header as string)];
+            Check("Sort Docs by: the four columns, which way round, back to the default, and this order for every folder",
+                sortHeaders.SequenceEqual(["Name", "Date modified", "Type", "Size", "Ascending", "Descending", "Reset to the default order", "Use this order for all folders"])
+                && Item(sortBy, "Name")?.IsChecked == true && Item(sortBy, "Reset to the default order")?.IsEnabled == false);
+            Choose(Item(sortBy, "Date modified")!);
+            Check("choosing Date modified sorts that folder alone, newest first", orders.SortOf(docs) == new ItemSort(SortColumn.Modified, true) && orders.SortOf(root) == ItemSort.Default);
+            var reset = Item(Item(main.BuildFolderAreaMenu(main.SettingsButton, docs), "Sort Docs by")!, "Reset to the default order")!;
+            Check("then it can be reset", reset.IsEnabled);
+            Choose(reset);
+            Check("and reset, it is on the default again", !orders.HasOwnOrder(docs));
+
+            Check("Properties only says Alt+Enter while the folder is what is selected",
+                Item(menu, "Properties") is { InputGestureText: "" } && Item(menu, "Add note\u2026")?.Icon is TextBlock { Text: "\uE70B" });
+            shell.Tree.Selection.ReplaceSingle(docs, true, 0, SelectionSource.Navigation);
+            Check("- as the right-click that opens the menu leaves it",
+                Item(main.BuildFolderAreaMenu(main.SettingsButton, docs), "Properties") is { InputGestureText: "Alt+Enter" });
+            shell.Tree.Selection.Clear(SelectionSource.Navigation);
+
+            Choose(Item(menu, "Pin to Home")!);
+            var pinned = shell.IsPinned(docs);
+            var unpin = Item(main.BuildFolderAreaMenu(main.SettingsButton, docs), "Unpin from Home");
+            if (unpin is not null)
+            {
+                Choose(unpin);
+            }
+
+            Check("Pin to Home pins the folder, whatever is selected, and its menu then offers Unpin, which takes it off",
+                pinned && unpin is not null && !shell.IsPinned(docs));
+
+            var colour = Item(menu, "Colour")!;
+            Choose(colour.Items.OfType<MenuItem>().First(item => item.Header as string == "Red"));
+            var red = shell.Marks.Get(docs).AccentHex;
+            var again = Item(main.BuildFolderAreaMenu(main.SettingsButton, docs), "Colour")!;
+            var current = again.Items.OfType<MenuItem>().Where(item => item.InputGestureText == "Current").Select(item => item.Header as string).ToList();
+            Choose(again.Items.OfType<MenuItem>().First(item => item.Header as string == "Default"));
+            Check("Colour colours that folder, and its menu then says which colour it has",
+                red == "#EF5A68" && current.SequenceEqual(["Red"]) && shell.Marks.Get(docs).AccentHex.Length == 0);
+
+            var outside = main.BuildFolderAreaMenu(main.SettingsButton, null);
+            Check("outside every folder there is no folder to set: Sort by orders them all",
+                Item(outside, "Sort by") is not null && Item(outside, "Properties") is null && Item(outside, "Colour") is null);
+        }
+        finally
+        {
+            orders.ResetFolder(docs);
+            shell.UnpinPath(docs);
+            TryDelete(root);
+        }
+    }
+
     // ---- reset all --------------------------------------------------------------------
 
     private static async Task SettingsResetChecks(MainViewModel shell)
@@ -341,6 +575,13 @@ internal static partial class Program
     /// <summary>A click on a switch, as UI Automation makes one.</summary>
     private static void Toggle(ToggleButton toggle) =>
         ((IToggleProvider)UIElementAutomationPeer.CreatePeerForElement(toggle).GetPattern(PatternInterface.Toggle)).Toggle();
+
+    /// <summary>A click on a button, raised on it directly: its handler runs at once.</summary>
+    private static bool Click(ButtonBase button)
+    {
+        button.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent, button));
+        return true;
+    }
 
     /// <summary>A click on a button, as UI Automation makes one: it runs on the dispatcher, so settle after.</summary>
     private static void Invoke(Button button) =>

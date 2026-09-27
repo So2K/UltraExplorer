@@ -481,7 +481,8 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// A cell's colours: a dark tint of the folder's own hue, one step lighter
     /// on every other level so a child reads against its parent, and the
-    /// user's colour label over the title when there is one.
+    /// user's colour label over the title when there is one and the marks
+    /// layer is showing.
     ///
     /// Worked out once and kept on the folder under the canvas's palette
     /// stamp, which moves on only when every cell's colours may have changed
@@ -497,7 +498,9 @@ public sealed partial class NestedCanvas
         }
 
         folder.PaletteStamp = _paletteStamp;
-        var mark = folder.IsComputer ? FolderMark.None : MarkOfFolder(folder);
+
+        // With the marks layer off, every folder is drawn as if unmarked.
+        var mark = folder.IsComputer || !Shows(CanvasLayer.Marks) ? FolderMark.None : MarkOfFolder(folder);
         folder.HasNote = !string.IsNullOrWhiteSpace(mark.Note);
 
         var hue = folder.Hue;

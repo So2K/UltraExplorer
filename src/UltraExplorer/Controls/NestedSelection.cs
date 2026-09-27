@@ -122,6 +122,9 @@ internal sealed class NestedSelection
     /// <summary>Whether anything waits for a folder the tree has not read.</summary>
     public bool HasPending => _pending.Count > 0;
 
+    /// <summary>The paths of the folders something waits in (see <see cref="ResolvePending"/>).</summary>
+    public IEnumerable<string> PendingFolders => _pending.Keys;
+
     /// <summary>Every folder something selected is directly inside; for drawing, which visits only these.</summary>
     public IReadOnlyList<NestedFolder> Containers
     {

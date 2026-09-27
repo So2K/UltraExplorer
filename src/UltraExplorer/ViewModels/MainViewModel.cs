@@ -69,6 +69,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _nestedZoomLabel = "Fit";
     private Controls.NestedLeftDrag _leftDrag = Controls.NestedLeftDrag.SelectArea;
     private bool _leftDragHintShown;
+    private CanvasLayer _layers = CanvasLayer.All;
     private readonly bool _isPickerSession;
     private string? _dialogTitle;
 
@@ -382,6 +383,30 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// The nested canvas's layers that are showing (see <see cref="CanvasLayer"/>):
+    /// all of them unless the user switched some off from the layers menu,
+    /// Canvas options or Settings.  Remembered with the workspace.
+    /// </summary>
+    public CanvasLayer Layers
+    {
+        get => _layers;
+        set
+        {
+            if (SetProperty(ref _layers, value & CanvasLayer.All))
+            {
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
+    /// <summary>Whether a layer is showing.</summary>
+    public bool IsLayerShown(CanvasLayer layer) => (_layers & layer) == layer;
+
+    /// <summary>Shows or hides one layer, leaving the others as they are.</summary>
+    public void SetLayer(CanvasLayer layer, bool shown) =>
+        Layers = shown ? _layers | layer : _layers & ~layer;
+
+    /// <summary>
     /// Whether the hint that left-drag now selects has been shown - once, at
     /// the first rectangle drawn, and never again.
     /// </summary>
@@ -442,6 +467,49 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (QuickAccess.FirstOrDefault(item => item.IsCustom && ViewAllPath.Equals(item.Path, path)) is { } item)
         {
             RemoveFavorite(item);
+        }
+    }
+
+    /// <summary>Pins one folder to Home, whatever is selected: what a folder's own menu offers.</summary>
+    public void PinPath(string path)
+    {
+        PinFolders([path]);
+        _ = SaveNowAsync();
+    }
+
+    /// <summary>The Windows properties sheet of one item, whatever is selected.</summary>
+    public void ShowPropertiesOf(string path)
+    {
+        try
+        {
+            NativeShellService.ShowProperties(path);
+        }
+        catch (Exception ex)
+        {
+            Toast.ShowError(ex.Message);
+        }
+    }
+
+    /// <summary>File Explorer on one item, whatever is selected.</summary>
+    public void ShowInExplorer(string path)
+    {
+        try
+        {
+            NativeShellService.ShowInExplorer(path);
+        }
+        catch (Exception ex)
+        {
+            Toast.ShowError(ex.Message);
+        }
+    }
+
+    /// <summary>Asks for one item's note - the one it has, to edit, or a new one - and keeps what comes back.</summary>
+    public void EditNoteOf(string path, string name)
+    {
+        var note = PromptRequested?.Invoke("Note", $"Note for {name}", _marks.Get(path).Note);
+        if (note is not null)
+        {
+            Tree.ApplyNote(path, note);
         }
     }
 
@@ -566,6 +634,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Rendering.Gpu.GpuBootstrap.SetSettingPreference(Renderer);
             _leftDrag = WorkspaceState.ParseLeftDrag(state.NestedLeftDrag);
             _leftDragHintShown = state.NestedLeftDragHintShown;
+            _layers = CanvasLayers.Parse(state.CanvasLayersOff);
 
             // Handed to the tree before it builds its first layout, so the
             // drives open already in the remembered orders.  A file dialog
@@ -728,6 +797,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var renderer = _savedRenderer;
         var leftDrag = WorkspaceState.LeftDragSetting(_leftDrag);
         var hintShown = _leftDragHintShown;
+        var layersOff = CanvasLayers.OffSetting(_layers);
         if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
         {
             layout = current.CanvasLayout;
@@ -738,6 +808,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             renderer = current.CanvasRenderer;
             leftDrag = current.NestedLeftDrag;
             hintShown = current.NestedLeftDragHintShown;
+            layersOff = current.CanvasLayersOff;
         }
 
         var state = new WorkspaceState
@@ -753,6 +824,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             CanvasRenderer = renderer,
             NestedLeftDrag = leftDrag,
             NestedLeftDragHintShown = hintShown,
+            CanvasLayersOff = layersOff,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))
@@ -1411,7 +1483,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void AddSelectionToFavorites()
     {
-        foreach (var path in Tree.SelectedOrActivePaths.Where(Directory.Exists))
+        PinFolders(Tree.SelectedOrActivePaths);
+        _ = SaveNowAsync();
+    }
+
+    /// <summary>Adds each of the folders among <paramref name="paths"/> to Home, unless it is there already.</summary>
+    private void PinFolders(IEnumerable<string> paths)
+    {
+        foreach (var path in paths.Where(Directory.Exists))
         {
             if (QuickAccess.Any(item => ViewAllPath.Equals(item.Path, path)))
             {
@@ -1430,8 +1509,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _fileSystemService.AttachIcons([item]);
             QuickAccess.Add(item);
         }
-
-        _ = SaveNowAsync();
     }
 
     private void RemoveFavorite(FavoriteItemViewModel? favorite)

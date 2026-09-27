@@ -355,6 +355,11 @@ internal static partial class Program
                     Check("every name was shaped and every glyph was in the atlas", complete);
                 }
 
+                if (set.IsWarp)
+                {
+                    await GpuLayerChecksAsync(canvas, tree, files, renderer, set, labels);
+                }
+
                 // A frame at rest and one in motion, warm: the walk, the names
                 // and the draw, and nothing for the garbage collector.
                 canvas.DpiOverride = new DpiScale(1.5, 1.5);
@@ -507,6 +512,74 @@ internal static partial class Program
         Check($"which the frames after draw ({fresh.DeferredShapes} shaped on the worker, {moving.TextsDrawn} names drawn, in {clock.ElapsedMilliseconds} ms)",
             moving.TextsPending == 0 && moving.TextsDrawn > 200 && fresh.DeferredShapes > 100);
         canvas.Tree = null;
+    }
+
+    /// <summary>
+    /// The layers on the graphics card: the names it draws leave out what
+    /// WPF's leave out - less ink with the details and counts off, the two
+    /// pictures still alike - and with the files off its cells are the
+    /// raster's, the sub-folders filling the folder the files were in.
+    /// </summary>
+    private static async Task GpuLayerChecksAsync(NestedCanvas canvas, NestedTree tree, NestedFolder files, NestedGpuRenderer renderer, GpuDeviceSet set, GpuLabelTarget labels)
+    {
+        canvas.DpiOverride = new DpiScale(1, 1);
+        tree.IncludeHidden = false;
+        canvas.SetFilter(null);
+
+        // Near enough to the files that their tiles have room for their sizes.
+        canvas.FlyTo(files, 0.9, animated: false);
+        canvas.ZoomAt(new Point(ViewWidth * 0.3, ViewHeight * 0.7), 2.5);
+
+        (LabelComparison Result, double Ink) Draw()
+        {
+            Render(canvas);
+            var width = canvas.ScenePixelWidth;
+            var height = canvas.ScenePixelHeight;
+            var sceneOnly = new uint[width * height];
+            canvas.SceneBitmap!.CopyPixels(new Int32Rect(0, 0, width, height), sceneOnly, width * 4, 0);
+            var wpf = GpuLabelWpfPicture(canvas, width, height, 1);
+            using var frame = new NestedGpuFrame();
+            using var target = set.CreateOffscreenTarget(width, height);
+            canvas.RenderOffscreen(renderer, target, frame, labels);
+            var gpu = target.ReadPixels();
+            return (GpuLabelCompare(sceneOnly, wpf, gpu, width, height), GpuInk(sceneOnly, gpu, width, height));
+        }
+
+        try
+        {
+            var all = Draw();
+            canvas.ShownLayers = CanvasLayer.All & ~CanvasLayer.Details & ~CanvasLayer.FolderCounts;
+            var fewer = Draw();
+            Check($"with the details and counts off, the graphics card writes less ({fewer.Ink / all.Ink:P0} of the ink) and still what WPF writes (within {Math.Abs(fewer.Result.InkRatio - 1):P1})",
+                fewer.Ink < all.Ink * 0.97 && Math.Abs(fewer.Result.InkRatio - 1) <= 0.08 && fewer.Result.MeanDifference <= 3);
+
+            canvas.ShownLayers = CanvasLayer.All & ~CanvasLayer.Files;
+            await tree.WhenSortIdleAsync();
+            var folders = Draw();
+            Check($"with the files off, the graphics card draws the raster's picture of sub-folders alone ({folders.Result.MeanDifference:F2} levels apart on average)",
+                files.Files.Count == 0 && folders.Result.MeanDifference <= 3 && Math.Abs(folders.Result.InkRatio - 1) <= 0.08);
+        }
+        finally
+        {
+            canvas.ShownLayers = CanvasLayer.All;
+            await tree.WhenSortIdleAsync();
+        }
+    }
+
+    /// <summary>How much lighter than the cells under them the graphics card's picture is, summed: the ink of its names.</summary>
+    private static double GpuInk(uint[] scene, byte[] gpu, int width, int height)
+    {
+        static double Luminance(uint pixel) => 0.2126 * ((pixel >> 16) & 0xFF) + 0.7152 * ((pixel >> 8) & 0xFF) + 0.0722 * (pixel & 0xFF);
+        var ink = 0.0;
+        for (var y = 0; y < height; y++)
+        {
+            for (var x = 0; x < width; x++)
+            {
+                ink += Math.Max(0, Luminance(OffscreenTarget.PixelAt(gpu, width, x, y)) - Luminance(scene[y * width + x]));
+            }
+        }
+
+        return ink;
     }
 
     // ---- pictures ------------------------------------------------------------------------------

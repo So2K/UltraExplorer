@@ -441,6 +441,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
                 _tree.FolderLoaded += OnFolderLoadedForFilter;
                 _tree.FolderLoaded += OnFolderLoadedForGpu;
                 _tree.SortChanged += OnTreeSortChanged;
+                _tree.ShowFiles = Shows(CanvasLayer.Files);
 
                 // Its finished reads are taken in at the start of this
                 // canvas's frames, and what it stamps with the time is on the
@@ -614,6 +615,119 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
         _ = ResolveBeaconsAsync();
     }
 
+    /// <summary>
+    /// The layers the canvas draws (see <see cref="CanvasLayer"/>): all of
+    /// them unless some were switched off.  The files are its tree's to show
+    /// or hide (<see cref="NestedTree.ShowFiles"/>), which places the folders
+    /// again for them while the one in view holds still; the rest is what
+    /// the names and marks draw - the same calls whether the graphics card
+    /// or the processor draws them - and only needs the picture again.
+    /// </summary>
+    public CanvasLayer ShownLayers
+    {
+        get => _shownLayers;
+        set
+        {
+            value &= CanvasLayer.All;
+            if (_shownLayers == value)
+            {
+                return;
+            }
+
+            var marksChanged = ((_shownLayers ^ value) & CanvasLayer.Marks) != 0;
+            _shownLayers = value;
+            if (marksChanged)
+            {
+                // Every cell's colours and every title's pin are worked out
+                // again, with the marks or without them.
+                _paletteStamp++;
+                _pinsFrom = null;
+            }
+
+            // A file that was not on the canvas may be now, and the other way
+            // round: every beacon is looked for again.
+            _unresolvable.Clear();
+            if (_tree is { } tree && tree.ShowFiles != Shows(CanvasLayer.Files))
+            {
+                tree.ShowFiles = Shows(CanvasLayer.Files);
+                if (tree.ShowFiles)
+                {
+                    ReselectWaitingFiles(tree);
+                }
+
+                if (_filter is not null)
+                {
+                    _ = RefilterWhenPlacedAsync(tree);
+                }
+            }
+
+            RequestFrame(Layers.All);
+            _ = ResolveBeaconsAsync();
+        }
+    }
+
+    private CanvasLayer _shownLayers = CanvasLayer.All;
+
+    /// <summary>
+    /// The files back: whatever was selected among them when they went has
+    /// waited in the selection since (see <see cref="NestedSelection.ResolvePending"/>),
+    /// and nothing reads its folder again to bring it back.  Each folder
+    /// something waits in is placed with its files now, and what waited is
+    /// selected again at once.
+    /// </summary>
+    private void ReselectWaitingFiles(NestedTree tree)
+    {
+        if (!_selection.HasPending)
+        {
+            return;
+        }
+
+        var any = false;
+        foreach (var path in _selection.PendingFolders.ToArray())
+        {
+            if (tree.Find(path) is { IsLoaded: true } folder)
+            {
+                tree.EnsureLayout(folder);
+                any |= _selection.ResolvePending(folder);
+            }
+        }
+
+        if (any)
+        {
+            SelectionChangedHere();
+        }
+    }
+
+    /// <summary>
+    /// The filter judged again once the tree has placed every folder with
+    /// the files shown or hidden: the files that match come and go with them,
+    /// and a folder lit only for the files in it is lit no more.
+    /// </summary>
+    private async Task RefilterWhenPlacedAsync(NestedTree tree)
+    {
+        do
+        {
+            await tree.WhenSortIdleAsync();
+        }
+        while (ReferenceEquals(_tree, tree) && tree.IsSorting);
+
+        if (ReferenceEquals(_tree, tree) && _filter is not null)
+        {
+            SetFilter(_filterText);
+        }
+    }
+
+    /// <summary>Whether a layer is drawn.</summary>
+    private bool Shows(CanvasLayer layer) => (_shownLayers & layer) != 0;
+
+    /// <summary>
+    /// Whether a beacon is drawn: all of them, except with the marks layer
+    /// off, when only the selection's and a search's are - a colour, a note
+    /// or a pin is a mark.
+    /// </summary>
+    private bool IsShown(NestedBeacon beacon) =>
+        Shows(CanvasLayer.Marks) || (beacon.Kind & (NestedBeaconKind.Active | NestedBeaconKind.Search)) != 0;
+
     /// <summary>Everything again, from the cells up.</summary>
     public void Redraw() => RequestFrame(Layers.All);
 
@@ -671,8 +785,15 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             return null;
         }
 
-        var index = NestedTree.FileIndexAsPlaced(parent, Path.GetFileName(path));
-        return index >= 0 ? (parent, index) : null;
+        var name = Path.GetFileName(path);
+        var index = NestedTree.FileIndexAsPlaced(parent, name);
+        if (index >= 0)
+        {
+            return (parent, index);
+        }
+
+        // With the files layer off, a file is found at the folder it is in.
+        return !_tree.ShowFiles && NestedTree.HoldsFile(parent, name) ? (parent, -1) : null;
     }
 
     private static readonly Brush FolderBrush = Frozen(FolderColour);

@@ -741,7 +741,7 @@ public sealed partial class NestedCanvas
         }
 
         var title = Text(name, 12, TextBrush, 360, bold: true);
-        var mark = _markLookup?.Invoke(hover.Path) ?? FolderMark.None;
+        var mark = Shows(CanvasLayer.Marks) ? _markLookup?.Invoke(hover.Path) ?? FolderMark.None : FolderMark.None;
         var noteText = string.IsNullOrWhiteSpace(mark.Note) ? string.Empty : mark.Note.Trim();
         var second = noteText.Length > 0 ? noteText : detail;
         ScaledText? sub = second.Length > 0 ? Text(second, 11, noteText.Length > 0 ? TextBrush : TextDimBrush, 360, bold: false) : null;
@@ -763,7 +763,7 @@ public sealed partial class NestedCanvas
 
     // ---- beacons -------------------------------------------------------------
 
-    private bool IsPinned(string path) => _pinned.Count > 0 && _pinned.Contains(path);
+    private bool IsPinned(string path) => _pinned.Count > 0 && Shows(CanvasLayer.Marks) && _pinned.Contains(path);
 
     /// <summary>
     /// Reads the folders on the way to every beacon, one path at a time, so a
@@ -782,6 +782,7 @@ public sealed partial class NestedCanvas
             for (var pass = 0; pass < 4; pass++)
             {
                 var pending = _beacons
+                    .Where(IsShown)
                     .Select(beacon => beacon.Path)
                     .Where(path => !_unresolvable.Contains(path) && (ResolveAsPlaced(path) is not { } found || !NestedTree.IsOnCanvas(found.Folder)))
                     .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -827,8 +828,12 @@ public sealed partial class NestedCanvas
         }
     }
 
+    /// <summary>The beacons the last picture of the marks placed, on the view or at its edges.</summary>
+    internal int BeaconsPlaced { get; private set; }
+
     private void DrawBeacons(DrawingContext dc)
     {
+        BeaconsPlaced = 0;
         if (_tree is null || _beacons.Count == 0)
         {
             return;
@@ -838,6 +843,11 @@ public sealed partial class NestedCanvas
         var offscreen = new List<Pin>();
         foreach (var beacon in _beacons)
         {
+            if (!IsShown(beacon))
+            {
+                continue;
+            }
+
             if (ResolveAsPlaced(beacon.Path) is not { } target || TargetRect(target.Folder, target.FileIndex, place: false) is not { } rect)
             {
                 continue;
@@ -862,6 +872,7 @@ public sealed partial class NestedCanvas
             pins.Add(new Pin(beacon, target.Folder, target.FileIndex, centre, Priority(beacon.Kind)));
         }
 
+        BeaconsPlaced = pins.Count + offscreen.Count;
         DrawEdgeMarkers(dc, offscreen);
         if (pins.Count == 0)
         {

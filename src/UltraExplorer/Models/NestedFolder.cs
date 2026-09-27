@@ -445,6 +445,9 @@ public sealed class NestedFolder
     /// <summary>Whether this folder's grids were last made to fill a column at a time (see <see cref="NestedGrid.DownFirst"/>).</summary>
     internal bool PlacedDownFirst { get; set; }
 
+    /// <summary>Whether this folder was last placed with its files shown (see <see cref="NestedTree.ShowFiles"/>).</summary>
+    internal bool PlacedShowFiles { get; set; } = true;
+
     /// <summary>Files that were counted but not listed, past <see cref="NestedTree.MaximumFiles"/>.</summary>
     public int UnlistedFileCount { get; internal set; }
 

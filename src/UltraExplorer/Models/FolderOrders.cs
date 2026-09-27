@@ -130,7 +130,7 @@ public sealed class FolderOrders
             ? entry.Sort
             : _default;
 
-    /// <summary>Whether a folder has an order of its own that is being used, which "Reset this folder" would undo.</summary>
+    /// <summary>Whether a folder has an order of its own that is being used, which "Reset to the default order" would undo.</summary>
     public bool HasOwnOrder(string? path) =>
         HasFolderOrders && !string.IsNullOrEmpty(path) && _folders.ContainsKey(path);
 
@@ -223,7 +223,7 @@ public sealed class FolderOrders
         Changed?.Invoke(path);
     }
 
-    /// <summary>"Reset this folder to the default order": its own order let go of.</summary>
+    /// <summary>"Reset to the default order": its own order let go of.</summary>
     public void ResetFolder(string path)
     {
         if (Forget(path))

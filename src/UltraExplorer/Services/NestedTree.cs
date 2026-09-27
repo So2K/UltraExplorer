@@ -137,7 +137,8 @@ public sealed partial class NestedTree : IDisposable
 
     /// <summary>
     /// Raised the moment any order changes - a folder's own, the default, the
-    /// scope or the way grids fill - before a single folder has been placed
+    /// scope or the way grids fill - or files are shown or hidden
+    /// (<see cref="ShowFiles"/>), before a single folder has been placed
     /// for it: every folder is still where the last picture showed it, which
     /// is when the canvas has to note what it is looking at if the view is to
     /// stay still while the contents move.
@@ -207,6 +208,34 @@ public sealed partial class NestedTree : IDisposable
             RefilterAll();
         }
     }
+
+    /// <summary>
+    /// Whether folders show their files - the Files layer of the canvas.
+    /// Switched off, no folder has files on the canvas: none are drawn, hit,
+    /// selected or stepped to, and each folder's sub-folders are placed in
+    /// the whole of it rather than in their share above the files.  Every
+    /// folder read keeps its files all the same, and says how many it has
+    /// (<see cref="NestedFolder.FileCount"/>).  Placed again like a change
+    /// of the way grids fill: the folder being looked at is held still (see
+    /// <see cref="SortChanged"/>), and the background pass places the rest
+    /// a few milliseconds at a time.
+    /// </summary>
+    public bool ShowFiles
+    {
+        get => _showFiles;
+        set
+        {
+            if (_showFiles == value)
+            {
+                return;
+            }
+
+            _showFiles = value;
+            OnOrdersChanged(null);
+        }
+    }
+
+    private bool _showFiles = true;
 
     /// <summary>
     /// Whether drawing a folder may start reading it.  Off only where the tree
@@ -414,6 +443,9 @@ public sealed partial class NestedTree : IDisposable
         EnsureLayout(folder);
         return FileIndexAsPlaced(folder, name);
     }
+
+    /// <summary>Whether a folder read holds a file of this name, shown or not.</summary>
+    internal static bool HoldsFile(NestedFolder folder, string name) => SearchFiles(folder.AllFiles, name) >= 0;
 
     /// <summary>
     /// <see cref="FindFileIndex"/> among the tiles as the folder is placed

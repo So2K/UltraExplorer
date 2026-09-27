@@ -331,6 +331,55 @@
                     </Border>
                 </controls:SettingCard>
 
+                <controls:SettingCard Glyph="&#xE81E;"
+                                      Header="Minimap"
+                                      Description="{Binding MinimapDescription}">
+                    <CheckBox x:Name="MinimapSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding IsMinimapVisible}"
+                              IsEnabled="{Binding CanShowMinimap}"
+                              AutomationProperties.Name="Minimap" />
+                </controls:SettingCard>
+
+                <!-- Layers: the switches of the layers menu in the canvas's corner. -->
+                <TextBlock Text="Layers" Style="{StaticResource SectionHeading}" />
+
+                <controls:SettingCard Glyph="&#xE8A5;"
+                                      Header="Files"
+                                      Description="File tiles. Off, each folder shows only its sub-folders, which then fill it; its title still counts its files.">
+                    <CheckBox x:Name="FilesLayerSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowFiles}"
+                              AutomationProperties.Name="Files" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8B9;"
+                                      Header="Icons"
+                                      Description="The icons of files and folders beside their names.">
+                    <CheckBox x:Name="IconsLayerSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowIcons}"
+                              AutomationProperties.Name="Icons" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE946;"
+                                      Header="Details"
+                                      Description="The size, date or type a file's tile shows beside its name.">
+                    <CheckBox x:Name="DetailsLayerSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowDetails}"
+                              AutomationProperties.Name="Details" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8B7;"
+                                      Header="Folder counts"
+                                      Description="How many folders and files a folder holds, on its title.">
+                    <CheckBox x:Name="FolderCountsLayerSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowFolderCounts}"
+                              AutomationProperties.Name="Folder counts" />
+                </controls:SettingCard>
+
                 <controls:SettingCard Glyph="&#xE890;"
                                       Header="Hidden items"
                                       Description="Show the files and folders Windows marks as hidden.">
@@ -340,14 +389,23 @@
                               AutomationProperties.Name="Hidden items" />
                 </controls:SettingCard>
 
-                <controls:SettingCard Glyph="&#xE81E;"
-                                      Header="Minimap"
-                                      Description="{Binding MinimapDescription}">
-                    <CheckBox x:Name="MinimapSwitch"
+                <controls:SettingCard Glyph="&#xE790;"
+                                      Header="Marks and notes"
+                                      Description="Colours, notes and pins on folders and files, and the beacons that find them.">
+                    <CheckBox x:Name="MarksLayerSwitch"
                               Style="{StaticResource ToggleSwitch}"
-                              IsChecked="{Binding IsMinimapVisible}"
-                              IsEnabled="{Binding CanShowMinimap}"
-                              AutomationProperties.Name="Minimap" />
+                              IsChecked="{Binding ShowMarks}"
+                              AutomationProperties.Name="Marks and notes" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE81E;"
+                                      Header="All layers"
+                                      Description="Every layer back on. Hidden items stay as they are.">
+                    <Button x:Name="ShowAllLayersButton"
+                            Style="{StaticResource CardButton}"
+                            Content="Show all"
+                            Command="{Binding ShowAllLayersCommand}"
+                            AutomationProperties.Name="Show all layers" />
                 </controls:SettingCard>
 
                 <!-- Sorting and order -->

@@ -217,7 +217,7 @@ public sealed partial class NestedTree
             // order when it is read.  Placed in that order already - its own
             // order set to what it showed anyway - nothing moves.
             if (Find(path) is not { LayoutSortGeneration: >= 0 } folder
-                || folder.PlacedSort == SortOf(folder) && folder.PlacedDownFirst == DownFirstIn(folder))
+                || folder.PlacedSort == SortOf(folder) && folder.PlacedDownFirst == DownFirstIn(folder) && folder.PlacedShowFiles == _showFiles)
             {
                 return;
             }
@@ -471,7 +471,18 @@ public sealed partial class NestedTree
         // already have, so it asks for nothing at all.
         var listingOrder = sort.IsDefault || folder.IsComputer;
         IReadOnlyList<NestedFile> files;
-        if (!listingOrder)
+        if (!_showFiles)
+        {
+            // The Files layer is off: the sub-folders are still put in the
+            // order, and no file is shown or ordered.
+            if (!listingOrder)
+            {
+                OrderFolders(visible, sort);
+            }
+
+            files = [];
+        }
+        else if (!listingOrder)
         {
             // Only which cell and which tile each one gets changes: the grids
             // depend on how many there are, not on which is which.
@@ -520,6 +531,7 @@ public sealed partial class NestedTree
         folder.LayoutSortGeneration = SortGeneration;
         folder.PlacedSort = sort;
         folder.PlacedDownFirst = downFirst;
+        folder.PlacedShowFiles = _showFiles;
     }
 
     /// <summary>
@@ -613,16 +625,20 @@ public sealed partial class NestedTree
         // its own order came back - or with too little in it for any order
         // to differ - one sub-folder and one file go where they go - or This
         // PC, whose drives are never reordered: the places are right, only
-        // the stamp is old.
+        // the stamp is old.  Files shown or hidden since it was placed move
+        // everything in a folder that has any, whatever its order.
         var sort = SortOf(folder);
         var downFirst = DownFirstIn(folder);
-        if (folder.PlacedSort == sort && folder.PlacedDownFirst == downFirst
-            || folder.IsComputer
-            || folder.Children.Count < 2 && folder.Files.Count < 2)
+        var filesAsPlaced = folder.PlacedShowFiles == _showFiles || folder.AllFiles.Length == 0;
+        if (filesAsPlaced
+            && (folder.PlacedSort == sort && folder.PlacedDownFirst == downFirst
+                || folder.IsComputer
+                || folder.Children.Count < 2 && folder.Files.Count < 2))
         {
             folder.LayoutSortGeneration = SortGeneration;
             folder.PlacedSort = sort;
             folder.PlacedDownFirst = downFirst;
+            folder.PlacedShowFiles = _showFiles;
             return false;
         }
 

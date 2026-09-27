@@ -433,6 +433,12 @@ public partial class MainWindow
                 // places what is on screen at once and the rest behind it.
                 UpdateSortHeaders();
                 break;
+            case nameof(MainViewModel.Layers):
+                // The files come and go through the tree's pass, like a change
+                // of the way grids fill; the rest is only drawn again.
+                Nested.ShownLayers = _viewModel.Layers;
+                ScheduleBeacons();
+                break;
         }
     }
 
@@ -454,28 +460,21 @@ public partial class MainWindow
     }
 
     /// <summary>
-    /// The folder the headers show and change the order of.  With several
-    /// things selected, the one with the focus decides.  Null for none -
-    /// This PC in view with nothing selected - where a header orders every
-    /// folder.
+    /// The folder the headers show and change the order of, and Canvas
+    /// options' Sort by with them.  With several things selected, the one
+    /// with the focus decides.  Null for none - This PC in view with nothing
+    /// selected - where a header orders every folder.
     ///
-    /// On the nested canvas: the folder the selected item sits in - a file
-    /// or a sub-folder alike, since both are items of the folder around
-    /// them, as a row picked in Explorer is and a header click there sorts
-    /// the list it is in - else the folder in view.  In a folder of
-    /// sub-folders nearly every click selects one of them, and a header
-    /// clicked next is about the folder being looked at, not the inside of
-    /// whichever sub-folder was clicked last.  The selection only decides
-    /// while it is in what the view is on - the folder in view or something
-    /// inside it: a drive selected at the start, or a file picked in another
-    /// folder an hour ago, is not what anybody sorting the folder in front
-    /// of them means.  A particular sub-folder is sorted by flying into it,
-    /// or from Sort by on its own background.
+    /// On the nested canvas: the folder being worked with - the folder
+    /// selected, or the one the selected file is in - else the folder in
+    /// view (see <see cref="NestedSortFolder"/>).  A sub-folder picked is
+    /// the one sorted, not the folder around it: whoever selects a folder
+    /// and clicks a header means that folder's contents.
     ///
     /// On the tree: the folder selected, whose children open out around it,
     /// else the folder the selected files are in, else the active one.
     /// </summary>
-    private string? SortFolder()
+    internal string? SortFolder()
     {
         // Worked out once per change of the selection: this is asked after
         // every move of the camera.
@@ -484,23 +483,19 @@ public partial class MainWindow
         {
             _sortSelectionVersion = selection.Version;
             _sortSelectionFolder = null;
-            _sortSelectionContainer = null;
             if (selection.Count > 0)
             {
                 var primary = selection.Focus is { } focus && selection.Contains(focus) ? focus : selection.Paths[0];
                 if (selection.TryGetItem(primary, out var item))
                 {
-                    _sortSelectionContainer = Path.GetDirectoryName(primary);
-                    _sortSelectionFolder = item.IsDirectory ? primary : _sortSelectionContainer;
+                    _sortSelectionFolder = item.IsDirectory ? primary : Path.GetDirectoryName(primary);
                 }
             }
         }
 
         if (IsNested)
         {
-            var container = _sortSelectionContainer;
-            var inView = Nested.FolderInView?.FullPath;
-            return container is not null && (inView is null || IsSameOrInside(container, inView)) ? container : inView;
+            return NestedSortFolder(_sortSelectionFolder, Nested.FolderInView?.FullPath);
         }
 
         if (_sortSelectionFolder is { } selected)
@@ -513,6 +508,19 @@ public partial class MainWindow
             : null;
     }
 
+    /// <summary>
+    /// The nested canvas's rule for the folder the headers sort, from the
+    /// folder the selection names - the folder selected, or the one the
+    /// selected file is in - and the folder in view: the selection's while
+    /// it is the folder in view or inside it, the folder in view otherwise.
+    /// A drive selected at the start, or a file picked in another folder an
+    /// hour ago, is not what anybody sorting the folder in front of them
+    /// means.  With no folder in view - an overview of This PC - the
+    /// selection's, or null, every folder, when nothing is selected.
+    /// </summary>
+    internal static string? NestedSortFolder(string? selected, string? inView) =>
+        selected is not null && (inView is null || IsSameOrInside(selected, inView)) ? selected : inView;
+
     /// <summary>Whether <paramref name="path"/> is <paramref name="folder"/> or somewhere inside it.</summary>
     private static bool IsSameOrInside(string path, string folder) =>
         path.StartsWith(folder, StringComparison.OrdinalIgnoreCase)
@@ -520,11 +528,8 @@ public partial class MainWindow
 
     private long _sortSelectionVersion = -1;
 
-    /// <summary>The selected folder, or the folder the selected file is in: what the tree's headers sort.</summary>
+    /// <summary>The selected folder, or the folder the selected file is in: what the headers sort, on the nested canvas while it is in view.</summary>
     private string? _sortSelectionFolder;
-
-    /// <summary>The folder the selected item is in, file or folder: what the nested canvas's headers sort.</summary>
-    private string? _sortSelectionContainer;
 
     // What the headers last showed: they are brought up to date on every
     // move of the camera, and nearly always nothing they show has changed.
@@ -728,10 +733,12 @@ public partial class MainWindow
     /// Everything the user has put on a folder, gathered into one list of
     /// beacons: colours and notes from the mark store, folders pinned to Home,
     /// the folder that is selected, and while a search is open, what it found.
-    /// A mark on a file shows on the folder it is in.
+    /// A mark on a file shows on the folder it is in.  With the marks layer
+    /// off, the colours, notes and pins are left out.
     /// </summary>
     private void RebuildBeacons()
     {
+        var marks = _viewModel.IsLayerShown(CanvasLayer.Marks);
         var beacons = new Dictionary<string, (NestedBeaconKind Kind, Color Colour, string Label, string Note)>(StringComparer.OrdinalIgnoreCase);
 
         void Add(string path, NestedBeaconKind kind, Color? colour, string label, string note = "")
@@ -754,7 +761,7 @@ public partial class MainWindow
             beacons[path] = (kind, colour ?? NoteBeaconColour, label, note);
         }
 
-        foreach (var (path, mark) in _viewModel.Marks.Snapshot())
+        foreach (var (path, mark) in marks ? _viewModel.Marks.Snapshot() : [])
         {
             var kind = NestedBeaconKind.None;
             Color? colour = null;
@@ -775,7 +782,7 @@ public partial class MainWindow
             }
         }
 
-        foreach (var pinned in _viewModel.QuickAccess.Where(item => item.IsCustom))
+        foreach (var pinned in _viewModel.QuickAccess.Where(item => marks && item.IsCustom))
         {
             Add(pinned.Path, NestedBeaconKind.Pinned, PinBeaconColour, pinned.Name);
         }

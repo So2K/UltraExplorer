@@ -900,7 +900,8 @@ public sealed partial class NestedCanvas
         var right = job.X + job.W - font * 0.5;
 
         var iconSize = Math.Min(job.H * 0.72, 20);
-        if (iconSize >= 9 && target.DrawIcon(folder, job.Index, file, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize)))
+        if (iconSize >= 9 && Shows(CanvasLayer.Icons)
+            && target.DrawIcon(folder, job.Index, file, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize)))
         {
             cursor += iconSize + font * 0.4;
         }
@@ -913,7 +914,7 @@ public sealed partial class NestedCanvas
         }
 
         var mark = FolderMark.None;
-        if (HoldsMarks(folderFacts))
+        if (Shows(CanvasLayer.Marks) && HoldsMarks(folderFacts))
         {
             var facts = FactsOf(folder, file);
             mark = MarkOf(folder, file, facts);
@@ -936,7 +937,7 @@ public sealed partial class NestedCanvas
         var column = folder.PlacedSort.Column;
         var asked = column is SortColumn.Modified or SortColumn.Type;
         var nameRoom = font * (asked ? 3.5 : 5);
-        if (job.W >= (asked ? 120 : 190) && FileDetailText(column, file, dateOnly: false) is { Length: > 0 } text)
+        if (job.W >= (asked ? 120 : 190) && Shows(CanvasLayer.Details) && FileDetailText(column, file, dateOnly: false) is { Length: > 0 } text)
         {
             var detail = target.Text(text, font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
 
@@ -1397,7 +1398,7 @@ public sealed partial class NestedCanvas
                 }
             }
 
-            if (job.W >= 280 && DetailText(folder, facts) is { Length: > 0 } detail)
+            if (job.W >= 280 && TitleDetail(folder, facts) is { Length: > 0 } detail)
             {
                 var info = target.Text(detail, font * 0.78, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
 
@@ -1422,11 +1423,14 @@ public sealed partial class NestedCanvas
                 }
             }
 
-            var glyph = target.Text(Glyph(folder), font * 0.9, GlyphColour(folder), double.MaxValue, LabelFace.Icons, scaled: true);
-            if (right - cursor > glyph.Width + font)
+            if (Shows(CanvasLayer.Icons))
             {
-                target.DrawText(glyph, new Point(cursor, job.Y + (header - glyph.Height) / 2 + font * 0.05));
-                cursor += glyph.Width + font * 0.4;
+                var glyph = target.Text(Glyph(folder), font * 0.9, GlyphColour(folder), double.MaxValue, LabelFace.Icons, scaled: true);
+                if (right - cursor > glyph.Width + font)
+                {
+                    target.DrawText(glyph, new Point(cursor, job.Y + (header - glyph.Height) / 2 + font * 0.05));
+                    cursor += glyph.Width + font * 0.4;
+                }
             }
 
             var available = right - cursor;
@@ -1467,6 +1471,11 @@ public sealed partial class NestedCanvas
         {
             message = folder.IsComputer ? string.Empty : "Reading…";
         }
+        else if (folder.Children.Count == 0 && !Shows(CanvasLayer.Files) && FilesBehindLayer(folder) is > 0 and var files)
+        {
+            // The files are not drawn, but the folder is not empty.
+            message = files == 1 ? "1 file" : NoteText(FilesNote, files);
+        }
         else if (folder.Children.Count == 0 && folder.Files.Count == 0)
         {
             message = folder.FileCount switch
@@ -1476,7 +1485,7 @@ public sealed partial class NestedCanvas
                 _ => NoteText(HiddenFilesNote, folder.FileCount)
             };
         }
-        else if (folder.UnlistedFileCount > 0)
+        else if (folder.UnlistedFileCount > 0 && Shows(CanvasLayer.Files))
         {
             message = NoteText(UnlistedFilesNote, folder.UnlistedFileCount);
             var text = target.Text(message, Math.Clamp(job.W * 0.018, 9, 14), TextDimColour, job.W - 16, LabelFace.Regular, scaled: true);
@@ -1509,6 +1518,11 @@ public sealed partial class NestedCanvas
     private const int HiddenFilesNote = 1;
     private const int UnlistedFilesNote = 2;
     private const int TruncatedNote = 3;
+    private const int FilesNote = 4;
+
+    /// <summary>The files the files layer keeps off a folder: every one it counted, less the hidden ones while hidden items are not shown.</summary>
+    private int FilesBehindLayer(NestedFolder folder) =>
+        _tree is { IncludeHidden: true } ? folder.FileCount : folder.FileCount - folder.HiddenFileCount;
 
     /// <summary>
     /// One of the notes with a count in it, made once per count rather than
@@ -1526,12 +1540,29 @@ public sealed partial class NestedCanvas
         {
             HiddenFilesNote => $"{count:N0} hidden files",
             UnlistedFilesNote => $"{count:N0} more files are not drawn",
+            FilesNote => $"{count:N0} files",
             _ => $"Only the first {count:N0} folders are shown"
         });
     }
 
     /// <summary>What a title says on its right: a drive's free space, or how many folders and files a folder holds.</summary>
     internal string DetailText(NestedFolder folder) => DetailText(folder, null);
+
+    /// <summary>
+    /// <see cref="DetailText(NestedFolder, FolderFacts?)"/> as a title shows
+    /// it: with the folder counts layer off, a folder's title keeps only the
+    /// date its order is about; a drive's free space is no count, and stays.
+    /// </summary>
+    private string TitleDetail(NestedFolder folder, FolderFacts facts)
+    {
+        var detail = DetailText(folder, facts);
+        return Shows(CanvasLayer.FolderCounts) || detail.Length == 0 || !ReferenceEquals(detail, facts.Detail)
+            ? detail
+            : facts.DetailDate;
+    }
+
+    /// <summary><see cref="TitleDetail"/> for a folder, for tests: what its title says on its right.</summary>
+    internal string TitleDetailForTests(NestedFolder folder) => TitleDetail(folder, FactsOf(folder));
 
     /// <summary>
     /// <see cref="DetailText(NestedFolder)"/>, kept on the folder's facts with
@@ -2525,6 +2556,52 @@ public sealed partial class NestedCanvas
         finally
         {
             _inFrameLoop = false;
+        }
+    }
+
+    /// <summary>
+    /// For tests: the calls the last walk's labels make, into a target that
+    /// only notes them - each text with its face, the icons asked for and the
+    /// rectangles filled.  The same calls reach WPF and the graphics card, so
+    /// what a layer leaves out can be read off them for both.
+    /// </summary>
+    internal (List<(string Text, LabelFace Face)> Texts, int Icons, int Rectangles) RecordLabelCallsForTests()
+    {
+        var recorder = new RecordingTarget();
+        DrawLabelLayer(recorder);
+        return (recorder.Texts, recorder.Icons, recorder.Rectangles);
+    }
+
+    /// <summary>A target that draws nothing and notes every call, with every text a plain width per character and every icon found.</summary>
+    private sealed class RecordingTarget : LabelTarget
+    {
+        public List<(string Text, LabelFace Face)> Texts { get; } = [];
+
+        public int Icons { get; private set; }
+
+        public int Rectangles { get; private set; }
+
+        public override LabelText Text(string text, double size, Color ink, double maxWidth, LabelFace face, bool scaled) =>
+            new(text, Math.Min(maxWidth, text.Length * size * 0.5), size * 1.3, Count: (int)face);
+
+        public override void DrawText(in LabelText text, Point origin)
+        {
+            if (text.Handle is string written)
+            {
+                Texts.Add((written, (LabelFace)text.Count));
+            }
+        }
+
+        public override void FillRect(Rect bounds, Color colour) => Rectangles++;
+
+        public override void FillRounded(Rect bounds, double radius, Color colour)
+        {
+        }
+
+        public override bool DrawIcon(NestedFolder folder, int fileIndex, in NestedFile file, Rect bounds)
+        {
+            Icons++;
+            return true;
         }
     }
 

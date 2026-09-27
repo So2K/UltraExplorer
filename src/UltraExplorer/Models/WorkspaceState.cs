@@ -63,6 +63,13 @@ public sealed class WorkspaceState
     /// <summary>Whether the one-time hint that left-drag now selects has been shown.</summary>
     public bool NestedLeftDragHintShown { get; set; }
 
+    /// <summary>
+    /// The canvas layers switched off, by name - "Files", "Icons", "Details",
+    /// "FolderCounts", "Marks" (see <see cref="CanvasLayers"/>).  Missing or
+    /// empty, every layer shows; a name not understood is ignored.
+    /// </summary>
+    public List<string>? CanvasLayersOff { get; set; }
+
     public static Controls.NestedLeftDrag ParseLeftDrag(string? setting) =>
         string.Equals(setting?.Trim(), "pan", StringComparison.OrdinalIgnoreCase)
             ? Controls.NestedLeftDrag.Pan
