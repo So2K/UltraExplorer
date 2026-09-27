@@ -161,6 +161,8 @@ internal static partial class Program
 
         Check("drive root keeps its separator", ViewAllPath.Normalize(@"C:\") == @"C:\");
         Check("trailing separator is trimmed", ViewAllPath.Normalize(root + @"\") == ViewAllPath.Normalize(root));
+        Check("a folder named like a variable keeps its name",
+            ViewAllPath.Normalize(@"C:\data\%USERNAME%") == @"C:\data\%USERNAME%");
         Check("node ids are deterministic",
             ViewAllNodeIdentity.FromPath(root) == ViewAllNodeIdentity.FromPath(root.ToUpperInvariant()));
 

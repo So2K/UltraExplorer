@@ -484,9 +484,22 @@ public static class ViewAllNodeIdentity
 
 public static class ViewAllPath
 {
+    /// <summary>
+    /// The one spelling of a path every map and comparison uses: full, with
+    /// no separator at the end unless it is a root.
+    ///
+    /// Environment variables are deliberately not expanded: this is handed
+    /// real paths off the disk, and a folder may really be called
+    /// <c>%APPDATA%</c> or <c>%USERNAME%</c> (installers that forget to
+    /// expand them leave such folders behind).  Expanded, such a folder
+    /// stood for another one - the list, the canvas, marks, and Delete,
+    /// Paste and Rename acted on <c>C:\data\john</c> for
+    /// <c>C:\data\%USERNAME%</c>.  What a person types is expanded where it
+    /// is typed: the address bar and the file dialog's name box.
+    /// </summary>
     public static string Normalize(string path)
     {
-        var fullPath = Path.GetFullPath(Environment.ExpandEnvironmentVariables(path.Trim().Trim('"')));
+        var fullPath = Path.GetFullPath(path.Trim().Trim('"'));
         var root = Path.GetPathRoot(fullPath);
         if (!string.IsNullOrEmpty(root) &&
             string.Equals(fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
