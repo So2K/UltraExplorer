@@ -483,7 +483,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             text = $"{informational[..plus]} ({commit[..Math.Min(7, commit.Length)]})";
         }
 
-        var file = assembly.Location is { Length: > 0 } location ? location : Environment.ProcessPath;
+        // The running exe, not the assembly: a single-file build has no
+        // assembly file of its own to date.
+        var file = Environment.ProcessPath;
         if (file is not null && File.Exists(file))
         {
             text += ", built " + File.GetLastWriteTime(file).ToString("d MMMM yyyy", CultureInfo.CurrentCulture);
