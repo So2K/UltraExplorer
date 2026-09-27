@@ -1,5 +1,9 @@
-# Builds UltraExplorer on every push and pull request, and publishes a
-# self-contained single-file release when a version tag (v1.2.3) is pushed.
+# Builds UltraExplorer on every push and pull request, packages it two ways -
+# a portable zip holding the self-contained single-file exe, and an installer
+# (Setup.exe, Inno Setup) that installs that exe with Start menu shortcuts and
+# an uninstaller - and publishes both as a release when a version tag (v1.2.3)
+# is pushed.  Every run keeps the packages as workflow artifacts, so a build of
+# any branch can be downloaded and tried.
 name: Build and release
 
 on:
@@ -22,24 +26,92 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      # A tag v1.2.3 is version 1.2.3 (v1.2.3-beta.1 is 1.2.3-beta.1, file
+      # version 1.2.3); any other build is 0.0.0-ci.<run number>.  The ref
+      # comes in through the environment, never pasted into the script.
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        env:
+          REF: ${{ github.ref }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if ($env:REF.StartsWith('refs/tags/v')) {
+            $version = $env:REF.Substring('refs/tags/v'.Length)
+          } else {
+            $version = "0.0.0-ci.$env:RUN_NUMBER"
+          }
+          if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)(\.\d+)?(-[0-9A-Za-z.-]+)?$') {
+            throw "A release tag looks like v1.2.3 or v1.2.3-beta.1, not '$env:REF'."
+          }
+          $fileVersion = ($version -split '-', 2)[0]
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "file_version=$fileVersion" >> $env:GITHUB_OUTPUT
+          Write-Host "Version $version (file version $fileVersion)"
+
       - name: Build the app and the checks
         run: |
           dotnet build src/UltraExplorer/UltraExplorer.csproj -c Release -nologo
           dotnet build tests/ViewAllSmoke/ViewAllSmoke.csproj -c Release -nologo
 
       - name: Publish a self-contained single file
-        if: startsWith(github.ref, 'refs/tags/v')
         shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           dotnet publish src/UltraExplorer/UltraExplorer.csproj -c Release -r win-x64 -o publish `
             --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true `
-            -p:EnableCompressionInSingleFile=true -nologo
+            -p:EnableCompressionInSingleFile=true "-p:Version=$env:VERSION" -nologo
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
+
+      # The packages carry no version in their names, so a link to
+      # releases/latest/download/<name> always gets the newest one.
+      - name: Pack the portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path packages | Out-Null
           Copy-Item LICENSE, README.md publish/
-          Compress-Archive -Path publish/UltraExplorer.exe, publish/LICENSE, publish/README.md -DestinationPath UltraExplorer-win-x64.zip
+          Compress-Archive -Path publish/UltraExplorer.exe, publish/LICENSE, publish/README.md `
+            -DestinationPath packages/UltraExplorer-win-x64.zip
+
+      # Inno Setup comes with the Windows runner images; it is installed from
+      # Chocolatey only where an image no longer has it.
+      - name: Build the installer
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          FILE_VERSION: ${{ steps.version.outputs.file_version }}
+        run: |
+          function Find-Iscc {
+            $command = Get-Command iscc.exe -ErrorAction SilentlyContinue
+            if ($command) { return $command.Source }
+            Get-ChildItem -Path "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
+              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          }
+          $iscc = Find-Iscc
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw "Installing Inno Setup failed with exit code $LASTEXITCODE." }
+            $iscc = Find-Iscc
+          }
+          if (-not $iscc) { throw 'Inno Setup (ISCC.exe) was not found.' }
+          Write-Host "Using $iscc"
+          & $iscc "/DAppVersion=$env:VERSION" "/DAppFileVersion=$env:FILE_VERSION" `
+            "/DPublishDir=..\publish" "/DOutputDir=..\packages" installer\UltraExplorer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
+
+      - name: Keep the packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: UltraExplorer-${{ steps.version.outputs.version }}-win-x64
+          path: packages/*
+          if-no-files-found: error
+          retention-days: 14
 
       - name: Create the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: UltraExplorer-win-x64.zip
+          files: packages/*
           generate_release_notes: true
+          prerelease: ${{ contains(steps.version.outputs.version, '-') }}

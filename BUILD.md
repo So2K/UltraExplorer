@@ -22,8 +22,26 @@ it. Run it again to update: it closes the installed copy (which saves its
 state), replaces it and, with `-Launch`, starts it. `-Desktop` also adds a
 desktop shortcut. Settings stay in `%LOCALAPPDATA%\UltraExplorer`.
 
-Pushing a `v*` tag builds a self-contained single-file `UltraExplorer.exe` on
-GitHub Actions (`.github/workflows/release.yml`) and attaches it to a release.
+Every push and pull request builds, on GitHub Actions
+(`.github/workflows/release.yml`), a self-contained single-file
+`UltraExplorer.exe` and packs it twice: `UltraExplorer-win-x64.zip` (portable)
+and `UltraExplorer-Setup-x64.exe`, an Inno Setup installer made from
+[`installer/UltraExplorer.iss`](installer/UltraExplorer.iss). Both are kept as
+the run's artifacts; pushing a `v*` tag (`v1.2.3`, `v1.2.3-beta.1`) stamps
+that version into the exe and the installer and attaches both to a release.
+
+The installer installs per user without elevation into the same folder as
+`install.ps1` (or, on request, for all users into Program Files), adds the
+Start menu shortcut with the app's taskbar id, an optional desktop shortcut and
+an uninstaller. The uninstaller also removes the file-dialog COM registration
+(`--register-picker`) when it points at the copy being removed; settings in
+`%LOCALAPPDATA%\UltraExplorer` are kept. To build it by hand, publish as in
+[Publish](#publish) below and run Inno Setup 6.3+ on that folder (paths are
+relative to the script); the setup lands in `artifacts\installer\`:
+
+```powershell
+iscc /DAppVersion=1.2.3 /DPublishDir=..\artifacts\win-x64 installer\UltraExplorer.iss
+```
 
 ## Run
 

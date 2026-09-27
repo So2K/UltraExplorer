@@ -47,9 +47,18 @@ works like the Explorer you know, with a map of everything underneath.
 
 ## Install
 
-**Download:** grab `UltraExplorer-win-x64.zip` from the
-[latest release](../../releases/latest), unzip it anywhere and run
-`UltraExplorer.exe`. It is a single self-contained file: no .NET install needed.
+**Installer:** download
+[`UltraExplorer-Setup-x64.exe`](../../releases/latest/download/UltraExplorer-Setup-x64.exe)
+from the [latest release](../../releases/latest) and run it. It installs for
+you alone, without administrator rights, into
+`%LOCALAPPDATA%\Programs\UltraExplorer` (or for all users, if you choose so),
+adds UltraExplorer to the Start menu and to Apps → Installed apps, and updates
+an earlier copy in place. No .NET install needed.
+
+**Portable:** grab
+[`UltraExplorer-win-x64.zip`](../../releases/latest/download/UltraExplorer-win-x64.zip),
+unzip it anywhere and run `UltraExplorer.exe`. It is a single self-contained
+file.
 
 **From source** (Windows 10 1903+ / 11, x64, [.NET 10 SDK](https://dotnet.microsoft.com/download)):
 
