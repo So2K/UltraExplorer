@@ -572,44 +572,6 @@ internal static partial class Program
         Check("clearing it goes back to the colour of the path", alpha.BranchColor == before);
     }
 
-    private static Task EverythingSearch()
-    {
-        Section("Everything search");
-
-        var everything = new EverythingSearchService();
-        Check($"the SDK is looked for and reported ({everything.LibraryPath ?? "not found"})",
-            everything.LibraryPath is null || File.Exists(everything.LibraryPath));
-        Check("availability implies a library",
-            !everything.IsAvailable || everything.LibraryPath is not null);
-        Check("an unavailable engine says why",
-            everything.IsAvailable || everything.UnavailableReason.Length > 0);
-
-        // Everything restricts a search to a subtree with a path term; getting
-        // this wrong silently searches the whole disk instead of the folder.
-        Check("an unscoped search is the query itself",
-            EverythingSearchService.BuildSearch("  report  ", null) == "report");
-        Check("a scoped search becomes a path term",
-            EverythingSearchService.BuildSearch("report", @"D:\Games")
-                == @"path:""D:\Games"" report");
-        Check("a trailing separator is trimmed off the scope",
-            EverythingSearchService.BuildSearch("report", @"D:\Games\")
-                == @"path:""D:\Games"" report");
-        Check("a drive root keeps its letter",
-            EverythingSearchService.BuildSearch("report", @"D:\")
-                .StartsWith(@"path:""D:""", StringComparison.Ordinal));
-
-        Check("IPC failure is explained in words", EverythingSearchService.DescribeError(2).Contains("not running"));
-        Check("an unknown code still says something", EverythingSearchService.DescribeError(99).Contains("99"));
-
-        // Asking an unavailable engine must be harmless, not an exception.
-        var empty = everything.IsAvailable
-            ? []
-            : everything.SearchAsync("anything", null, 10, CancellationToken.None).GetAwaiter().GetResult();
-        Check("an unavailable engine returns nothing rather than throwing", empty.Count == 0);
-
-        return Task.CompletedTask;
-    }
-
     private static Task ProgramTargets()
     {
         Section("dropping onto a program");

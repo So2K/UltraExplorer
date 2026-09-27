@@ -32,6 +32,12 @@ works like the Explorer you know, with a map of everything underneath.
 - **Find things on a huge map.** Colour marks, notes and pins stay visible as
   beacons at any zoom, with arrows at the edge for what is off screen. A name
   filter (`report`, `*.png`, `a;b`) lights up matches.
+- **Search every drive, this folder first.** Results appear as you type, what
+  is in the folder you are in on top, then everything else; exact names first,
+  `node_modules` and caches last. They stay up while you move around the
+  canvas: ↑↓ to walk them, Enter to show one, Ctrl+Enter to open. Instant with
+  [Everything](https://www.voidtools.com/) running (no DLL needed); without it
+  the drives are walked.
 - **Layers.** Hide files to see only the folder structure, or turn off icons,
   details, counts, hidden items and marks.
 - **A tree canvas too.** Switch to a node-graph view of the same folders at any
@@ -66,6 +72,7 @@ find it. Run it again to update. Settings live in `%LOCALAPPDATA%\UltraExplorer`
 | Open a folder | Double-click it (the canvas flies into it) |
 | Select | Click, Ctrl + click, Shift + click, or drag a marquee in a folder's open space |
 | Everything / the selection | Shift + 1 / Shift + 2 |
+| Search every drive | Ctrl + F, then ↑↓, Enter to show, Ctrl + Enter to open, Esc |
 | Filter by name | Ctrl + Shift + F |
 | Settings | the gear, or Ctrl + , |
 

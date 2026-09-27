@@ -495,50 +495,70 @@
             </Canvas>
 
             <Border Grid.Column="2"
-                    Width="300"
+                    Width="320"
                     MinWidth="220"
-                    MaxWidth="360"
+                    MaxWidth="380"
                     Height="32"
                     Margin="0,0,8,0"
                     VerticalAlignment="Center"
                     CornerRadius="4"
                     Background="{StaticResource SurfaceRaisedBrush}"
-                    BorderBrush="{StaticResource BorderStrongBrush}"
                     BorderThickness="1">
+                <Border.Style>
+                    <Style TargetType="Border">
+                        <Setter Property="BorderBrush" Value="{StaticResource BorderStrongBrush}" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsKeyboardFocusWithin, RelativeSource={RelativeSource Self}}" Value="True">
+                                <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </Border.Style>
                 <Grid>
                     <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="30" />
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <Grid>
+                    <Button Width="28"
+                            Height="26"
+                            Padding="0"
+                            Style="{StaticResource FlatButton}"
+                            Command="{Binding Search.SearchNowCommand}"
+                            ToolTip="Search every drive, this folder first (Ctrl+F)" AutomationProperties.Name="Search">
+                        <TextBlock Text="&#xE721;" Style="{StaticResource IconText}" FontSize="12" />
+                    </Button>
+                    <Grid Grid.Column="1">
                         <TextBox x:Name="SearchBox"
-                                 Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+                                 Text="{Binding Search.Text, UpdateSourceTrigger=PropertyChanged}"
                                  Background="Transparent"
                                  Foreground="{StaticResource TextBrush}"
                                  CaretBrush="{StaticResource TextBrush}"
                                  SelectionBrush="{StaticResource AccentBrush}"
                                  BorderThickness="0"
                                  Height="26"
-                                 Padding="8,0"
+                                 Padding="2,0,4,0"
                                  VerticalContentAlignment="Center"
                                  FontSize="12"
-                                 KeyDown="SearchBox_KeyDown" />
-                        <TextBlock Text="{Binding SearchPlaceholder}"
-                                   Margin="10,0,0,0"
+                                 AutomationProperties.Name="Search text"
+                                 PreviewKeyDown="SearchBox_PreviewKeyDown" />
+                        <TextBlock Text="{Binding Search.Placeholder}"
+                                   Margin="4,0,0,0"
                                    VerticalAlignment="Center"
                                    FontSize="12"
                                    Foreground="{StaticResource TextDimBrush}"
                                    IsHitTestVisible="False"
-                                   Visibility="{Binding SearchText, Converter={StaticResource StringToVisibility}, ConverterParameter=Invert}" />
+                                   Visibility="{Binding Search.Text, Converter={StaticResource StringToVisibility}, ConverterParameter=Invert}" />
                     </Grid>
-                    <Button Grid.Column="1"
-                            Width="28"
+                    <Button Grid.Column="2"
+                            Width="26"
                             Height="26"
                             Padding="0"
                             Style="{StaticResource FlatButton}"
-                            Command="{Binding SearchCommand}"
-                            ToolTip="Search (Ctrl+F)" AutomationProperties.Name="Search">
-                        <TextBlock Text="&#xE721;" Style="{StaticResource IconText}" FontSize="12" />
+                            Command="{Binding Search.CloseCommand}"
+                            Visibility="{Binding Search.Text, Converter={StaticResource StringToVisibility}}"
+                            ToolTip="Clear the search (Esc)" AutomationProperties.Name="Clear search">
+                        <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
                     </Button>
                 </Grid>
             </Border>
@@ -1140,96 +1160,185 @@
                     </Grid>
                 </Border>
 
-                <!-- Search results -->
-                <Border Width="420"
-                        MaxHeight="520"
+                <!-- Search results: every drive, the folder searched from first.
+                     Stays up while the canvas is used; Esc in the box or the
+                     close button puts it away. -->
+                <Border x:Name="SearchPanel"
+                        Width="560"
+                        MinWidth="380"
                         HorizontalAlignment="Right"
                         VerticalAlignment="Top"
-                        Margin="14"
-                        Padding="8"
+                        Margin="14,14,14,62"
                         CornerRadius="8"
-                        Background="#F2242424"
+                        Background="#F5222222"
                         BorderBrush="{StaticResource BorderStrongBrush}"
                         BorderThickness="1"
-                        Visibility="{Binding IsSearchOpen, Converter={StaticResource BoolToVisibility}}">
+                        Visibility="{Binding Search.IsOpen, Converter={StaticResource BoolToVisibility}}">
                     <Border.Effect>
-                        <DropShadowEffect BlurRadius="20" ShadowDepth="6" Opacity="0.45" Color="#000000" />
+                        <DropShadowEffect BlurRadius="24" ShadowDepth="6" Opacity="0.5" Color="#000000" />
                     </Border.Effect>
                     <Grid>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="40" />
-                            <RowDefinition Height="*" />
-                        </Grid.RowDefinitions>
-                        <Grid Margin="6,0">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <StackPanel VerticalAlignment="Center">
-                                <TextBlock Text="{Binding SearchResults.Count, StringFormat=Search results ({0})}" FontWeight="SemiBold" FontSize="12.5" />
-                                <TextBlock Text="{Binding SearchStatusText}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" ToolTip="{Binding SearchStatusText}" />
-                            </StackPanel>
-                            <ProgressBar Grid.Column="1" Width="60" MaxWidth="60" Height="3" Margin="8,0" VerticalAlignment="Center" IsIndeterminate="True"
-                                         Visibility="{Binding IsSearchBusy, Converter={StaticResource BoolToVisibility}}" />
-                            <Button Grid.Column="2" Width="26" Height="26" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding CloseSearchCommand}">
-                                <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
-                            </Button>
-                        </Grid>
-                        <TextBlock Grid.Row="1"
-                                   Margin="8,10,8,14"
-                                   FontSize="11.5"
-                                   Foreground="{StaticResource TextDimBrush}"
-                                   TextWrapping="Wrap"
-                                   Text="{Binding SearchStatusText}"
-                                   Visibility="{Binding SearchResults.Count, Converter={StaticResource ZeroCountToVisibility}}" />
-                        <ListBox Grid.Row="1"
-                                 ItemsSource="{Binding SearchResults}"
-                                 Background="Transparent"
-                                 BorderThickness="0"
-                                 MaxHeight="450"
-                                 MouseDoubleClick="SearchResults_MouseDoubleClick">
-                            <ListBox.ItemContainerStyle>
-                                <Style TargetType="ListBoxItem">
-                                    <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                                    <Setter Property="Padding" Value="0" />
-                                    <Setter Property="Margin" Value="0,1" />
-                                    <Setter Property="Background" Value="Transparent" />
-                                    <Setter Property="Template">
-                                        <Setter.Value>
-                                            <ControlTemplate TargetType="ListBoxItem">
-                                                <Border x:Name="Chrome" CornerRadius="4" Background="{TemplateBinding Background}" Padding="8,6">
-                                                    <ContentPresenter />
-                                                </Border>
-                                                <ControlTemplate.Triggers>
-                                                    <Trigger Property="IsMouseOver" Value="True">
-                                                        <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
-                                                    </Trigger>
-                                                    <Trigger Property="IsSelected" Value="True">
-                                                        <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentSoftBrush}" />
-                                                    </Trigger>
-                                                </ControlTemplate.Triggers>
-                                            </ControlTemplate>
-                                        </Setter.Value>
-                                    </Setter>
-                                </Style>
-                            </ListBox.ItemContainerStyle>
-                            <ListBox.ItemTemplate>
-                                <DataTemplate DataType="{x:Type models:SearchResultViewModel}">
-                                    <Grid>
-                                        <Grid.ColumnDefinitions>
-                                            <ColumnDefinition Width="26" />
-                                            <ColumnDefinition Width="*" />
-                                        </Grid.ColumnDefinitions>
-                                        <TextBlock Text="{Binding Glyph}" Style="{StaticResource IconText}" FontSize="13" Foreground="{StaticResource FolderBrush}" />
-                                        <StackPanel Grid.Column="1">
-                                            <TextBlock Text="{Binding Name}" FontSize="12" TextTrimming="CharacterEllipsis" />
-                                            <TextBlock Text="{Binding ParentPath}" FontSize="9.5" Foreground="{StaticResource TextDimBrush}" TextTrimming="CharacterEllipsis" />
-                                        </StackPanel>
-                                    </Grid>
-                                </DataTemplate>
-                            </ListBox.ItemTemplate>
-                        </ListBox>
+                        <DockPanel>
+                            <!-- Heading: how many, which engine, close -->
+                            <Grid DockPanel.Dock="Top" Margin="14,10,8,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel VerticalAlignment="Center">
+                                    <TextBlock Text="{Binding Search.Summary}" FontWeight="SemiBold" FontSize="13" Foreground="{StaticResource TextBrush}" />
+                                    <TextBlock Text="{Binding Search.Status}"
+                                               Margin="0,2,0,0"
+                                               FontSize="10"
+                                               Foreground="{StaticResource TextDimBrush}"
+                                               TextTrimming="CharacterEllipsis"
+                                               ToolTip="{Binding Search.Status}" />
+                                </StackPanel>
+                                <ProgressBar Grid.Column="1" Width="64" Height="3" Margin="10,0" VerticalAlignment="Center" IsIndeterminate="True"
+                                             Foreground="{StaticResource AccentBrush}" Background="Transparent" BorderThickness="0"
+                                             Visibility="{Binding Search.IsBusy, Converter={StaticResource BoolToVisibility}}" />
+                                <Button Grid.Column="2" Width="28" Height="28" Padding="0" VerticalAlignment="Top"
+                                        Style="{StaticResource FlatButton}"
+                                        Command="{Binding Search.CloseCommand}"
+                                        ToolTip="Close the results (Esc in the search box)" AutomationProperties.Name="Close search results">
+                                    <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="10" />
+                                </Button>
+                            </Grid>
+
+                            <!-- Keys, and Everything when it is missing -->
+                            <Border DockPanel.Dock="Bottom" BorderBrush="{StaticResource BorderBrush}" BorderThickness="0,1,0,0" Padding="14,7,10,8">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock FontSize="10" Foreground="{StaticResource TextDimBrush}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
+                                               Text="↑↓ move · Enter show · Ctrl+Enter open · right-click for more · Esc close" />
+                                    <Button Grid.Column="1" Padding="8,2" Margin="8,0,0,0" Style="{StaticResource FlatButton}"
+                                            Command="{Binding Search.GetEverythingCommand}"
+                                            Visibility="{Binding Search.OffersEverything, Converter={StaticResource BoolToVisibility}}"
+                                            ToolTip="Everything (voidtools.com) indexes every drive; with it running, search answers at once">
+                                        <TextBlock Text="Get Everything for instant search" FontSize="10.5" Foreground="{StaticResource AccentBrush}" />
+                                    </Button>
+                                </Grid>
+                            </Border>
+
+                            <Grid>
+                                <TextBlock Margin="16,14,16,18"
+                                           FontSize="12"
+                                           Foreground="{StaticResource TextDimBrush}"
+                                           TextWrapping="Wrap"
+                                           Text="{Binding Search.EmptyText}"
+                                           Visibility="{Binding Search.EmptyText, Converter={StaticResource StringToVisibility}}" />
+                                <ListBox x:Name="SearchResultsList"
+                                         ItemsSource="{Binding Search.Rows}"
+                                         SelectedItem="{Binding Search.Selected, Mode=TwoWay}"
+                                         Background="Transparent"
+                                         BorderThickness="0"
+                                         Padding="6,0,6,6"
+                                         Focusable="False"
+                                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                         VirtualizingPanel.IsVirtualizing="True"
+                                         VirtualizingPanel.VirtualizationMode="Recycling"
+                                         VirtualizingPanel.ScrollUnit="Pixel"
+                                         AutomationProperties.Name="Search results"
+                                         SelectionChanged="SearchResults_SelectionChanged"
+                                         PreviewMouseLeftButtonUp="SearchResults_PreviewMouseLeftButtonUp"
+                                         PreviewMouseRightButtonUp="SearchResults_PreviewMouseRightButtonUp"
+                                         MouseDoubleClick="SearchResults_MouseDoubleClick">
+                                    <ListBox.ItemContainerStyle>
+                                        <Style TargetType="ListBoxItem">
+                                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                            <Setter Property="Padding" Value="0" />
+                                            <Setter Property="Margin" Value="0,1" />
+                                            <Setter Property="Background" Value="Transparent" />
+                                            <Setter Property="Focusable" Value="False" />
+                                            <Setter Property="Template">
+                                                <Setter.Value>
+                                                    <ControlTemplate TargetType="ListBoxItem">
+                                                        <Border x:Name="Chrome" CornerRadius="5" Background="{TemplateBinding Background}" Padding="8,5">
+                                                            <ContentPresenter />
+                                                        </Border>
+                                                        <ControlTemplate.Triggers>
+                                                            <Trigger Property="IsMouseOver" Value="True">
+                                                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource SurfaceHoverBrush}" />
+                                                            </Trigger>
+                                                            <Trigger Property="IsSelected" Value="True">
+                                                                <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentSoftBrush}" />
+                                                            </Trigger>
+                                                            <DataTrigger Binding="{Binding IsHeader}" Value="True">
+                                                                <Setter TargetName="Chrome" Property="Background" Value="Transparent" />
+                                                                <Setter TargetName="Chrome" Property="Padding" Value="8,10,8,3" />
+                                                                <Setter Property="IsHitTestVisible" Value="False" />
+                                                            </DataTrigger>
+                                                        </ControlTemplate.Triggers>
+                                                    </ControlTemplate>
+                                                </Setter.Value>
+                                            </Setter>
+                                        </Style>
+                                    </ListBox.ItemContainerStyle>
+                                    <ListBox.Resources>
+                                        <DataTemplate DataType="{x:Type models:SearchHeaderRow}">
+                                            <Grid ToolTip="{Binding Detail}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <TextBlock x:Name="Title" Text="{Binding Title}" FontSize="11" FontWeight="SemiBold" Foreground="{StaticResource TextMutedBrush}"
+                                                           TextTrimming="CharacterEllipsis" MaxWidth="360" />
+                                                <Border Grid.Column="1" Height="1" Margin="10,1,10,0" VerticalAlignment="Center" Background="{StaticResource BorderStrongBrush}" />
+                                                <TextBlock Grid.Column="2" Text="{Binding CountText}" FontSize="10.5" Foreground="{StaticResource TextDimBrush}" />
+                                            </Grid>
+                                            <DataTemplate.Triggers>
+                                                <DataTrigger Binding="{Binding Place}" Value="Here">
+                                                    <Setter TargetName="Title" Property="Foreground" Value="{StaticResource AccentBrush}" />
+                                                </DataTrigger>
+                                            </DataTemplate.Triggers>
+                                        </DataTemplate>
+                                        <DataTemplate DataType="{x:Type models:SearchResultViewModel}">
+                                            <Grid ToolTip="{Binding FullPath}">
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="30" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <Grid Width="20" Height="20" HorizontalAlignment="Left" VerticalAlignment="Center">
+                                                    <Image Source="{Binding Icon}" Width="20" Height="20" RenderOptions.BitmapScalingMode="HighQuality" />
+                                                    <TextBlock Text="{Binding Glyph}"
+                                                               Style="{StaticResource IconText}"
+                                                               FontSize="14"
+                                                               Foreground="{Binding Tint}"
+                                                               HorizontalAlignment="Center"
+                                                               VerticalAlignment="Center"
+                                                               Visibility="{Binding Icon, Converter={StaticResource NullToVisibility}, ConverterParameter=Invert}" />
+                                                </Grid>
+                                                <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="0,0,10,0">
+                                                    <TextBlock controls:SearchHighlight.Segments="{Binding NameSegments}"
+                                                               FontSize="12.5"
+                                                               Foreground="{StaticResource TextBrush}"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                    <TextBlock Text="{Binding Location}"
+                                                               Margin="0,1,0,0"
+                                                               FontSize="10"
+                                                               Foreground="{StaticResource TextDimBrush}"
+                                                               TextTrimming="CharacterEllipsis" />
+                                                </StackPanel>
+                                                <StackPanel Grid.Column="2" VerticalAlignment="Center" MinWidth="70">
+                                                    <TextBlock Text="{Binding SizeText}" FontSize="10.5" Foreground="{StaticResource TextMutedBrush}" HorizontalAlignment="Right" />
+                                                    <TextBlock Text="{Binding DateText}" Margin="0,1,0,0" FontSize="10" Foreground="{StaticResource TextDimBrush}" HorizontalAlignment="Right" />
+                                                </StackPanel>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ListBox.Resources>
+                                </ListBox>
+                            </Grid>
+                        </DockPanel>
+
+                        <!-- The left edge widens the panel -->
+                        <Thumb Width="6" HorizontalAlignment="Left" Cursor="SizeWE" Opacity="0"
+                               DragDelta="SearchPanelEdge_DragDelta" />
                     </Grid>
                 </Border>
 

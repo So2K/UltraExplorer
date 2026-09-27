@@ -528,18 +528,18 @@ internal static partial class Program
             // Re-reading a branch rebuilds its nodes, so the folder has to be
             // looked up again after every change of options.
             await graph.ApplyOptionsAsync(graph.Options with { IncludeHidden = true });
-            node = Refetch(graph, root);
+            node = Refetch(graph, root) ?? await Reveal(graph, root);
             Check("showing hidden items reveals it",
                 node!.Children.Any(child => child.DisplayName == "hidden-system.txt"));
 
             await graph.ApplyOptionsAsync(graph.Options with { ShowFiles = false, IncludeHidden = false });
-            node = Refetch(graph, root);
+            node = Refetch(graph, root) ?? await Reveal(graph, root);
             Check("a folder dialog shows no files at all",
                 node!.Children.Count > 0 && node.Children.All(child => child.IsDirectory));
             Check("but still every folder", node.Children.Count == 3);
 
             await graph.ApplyOptionsAsync(graph.Options with { ShowFiles = true, FileFilter = null });
-            node = Refetch(graph, root);
+            node = Refetch(graph, root) ?? await Reveal(graph, root);
             Check("dropping the filter brings the files back",
                 node!.Children.Any(child => child.DisplayName == "component.json")
                 && node.Children.Any(child => child.DisplayName == "readme.txt"));
@@ -563,6 +563,13 @@ internal static partial class Program
         ViewAllNodeViewModel? current = null;
         foreach (var step in ViewAllPath.AncestorChain(path))
         {
+            // A big folder on the way - a temp folder of thousands - lists
+            // only its first few thousand at first; the rest is asked for.
+            while (!graph.TryGetNode(step, out _) && current is { IsTruncated: true })
+            {
+                await graph.LoadMoreAsync(current);
+            }
+
             if (!graph.TryGetNode(step, out var node))
             {
                 return null;

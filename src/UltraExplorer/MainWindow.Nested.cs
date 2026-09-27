@@ -118,7 +118,7 @@ public partial class MainWindow
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
         _viewModel.Tree.DeepRefreshRequested += OnTreeDeepRefreshRequested;
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
-        _viewModel.SearchResults.CollectionChanged += OnBeaconSourceChanged;
+        _viewModel.Search.PropertyChanged += OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
         UpdateSortHeaders();
     }
@@ -131,7 +131,7 @@ public partial class MainWindow
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
         _viewModel.Tree.DeepRefreshRequested -= OnTreeDeepRefreshRequested;
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
-        _viewModel.SearchResults.CollectionChanged -= OnBeaconSourceChanged;
+        _viewModel.Search.PropertyChanged -= OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged -= OnMarkChangedForNested;
         _nestedTree.FolderLoaded -= OnFolderLoadedForIcons;
         Nested.IconArrivals = null;
@@ -425,9 +425,6 @@ public partial class MainWindow
                 // The other picture decides the current folder its own way.
                 UpdateSortHeaders();
                 break;
-            case nameof(MainViewModel.IsSearchOpen):
-                ScheduleBeacons();
-                break;
             case nameof(MainViewModel.Sort):
                 // Any order changed.  The tree follows the orders itself: the
                 // canvas keeps what it is looking at where it is, and the tree
@@ -548,6 +545,12 @@ public partial class MainWindow
     /// </summary>
     private void UpdateSortHeaders()
     {
+        // The search puts first what is in the folder these headers are for.
+        if (_viewModel.Search.IsOpen)
+        {
+            _viewModel.Search.NoteFolder(SortFolder());
+        }
+
         var orders = _viewModel.Orders;
         var folder = orders.Scope == SortScope.AllFolders ? null : SortFolder();
         var sort = orders.SortOf(folder);
@@ -707,6 +710,15 @@ public partial class MainWindow
 
     private void OnBeaconSourceChanged(object? sender, NotifyCollectionChangedEventArgs e) => ScheduleBeacons();
 
+    /// <summary>The search's results are beacons on the canvas while its panel is up.</summary>
+    private void OnSearchPropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(SearchViewModel.IsOpen) or nameof(SearchViewModel.Results))
+        {
+            ScheduleBeacons();
+        }
+    }
+
     private void OnMarkChangedForNested(string path, FolderMark mark)
     {
         // Raised on whichever thread set the mark.
@@ -796,9 +808,9 @@ public partial class MainWindow
             }
         }
 
-        if (_viewModel.IsSearchOpen)
+        if (_viewModel.Search.IsOpen)
         {
-            foreach (var result in _viewModel.SearchResults.Take(SearchBeaconLimit))
+            foreach (var result in _viewModel.Search.Results.Take(SearchBeaconLimit))
             {
                 Add(result.FullPath, NestedBeaconKind.Search, SearchBeaconColour, result.Name);
             }

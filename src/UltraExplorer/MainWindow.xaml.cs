@@ -71,6 +71,10 @@ public partial class MainWindow : Window
         InitializeComponent();
         DataContext = _viewModel;
 
+        // A search puts first what is in the folder the headers would sort:
+        // the one selected, the one the selected file is in, or the one in view.
+        _viewModel.Search.HereFolder = SortFolder;
+
         // A benchmark or snapshot run, or a copy started to try a build, opens
         // on a monitor nobody is using and must not take the keyboard from
         // whatever the user is doing.
@@ -1466,27 +1470,113 @@ public partial class MainWindow : Window
         _viewModel.Address.EndEdit();
     }
 
-    private void SearchBox_KeyDown(object sender, KeyEventArgs e)
+    /// <summary>
+    /// The search box keeps the keyboard while its results are up: the
+    /// arrows go through the results, Enter shows the chosen one on the
+    /// canvas and Ctrl+Enter (or Shift+Enter) opens it, and Escape puts the
+    /// search away.  Everything else is typing.
+    /// </summary>
+    private void SearchBox_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter)
+        var search = _viewModel.Search;
+        var modifiers = Keyboard.Modifiers;
+        switch (e.Key)
         {
-            _viewModel.SearchCommand.Execute(null);
-            e.Handled = true;
+            case Key.Down when search.IsOpen:
+                search.MoveSelection(1);
+                break;
+            case Key.Up when search.IsOpen:
+                search.MoveSelection(-1);
+                break;
+            case Key.PageDown when search.IsOpen:
+                search.MoveSelection(8);
+                break;
+            case Key.PageUp when search.IsOpen:
+                search.MoveSelection(-8);
+                break;
+            case Key.Enter when (modifiers & (ModifierKeys.Control | ModifierKeys.Shift)) != 0:
+                search.OpenSelected();
+                break;
+            case Key.Enter:
+                if (!search.IsOpen || search.Results.Count == 0)
+                {
+                    search.SearchNow();
+                }
+                else
+                {
+                    _ = search.RevealSelectedAsync();
+                }
+
+                break;
+            case Key.Escape:
+                search.Close();
+                FocusCanvas();
+                break;
+            default:
+                return;
         }
-        else if (e.Key == Key.Escape)
+
+        e.Handled = true;
+    }
+
+    private void SearchResults_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (SearchResultsList.SelectedItem is { } selected)
         {
-            _viewModel.CloseSearchCommand.Execute(null);
-            FocusCanvas();
+            SearchResultsList.ScrollIntoView(selected);
+        }
+    }
+
+    /// <summary>A click on a result shows it on the canvas; the results stay up.</summary>
+    private void SearchResults_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        if (SearchResultUnder(e) is { } result)
+        {
+            _ = _viewModel.Search.RevealAsync(result);
+        }
+    }
+
+    /// <summary>A double-click opens it: a file in its program, a folder by going into it.</summary>
+    private void SearchResults_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (SearchResultUnder(e) is { } result)
+        {
+            _viewModel.Search.OpenCommand.Execute(result);
             e.Handled = true;
         }
     }
 
-    private void SearchResults_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    /// <summary>A right-click is the Shell's menu for the result, as it would be anywhere else.</summary>
+    private void SearchResults_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
-        if ((sender as ListBox)?.SelectedItem is SearchResultViewModel result)
+        if (SearchResultUnder(e) is not { } result)
         {
-            _viewModel.OpenSearchResultCommand.Execute(result);
+            return;
         }
+
+        e.Handled = true;
+        _viewModel.Search.Selected = result;
+        ShowContextMenu([result.FullPath], SearchResultsList, e.GetPosition(SearchResultsList), includeCanvasCommands: false);
+    }
+
+    private static SearchResultViewModel? SearchResultUnder(MouseEventArgs e)
+    {
+        for (var element = e.OriginalSource as DependencyObject; element is not null; element = VisualTreeHelper.GetParent(element) ?? LogicalTreeHelper.GetParent(element))
+        {
+            if (element is ListBoxItem { DataContext: SearchResultViewModel result })
+            {
+                return result;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>The panel's left edge widens it, as far as the canvas allows.</summary>
+    private void SearchPanelEdge_DragDelta(object sender, System.Windows.Controls.Primitives.DragDeltaEventArgs e)
+    {
+        var room = SearchPanel.Parent is FrameworkElement area ? area.ActualWidth - 28 : 1200;
+        SearchPanel.Width = Math.Clamp(SearchPanel.Width - e.HorizontalChange, SearchPanel.MinWidth, Math.Max(SearchPanel.MinWidth, room));
     }
 
     // ---- Keyboard ----------------------------------------------------------
@@ -1647,12 +1737,13 @@ public partial class MainWindow : Window
             case (ModifierKeys.None, Key.Escape):
                 // A crumb's list of folders is the nearest thing to a menu the
                 // bar has, and Escape closes menus.
+                // The search's results stay up while the canvas is used; its
+                // own box, or its close button, puts them away.
                 foreach (var crumb in _viewModel.Address.Breadcrumbs)
                 {
                     crumb.IsMenuOpen = false;
                 }
 
-                _viewModel.CloseSearchCommand.Execute(null);
                 return;
             default:
                 return;

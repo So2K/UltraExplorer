@@ -116,6 +116,25 @@ z-order. Without the switch the service is never constructed.
 UltraExplorer.exe --capture C:\temp\shot.png
 ```
 
+## Search
+
+The search box searches every drive and puts first what is in the folder you
+are in: results right in it, then inside its folders, then everywhere else;
+within each, exact names before names that start with the word, before the
+rest, and caches and package folders (`node_modules`, `AppData`, WinSxS) last.
+Results come as you type and stay up while the canvas is used: ↑↓ walk them
+(the canvas follows), Enter shows one, Ctrl+Enter opens it, a right-click is
+its Shell menu, Esc in the box closes. Moving to another folder yourself
+re-orders them for it; going to a result does not.
+
+It asks [Everything](https://www.voidtools.com/) when that is running with its
+index loaded, straight over Everything's own window-message IPC
+(`Services/Search/EverythingClient.cs`) — no `Everything64.dll` is needed. An
+installed Everything that is not running is started on the first search.
+Without it the drives are walked on a few low-priority threads, the folder you
+are in first, results streaming in. `subst` letters are folded into the
+folders they stand for, so nothing is listed twice.
+
 ## Renderer
 
 The nested canvas draws with Direct3D 11 when it can and with the CPU raster

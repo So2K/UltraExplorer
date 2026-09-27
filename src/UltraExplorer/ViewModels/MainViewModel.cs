@@ -39,7 +39,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly WorkspaceStore _workspaceStore = new();
     private readonly FolderMarkService _marks = new();
     private readonly FileSystemService _fileSystemService;
-    private readonly EverythingSearchService _everything = new();
     private readonly List<string> _navigationHistory = [];
 
     /// <summary>
@@ -49,15 +48,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// </summary>
     private readonly ChangeHub _changes = new(TimeProvider.System);
 
-    private CancellationTokenSource? _searchCancellation;
     private int _navigationIndex = -1;
     private bool _isInitialized;
     private bool _isDisposed;
     private bool _isNavigating;
-    private string _searchText = string.Empty;
-    private bool _isSearchOpen;
-    private bool _isSearchBusy;
-    private string _searchStatusText = string.Empty;
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
@@ -134,9 +128,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         AddToFavoritesCommand = new RelayCommand(AddSelectionToFavorites);
         RemoveFavoriteCommand = new RelayCommand<FavoriteItemViewModel>(RemoveFavorite);
 
-        SearchCommand = new AsyncRelayCommand(SearchAsync);
-        CloseSearchCommand = new RelayCommand(CloseSearch);
-        OpenSearchResultCommand = new AsyncRelayCommand<SearchResultViewModel>(OpenSearchResultAsync);
+        Search = new SearchViewModel(_iconService, path => Tree.RevealPathAsync(path), OpenSearchResult);
 
         FitAllCommand = new RelayCommand(() => FitAllRequested?.Invoke());
         ZoomInCommand = new RelayCommand(() => ZoomRequested?.Invoke(1.25));
@@ -182,7 +174,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ObservableCollection<FavoriteItemViewModel> PickerPlaces { get; } = [];
     public ObservableCollection<FavoriteItemViewModel> Drives { get; } = [];
     public ObservableCollection<FavoriteItemViewModel> NetworkLocations { get; } = [];
-    public ObservableCollection<SearchResultViewModel> SearchResults { get; } = [];
+    /// <summary>The search box and its results.</summary>
+    public SearchViewModel Search { get; }
 
     public ICommand BackCommand { get; }
     public ICommand ForwardCommand { get; }
@@ -207,9 +200,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public ICommand ShowInExplorerCommand { get; }
     public ICommand AddToFavoritesCommand { get; }
     public ICommand RemoveFavoriteCommand { get; }
-    public ICommand SearchCommand { get; }
-    public ICommand CloseSearchCommand { get; }
-    public ICommand OpenSearchResultCommand { get; }
     public ICommand FitAllCommand { get; }
     public ICommand ZoomInCommand { get; }
     public ICommand ZoomOutCommand { get; }
@@ -525,37 +515,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    public string SearchText
-    {
-        get => _searchText;
-        set => SetProperty(ref _searchText, value);
-    }
-
-    public string SearchPlaceholder
-        => Tree.ActiveNode is { } node ? $"Search {node.DisplayName}" : "Search this PC";
-
-    public bool IsSearchOpen
-    {
-        get => _isSearchOpen;
-        private set => SetProperty(ref _isSearchOpen, value);
-    }
-
-    public bool IsSearchBusy
-    {
-        get => _isSearchBusy;
-        private set => SetProperty(ref _isSearchBusy, value);
-    }
-
-    /// <summary>Which engine answered, so a slow search is never a mystery.</summary>
-    public string SearchStatusText
-    {
-        get => _searchStatusText;
-        private set => SetProperty(ref _searchStatusText, value);
-    }
-
-    /// <summary>True when Everything is installed and running.</summary>
-    public bool IsEverythingAvailable => _everything.IsAvailable;
-
     public bool IsMinimapVisible
     {
         get => _isMinimapVisible;
@@ -850,8 +809,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         _isDisposed = true;
-        _searchCancellation?.Cancel();
-        _searchCancellation?.Dispose();
+        Search.Dispose();
         Tree.PropertyChanged -= OnTreePropertyChanged;
         Tree.MessageRequested -= OnTreeMessage;
         Address.Dispose();
@@ -884,7 +842,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 break;
             case nameof(ViewAllViewModel.ActivePath):
                 OnPropertyChanged(nameof(TabTitle));
-                OnPropertyChanged(nameof(SearchPlaceholder));
                 Address.SetPath(Tree.ActivePath);
                 UpdateSidebarSelection();
 
@@ -1547,119 +1504,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return Task.CompletedTask;
     }
 
-    private async Task SearchAsync()
+    /// <summary>
+    /// What opening a search result does: a file opens in its program; a
+    /// folder is shown on the canvas and gone into, as a double-click there
+    /// would.
+    /// </summary>
+    private void OpenSearchResult(string path, bool isDirectory)
     {
-        var query = SearchText.Trim();
-        if (string.IsNullOrWhiteSpace(query))
+        if (isDirectory)
         {
-            CloseSearch();
+            _ = Tree.RevealPathAsync(path);
             return;
         }
-
-        var root = Tree.ActiveNode is { IsDirectory: true } node
-            ? node.FullPath
-            : Path.GetDirectoryName(Tree.ActivePath);
-        if (string.IsNullOrWhiteSpace(root))
-        {
-            Toast.ShowError("Select a folder to search in.");
-            return;
-        }
-
-        _searchCancellation?.Cancel();
-        _searchCancellation?.Dispose();
-        _searchCancellation = new CancellationTokenSource();
-        var token = _searchCancellation.Token;
-
-        IsSearchOpen = true;
-        IsSearchBusy = true;
-        SearchResults.Clear();
-
-        // Everything has already read the file table of every volume, so it
-        // answers a query outright.  Walking the tree is the fallback, and the
-        // difference on a folder like C:\Windows is seconds against nothing.
-        if (_everything.IsAvailable)
-        {
-            SearchStatusText = "Asking Everything…";
-            try
-            {
-                var found = await _everything.SearchAsync(query, root, 1_000, token);
-                if (!token.IsCancellationRequested)
-                {
-                    foreach (var result in found)
-                    {
-                        SearchResults.Add(result);
-                    }
-
-                    SearchStatusText = found.Count > 0
-                        ? $"Everything · {found.Count} result(s) under {Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar))}"
-                        : $"Everything found nothing under {Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar))}";
-                    IsSearchBusy = false;
-                    return;
-                }
-            }
-            catch (OperationCanceledException)
-            {
-                return;
-            }
-            catch (Exception exception)
-            {
-                // A broken index or a version mismatch is a reason to fall back,
-                // not a reason to fail the search.
-                SearchStatusText = $"Everything failed ({exception.Message}) — walking the folder tree instead.";
-            }
-        }
-        else
-        {
-            SearchStatusText = $"Walking the folder tree. {_everything.UnavailableReason}";
-        }
-
-        // Progress<T> marshals back to the UI thread, so matches appear while the
-        // walk is still running instead of all at once at the end.
-        var progress = new Progress<SearchResultViewModel>(result =>
-        {
-            if (!token.IsCancellationRequested)
-            {
-                SearchResults.Add(result);
-            }
-        });
 
         try
         {
-            await _fileSystemService.SearchAsync(root, query, 200, progress, token);
+            NativeShellService.Open(path);
         }
-        catch (OperationCanceledException)
+        catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException)
         {
+            Toast.ShowError($"{Path.GetFileName(path)} could not be opened: {exception.Message}");
         }
-        finally
-        {
-            if (!token.IsCancellationRequested)
-            {
-                IsSearchBusy = false;
-                if (!_everything.IsAvailable)
-                {
-                    SearchStatusText = $"{SearchResults.Count} result(s) — walked the folder tree. {_everything.UnavailableReason}";
-                }
-            }
-        }
-    }
-
-    private void CloseSearch()
-    {
-        _searchCancellation?.Cancel();
-        IsSearchOpen = false;
-        IsSearchBusy = false;
-        SearchResults.Clear();
-    }
-
-    private async Task OpenSearchResultAsync(SearchResultViewModel? result)
-    {
-        if (result is null)
-        {
-            return;
-        }
-
-        await Tree.RevealPathAsync(result.FullPath);
-        CloseSearch();
     }
 }
 

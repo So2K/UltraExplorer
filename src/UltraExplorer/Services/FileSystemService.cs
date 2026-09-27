@@ -7,7 +7,8 @@ namespace UltraExplorer.Services;
 public readonly record struct ReadyDrive(string Name, string Path, bool IsNetwork);
 
 /// <summary>
-/// Shell-level helpers: navigation pane content and recursive search.
+/// Shell-level helpers: navigation pane content.  Search is
+/// <see cref="Search.SearchEngine"/>'s.
 /// Directory enumeration for the graph itself lives in
 /// <see cref="ViewAllFileSystemService"/>; keeping what is shown current as
 /// the disk changes is the change hub's (<see cref="Watch.ChangeHub"/>).
@@ -15,82 +16,6 @@ public readonly record struct ReadyDrive(string Name, string Path, bool IsNetwor
 public sealed class FileSystemService(ShellIconService iconService)
 {
     private const string WslRoot = @"\\wsl$";
-
-    /// <summary>
-    /// Breadth-first so the shallowest — and usually most relevant — matches
-    /// arrive first, and streamed through <paramref name="progress"/> so the
-    /// results list fills in while the walk is still running.
-    /// </summary>
-    public Task<IReadOnlyList<SearchResultViewModel>> SearchAsync(
-        string rootPath,
-        string query,
-        int maxResults,
-        IProgress<SearchResultViewModel>? progress,
-        CancellationToken cancellationToken)
-        => Task.Run<IReadOnlyList<SearchResultViewModel>>(() =>
-        {
-            var results = new List<SearchResultViewModel>(Math.Min(maxResults, 128));
-            var pending = new Queue<string>();
-            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            pending.Enqueue(rootPath);
-
-            while (pending.Count > 0 && results.Count < maxResults)
-            {
-                cancellationToken.ThrowIfCancellationRequested();
-                var current = pending.Dequeue();
-                if (!visited.Add(current))
-                {
-                    continue;
-                }
-
-                try
-                {
-                    foreach (var entry in Directory.EnumerateFileSystemEntries(current))
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        FileAttributes attributes;
-                        try
-                        {
-                            attributes = File.GetAttributes(entry);
-                        }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                        {
-                            continue;
-                        }
-
-                        var isDirectory = attributes.HasFlag(FileAttributes.Directory);
-                        var name = Path.GetFileName(entry);
-                        if (name.Contains(query, StringComparison.OrdinalIgnoreCase))
-                        {
-                            var result = new SearchResultViewModel(
-                                name,
-                                entry,
-                                current,
-                                isDirectory,
-                                isDirectory ? "\uE8B7" : "\uE8A5");
-                            results.Add(result);
-                            progress?.Report(result);
-                            if (results.Count >= maxResults)
-                            {
-                                break;
-                            }
-                        }
-
-                        // Reparse points are skipped: following them turns the
-                        // search into an unbounded walk over the same folders.
-                        if (isDirectory && !attributes.HasFlag(FileAttributes.ReparsePoint))
-                        {
-                            pending.Enqueue(entry);
-                        }
-                    }
-                }
-                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or DirectoryNotFoundException)
-                {
-                }
-            }
-
-            return results;
-        }, cancellationToken);
 
     public IReadOnlyList<FavoriteItemViewModel> GetQuickAccess()
     {
