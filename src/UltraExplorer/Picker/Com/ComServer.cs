@@ -16,6 +16,15 @@ namespace UltraExplorer.Picker.Com;
 [ClassInterface(ClassInterfaceType.None)]
 internal sealed class UltraFileOpenDialog : FileDialogComBase, IFileOpenDialog
 {
+    public UltraFileOpenDialog()
+    {
+        // What GetOptions reports on a fresh CLSID_FileOpenDialog.  Callers
+        // write GetOptions(&f); SetOptions(f | FOS_...), and one that never
+        // calls SetOptions at all expects exactly these checks.
+        Request.Options = FileDialogOptions.PathMustExist
+            | FileDialogOptions.FileMustExist
+            | FileDialogOptions.NoChangeDir;
+    }
 }
 
 /// <summary>The save dialog, the counterpart of <see cref="UltraFileOpenDialog"/>.</summary>
@@ -26,10 +35,15 @@ internal sealed class UltraFileSaveDialog : FileDialogComBase, IFileSaveDialog
 {
     public UltraFileSaveDialog()
     {
-        // A save dialog that did not ask before replacing a file would be a
-        // trap; the system one turns this on for the same reason.
+        // What GetOptions reports on a fresh CLSID_FileSaveDialog.  A save
+        // dialog that did not ask before replacing a file would be a trap,
+        // and the rest keeps GetOptions | FOS_... meaning what it means for
+        // the system dialog.
         Request.Mode = FileDialogMode.Save;
-        Request.Options |= FileDialogOptions.OverwritePrompt;
+        Request.Options = FileDialogOptions.OverwritePrompt
+            | FileDialogOptions.NoReadOnlyReturn
+            | FileDialogOptions.PathMustExist
+            | FileDialogOptions.NoChangeDir;
     }
 }
 

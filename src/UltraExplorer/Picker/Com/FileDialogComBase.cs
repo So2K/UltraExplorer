@@ -72,11 +72,11 @@ internal abstract class FileDialogComBase
         using var finished = new ManualResetEventSlim(false);
 
         _dialogRunning = true;
-        _ = Ui.BeginInvoke(() =>
+        _ = Ui.InvokeAsync(async () =>
         {
             try
             {
-                result = ShowOnUi(owner);
+                result = await ShowOnUiAsync(owner);
             }
             finally
             {
@@ -132,7 +132,15 @@ internal abstract class FileDialogComBase
         done.Wait();
     }
 
-    private int ShowOnUi(IntPtr owner)
+    /// <summary>
+    /// Shows the window and completes when it closes.  It is shown modeless on
+    /// purpose: two programs can each have a dialog open from this one server,
+    /// and nested ShowDialog loops would disable the first one's window and
+    /// keep its Show from returning until the second was dismissed.  The
+    /// caller's own window is what has to be modal to, and it is disabled by
+    /// hand below.
+    /// </summary>
+    private async Task<int> ShowOnUiAsync(IntPtr owner)
     {
         try
         {
@@ -166,7 +174,11 @@ internal abstract class FileDialogComBase
 
             try
             {
-                window.ShowDialog();
+                var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                window.Closed += (_, _) => closed.TrySetResult();
+                window.Show();
+                window.Activate();
+                await closed.Task;
             }
             finally
             {
@@ -617,8 +629,12 @@ internal abstract class FileDialogComBase
         {
             return exception.HResult;
         }
-        catch (InvalidComObjectException)
+        catch (Exception exception)
         {
+            // Anything else escaping here would unwind the caller's drain
+            // loop in Show and leave every later callback waiting on a
+            // thread that no longer drains them.
+            ComTrace.Write($"event sink failed: {exception.GetType().Name} {exception.Message}");
             return Hresult.Fail;
         }
     }

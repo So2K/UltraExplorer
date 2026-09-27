@@ -332,11 +332,18 @@ public sealed class FileDialogSession : ObservableObject
             return new FileDialogAction(FileDialogActionKind.Filter, [], pattern, folder);
         }
 
-        var names = FileDialogNaming.SplitTypedNames(text);
-        var paths = names
-            .Select(name => FileDialogNaming.ToFullPath(name, CurrentFolder))
-            .OfType<string>()
-            .ToList();
+        // Each path is kept with the name it was typed as: a name that makes
+        // no path is dropped, and the first path's own name is needed below.
+        var typed = new List<string>();
+        var paths = new List<string>();
+        foreach (var name in FileDialogNaming.SplitTypedNames(text))
+        {
+            if (FileDialogNaming.ToFullPath(name, CurrentFolder) is { } path)
+            {
+                typed.Add(name);
+                paths.Add(path);
+            }
+        }
 
         if (paths.Count == 0)
         {
@@ -348,7 +355,10 @@ public sealed class FileDialogSession : ObservableObject
             return new FileDialogAction(FileDialogActionKind.Navigate, [], Folder: paths[0]);
         }
 
-        if (Request.IsSave)
+        // Windows' GetFullPath drops a trailing dot, so "report." has become
+        // "...\report" by now; the dot that asks for no extension is read
+        // from what was typed instead.
+        if (Request.IsSave && !FileDialogNaming.AsksForNoExtension(typed[0]))
         {
             var directory = Path.GetDirectoryName(paths[0]) ?? CurrentFolder;
             var name = FileDialogNaming.ApplyDefaultExtension(

@@ -46,7 +46,12 @@ function Select-UltraPath {
 
     # Quote every argument: a filter is full of spaces, semicolons and
     # parentheses, and Start-Process joins the list with spaces otherwise.
-    $line = ($arguments | ForEach-Object { '"{0}"' -f ($_ -replace '"', '\"') }) -join ' '
+    # Backslashes before a quote, and before the closing quote, are doubled
+    # (the CommandLineToArgvW rules), so -StartIn 'D:\' arrives as D:\ and
+    # does not swallow the arguments after it.
+    $line = ($arguments | ForEach-Object {
+        '"{0}"' -f (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1')
+    }) -join ' '
 
     try {
         $process = Start-Process -FilePath $Executable -ArgumentList $line -PassThru -Wait

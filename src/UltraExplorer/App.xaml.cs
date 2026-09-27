@@ -197,11 +197,26 @@ public partial class App : Application
         Environment.ProcessPath
         ?? Path.Combine(AppContext.BaseDirectory, "UltraExplorer.exe");
 
+    /// <summary>
+    /// True when <paramref name="name"/> is given as a switch (<c>--name</c>,
+    /// <c>-name</c> or <c>/name</c>).  An argument without the dash is some
+    /// switch's value, and a picker's arguments are all its own: without both
+    /// rules <c>--pick --title Embedding</c> started an invisible COM server
+    /// that exited with 0, "accepted", and <c>--file-name register-picker</c>
+    /// rewrote the registry and printed that as the chosen path.
+    /// </summary>
     private static bool HasSwitch(IReadOnlyList<string> args, string name)
     {
+        if (FileDialogCommandLine.IsPickerInvocation(args))
+        {
+            return false;
+        }
+
         foreach (var argument in args)
         {
-            if (argument.TrimStart('-', '/').Equals(name, StringComparison.OrdinalIgnoreCase))
+            if (argument.Length > 1
+                && (argument[0] is '-' or '/')
+                && argument.TrimStart('-', '/').Equals(name, StringComparison.OrdinalIgnoreCase))
             {
                 return true;
             }

@@ -239,7 +239,15 @@ public partial class MainWindow
                     box.GetBindingExpression(ComboBox.TextProperty)?.UpdateSource();
                 }
 
-                _picker.MarkInteraction();
+                // Enter is the OK button.  While OKBUTTONNEEDSINTERACTION
+                // keeps that button disabled, Enter is exactly the stray
+                // keystroke the flag is there to stop, so it is not itself
+                // counted as the interaction.
+                if (_picker.Request.Has(FileDialogOptions.OkButtonNeedsInteraction) && !_picker.HasInteracted)
+                {
+                    break;
+                }
+
                 _ = RunPickerAcceptAsync();
                 break;
 
@@ -247,6 +255,20 @@ public partial class MainWindow
                 e.Handled = true;
                 CancelPicker();
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Editing the name is interaction (FOS_OKBUTTONNEEDSINTERACTION), but
+    /// only when the user does it: the box's text also changes when a click
+    /// on the canvas fills it in, which is interaction of its own, or when
+    /// the window sets it up, which is not.
+    /// </summary>
+    private void PickerNameBox_TextChanged(object sender, TextChangedEventArgs e)
+    {
+        if (_picker is { } session && sender is UIElement { IsKeyboardFocusWithin: true })
+        {
+            session.MarkInteraction();
         }
     }
 
@@ -324,6 +346,12 @@ public partial class MainWindow
         {
             return;
         }
+
+        // An answer belongs to the attempt it was given in: a "Replace" for
+        // a.txt whose save then stopped short (the caller's OnFileOk said no,
+        // or a later question was answered No) must not replace b.txt without
+        // asking when OK is pressed again.
+        session.ForgetAnswers();
 
         // Each answered question is remembered, so the loop always advances.
         for (var attempt = 0; attempt < 4; attempt++)

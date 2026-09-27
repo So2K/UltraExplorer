@@ -60,15 +60,33 @@ public static class FileDialogHost
         {
             try
             {
-                var directory = Path.GetDirectoryName(Path.GetFullPath(invocation.ResultPath));
+                var target = Path.GetFullPath(invocation.ResultPath);
+                var directory = Path.GetDirectoryName(target);
                 if (!string.IsNullOrEmpty(directory))
                 {
                     Directory.CreateDirectory(directory);
                 }
 
-                File.WriteAllText(invocation.ResultPath, FileDialogJson.WriteResult(result), Encoding.UTF8);
+                // UTF-8 without a byte order mark: JSON must not carry one
+                // (RFC 8259), and Python's json module refuses a file that
+                // does.  Written beside the target and moved over it, so a
+                // caller polling for the file never reads half of it.
+                var temporary = $"{target}.{Guid.NewGuid():N}.tmp";
+                try
+                {
+                    File.WriteAllText(temporary, FileDialogJson.WriteResult(result), new UTF8Encoding(false));
+                    File.Move(temporary, target, overwrite: true);
+                }
+                finally
+                {
+                    if (File.Exists(temporary))
+                    {
+                        File.Delete(temporary);
+                    }
+                }
             }
-            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException
+                or ArgumentException or NotSupportedException)
             {
                 WriteConsole($"Could not write {invocation.ResultPath}: {exception.Message}");
             }

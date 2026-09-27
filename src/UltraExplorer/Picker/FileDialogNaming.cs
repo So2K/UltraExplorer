@@ -106,6 +106,13 @@ public static class FileDialogNaming
     }
 
     /// <summary>
+    /// True when a typed name ends in a dot: "report." saves as "report", with
+    /// no extension added, as in the standard dialog.
+    /// </summary>
+    public static bool AsksForNoExtension(string typedName) =>
+        typedName.Trim().Trim('"').TrimEnd().EndsWith('.');
+
+    /// <summary>
     /// Appends the extension a save is expected to have: the caller's default
     /// extension if it set one, otherwise the first literal extension of the
     /// selected file type.  A name that already has an extension, or that ends

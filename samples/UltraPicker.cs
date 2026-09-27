@@ -73,6 +73,15 @@ public static class UltraPicker
         start.ArgumentList.Add("--result");
         start.ArgumentList.Add(resultFile);
 
+        void Add(string name, string? value)
+        {
+            if (!string.IsNullOrEmpty(value))
+            {
+                start.ArgumentList.Add(name);
+                start.ArgumentList.Add(value);
+            }
+        }
+
         Add("--title", request.Title);
         Add("--filter", request.Filter);
         Add("--file-name", request.FileName);
@@ -100,7 +109,7 @@ public static class UltraPicker
         if (request.Owner != IntPtr.Zero)
         {
             start.ArgumentList.Add("--owner");
-            start.ArgumentList.Add(request.Owner.ToInt64().ToString());
+            start.ArgumentList.Add(request.Owner.ToInt64().ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
 
         try
@@ -166,11 +175,17 @@ public static class UltraPicker
         try
         {
             instance = Activator.CreateInstance(type);
-            var dialog = (IFileOpenDialog)instance!;
 
-            uint options = 0x800;                                  // FOS_PATHMUSTEXIST
+            // IFileDialog is what the open and the save dialog have in common;
+            // the save class does not answer to IFileOpenDialog.
+            var dialog = (IFileDialog)instance!;
+
+            // Added to the dialog's own defaults, as with the system dialog:
+            // those already make an opened file exist and a save ask before
+            // it replaces one.
+            dialog.GetOptions(out var options);
+            options |= 0x800;                                       // FOS_PATHMUSTEXIST
             if (request.Mode == PickMode.Folder) options |= 0x20;   // FOS_PICKFOLDERS
-            if (request.Mode == PickMode.Open) options |= 0x1000;   // FOS_FILEMUSTEXIST
             if (request.MultiSelect) options |= 0x200;              // FOS_ALLOWMULTISELECT
             if (request.ShowHidden) options |= 0x10000000;          // FOS_FORCESHOWHIDDEN
             dialog.SetOptions(options);
@@ -216,7 +231,7 @@ public static class UltraPicker
                 return [];
             }
 
-            if (request.MultiSelect && dialog.GetResults(out var many) == 0)
+            if (request.MultiSelect && instance is IFileOpenDialog open && open.GetResults(out var many) == 0)
             {
                 many.GetCount(out var count);
                 var paths = new string[count];
@@ -326,8 +341,41 @@ public static class UltraPicker
         [PreserveSig] int EnumItems(out IntPtr enumerator);
     }
 
-    // Only the methods this sample calls are named; the rest hold their vtable
-    // slots, because the order is the contract.
+    // Every IModalWindow and IFileDialog slot, in order, because the order
+    // is the contract.
+    [ComImport]
+    [Guid("42f85136-db7e-439c-85f1-e4075d135fc8")]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IFileDialog
+    {
+        [PreserveSig] int Show(IntPtr owner);
+        [PreserveSig] int SetFileTypes(uint count, [In, MarshalAs(UnmanagedType.LPArray, SizeParamIndex = 0)] ComDlgFilterSpec[] filters);
+        [PreserveSig] int SetFileTypeIndex(uint index);
+        [PreserveSig] int GetFileTypeIndex(out uint index);
+        [PreserveSig] int Advise(IntPtr events, out uint cookie);
+        [PreserveSig] int Unadvise(uint cookie);
+        [PreserveSig] int SetOptions(uint options);
+        [PreserveSig] int GetOptions(out uint options);
+        [PreserveSig] int SetDefaultFolder(IShellItem folder);
+        [PreserveSig] int SetFolder(IShellItem folder);
+        [PreserveSig] int GetFolder(out IShellItem folder);
+        [PreserveSig] int GetCurrentSelection(out IShellItem item);
+        [PreserveSig] int SetFileName([MarshalAs(UnmanagedType.LPWStr)] string name);
+        [PreserveSig] int GetFileName(out IntPtr name);
+        [PreserveSig] int SetTitle([MarshalAs(UnmanagedType.LPWStr)] string title);
+        [PreserveSig] int SetOkButtonLabel([MarshalAs(UnmanagedType.LPWStr)] string text);
+        [PreserveSig] int SetFileNameLabel([MarshalAs(UnmanagedType.LPWStr)] string label);
+        [PreserveSig] int GetResult(out IShellItem item);
+        [PreserveSig] int AddPlace(IShellItem place, int placement);
+        [PreserveSig] int SetDefaultExtension([MarshalAs(UnmanagedType.LPWStr)] string extension);
+        [PreserveSig] int Close(int result);
+        [PreserveSig] int SetClientGuid(ref Guid client);
+        [PreserveSig] int ClearClientData();
+        [PreserveSig] int SetFilter(IntPtr filter);
+    }
+
+    // The same slots again, then the two IFileOpenDialog adds; only
+    // GetResults is called.
     [ComImport]
     [Guid("d57c7288-d4ad-4768-be02-9d969532d960")]
     [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]

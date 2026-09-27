@@ -398,6 +398,11 @@ internal static class ShellNative
     [DllImport("shell32.dll")]
     public static extern void ILFree(IntPtr idList);
 
+    [DllImport("shell32.dll")]
+    public static extern int SHGetIDListFromObject(
+        [MarshalAs(UnmanagedType.IUnknown)] object item,
+        out IntPtr idList);
+
     [DllImport("shell32.dll", PreserveSig = false)]
     public static extern IShellItemArray SHCreateShellItemArrayFromIDLists(
         uint count,
@@ -509,9 +514,31 @@ internal static class ShellNative
             for (var index = 0; index < paths.Count; index++)
             {
                 idLists[index] = ILCreateFromPath(paths[index]);
-                if (idLists[index] == IntPtr.Zero)
+                if (idLists[index] != IntPtr.Zero)
+                {
+                    continue;
+                }
+
+                // ILCreateFromPath reads the disk, and a name that is not
+                // there yet (open-or-create, a new folder) has nothing to
+                // read.  ItemFor parses it from find data instead, as
+                // GetResult already does.
+                if (ItemFor(paths[index]) is not { } item)
                 {
                     return null;
+                }
+
+                try
+                {
+                    if (SHGetIDListFromObject(item, out idLists[index]) != Hresult.Ok)
+                    {
+                        idLists[index] = IntPtr.Zero;
+                        return null;
+                    }
+                }
+                finally
+                {
+                    Marshal.ReleaseComObject(item);
                 }
             }
 

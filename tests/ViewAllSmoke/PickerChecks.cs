@@ -94,6 +94,22 @@ internal static partial class Program
         Check("a folder dialog is not given file types", folder.Request.Filters.Count == 0);
         Check("a path value is not mistaken for name:value",
             folder.Request.InitialFolder == @"C:\Windows");
+        Check("a folder dialog defaults to requiring the folder to exist",
+            folder.Request.Has(FileDialogOptions.PathMustExist));
+
+        FileDialogCommandLine.TryParse(["--pick", "--flag", "PickFolders"], out var pickFolders, out _);
+        Check("--flag PickFolders gets the same folder defaults as --folder",
+            pickFolders.Request.PicksFolders && pickFolders.Request.Has(FileDialogOptions.PathMustExist)
+            && !pickFolders.Request.Has(FileDialogOptions.FileMustExist));
+
+        FileDialogCommandLine.TryParse(["--pick", "--ofn", "0x2000"], out var createPrompt, out _);
+        Check("an open dialog that offers to create a file does not also demand that it exist",
+            createPrompt.Request.Has(FileDialogOptions.CreatePrompt)
+            && !createPrompt.Request.Has(FileDialogOptions.FileMustExist)
+            && createPrompt.Request.Has(FileDialogOptions.PathMustExist));
+
+        Check("an unreadable request file is an error, not a crash",
+            !FileDialogCommandLine.TryParse(["--pick", "--request", ""], out _, out _));
 
         // OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_HIDEREADONLY
         FileDialogCommandLine.TryParse(["--pick", "--ofn", "0x1A04"], out var legacy, out _);
@@ -306,6 +322,12 @@ internal static partial class Program
                 saved.Kind == FileDialogActionKind.Accept
                 && Path.GetFileName(saved.Paths[0]) == "export.txt");
 
+            save.FileNameText = "export.";
+            var noExtension = save.Prepare([]);
+            Check("a typed trailing dot saves with no extension at all",
+                noExtension.Kind == FileDialogActionKind.Accept
+                && Path.GetFileName(noExtension.Paths[0]) == "export");
+
             save.FileNameText = "export.txt";
             save.SelectedFilterIndex = 1;
             Check("changing the file type retypes the name, it does not stack extensions",
@@ -468,6 +490,15 @@ internal static partial class Program
         }.Normalize();
         Check("CreatePrompt asks before making a new file",
             FileDialogValidator.Evaluate(createPrompt, text, [missing]).Kind == FileDialogVerdictKind.ConfirmCreate);
+
+        var openCreate = new FileDialogRequest
+        {
+            Options = FileDialogOptions.CreatePrompt | FileDialogOptions.FileMustExist | FileDialogOptions.PathMustExist
+        }.Normalize();
+        Check("CreatePrompt asks in an open dialog too, rather than refusing the name",
+            FileDialogValidator.Evaluate(openCreate, text, [missing]).Kind == FileDialogVerdictKind.ConfirmCreate);
+        Check("once creating is agreed, the open dialog accepts the new name",
+            FileDialogValidator.Evaluate(openCreate, text, [missing], new HashSet<FileDialogGate> { FileDialogGate.Create }).IsAccept);
 
         var readOnly = Path.Combine(root, "locked.txt");
         File.WriteAllText(readOnly, "x");

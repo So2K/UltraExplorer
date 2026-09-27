@@ -91,7 +91,7 @@ public static class FileDialogValidator
         {
             FileDialogMode.PickFolder => EvaluateFolders(request, paths),
             FileDialogMode.Save => EvaluateSave(request, filter, paths[0], resolved),
-            _ => EvaluateOpen(request, filter, paths)
+            _ => EvaluateOpen(request, filter, paths, resolved)
         };
     }
 
@@ -121,7 +121,8 @@ public static class FileDialogValidator
     private static FileDialogVerdict EvaluateOpen(
         FileDialogRequest request,
         FileDialogFilter filter,
-        IReadOnlyList<string> paths)
+        IReadOnlyList<string> paths,
+        IReadOnlySet<FileDialogGate> resolved)
     {
         foreach (var path in paths)
         {
@@ -130,15 +131,31 @@ public static class FileDialogValidator
                 return Reject($"{Path.GetFileName(path)} is a folder. Open it to choose a file inside it.");
             }
 
-            var exists = File.Exists(path);
-            if (request.Has(FileDialogOptions.FileMustExist) && !exists)
-            {
-                return Reject($"{path}\nFile not found. Check the file name and try again.");
-            }
-
             if (request.Has(FileDialogOptions.PathMustExist) && !DirectoryOfExists(path))
             {
                 return Reject($"{path}\nThe path does not exist.");
+            }
+
+            // CREATEPROMPT (OFN_CREATEPROMPT) is above all an Open flag: a name
+            // that is not there yet is offered for creation, and that offer
+            // is what the caller asked for even where FILEMUSTEXIST would
+            // otherwise refuse it.
+            var exists = File.Exists(path);
+            if (!exists
+                && request.Has(FileDialogOptions.CreatePrompt)
+                && !resolved.Contains(FileDialogGate.Create))
+            {
+                return new FileDialogVerdict(
+                    FileDialogVerdictKind.ConfirmCreate,
+                    [path],
+                    $"{Path.GetFileName(path)} does not exist.\nDo you want to create it?",
+                    "Confirm Open");
+            }
+
+            if (request.Has(FileDialogOptions.FileMustExist) && !exists
+                && !(request.Has(FileDialogOptions.CreatePrompt) && resolved.Contains(FileDialogGate.Create)))
+            {
+                return Reject($"{path}\nFile not found. Check the file name and try again.");
             }
 
             if (request.Has(FileDialogOptions.StrictFileTypes)

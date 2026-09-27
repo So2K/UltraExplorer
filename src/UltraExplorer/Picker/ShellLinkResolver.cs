@@ -10,6 +10,7 @@ namespace UltraExplorer.Picker;
 /// </summary>
 internal static class ShellLinkResolver
 {
+    /// <summary>A shell link stores its target in at most this many characters.</summary>
     private const int MaxPath = 260;
 
     /// <summary>
@@ -41,9 +42,12 @@ internal static class ShellLinkResolver
 
             persist.Load(path, STGM_READ);
 
+            // Not SLGP_RAWPATH: a raw path may still hold %SystemRoot% and the
+            // like, which File.Exists and the caller cannot use.  The expand
+            // below catches a link that stores its target only that way.
             var buffer = new StringBuilder(MaxPath);
-            link.GetPath(buffer, buffer.Capacity, IntPtr.Zero, SLGP_RAWPATH);
-            var target = buffer.ToString();
+            link.GetPath(buffer, buffer.Capacity, IntPtr.Zero, 0);
+            var target = Environment.ExpandEnvironmentVariables(buffer.ToString());
             return string.IsNullOrWhiteSpace(target) ? path : target;
         }
         catch (Exception exception) when (exception is COMException or InvalidCastException
@@ -63,7 +67,6 @@ internal static class ShellLinkResolver
     private static readonly Guid ShellLinkClassId = new("00021401-0000-0000-C000-000000000046");
 
     private const int STGM_READ = 0;
-    private const int SLGP_RAWPATH = 4;
 
     /// <summary>
     /// Only <c>GetPath</c> is declared, and it is the first slot after

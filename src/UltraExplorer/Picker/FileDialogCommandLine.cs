@@ -145,7 +145,7 @@ public static class FileDialogCommandLine
 
                     case "filter-index":
                     case "type-index":
-                        request.FileTypeIndex = int.Parse(Value());
+                        request.FileTypeIndex = int.Parse(Value(), System.Globalization.CultureInfo.InvariantCulture);
                         break;
 
                     case "title":
@@ -251,7 +251,8 @@ public static class FileDialogCommandLine
             }
         }
         catch (Exception exception) when (exception is FormatException or OverflowException
-            or IOException or InvalidDataException or System.Text.Json.JsonException)
+            or IOException or InvalidDataException or System.Text.Json.JsonException
+            or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
             error = exception.Message;
             return false;
@@ -259,13 +260,25 @@ public static class FileDialogCommandLine
 
         request.Options |= FileDialogJson.ParseOptions(rawOptions, flagNames);
 
-        // Nothing said otherwise, so behave like the standard Open dialog does
-        // out of the box.
-        if (request.Mode == FileDialogMode.Open
+        // Normalized first, so --flag PickFolders is a folder pick below as
+        // much as --folder is.
+        request.Normalize();
+
+        // Nothing said otherwise, so behave like the standard dialog does out
+        // of the box: an opened file exists (unless the caller offers to
+        // create it), and a picked folder exists.
+        if (request.PicksFolders
+            && !request.Has(FileDialogOptions.NoValidate))
+        {
+            request.Options |= FileDialogOptions.PathMustExist;
+        }
+        else if (request.Mode == FileDialogMode.Open
             && !request.Has(FileDialogOptions.NoValidate)
             && (request.Options & (FileDialogOptions.FileMustExist | FileDialogOptions.PathMustExist)) == 0)
         {
-            request.Options |= FileDialogOptions.FileMustExist | FileDialogOptions.PathMustExist;
+            request.Options |= request.Has(FileDialogOptions.CreatePrompt)
+                ? FileDialogOptions.PathMustExist
+                : FileDialogOptions.FileMustExist | FileDialogOptions.PathMustExist;
         }
 
         if (request.Mode == FileDialogMode.Save
@@ -324,13 +337,28 @@ public static class FileDialogCommandLine
           --request path  read every setting above from a JSON file
         """;
 
+    /// <summary>
+    /// Takes what the file says and only that: a file that names no mode or
+    /// file type leaves <c>--save</c> or <c>--filter-index</c> as they were,
+    /// and a file with no file types adds no "All Files" in front of the
+    /// command line's own <c>--type</c> entries.
+    /// </summary>
     private static void MergeRequestFile(FileDialogRequest request, string path)
     {
-        var loaded = FileDialogJson.ReadRequestFile(path);
+        var document = FileDialogJson.ReadRequestDocument(path);
+        var loaded = FileDialogJson.Build(document);
 
-        request.Mode = loaded.Mode;
+        if (document.Mode is not null)
+        {
+            request.Mode = loaded.Mode;
+        }
+
+        if (document.FileTypeIndex is not null)
+        {
+            request.FileTypeIndex = loaded.FileTypeIndex;
+        }
+
         request.Options |= loaded.Options;
-        request.FileTypeIndex = loaded.FileTypeIndex;
 
         Take(loaded.Title, value => request.Title = value);
         Take(loaded.OkButtonLabel, value => request.OkButtonLabel = value);
@@ -394,8 +422,8 @@ public static class FileDialogCommandLine
     {
         var cleaned = text.Trim();
         return cleaned.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-            ? long.Parse(cleaned[2..], System.Globalization.NumberStyles.HexNumber)
-            : long.Parse(cleaned);
+            ? long.Parse(cleaned[2..], System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture)
+            : long.Parse(cleaned, System.Globalization.CultureInfo.InvariantCulture);
     }
 
     private static bool IsSwitch(string argument, string name) =>

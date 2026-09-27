@@ -58,7 +58,8 @@ def pick(
         if code != ACCEPTED or not os.path.exists(result_file):
             return []
 
-        with open(result_file, "r", encoding="utf-8") as handle:
+        # utf-8-sig reads the file with or without a byte order mark.
+        with open(result_file, "r", encoding="utf-8-sig") as handle:
             answer = json.load(handle)
 
         return answer.get("paths", []) if answer.get("accepted") else []

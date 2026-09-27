@@ -10,16 +10,20 @@ namespace UltraExplorer.Picker;
 /// </summary>
 public sealed class FileDialogRequestDocument
 {
-    public string Mode { get; set; } = "open";
+    /// <summary>open, save or folder; open when the document names none.</summary>
+    public string? Mode { get; set; }
 
-    /// <summary>Raw <c>FOS_</c> mask; decimal or "0x..." both parse.</summary>
+    /// <summary>Raw <c>FOS_</c> mask: a JSON number, or a string in decimal or "0x...".</summary>
+    [JsonConverter(typeof(FileDialogMaskConverter))]
     public string? Options { get; set; }
 
     /// <summary>Named flags, merged into <see cref="Options"/>.</summary>
     public List<string>? Flags { get; set; }
 
+    [JsonConverter(typeof(FileDialogMaskConverter))]
     public string? OpenFileNameFlags { get; set; }
 
+    [JsonConverter(typeof(FileDialogMaskConverter))]
     public string? BrowseInfoFlags { get; set; }
 
     public List<FileDialogFilterDocument>? Filters { get; set; }
@@ -27,7 +31,8 @@ public sealed class FileDialogRequestDocument
     /// <summary>Flat filter string, either pipe- or null-separated.</summary>
     public string? Filter { get; set; }
 
-    public int FileTypeIndex { get; set; } = 1;
+    /// <summary>One-based; the first file type when the document names none.</summary>
+    public int? FileTypeIndex { get; set; }
 
     public string? Title { get; set; }
 
@@ -96,13 +101,20 @@ public static class FileDialogJson
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
     };
 
-    public static FileDialogRequest FromDocument(FileDialogRequestDocument document)
+    public static FileDialogRequest FromDocument(FileDialogRequestDocument document) =>
+        Build(document).Normalize();
+
+    /// <summary>
+    /// The request a document describes, not yet normalized: nothing the
+    /// document leaves out is filled in, so it can be merged into another.
+    /// </summary>
+    public static FileDialogRequest Build(FileDialogRequestDocument document)
     {
         var request = new FileDialogRequest
         {
             Mode = ParseMode(document.Mode),
             Options = ParseOptions(document.Options, document.Flags),
-            FileTypeIndex = document.FileTypeIndex,
+            FileTypeIndex = document.FileTypeIndex ?? 1,
             Title = document.Title ?? string.Empty,
             OkButtonLabel = document.OkButtonLabel ?? string.Empty,
             FileNameLabel = document.FileNameLabel ?? string.Empty,
@@ -136,31 +148,40 @@ public static class FileDialogJson
             request.Filters.Add(spec);
         }
 
+        // A null entry, or "name": null, is a malformed request, not a
+        // reason for the file-type box to throw while it draws.
         foreach (var filter in document.Filters ?? [])
         {
+            if (filter is null)
+            {
+                continue;
+            }
+
             request.Filters.Add(new FileDialogFilterSpec(
-                filter.Name,
+                filter.Name ?? string.Empty,
                 string.IsNullOrWhiteSpace(filter.Pattern) ? "*.*" : filter.Pattern));
         }
 
         foreach (var place in document.Places ?? [])
         {
-            if (!string.IsNullOrWhiteSpace(place.Path))
+            if (!string.IsNullOrWhiteSpace(place?.Path))
             {
                 request.Places.Add(new FileDialogPlace(place.Path, place.Top));
             }
         }
 
-        return request.Normalize();
+        return request;
     }
 
-    public static FileDialogRequest ReadRequestFile(string path)
+    public static FileDialogRequestDocument ReadRequestDocument(string path)
     {
         var text = File.ReadAllText(path);
-        var document = JsonSerializer.Deserialize<FileDialogRequestDocument>(text, Options)
+        return JsonSerializer.Deserialize<FileDialogRequestDocument>(text, Options)
             ?? throw new InvalidDataException($"Not a picker request: {path}");
-        return FromDocument(document);
     }
+
+    public static FileDialogRequest ReadRequestFile(string path) =>
+        FromDocument(ReadRequestDocument(path));
 
     public static string WriteResult(FileDialogResult result)
     {
@@ -234,7 +255,38 @@ public static class FileDialogJson
 
         var cleaned = text.Trim();
         return cleaned.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
-            ? uint.TryParse(cleaned[2..], System.Globalization.NumberStyles.HexNumber, null, out value)
-            : uint.TryParse(cleaned, out value);
+            ? uint.TryParse(cleaned[2..], System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out value)
+            : uint.TryParse(cleaned, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
+}
+
+/// <summary>
+/// A flag mask written either way a caller would write it: a JSON number
+/// (<c>"options": 4096</c>) or a string (<c>"options": "0x1000"</c>).
+/// </summary>
+internal sealed class FileDialogMaskConverter : JsonConverter<string?>
+{
+    public override bool HandleNull => true;
+
+    public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options) =>
+        reader.TokenType switch
+        {
+            JsonTokenType.Null => null,
+            JsonTokenType.String => reader.GetString(),
+            JsonTokenType.Number when reader.TryGetUInt32(out var mask) =>
+                mask.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            _ => throw new JsonException("A flag mask is a non-negative number or a string such as \"0x1000\".")
+        };
+
+    public override void Write(Utf8JsonWriter writer, string? value, JsonSerializerOptions options)
+    {
+        if (value is null)
+        {
+            writer.WriteNullValue();
+        }
+        else
+        {
+            writer.WriteStringValue(value);
+        }
     }
 }
