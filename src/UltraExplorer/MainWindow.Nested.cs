@@ -974,12 +974,15 @@ public partial class MainWindow
             return;
         }
 
-        Nested.DropTarget = target;
-        e.Effects = IsCopyOperation(paths, target.FullPath) ? DragDropEffects.Copy : DragDropEffects.Move;
+        // The keys and what the source allows, as the tree canvas has them (see DropEffectFor).
+        var effect = DropEffectFor(e, paths, target.FullPath);
+        Nested.DropTarget = effect == DragDropEffects.None ? null : target;
+        e.Effects = effect;
     }
 
     private void Nested_DragLeave(object sender, DragEventArgs e)
     {
+        ForgetDropPaths();
         if (!Nested.IsMouseOver)
         {
             Nested.DropTarget = null;
@@ -990,12 +993,22 @@ public partial class MainWindow
     {
         e.Handled = true;
         Nested.DropTarget = null;
-        if (!TryGetDropPaths(e.Data, out var paths) || ResolveNestedDropTarget(e, paths) is not { } target)
+        var carriesPaths = TryGetDropPaths(e.Data, out var paths);
+        ForgetDropPaths();
+        if (!carriesPaths || ResolveNestedDropTarget(e, paths) is not { } target)
+        {
+            e.Effects = DragDropEffects.None;
+            return;
+        }
+
+        var effect = DropEffectFor(e, paths, target.FullPath);
+        e.Effects = ReportedDropEffect(effect);
+        if (effect == DragDropEffects.None)
         {
             return;
         }
 
-        await _viewModel.DropIntoPathAsync(paths, target.FullPath, Keyboard.Modifiers);
+        await _viewModel.DropIntoPathAsync(paths, target.FullPath, move: effect == DragDropEffects.Move);
     }
 
     /// <summary>The innermost folder under the pointer, unless it is one of the things being dropped or inside one.</summary>
@@ -1007,10 +1020,10 @@ public partial class MainWindow
         }
 
         var target = hit.Folder;
-        return paths.Any(path =>
+        return IsDropRefused(target.FullPath, () => paths.Any(path =>
             ViewAllPath.Equals(path, target.FullPath)
             || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)
-            || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _nestedDragPaths is not null)
+            || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _nestedDragPaths is not null))
             ? null
             : target;
     }

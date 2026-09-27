@@ -1046,6 +1046,14 @@ public partial class MainWindow : Window
 
     // ---- Drag and drop -----------------------------------------------------
 
+    /// <summary>The data object of the drag being read, and the paths it was found to carry (see <see cref="TryGetDropPaths"/>).</summary>
+    private IDataObject? _dropData;
+    private string[] _dropPaths = [];
+
+    /// <summary>The last folder the drag was over, and whether its items may not go in (see <see cref="IsDropRefused"/>).</summary>
+    private string? _dropCheckedFolder;
+    private bool _dropFolderRefused;
+
     private void Editor_PreviewDragOver(object sender, DragEventArgs e)
     {
         if (!TryGetDropPaths(e.Data, out var paths))
@@ -1057,17 +1065,15 @@ public partial class MainWindow : Window
         }
 
         var target = ResolveDropTarget(e, paths);
-        _viewModel.Tree.SetDropTarget(target);
-        e.Effects = target is null
-            ? DragDropEffects.None
-            : IsCopyOperation(paths, target.FullPath)
-                ? DragDropEffects.Copy
-                : DragDropEffects.Move;
+        var effect = target is null ? DragDropEffects.None : DropEffectFor(e, paths, target.FullPath);
+        _viewModel.Tree.SetDropTarget(effect == DragDropEffects.None ? null : target);
+        e.Effects = effect;
         e.Handled = true;
     }
 
     private void Editor_PreviewDragLeave(object sender, DragEventArgs e)
     {
+        ForgetDropPaths();
         if (!Editor.IsMouseOver)
         {
             _viewModel.Tree.SetDropTarget(null);
@@ -1076,8 +1082,11 @@ public partial class MainWindow : Window
 
     private async void Editor_PreviewDrop(object sender, DragEventArgs e)
     {
-        if (!TryGetDropPaths(e.Data, out var paths))
+        var carriesPaths = TryGetDropPaths(e.Data, out var paths);
+        ForgetDropPaths();
+        if (!carriesPaths)
         {
+            e.Effects = DragDropEffects.None;
             return;
         }
 
@@ -1085,11 +1094,19 @@ public partial class MainWindow : Window
         _viewModel.Tree.SetDropTarget(null);
         if (target is null)
         {
+            e.Effects = DragDropEffects.None;
             return;
         }
 
         e.Handled = true;
-        await _viewModel.DropIntoPathAsync(paths, target.FullPath, Keyboard.Modifiers);
+        var effect = DropEffectFor(e, paths, target.FullPath);
+        e.Effects = ReportedDropEffect(effect);
+        if (effect == DragDropEffects.None)
+        {
+            return;
+        }
+
+        await _viewModel.DropIntoPathAsync(paths, target.FullPath, move: effect == DragDropEffects.Move);
     }
 
     /// <summary>
@@ -1108,26 +1125,117 @@ public partial class MainWindow : Window
         }
 
         // Dropping something onto itself or into its own subtree is not a move.
-        return paths.Any(path =>
+        return IsDropRefused(target.FullPath, () => paths.Any(path =>
             ViewAllPath.Equals(path, target.FullPath)
-            || NativeShellService.IsInvalidMoveTarget(path, target.FullPath))
+            || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)))
             ? null
             : target;
     }
 
-    private static bool IsCopyOperation(IReadOnlyList<string> paths, string targetDirectory)
-        => !MainViewModel.ShouldMove(paths, targetDirectory, Keyboard.Modifiers);
-
-    private static bool TryGetDropPaths(IDataObject data, out string[] paths)
+    /// <summary>
+    /// What dropping here does: Explorer's rule (<see cref="MainViewModel.ShouldMove"/>)
+    /// with the keys the drag itself reports, then kept to what the drag's
+    /// source allows - what the keys ask for if it may, otherwise a copy,
+    /// otherwise a move, otherwise nothing.  A source that only lets its items
+    /// be copied - a browser, a mail attachment, a zip file - is not offered a
+    /// move it would refuse.
+    ///
+    /// The keys are the drag's, not <see cref="Keyboard.Modifiers"/>: while
+    /// another program runs the drag, this window is never given the keyboard,
+    /// and its own idea of what is held down is whatever it was when it last
+    /// had it - so Ctrl held over a drag from Explorer went unseen, and a copy
+    /// on the same drive was made a move.
+    /// </summary>
+    private static DragDropEffects DropEffectFor(DragEventArgs e, IReadOnlyList<string> paths, string targetDirectory)
     {
-        paths = [];
-        if (!data.GetDataPresent(DataFormats.FileDrop) || data.GetData(DataFormats.FileDrop) is not string[] dropped)
+        var modifiers = ModifierKeys.None;
+        if ((e.KeyStates & DragDropKeyStates.ShiftKey) != 0)
         {
-            return false;
+            modifiers |= ModifierKeys.Shift;
         }
 
-        paths = dropped;
-        return dropped.Length > 0;
+        if ((e.KeyStates & DragDropKeyStates.ControlKey) != 0)
+        {
+            modifiers |= ModifierKeys.Control;
+        }
+
+        if ((e.KeyStates & DragDropKeyStates.AltKey) != 0)
+        {
+            modifiers |= ModifierKeys.Alt;
+        }
+
+        var wanted = MainViewModel.ShouldMove(paths, targetDirectory, modifiers)
+            ? DragDropEffects.Move
+            : DragDropEffects.Copy;
+        foreach (var effect in new[] { wanted, DragDropEffects.Copy, DragDropEffects.Move })
+        {
+            if ((e.AllowedEffects & effect) == effect)
+            {
+                return effect;
+            }
+        }
+
+        return DragDropEffects.None;
+    }
+
+    /// <summary>
+    /// What the source of a drop is told was done, which some sources act on.
+    /// A copy is said as a copy, so the originals are left alone.  A move is
+    /// made here, whole, and only once the drop has returned: the source is
+    /// told there is nothing left for it to do, because a source that hears
+    /// "moved" may delete what it takes to be its leftover originals - before
+    /// this move has even picked them up.
+    /// </summary>
+    private static DragDropEffects ReportedDropEffect(DragDropEffects effect)
+        => effect == DragDropEffects.Copy ? DragDropEffects.Copy : DragDropEffects.None;
+
+    /// <summary>
+    /// The files a drag carries, read from it once per drag.  DragOver comes
+    /// with every move of the pointer, and each read of a drag from another
+    /// program is a call into that program and a fresh copy of every path it
+    /// carries.  A drag's data object stays the same one from the moment it
+    /// comes over the window to its drop, so the answer is kept against it;
+    /// leaving or dropping lets it go (see <see cref="ForgetDropPaths"/>).
+    /// </summary>
+    private bool TryGetDropPaths(IDataObject data, out string[] paths)
+    {
+        if (!ReferenceEquals(data, _dropData))
+        {
+            ForgetDropPaths();
+            _dropData = data;
+            _dropPaths = data.GetDataPresent(DataFormats.FileDrop) && data.GetData(DataFormats.FileDrop) is string[] dropped
+                ? dropped
+                : [];
+        }
+
+        paths = _dropPaths;
+        return paths.Length > 0;
+    }
+
+    /// <summary>
+    /// Whether the drag's items may not go into <paramref name="folder"/>, as
+    /// <paramref name="refuses"/> decides - asked once for each folder the
+    /// pointer comes to rather than on every DragOver while it stays there,
+    /// because the answer compares every item the drag carries.
+    /// </summary>
+    private bool IsDropRefused(string folder, Func<bool> refuses)
+    {
+        if (!string.Equals(folder, _dropCheckedFolder, StringComparison.OrdinalIgnoreCase))
+        {
+            _dropCheckedFolder = folder;
+            _dropFolderRefused = refuses();
+        }
+
+        return _dropFolderRefused;
+    }
+
+    /// <summary>The drag left or was dropped: what it carried is not kept for the next one.</summary>
+    private void ForgetDropPaths()
+    {
+        _dropData = null;
+        _dropPaths = [];
+        _dropCheckedFolder = null;
+        _dropFolderRefused = false;
     }
 
     // ---- Context menus -----------------------------------------------------

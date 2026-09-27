@@ -2,6 +2,7 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Interop;
 using Microsoft.VisualBasic.FileIO;
 
 namespace UltraExplorer.Services;
@@ -220,69 +221,61 @@ public sealed class NativeShellService
         return DropEffectCopy;
     }
 
+    /// <summary>
+    /// Copies or moves items into a folder as one operation of the Shell's own,
+    /// as Explorer does: one progress window, and one question for a clash,
+    /// with "do this for all" and Skip, rather than one per item - and an
+    /// answer of Skip or Cancel no longer leaves the rest of the batch undone
+    /// half way through.  Undo in Explorer covers it too.
+    /// </summary>
     public Task CopyOrMoveAsync(IEnumerable<string> sources, string targetDirectory, bool move)
     {
-        var sourceArray = sources.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var sourceArray = sources
+            .Where(PathExists)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+
+            // Into the folder it is already in: nothing to do, and the Shell
+            // would only say that the source and the destination are the same.
+            .Where(source => !PathsEqual(source, Path.Combine(targetDirectory, Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar)))))
+            .ToArray();
         if (sourceArray.Length == 0)
         {
             return Task.CompletedTask;
         }
 
+        ThrowIfAnyRoot(sourceArray, move ? "moved" : "copied");
         Directory.CreateDirectory(targetDirectory);
-        return RunStaAsync(() =>
-        {
-            foreach (var source in sourceArray)
-            {
-                var target = Path.Combine(targetDirectory, Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar)));
-                if (PathsEqual(source, target))
-                {
-                    continue;
-                }
-
-                if (Directory.Exists(source))
-                {
-                    if (move)
-                    {
-                        FileSystem.MoveDirectory(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
-                    }
-                    else
-                    {
-                        FileSystem.CopyDirectory(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
-                    }
-                }
-                else if (File.Exists(source))
-                {
-                    if (move)
-                    {
-                        FileSystem.MoveFile(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
-                    }
-                    else
-                    {
-                        FileSystem.CopyFile(source, target, UIOption.AllDialogs, UICancelOption.ThrowException);
-                    }
-                }
-            }
-        });
+        var owner = OwnerWindowHandle();
+        return RunStaAsync(() => RunShellOperation(
+            owner,
+            move ? FileOperation.Move : FileOperation.Copy,
+            sourceArray,
+            targetDirectory,
+            FileOperationFlags.AllowUndo | FileOperationFlags.NoConnectedElements));
     }
 
+    /// <summary>
+    /// Deletes items as one operation of the Shell's own.  To the Recycle Bin,
+    /// Windows asks - or not - as the user has told the Recycle Bin to, once
+    /// for the lot, and warns before anything that cannot be recycled is
+    /// destroyed instead.  Permanently, the app has already asked, so Windows
+    /// does not ask again for every item.
+    /// </summary>
     public Task DeleteAsync(IEnumerable<string> paths, bool permanently)
     {
         var pathArray = paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        return RunStaAsync(() =>
+        if (pathArray.Length == 0)
         {
-            foreach (var path in pathArray)
-            {
-                var recycle = permanently ? RecycleOption.DeletePermanently : RecycleOption.SendToRecycleBin;
-                if (Directory.Exists(path))
-                {
-                    FileSystem.DeleteDirectory(path, UIOption.AllDialogs, recycle, UICancelOption.ThrowException);
-                }
-                else if (File.Exists(path))
-                {
-                    FileSystem.DeleteFile(path, UIOption.AllDialogs, recycle, UICancelOption.ThrowException);
-                }
-            }
-        });
+            return Task.CompletedTask;
+        }
+
+        ThrowIfAnyRoot(pathArray, "deleted");
+        var flags = FileOperationFlags.NoConnectedElements
+            | (permanently
+                ? FileOperationFlags.NoConfirmation
+                : FileOperationFlags.AllowUndo | FileOperationFlags.WantNukeWarning);
+        var owner = OwnerWindowHandle();
+        return RunStaAsync(() => RunShellOperation(owner, FileOperation.Delete, pathArray, null, flags));
     }
 
     public Task<string> DuplicateAsync(string path)
@@ -310,7 +303,12 @@ public sealed class NativeShellService
 
         var parent = Path.GetDirectoryName(path) ?? throw new InvalidOperationException("The parent folder is unavailable.");
         var target = Path.Combine(parent, newName.Trim());
-        if (PathExists(target))
+
+        // A new name that differs only in its capitals names the same item on
+        // Windows, which of course exists; that is a rename, not a clash.  The
+        // moves below change the capitals and never replace anything, so a
+        // folder that really does keep two such names apart still refuses.
+        if (!PathsEqual(path, target) && PathExists(target))
         {
             throw new IOException("An item with this name already exists.");
         }
@@ -370,16 +368,24 @@ public sealed class NativeShellService
     public static bool IsSameVolume(string source, string targetDirectory)
         => string.Equals(Path.GetPathRoot(source), Path.GetPathRoot(targetDirectory), StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Whether <paramref name="targetDirectory"/> is <paramref name="source"/>
+    /// itself or inside it, when the source is a folder.  The names are
+    /// compared first and the disk is asked only when they say yes: a drag
+    /// asks this for every item it carries on every move of the pointer, and
+    /// a lookup each time - thousands, perhaps over a network - stalled it.
+    /// </summary>
     public static bool IsInvalidMoveTarget(string source, string targetDirectory)
     {
-        if (!Directory.Exists(source))
+        if (source.Length == 0 || targetDirectory.Length == 0)
         {
             return false;
         }
 
         var sourceWithSeparator = Path.GetFullPath(source).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
         var targetWithSeparator = Path.GetFullPath(targetDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
-        return targetWithSeparator.StartsWith(sourceWithSeparator, StringComparison.OrdinalIgnoreCase);
+        return targetWithSeparator.StartsWith(sourceWithSeparator, StringComparison.OrdinalIgnoreCase)
+            && Directory.Exists(source);
     }
 
     private const string PreferredDropEffectFormat = "Preferred DropEffect";
@@ -407,6 +413,76 @@ public sealed class NativeShellService
 
         return candidate;
     }
+
+    /// <summary>
+    /// A drive's or a share's root is not an item to delete, move or copy into
+    /// a folder, and what the Shell would make of being handed one is not worth
+    /// finding out: the whole operation is refused before anything is touched.
+    /// </summary>
+    private static void ThrowIfAnyRoot(IEnumerable<string> paths, string verb)
+    {
+        if (paths.FirstOrDefault(path => Path.GetDirectoryName(Path.GetFullPath(path)) is null) is { } root)
+        {
+            throw new IOException($"{root} is the root of a drive and cannot be {verb}.");
+        }
+    }
+
+    /// <summary>
+    /// The window the Shell's dialogs belong to - the app's window in front -
+    /// asked for on the UI thread, before the operation leaves it.  Owned, a
+    /// question stays in front of the window it is about.
+    /// </summary>
+    private static IntPtr OwnerWindowHandle()
+    {
+        var application = Application.Current;
+        if (application is null || !application.Dispatcher.CheckAccess())
+        {
+            return IntPtr.Zero;
+        }
+
+        var owner = application.Windows.OfType<Window>().FirstOrDefault(candidate => candidate.IsActive) ?? application.MainWindow;
+        return owner is null ? IntPtr.Zero : new WindowInteropHelper(owner).Handle;
+    }
+
+    /// <summary>
+    /// One SHFileOperation over every item.  The Shell takes its items as one
+    /// string, each full path ended by a null and the list by another, and a
+    /// path that is not full it would read from the current directory - so
+    /// every path is made full here.  Stopped by the user - Cancel, or No to
+    /// one of its questions - it is an <see cref="OperationCanceledException"/>,
+    /// which the callers have always taken as "cancelled"; any other failure
+    /// is an <see cref="IOException"/>, once Windows has shown its own error.
+    /// </summary>
+    private static void RunShellOperation(
+        IntPtr owner,
+        FileOperation operation,
+        IReadOnlyList<string> sources,
+        string? targetDirectory,
+        FileOperationFlags flags)
+    {
+        var request = new ShellFileOperation
+        {
+            Window = owner,
+            Function = operation,
+            From = DoubleNullTerminated(sources),
+            To = targetDirectory is null ? null : DoubleNullTerminated([targetDirectory]),
+            Flags = flags
+        };
+
+        var result = SHFileOperation(ref request);
+        if (request.AnyOperationsAborted || result is ErrorCancelled or LegacyErrorCancelled)
+        {
+            throw new OperationCanceledException();
+        }
+
+        if (result != 0)
+        {
+            throw new IOException($"Windows could not finish the operation (error 0x{result:X}).");
+        }
+    }
+
+    private static string DoubleNullTerminated(IEnumerable<string> paths)
+        => string.Concat(paths.Select(path => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)) + '\0')) + '\0';
 
     private static Task RunStaAsync(Action action)
     {
@@ -498,4 +574,44 @@ public sealed class NativeShellService
     [DllImport("shell32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool ShellExecuteEx(ref ShellExecuteInfo executeInfo);
+
+    private const int ErrorCancelled = 1223;
+    private const int LegacyErrorCancelled = 0x75;
+
+    private enum FileOperation : uint
+    {
+        Move = 0x0001,
+        Copy = 0x0002,
+        Delete = 0x0003
+    }
+
+    [Flags]
+    private enum FileOperationFlags : ushort
+    {
+        NoConfirmation = 0x0010,
+        AllowUndo = 0x0040,
+        NoConnectedElements = 0x2000,
+        WantNukeWarning = 0x4000
+    }
+
+    /// <summary>
+    /// SHFILEOPSTRUCTW.  shellapi.h packs it to single bytes only on 32-bit
+    /// Windows; the app is built for x64 alone (the project's
+    /// RuntimeIdentifier), where it has the natural layout declared here.
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct ShellFileOperation
+    {
+        public IntPtr Window;
+        public FileOperation Function;
+        [MarshalAs(UnmanagedType.LPWStr)] public string From;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? To;
+        public FileOperationFlags Flags;
+        [MarshalAs(UnmanagedType.Bool)] public bool AnyOperationsAborted;
+        public IntPtr NameMappings;
+        [MarshalAs(UnmanagedType.LPWStr)] public string? ProgressTitle;
+    }
+
+    [DllImport("shell32.dll", EntryPoint = "SHFileOperationW", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern int SHFileOperation(ref ShellFileOperation fileOperation);
 }

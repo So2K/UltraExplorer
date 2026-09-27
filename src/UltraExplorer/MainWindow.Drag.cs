@@ -6,6 +6,7 @@ using Nodify;
 using Nodify.Events;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.ViewModels;
 
 namespace UltraExplorer;
 
@@ -212,7 +213,10 @@ public partial class MainWindow
         {
             if (action == NodeDropAction.MoveInto)
             {
-                await _viewModel.DropIntoPathAsync(paths, target.FullPath, Keyboard.Modifiers);
+                // A node dragged within the window: the keyboard has been this
+                // window's all along, so what it says is held is what is held.
+                var move = MainViewModel.ShouldMove(paths, target.FullPath, Keyboard.Modifiers);
+                await _viewModel.DropIntoPathAsync(paths, target.FullPath, move);
                 return;
             }
 
