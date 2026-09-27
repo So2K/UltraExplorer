@@ -222,6 +222,17 @@ internal static partial class Program
             Check($"a selected file renamed elsewhere is selected under its new name in {times[0]} ms", times[0] is >= 0 and <= 1_000 && !tree.Selection.Contains(notes));
             Check("and its mark moved with it", marks.Get(notesRenamed).AccentHex == "#EF5A68" && marks.Get(notes).IsEmpty);
 
+            // ---- a rename that only changes the case keeps the mark ------------------------------
+            // Marks are kept without regard to case, so the old name and the new
+            // one are the same key: clearing the old name after marking the new
+            // one used to clear the mark altogether.
+            var notesCased = Path.Combine(clamp, "Notes-Renamed.txt");
+            File.Move(notesRenamed, notesCased);
+            await LiveWait(() => marks.Snapshot().Any(pair => string.Equals(pair.Key, notesCased, StringComparison.Ordinal)), 3_000);
+            Check("a rename that only changes the case keeps the mark, under the new spelling",
+                marks.Get(notesCased).AccentHex == "#EF5A68"
+                && marks.Snapshot().Any(pair => string.Equals(pair.Key, notesCased, StringComparison.Ordinal)));
+
             // ---- a selected file deleted elsewhere is let go ------------------------------------
             await tree.SelectPathAsync(notesRenamed);
             File.Delete(notesRenamed);

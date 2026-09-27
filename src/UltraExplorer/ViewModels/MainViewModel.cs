@@ -51,7 +51,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private int _navigationIndex = -1;
     private bool _isInitialized;
     private bool _isDisposed;
-    private bool _isNavigating;
+
+    /// <summary>
+    /// How many steps back or forward are still under way.  A count, not a
+    /// flag: with two in flight, the first to finish would otherwise clear it
+    /// while the other was still going, and that one arriving would be taken
+    /// for a new place and cut off the forward history.
+    /// </summary>
+    private int _historyNavigations;
+
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
@@ -103,7 +111,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         UpCommand = new AsyncRelayCommand(GoUpAsync);
         HomeCommand = new AsyncRelayCommand(GoHomeAsync);
         RefreshCommand = new AsyncRelayCommand(RefreshActiveAsync);
-        OpenSidebarItemCommand = new AsyncRelayCommand<FavoriteItemViewModel>(OpenSidebarItemAsync);
+        // One command for every entry of the navigation pane, so it must not
+        // switch itself off while one of them is being reached: a share that
+        // is slow to answer would grey out the whole pane.  The last entry
+        // clicked is where the canvas ends up (see ViewAllViewModel.RevealPathAsync).
+        OpenSidebarItemCommand = new AsyncRelayCommand<FavoriteItemViewModel>(OpenSidebarItemAsync, allowConcurrent: true);
 
         Address = new AddressBarViewModel(
             path => Tree.RevealPathAsync(path),
@@ -614,9 +626,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 _loadingOrders = false;
             }
 
-            foreach (var legacy in state.Nodes)
+            // A file edited by hand can hold a null for a list or an entry;
+            // what cannot be read is passed over, not a reason not to start.
+            foreach (var legacy in state.Nodes ?? [])
             {
-                _marks.Seed(legacy.Path, legacy.AccentHex, legacy.Note);
+                if (legacy?.Path is { } legacyPath)
+                {
+                    _marks.Seed(legacyPath, legacy.AccentHex, legacy.Note);
+                }
+            }
+
+            // Before the tree reads anything, so the drives come up with or
+            // without their hidden items as they were left.  A file dialog
+            // keeps to its caller's rules, and does not write this back either.
+            if (!_isPickerSession)
+            {
+                Tree.RestoreShowHiddenItems(state.ShowHiddenItems);
             }
         }
 
@@ -635,16 +660,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         if (state is not null)
         {
-            foreach (var favorite in state.Favorites.Where(favorite => Directory.Exists(favorite.Path)))
+            // Every pinned folder comes back, whether or not it can be reached
+            // right now.  A share on a NAS that is off, a VPN not yet up, a USB
+            // disk not plugged in: checking would hold the window up for as
+            // long as the network takes to give up, and dropping the pin would
+            // lose it for good at the next save.  One that is still out of
+            // reach says so when it is clicked.
+            foreach (var favorite in state.Favorites ?? [])
             {
+                if (favorite is null || string.IsNullOrWhiteSpace(favorite.Path))
+                {
+                    continue;
+                }
+
                 if (HomeItems.Concat(QuickAccess).All(existing => !ViewAllPath.Equals(existing.Path, favorite.Path)))
                 {
                     QuickAccess.Add(new FavoriteItemViewModel
                     {
-                        Name = favorite.Name,
+                        Name = string.IsNullOrWhiteSpace(favorite.Name) ? favorite.Path : favorite.Name,
                         Path = favorite.Path,
-                        Glyph = favorite.Glyph,
-                        AccentHex = favorite.AccentHex,
+                        Glyph = favorite.Glyph ?? "\uE8B7",
+                        AccentHex = favorite.AccentHex ?? "#E3B341",
                         IsCustom = true
                     });
                 }
@@ -757,6 +793,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var leftDrag = WorkspaceState.LeftDragSetting(_leftDrag);
         var hintShown = _leftDragHintShown;
         var layersOff = CanvasLayers.OffSetting(_layers);
+
+        // A file dialog's hidden items are its caller's rules, not a choice.
+        var showHidden = !_isPickerSession && Tree.ShowHiddenItems;
         if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
         {
             layout = current.CanvasLayout;
@@ -768,6 +807,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             leftDrag = current.NestedLeftDrag;
             hintShown = current.NestedLeftDragHintShown;
             layersOff = current.CanvasLayersOff;
+            showHidden = current.ShowHiddenItems;
         }
 
         var state = new WorkspaceState
@@ -775,6 +815,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             SidebarWidth = SidebarWidth,
             IsMinimapVisible = IsMinimapVisible,
             IsFolderListVisible = Tree.FolderList.IsVisible,
+            ShowHiddenItems = showHidden,
             CanvasLayout = layout,
             CanvasSort = sort,
             CanvasSortScope = scope,
@@ -840,6 +881,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             case nameof(ViewAllViewModel.HiddenCount):
                 OnPropertyChanged(nameof(HiddenCount));
                 break;
+            case nameof(ViewAllViewModel.ShowHiddenItems):
+                // Remembered as it is changed, from the menu or the Settings
+                // page alike.  A file dialog's rules are not written down.
+                if (!_isPickerSession)
+                {
+                    _ = SaveNowAsync();
+                }
+
+                break;
             case nameof(ViewAllViewModel.ActivePath):
                 OnPropertyChanged(nameof(TabTitle));
                 Address.SetPath(Tree.ActivePath);
@@ -902,7 +952,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void RecordNavigation(string path)
     {
-        if (_isNavigating || string.IsNullOrWhiteSpace(path))
+        if (_historyNavigations > 0 || string.IsNullOrWhiteSpace(path))
         {
             return;
         }
@@ -952,14 +1002,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task NavigateHistoryAsync(string path)
     {
-        _isNavigating = true;
+        _historyNavigations++;
         try
         {
             await Tree.RevealPathAsync(path);
         }
         finally
         {
-            _isNavigating = false;
+            _historyNavigations--;
         }
     }
 

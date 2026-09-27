@@ -53,6 +53,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     private bool _isSyncingSelection;
     private bool _treeSelectionPending;
     private int _selectTicket;
+
+    /// <summary>Which navigation through <see cref="RevealPathAsync"/> is the latest; an older one still reading does not select.</summary>
+    private int _revealTicket;
+
     private int _marqueePreview = -1;
     private bool _focusRecordsNavigation = true;
     private ViewAllNodeViewModel? _activeNode;
@@ -592,6 +596,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Adds a non-drive location (WSL, UNC share) as its own root.</summary>
     public async Task<ViewAllNodeViewModel?> AddRootAsync(string path)
     {
+        // A navigation like any other: a share slow to answer does not take
+        // the selection back from somewhere the user went meanwhile.
+        var ticket = ++_revealTicket;
         var node = await _graph.AddRootAsync(path);
         if (node is null)
         {
@@ -600,9 +607,18 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         await _graph.ExpandAsync(node);
-        SelectOnly(node);
+        var superseded = ticket != _revealTicket;
+        if (!superseded)
+        {
+            SelectOnly(node);
+        }
+
         RebuildRenderSet();
-        FocusNodeRequested?.Invoke(node, true);
+        if (!superseded)
+        {
+            FocusNodeRequested?.Invoke(node, true);
+        }
+
         ScheduleSave();
         return node;
     }
@@ -662,6 +678,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     public bool ShowHiddenItems
     {
         get => _graph.Options.IncludeHidden;
+    }
+
+    /// <summary>
+    /// The hidden items choice remembered from last time.  Only before
+    /// <see cref="InitializeAsync"/>, so the drives are read that way from the
+    /// start; nothing has read the choice yet, so nothing is told it changed.
+    /// Later it is <see cref="SetShowHiddenItemsAsync"/>.
+    /// </summary>
+    public void RestoreShowHiddenItems(bool include)
+    {
+        if (_isInitialized || _isDisposed || _graph.Options.IncludeHidden == include)
+        {
+            return;
+        }
+
+        _graph.PresetOptions(_graph.Options with { IncludeHidden = include });
     }
 
     public async Task SetShowHiddenItemsAsync(bool include)
@@ -1093,6 +1125,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return null;
         }
 
+        // Going somewhere while an earlier navigation is still reading its way
+        // down - Back twice in quick succession, a second favourite clicked
+        // while a share takes its time - must end where the last one asked
+        // to, whichever finishes last.  Only a reveal that selects takes a
+        // new ticket; one that flies there without selecting stands down for
+        // any that starts after it.
+        var ticket = select ? ++_revealTicket : _revealTicket;
+
         IReadOnlyList<string> chain;
         string normalized;
         try
@@ -1164,13 +1204,17 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return null;
         }
 
-        if (select)
+        // Superseded: the folders on the way are open and the node exists, but
+        // the selection, the view and the history belong to the navigation
+        // that came after.
+        var superseded = ticket != _revealTicket;
+        if (select && !superseded)
         {
             SelectOnly(node);
         }
 
         RebuildRenderSet();
-        if (focus)
+        if (focus && !superseded)
         {
             FocusNodeRequested?.Invoke(node, true);
         }
@@ -1691,10 +1735,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 continue;
             }
 
-            _marks.SetAccent(moved, mark.AccentHex);
-            _marks.SetNote(moved, mark.Note);
+            // The old name is let go of before the new one takes the mark.
+            // Marks are kept without regard to case, so after a rename that
+            // only changed the case - Photos to photos - the two names are one
+            // key, and clearing the old name last would clear the mark it had
+            // just been given.  This way round the mark also takes the new
+            // spelling.
             _marks.SetAccent(path, null);
             _marks.SetNote(path, null);
+            _marks.SetAccent(moved, mark.AccentHex);
+            _marks.SetNote(moved, mark.Note);
         }
     }
 

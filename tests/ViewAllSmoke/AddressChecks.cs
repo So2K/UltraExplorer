@@ -175,15 +175,30 @@ internal static partial class Program
             Check("finishing a folder leaves the line ready for the next level",
                 address.Text == inner + separator && address.Highlighted is null);
 
+            // Whether a typed path exists is asked off the interface thread, so
+            // Enter answers a moment later rather than at once.
             address.Text = Path.Combine(root, "nowhere-at-all");
             address.GoCommand.Execute(null);
-            Check("a path that does not exist says so", messages.Any(message => message.IsError));
+            Check("a path that does not exist says so", await AddressWaitFor(() => messages.Any(message => message.IsError)));
             Check("and leaves what was typed where it can be corrected", address.IsEditing);
 
             address.Text = beta;
             address.GoCommand.Execute(null);
-            Check("a path that does exist is where the window goes", navigated.Contains(beta));
+            Check("a path that does exist is where the window goes", await AddressWaitFor(() => navigated.Contains(beta)));
             Check("and the line hands the strip back to the crumbs", !address.IsEditing);
+
+            // A path that is not a full one is read against the folder the
+            // window is showing, never against the directory the process
+            // happens to be in - and a drive letter alone is the drive.
+            Check("a relative path is read against the folder being shown",
+                AddressBarViewModel.Resolve(Path.Combine("..", "beta"), alpha) == beta);
+            Check("and against the folder of a file being shown",
+                AddressBarViewModel.Resolve("alpha", Path.Combine(root, "readme.txt")) == alpha);
+            Check("with nothing shown, a relative path leads nowhere",
+                AddressBarViewModel.Resolve("beta", string.Empty) is null);
+            var drive = Path.GetPathRoot(root)!;
+            Check("a drive letter on its own is the drive's root",
+                AddressBarViewModel.Resolve(drive[..2], alpha) == drive);
 
             address.SetPath(beta);
             address.BeginEdit();
@@ -193,7 +208,7 @@ internal static partial class Program
                 !address.IsEditing && address.Text == beta && address.Suggestions.Count == 0);
 
             history.Add(alpha);
-            address.ShowRecent();
+            await address.ShowRecentAsync();
             Check("the drop-down button offers where the window has already been",
                 address.IsEditing && address.Suggestions.Any(item => item.FullPath == alpha));
         }
@@ -204,5 +219,15 @@ internal static partial class Program
 
         static IReadOnlyList<string> Names(IReadOnlyList<AddressSuggestion> found)
             => found.Select(item => item.Name).ToArray();
+    }
+
+    private static async Task<bool> AddressWaitFor(Func<bool> condition)
+    {
+        for (var attempt = 0; attempt < 200 && !condition(); attempt++)
+        {
+            await Task.Delay(10);
+        }
+
+        return condition();
     }
 }

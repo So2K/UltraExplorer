@@ -26,7 +26,20 @@ public sealed class RelayCommand<T>(Action<T?> execute, Predicate<T?>? canExecut
     private static T? Coerce(object? parameter) => parameter is T typed ? typed : default;
 }
 
-public sealed class AsyncRelayCommand<T>(Func<T?, Task> execute, Predicate<T?>? canExecute = null) : ICommand
+/// <summary>
+/// A command that runs a task.  By default one run at a time: the command
+/// reports itself unavailable until the run in flight is over, so a slow one -
+/// a delete, a paste - is not started a second time over the first.
+/// </summary>
+/// <param name="allowConcurrent">
+/// Lets a second run start while the first is still going, for going
+/// somewhere.  A command shared by every entry of a list - the navigation
+/// pane's - would otherwise switch the whole list off while one share takes
+/// its time to answer, and Enter in the address bar would do nothing; the
+/// navigation itself sees to it that the last one asked for is the one that
+/// wins.
+/// </param>
+public sealed class AsyncRelayCommand<T>(Func<T?, Task> execute, Predicate<T?>? canExecute = null, bool allowConcurrent = false) : ICommand
 {
     private bool _isRunning;
     public event EventHandler? CanExecuteChanged;
@@ -37,6 +50,12 @@ public sealed class AsyncRelayCommand<T>(Func<T?, Task> execute, Predicate<T?>? 
     {
         if (!CanExecute(parameter))
         {
+            return;
+        }
+
+        if (allowConcurrent)
+        {
+            await execute(Coerce(parameter));
             return;
         }
 
@@ -56,7 +75,8 @@ public sealed class AsyncRelayCommand<T>(Func<T?, Task> execute, Predicate<T?>? 
     private static T? Coerce(object? parameter) => parameter is T typed ? typed : default;
 }
 
-public sealed class AsyncRelayCommand(Func<Task> execute, Func<bool>? canExecute = null) : ICommand
+/// <inheritdoc cref="AsyncRelayCommand{T}"/>
+public sealed class AsyncRelayCommand(Func<Task> execute, Func<bool>? canExecute = null, bool allowConcurrent = false) : ICommand
 {
     private bool _isRunning;
     public event EventHandler? CanExecuteChanged;
@@ -67,6 +87,12 @@ public sealed class AsyncRelayCommand(Func<Task> execute, Func<bool>? canExecute
     {
         if (!CanExecute(parameter))
         {
+            return;
+        }
+
+        if (allowConcurrent)
+        {
+            await execute();
             return;
         }
 

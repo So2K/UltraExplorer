@@ -14,6 +14,13 @@ public sealed class WorkspaceState
     /// <summary>Whether the current folder is also shown as a list.</summary>
     public bool IsFolderListVisible { get; set; } = true;
 
+    /// <summary>
+    /// Explorer's hidden items: whether hidden files and folders are listed.
+    /// Missing - a workspace written before it was remembered - they are not,
+    /// as Explorer starts.
+    /// </summary>
+    public bool ShowHiddenItems { get; set; }
+
     /// <summary>"Nested" or "Tree": which picture of the drives the canvas shows.</summary>
     public string CanvasLayout { get; set; } = "Nested";
 

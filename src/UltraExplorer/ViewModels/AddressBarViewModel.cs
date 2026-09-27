@@ -53,6 +53,9 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     private AddressSuggestion? _highlighted;
     private bool _isDisposed;
 
+    /// <summary>Which press of the recent-places button is the latest (see <see cref="ShowRecentAsync"/>).</summary>
+    private int _recentTicket;
+
     /// <param name="navigate">Takes the window to a path that has been checked to exist.</param>
     /// <param name="recent">Where the window has already been, newest first.</param>
     /// <param name="report">Something to say to the user; the flag marks it an error.</param>
@@ -73,16 +76,20 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         };
         _debounce.Tick += (_, _) => _ = RefreshSuggestionsAsync();
 
-        OpenSegmentCommand = new AsyncRelayCommand<BreadcrumbSegment>(OpenSegmentAsync);
+        // Going somewhere is never held up by a place still being reached: a
+        // share that takes its time to answer would otherwise leave the crumbs
+        // dead and Enter ignored until it did.  The window's navigation lets
+        // the last place asked for win.
+        OpenSegmentCommand = new AsyncRelayCommand<BreadcrumbSegment>(OpenSegmentAsync, allowConcurrent: true);
         ToggleSegmentMenuCommand = new AsyncRelayCommand<BreadcrumbSegment>(ToggleSegmentMenuAsync);
-        AcceptCommand = new AsyncRelayCommand<AddressSuggestion>(AcceptAsync);
-        GoCommand = new AsyncRelayCommand(GoAsync);
+        AcceptCommand = new AsyncRelayCommand<AddressSuggestion>(AcceptAsync, allowConcurrent: true);
+        GoCommand = new AsyncRelayCommand(GoAsync, allowConcurrent: true);
         EditCommand = new RelayCommand(BeginEdit);
         CancelCommand = new RelayCommand(EndEdit);
         CopyCommand = new RelayCommand(() => Copy(quoted: false));
         CopyQuotedCommand = new RelayCommand(() => Copy(quoted: true));
-        PasteAndGoCommand = new AsyncRelayCommand(PasteAndGoAsync);
-        ShowRecentCommand = new RelayCommand(ShowRecent);
+        PasteAndGoCommand = new AsyncRelayCommand(PasteAndGoAsync, allowConcurrent: true);
+        ShowRecentCommand = new AsyncRelayCommand(ShowRecentAsync, allowConcurrent: true);
         OpenInExplorerCommand = new RelayCommand(OpenInExplorer);
     }
 
@@ -302,8 +309,14 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// <summary>
     /// The drop-down button and F4: where this window has already been, which is
     /// the one list that cannot be worked out from what has been typed.
+    ///
+    /// Which of those places are still there, and which drives are ready, is
+    /// asked off the interface thread: a share that has gone offline takes as
+    /// long as the network allows to say so, and a disc spinning up takes
+    /// seconds.  A list that arrives after the line has moved on, or after the
+    /// button was pressed again, is dropped.
     /// </summary>
-    public void ShowRecent()
+    public async Task ShowRecentAsync()
     {
         if (!IsEditing)
         {
@@ -312,15 +325,33 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
             EditRequested?.Invoke();
         }
 
+        var ticket = ++_recentTicket;
+        var typed = Text;
+        var recent = _recent();
+        var found = await Task.Run(() => RecentOrDrives(recent));
+        if (_isDisposed
+            || ticket != _recentTicket
+            || !IsEditing
+            || !string.Equals(typed, Text, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        Show(found, string.Empty);
+    }
+
+    /// <summary>The places recently been to that are still there, or the drives when there are none.  Off the interface thread.</summary>
+    private static IReadOnlyList<AddressSuggestion> RecentOrDrives(IReadOnlyList<string> recent)
+    {
         var found = new List<AddressSuggestion>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        AddRecent(found, seen, _recent(), string.Empty);
+        AddRecent(found, seen, recent, string.Empty);
         if (found.Count == 0)
         {
             AddDrives(found, seen, string.Empty);
         }
 
-        Show(found, string.Empty);
+        return found;
     }
 
     // ---- going somewhere ---------------------------------------------------
@@ -362,14 +393,67 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
             return;
         }
 
-        if (!Directory.Exists(expanded) && !File.Exists(expanded))
+        // Asked off the interface thread: a share that is offline takes as
+        // long as the network allows to say it is not there.
+        var current = CurrentPath;
+        var resolved = await Task.Run(() => Resolve(expanded, current));
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        if (resolved is null)
         {
             _report("That location does not exist.", true);
             return;
         }
 
         EndEdit();
-        await _navigate(expanded);
+        await _navigate(resolved);
+    }
+
+    /// <summary>
+    /// What a line typed into the bar names, as a full path that exists, or
+    /// null.  A drive letter on its own means the drive: to Windows "C:" means
+    /// whatever directory the process last left on C, which is where the
+    /// program was started from.  Anything else that is not a full path -
+    /// "..", "Windows", "\Temp" - is read the way a shell reads it, against
+    /// the folder the window is showing (<paramref name="currentPath"/>, or
+    /// the folder of the file it is showing), never against the directory
+    /// the process happens to be in.  Touches the disk; off the interface
+    /// thread.
+    /// </summary>
+    internal static string? Resolve(string expanded, string currentPath)
+    {
+        try
+        {
+            if (expanded.Length == 2 && expanded[1] == ':' && char.IsAsciiLetter(expanded[0]))
+            {
+                expanded += System.IO.Path.DirectorySeparatorChar;
+            }
+
+            if (!System.IO.Path.IsPathFullyQualified(expanded))
+            {
+                if (string.IsNullOrWhiteSpace(currentPath) || !System.IO.Path.IsPathFullyQualified(currentPath))
+                {
+                    return null;
+                }
+
+                var folder = File.Exists(currentPath) ? System.IO.Path.GetDirectoryName(currentPath) : currentPath;
+                if (string.IsNullOrEmpty(folder))
+                {
+                    return null;
+                }
+
+                expanded = System.IO.Path.GetFullPath(expanded, folder);
+            }
+
+            return Directory.Exists(expanded) || File.Exists(expanded) ? expanded : null;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
     }
 
     // ---- the crumb chevrons ------------------------------------------------
