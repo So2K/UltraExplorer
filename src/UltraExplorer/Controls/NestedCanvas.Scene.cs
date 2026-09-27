@@ -849,7 +849,10 @@ public sealed partial class NestedCanvas
             _filterOutlines.Add(new Rect(x, y, w, h));
         }
 
-        if (w >= LoadPixels && folder.CanLoad)
+        // A link is never read for being drawn, but one already read by name
+        // is drawn from what it held then, and is kept up to date like any
+        // other folder (NestedTree.Request).
+        if (w >= LoadPixels && (folder.CanLoad || folder.IsReparsePoint && folder.IsLoaded))
         {
             _tree!.Request(folder, w);
         }

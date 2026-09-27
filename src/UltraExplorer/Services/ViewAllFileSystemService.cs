@@ -447,7 +447,9 @@ public sealed class ViewAllFileSystemService
     {
         if (isDirectory)
         {
-            return info.LastWriteTime.ToString("g", CultureInfo.CurrentCulture);
+            // Made while the folder is listed: a date the culture's calendar
+            // cannot write would otherwise fail the whole listing.
+            return Infrastructure.CultureDates.Format(info.LastWriteTime, "g");
         }
 
         var extension = string.IsNullOrWhiteSpace(info.Extension)

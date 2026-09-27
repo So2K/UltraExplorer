@@ -131,7 +131,7 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
         switch (column)
         {
             case SortColumn.Modified when entry.ModifiedUtc > DateTime.MinValue:
-                return entry.ModifiedUtc.ToLocalTime().ToString("g", System.Globalization.CultureInfo.CurrentCulture);
+                return Infrastructure.CultureDates.Format(entry.ModifiedUtc.ToLocalTime(), "g");
             case SortColumn.Type when isFolder:
                 return FileTypeNames.Folder;
             case SortColumn.Type:

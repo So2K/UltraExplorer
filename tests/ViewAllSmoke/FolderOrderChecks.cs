@@ -811,7 +811,12 @@ internal static partial class Program
             var late = new DateTime(2100, 6, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
             var inside = new DateTime(2020, 6, 1, 12, 0, 0, DateTimeKind.Utc).Ticks;
             return canvas.DateText(early, dateOnly: false).Length > 0 && canvas.DateText(late, dateOnly: true).Length > 0
-                && canvas.DateText(inside, dateOnly: false).Length > 0;
+                && canvas.DateText(inside, dateOnly: false).Length > 0
+
+                // The lists' and the tree's dates, written the same way.
+                && UltraExplorer.Infrastructure.CultureDates.Format(new DateTime(1850, 3, 1), "g").Length > 0
+                && UltraExplorer.Infrastructure.CultureDates.Format(new DateTime(2100, 6, 1), "g").Length > 0
+                && UltraExplorer.Infrastructure.CultureDates.Format(DateTime.FromFileTimeUtc(0).ToLocalTime(), "g").Length == 0;
         }
         catch (ArgumentOutOfRangeException)
         {
