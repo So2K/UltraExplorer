@@ -30,6 +30,10 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
+        // Before anything that can fail: whatever nothing else catches is
+        // written down, and survived where that is safe.
+        CrashReporter.Install(this);
+
         // First, before any window exists: the id is read when a window is shown.
         var isTestCopy = Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1"
             || e.Args.Any(argument => argument.Equals("--nested-bench", StringComparison.OrdinalIgnoreCase)

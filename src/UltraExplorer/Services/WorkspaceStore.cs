@@ -24,10 +24,15 @@ public sealed class WorkspaceStore
     private readonly SemaphoreSlim _saving = new(1, 1);
 
     /// <param name="statePath">Where the workspace is kept; the user's state folder unless a test says otherwise.</param>
+    /// <remarks>
+    /// The folder is made by the first save, not here: this runs while the
+    /// window is being built, and a state folder that cannot be made (a
+    /// <c>ULTRAEXPLORER_STATE_DIR</c> on a drive that is gone) must cost the
+    /// saves, not the window.
+    /// </remarks>
     public WorkspaceStore(string? statePath = null)
     {
         _statePath = statePath ?? AppPaths.State("workspace.json");
-        Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
     }
 
     /// <summary>
@@ -92,15 +97,35 @@ public sealed class WorkspaceStore
     public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
     {
         await _saving.WaitAsync(cancellationToken);
+        var tempPath = _statePath + ".tmp";
         try
         {
-            var tempPath = _statePath + ".tmp";
-            await using (var stream = File.Create(tempPath))
+            Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
+
+            // On disk before the move, not only in the cache: a power cut
+            // after a rename of unwritten data leaves an empty workspace,
+            // which loads as none at all.
+            await using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.Asynchronous))
             {
                 await JsonSerializer.SerializeAsync(stream, state, JsonOptions, cancellationToken);
+                await stream.FlushAsync(cancellationToken);
+                stream.Flush(flushToDisk: true);
             }
 
             File.Move(tempPath, _statePath, true);
+        }
+        catch
+        {
+            try
+            {
+                File.Delete(tempPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // The next save writes over it.
+            }
+
+            throw;
         }
         finally
         {

@@ -13,6 +13,7 @@ using Nodify.Events;
 using Nodify.Interactivity;
 using UltraExplorer.Controls;
 using UltraExplorer.Dialogs;
+using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Picker;
 using UltraExplorer.Services;
@@ -34,6 +35,12 @@ public partial class MainWindow : Window
     private readonly MainViewModel _viewModel;
     private WindowCaptureService? _capture;
     private bool _allowClose;
+
+    /// <summary>Set once a close has started saving, so it saves once.</summary>
+    private bool _closeRequested;
+
+    /// <summary>How long a session that Windows is ending may take to save.</summary>
+    private static readonly TimeSpan SessionEndSaveTimeout = TimeSpan.FromSeconds(3);
     private bool _maximizeHover;
     private bool _sidebarCollapsed;
     private double _restoredSidebarWidth = 240;
@@ -85,6 +92,11 @@ public partial class MainWindow : Window
         }
 
         ConfigureFigmaGestures();
+
+        if (Application.Current is { } application)
+        {
+            application.SessionEnding += OnSessionEnding;
+        }
 
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
@@ -241,6 +253,11 @@ public partial class MainWindow : Window
 
         if (_allowClose)
         {
+            if (Application.Current is { } application)
+            {
+                application.SessionEnding -= OnSessionEnding;
+            }
+
             DependencyPropertyDescriptor
                 .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
                 .RemoveValueChanged(Editor, OnViewportLocationChanged);
@@ -254,11 +271,86 @@ public partial class MainWindow : Window
         }
 
         e.Cancel = true;
+
+        // One save per close: a second click on the close button while the
+        // first save is still being written waits for that one.
+        if (_closeRequested)
+        {
+            return;
+        }
+
+        _closeRequested = true;
+        try
+        {
+            CaptureStateForSave();
+            await _viewModel.SaveNowAsync();
+        }
+        catch (Exception exception)
+        {
+            // A window that cannot be closed is worse than a session that
+            // could not be written, so the failure is recorded and the close
+            // goes on.
+            CrashReporter.Log("saving the session on close", exception);
+        }
+        finally
+        {
+            _allowClose = true;
+
+            // Posted, never called from here: the save returns at once when
+            // there is nothing to save yet, and Close() from inside Closing
+            // throws.
+            _ = Dispatcher.InvokeAsync(Close);
+        }
+    }
+
+    private void CaptureStateForSave()
+    {
         _viewModel.SidebarWidth = SidebarColumn.ActualWidth > 0 ? SidebarColumn.ActualWidth : _restoredSidebarWidth;
         CaptureNestedCamera();
-        await _viewModel.SaveNowAsync();
-        _allowClose = true;
-        Close();
+    }
+
+    /// <summary>
+    /// Logoff, shutdown, or an installer closing the app through Restart
+    /// Manager to update it.  WPF then shuts down without honouring the
+    /// Cancel that <see cref="Window_Closing"/> uses to save first, so that
+    /// save would be cut off.  It is made here instead, while Windows waits for
+    /// the answer to WM_QUERYENDSESSION: the dispatcher keeps running until the
+    /// save is on disk, for a few seconds at most.
+    /// </summary>
+    private void OnSessionEnding(object? sender, SessionEndingCancelEventArgs e)
+    {
+        if (_allowClose || _closeRequested)
+        {
+            return;
+        }
+
+        _closeRequested = true;
+        try
+        {
+            CaptureStateForSave();
+            var saving = _viewModel.SaveNowAsync();
+            if (!saving.IsCompleted)
+            {
+                var frame = new DispatcherFrame();
+                _ = saving.ContinueWith(_ => frame.Continue = false, TaskScheduler.Default);
+                using var giveUp = new Timer(_ => frame.Continue = false, null, SessionEndSaveTimeout, Timeout.InfiniteTimeSpan);
+                Dispatcher.PushFrame(frame);
+            }
+
+            if (saving.IsFaulted)
+            {
+                CrashReporter.Log("saving the session as Windows ends it", saving.Exception);
+            }
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or IOException or UnauthorizedAccessException)
+        {
+            CrashReporter.Log("saving the session as Windows ends it", exception);
+        }
+        finally
+        {
+            // The Closing that follows only tidies up.
+            _allowClose = true;
+        }
     }
 
     /// <summary>
