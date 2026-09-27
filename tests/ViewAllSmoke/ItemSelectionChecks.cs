@@ -96,6 +96,13 @@ internal static partial class Program
         Check("a path's folder is read off it without a copy: C:\\Windows is in C:\\, C:\\ in This PC",
             ItemSelection.ParentOf(@"C:\Windows").SequenceEqual(@"C:\") && ItemSelection.ParentOf(@"C:\").Length == 0
             && ItemSelection.ParentOf(@"C:\Windows\System32\").SequenceEqual(@"C:\Windows"));
+        Check("a share or a WSL distribution is in This PC beside the drives, and what is in one is in it",
+            ItemSelection.ParentOf(@"\\wsl.localhost\Ubuntu").Length == 0 && ItemSelection.ParentOf(@"\\server\share\").Length == 0
+            && ItemSelection.ParentOf(@"\\server\share\docs").SequenceEqual(@"\\server\share")
+            && ItemSelection.ParentOf(@"\\server\share\docs\a.txt").SequenceEqual(@"\\server\share\docs"));
+        var share = new ItemSelection();
+        share.Apply(new SelectionEdit { Added = [new SelectionItem(@"\\wsl.localhost\Ubuntu", true, 0)] });
+        Check("so a share selected is, like a drive, in no folder to paste into - not in \\\\wsl.localhost", share.Container is null && share.Count == 1);
 
         // ---- clearing keeps the focus ------------------------------------------------------
         spread.Apply(new SelectionEdit { Anchor = @"Q:\a\one.txt", Focus = @"Q:\a\two.txt" });

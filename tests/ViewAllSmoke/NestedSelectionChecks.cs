@@ -195,6 +195,8 @@ internal static partial class Program
             SelectionRoundTripChecks(canvas, tree, shared, ref edits);
             SelectionScaleChecks(canvas, tree);
             await SelectionGoneChecks(canvas, tree, disk);
+            SelectionPendingChecks(tree);
+            SelectionShareRootChecks();
         }
         finally
         {
@@ -1317,5 +1319,79 @@ internal static partial class Program
             canvas.SelectionCommitted -= OnEdit;
             Clear(canvas);
         }
+    }
+
+    // ---- waiting for a folder ----------------------------------------------------------------
+
+    /// <summary>
+    /// A selection the canvas holds only as items waiting for a folder it has
+    /// not read - nothing of it on screen - is still the window's, which a
+    /// Delete would act on: Esc lets go of it.  On a canvas of its own, which
+    /// has never been handed a version of any selection.
+    /// </summary>
+    private static void SelectionPendingChecks(NestedTree tree)
+    {
+        Section("nested selection: items waiting for their folder");
+        var canvas = new NestedCanvas { Tree = tree };
+        canvas.Measure(new Size(ViewWidth, ViewHeight));
+        canvas.Arrange(new Rect(0, 0, ViewWidth, ViewHeight));
+        canvas.UpdateLayout();
+        var model = new ItemSelection();
+        model.Apply(new SelectionEdit
+        {
+            Clear = true,
+            Added = [new SelectionItem(@"Q:\not-read-yet\waiting.txt", false, 1)],
+            Source = SelectionSource.List
+        });
+        var clears = 0;
+        void OnEdit(SelectionEdit edit) => clears += edit.Clear ? 1 : 0;
+        canvas.SelectionCommitted += OnEdit;
+        try
+        {
+            canvas.LoadSelection(model);
+            var waiting = canvas.SelectedCount == 0 && canvas.SelectionState.HasPending;
+            var handled = canvas.HandleKey(Key.Escape, ModifierKeys.None);
+            Check("Esc lets go of a selection held only as waiting for a folder not read yet, and tells the window to clear it",
+                waiting && handled && clears == 1 && !canvas.SelectionState.HasPending);
+            Check("and a second Esc, with nothing left at all, is the window's",
+                !canvas.HandleKey(Key.Escape, ModifierKeys.None) && clears == 1);
+        }
+        finally
+        {
+            canvas.SelectionCommitted -= OnEdit;
+            canvas.Tree = null;
+        }
+    }
+
+    /// <summary>
+    /// A share or a WSL distribution is a root of its own, in This PC beside
+    /// the drives: selected anywhere else, the canvas finds it there by its
+    /// whole path - \\ and all - rather than waiting for a folder called
+    /// \\server that is never read.
+    /// </summary>
+    private static void SelectionShareRootChecks()
+    {
+        Section("nested selection: a share beside the drives");
+        const string sharePath = @"\\wsl.localhost\Ubuntu";
+        using var tree = new NestedTree(new FakeDisk().Read) { IsReadingOnDemand = false };
+        tree.SetRoots(
+        [
+            new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive),
+            new NestedRoot(sharePath, "Ubuntu", NestedFolderKind.Drive)
+        ]);
+        var share = tree.Find(sharePath);
+        var model = new ItemSelection();
+        model.Apply(new SelectionEdit
+        {
+            Clear = true,
+            Added = [new SelectionItem(sharePath, true, 0)],
+            Focus = sharePath,
+            Source = SelectionSource.List
+        });
+        var selection = new NestedSelection();
+        selection.Load(model, tree);
+        Check("a share selected elsewhere is selected on the canvas, with the focus on it, and waits for nothing",
+            share is not null && selection.IsSelected(share) && !selection.HasPending
+            && selection.Active is { Folder: { } focused } && ReferenceEquals(focused, share));
     }
 }

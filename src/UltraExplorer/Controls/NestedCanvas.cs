@@ -441,6 +441,25 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
                 }
             }
 
+            // Nothing of the old tree is held on to: the camera's folder and
+            // the chain of rectangles up from it, a flight to one of its
+            // folders, a rectangle being drawn over one, what the pointer is
+            // over or went down on.  Any of them would take the camera, or a
+            // frame's walk, into a tree it is no longer drawing, whose This
+            // PC is not the one the walk starts from.
+            StopFlight();
+            CancelMarquee();
+            _anchor = null;
+            _chain.Clear();
+            _hover = null;
+            _pressHit = null;
+            if (_press == PressKind.Left)
+            {
+                // The button is still down, over something that has gone:
+                // the rest of this press does nothing, rather than click on it.
+                _pressIntent = PressIntent.Spent;
+            }
+
             _tree = value;
             _hasCamera = false;
             if (_tree is not null)

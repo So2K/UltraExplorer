@@ -370,10 +370,15 @@ public sealed partial class NestedCanvas
         });
     }
 
-    /// <summary>Esc, or a click on nothing: nothing selected, the focus and the anchor kept.  False when nothing was.</summary>
+    /// <summary>
+    /// Esc, or a click on nothing: nothing selected, the focus and the anchor
+    /// kept.  False when nothing was - not even something waiting for a
+    /// folder to be read, which the canvas cannot show yet but the window
+    /// still holds, and a Delete would act on.
+    /// </summary>
     private bool ClearSelection()
     {
-        if (_selection.IsEmpty)
+        if (_selection.IsEmpty && !_selection.HasPending)
         {
             return false;
         }

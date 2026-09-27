@@ -99,8 +99,10 @@ public sealed partial class NestedCanvas
 
         _selectionKey = key;
         _selectionMarquee = _marquee;
+        // What vanished is not cleared here: bringing the rectangle up to
+        // date, just above, and starting it may already have found files
+        // gone, and those are reported below with the rest.
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
-        _vanished.Clear();
         if (tree.Version != _prunedTreeVersion)
         {
             _prunedTreeVersion = tree.Version;
@@ -134,6 +136,10 @@ public sealed partial class NestedCanvas
         SelectionRecordCount++;
         LastSelectionPrimitives = primitives;
         LastSelectionMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+
+        // With those the gestures found gone since - a Ctrl+click, a range,
+        // a rectangle let go of - which had nowhere to say so.
+        _selection.TakeVanished(_vanished);
         if (_vanished.Count > 0)
         {
             // Gone from disk since they were selected: one edit for all of

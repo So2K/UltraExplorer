@@ -96,6 +96,15 @@ internal sealed class NestedSelection
     private Dictionary<string, int>? _nameIndex;
     private int _fileCount;
 
+    /// <summary>
+    /// Paths found gone while catching a folder up for a caller with no list
+    /// of its own to put them in - a Ctrl+click asking whether an item is
+    /// selected, a range or a rectangle setting bits - kept until the canvas
+    /// reports what vanished (<see cref="TakeVanished"/>), so the window
+    /// drops them too rather than keeping items nothing shows.
+    /// </summary>
+    private readonly List<string> _unreported = [];
+
     /// <summary>The item Shift ranges are measured from.</summary>
     public NestedItemKey? Anchor { get; set; }
 
@@ -175,7 +184,8 @@ internal sealed class NestedSelection
     /// tiles are placed now, or null when none are selected.  Caught up here,
     /// once, when the folder was sorted or read again since the bits were
     /// set; the paths of files that are gone are added to
-    /// <paramref name="vanished"/>, and a folder that is gone takes its
+    /// <paramref name="vanished"/> - or, without one, kept for
+    /// <see cref="TakeVanished"/> - and a folder that is gone takes its
     /// selection with it.
     /// </summary>
     public FileSet? FilesOf(NestedFolder container, List<string>? vanished)
@@ -185,16 +195,14 @@ internal sealed class NestedSelection
             return null;
         }
 
+        vanished ??= _unreported;
         if (NestedTree.IsDetached(container))
         {
-            if (vanished is not null)
+            for (var index = 0; index < set.FilesRef.Count; index++)
             {
-                for (var index = 0; index < set.FilesRef.Count; index++)
+                if (set[index])
                 {
-                    if (set[index])
-                    {
-                        vanished.Add(container.PathOf(set.FilesRef[index]));
-                    }
+                    vanished.Add(container.PathOf(set.FilesRef[index]));
                 }
             }
 
@@ -256,6 +264,9 @@ internal sealed class NestedSelection
     /// <summary>Nothing selected; anchor and focus kept.</summary>
     public void Clear()
     {
+        // Nothing is left for a path found gone to be taken out of: the
+        // edit that clears the canvas clears the window's selection too.
+        _unreported.Clear();
         if (IsEmpty && _pending.Count == 0)
         {
             return;
@@ -267,6 +278,20 @@ internal sealed class NestedSelection
         _pending.Clear();
         _fileCount = 0;
         Version++;
+    }
+
+    /// <summary>
+    /// Hands over the paths found gone since the last call by the calls that
+    /// had no list of their own to report them in (see <see cref="FilesOf"/>),
+    /// adding them to <paramref name="vanished"/>.
+    /// </summary>
+    public void TakeVanished(List<string> vanished)
+    {
+        if (_unreported.Count > 0)
+        {
+            vanished.AddRange(_unreported);
+            _unreported.Clear();
+        }
     }
 
     /// <summary>Takes every item out of one folder, leaving the rest.</summary>
@@ -342,7 +367,7 @@ internal sealed class NestedSelection
         }
         else if (!ReferenceEquals(set.FilesRef, container.Files))
         {
-            Remap(container, set, null);
+            Remap(container, set, _unreported);
         }
 
         var before = set.Count;
@@ -377,7 +402,7 @@ internal sealed class NestedSelection
         }
         else if (!ReferenceEquals(set.FilesRef, container.Files))
         {
-            Remap(container, set, null);
+            Remap(container, set, _unreported);
         }
 
         return set;
@@ -577,11 +602,16 @@ internal sealed class NestedSelection
         names.Add(name);
     }
 
-    /// <summary>The name part of <paramref name="path"/> after its folder's <paramref name="parentLength"/> characters.</summary>
+    /// <summary>
+    /// The name part of <paramref name="path"/> after its folder's
+    /// <paramref name="parentLength"/> characters.  In This PC - no folder
+    /// before it - the whole path is the name, as This PC's children are
+    /// found by their full paths: a share's leading \\ is part of it.
+    /// </summary>
     private static ReadOnlySpan<char> NameAfter(string path, int parentLength)
     {
         var name = path.AsSpan(parentLength);
-        while (name.Length > 0 && (name[0] == '\\' || name[0] == '/'))
+        while (parentLength > 0 && name.Length > 0 && (name[0] == '\\' || name[0] == '/'))
         {
             name = name[1..];
         }
@@ -602,7 +632,7 @@ internal sealed class NestedSelection
     /// hidden items are hidden - waits to be shown again; one not in the
     /// listing at all is gone.
     /// </summary>
-    private void Remap(NestedFolder container, FileSet set, List<string>? vanished)
+    private void Remap(NestedFolder container, FileSet set, List<string> vanished)
     {
         var old = set.FilesRef;
         var oldBits = set.Bits;
@@ -642,7 +672,7 @@ internal sealed class NestedSelection
                 }
                 else
                 {
-                    vanished?.Add(container.PathOf(old[at]));
+                    vanished.Add(container.PathOf(old[at]));
                 }
             }
         }

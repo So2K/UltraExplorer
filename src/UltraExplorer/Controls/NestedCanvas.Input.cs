@@ -582,18 +582,21 @@ public sealed partial class NestedCanvas
                 UpdateHover(point);
                 return true;
             case MouseButton.Right:
-                if (_press == PressKind.Right)
+                if (_press != PressKind.Right)
                 {
-                    var dragged = _pressMoved;
-                    EndPress();
-                    if (dragged)
-                    {
-                        UpdateHover(point);
-                        return true;
-                    }
+                    // Not a right press of the canvas's own: one that went
+                    // down somewhere else and came up here, one that went down
+                    // while the left button was held, or one whose mouse was
+                    // taken away (PointerLost) - none of them a click, so no
+                    // menu.  Taken while another button's press is under way.
+                    return _press != PressKind.None;
                 }
-                else if (_press != PressKind.None)
+
+                var dragged = _pressMoved;
+                EndPress();
+                if (dragged)
                 {
+                    UpdateHover(point);
                     return true;
                 }
 
@@ -624,7 +627,7 @@ public sealed partial class NestedCanvas
         _press = PressKind.None;
         _pressIntent = PressIntent.Pan;
         _pressContainer = null;
-        ClearValue(CursorProperty);
+        RestoreCursor();
         RequestFrame(Layers.Overlay);
     }
 
@@ -771,8 +774,25 @@ public sealed partial class NestedCanvas
             ReleaseMouseCapture();
         }
 
-        ClearValue(CursorProperty);
+        RestoreCursor();
         RequestFrame(Layers.Overlay);
+    }
+
+    /// <summary>
+    /// The cursor once a press is over: the open hand while Space is still
+    /// held - the window set it when Space went down, and only puts it back
+    /// when Space comes up - otherwise the canvas's own.
+    /// </summary>
+    private void RestoreCursor()
+    {
+        if (IsSpacePanArmed)
+        {
+            Cursor = Cursors.Hand;
+        }
+        else
+        {
+            ClearValue(CursorProperty);
+        }
     }
 
     private void UpdateHover(Point point)

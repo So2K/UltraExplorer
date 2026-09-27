@@ -356,6 +356,8 @@ public sealed class ItemSelection
     /// <summary>
     /// The folder a path is directly inside, as a slice of the path itself -
     /// nothing is allocated to find it.  A drive's folder is empty: This PC.
+    /// So is a share's or a WSL distribution's (\\server\share), which sit
+    /// in This PC beside the drives.
     /// </summary>
     public static ReadOnlySpan<char> ParentOf(ReadOnlySpan<char> path)
     {
@@ -376,8 +378,11 @@ public sealed class ItemSelection
             return path.Length == 3 ? [] : path[..3];
         }
 
-        if (cut < 2 && path.StartsWith(@"\\"))
+        if (path.StartsWith(@"\\") && path[2..].IndexOfAny('\\', '/') == cut - 2)
         {
+            // "\\server" or "\\server\share": the separator after the server's
+            // name is the last one, so this is a share itself, not something in
+            // one - and "\\server" is no folder anybody can open.
             return [];
         }
 

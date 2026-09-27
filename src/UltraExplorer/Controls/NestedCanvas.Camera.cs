@@ -28,7 +28,21 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        if (!animated || _viewWidth <= 0)
+        if (_viewWidth <= 0)
+        {
+            // No size yet: This PC would be framed in a view of none - a
+            // speck 40 DIPs wide - and kept that way, as a camera somebody
+            // chose.  It is framed instead once the canvas knows its size
+            // (EnsureCamera), and framed again for each size until somebody
+            // moves it, as the first view always is.
+            StopFlight();
+            _anchor = _tree.Root;
+            _hasCamera = false;
+            RequestFrame(Layers.All);
+            return;
+        }
+
+        if (!animated)
         {
             StopFlight();
             _anchor = _tree.Root;
@@ -212,15 +226,19 @@ public sealed partial class NestedCanvas
     /// </summary>
     public async Task RestoreCameraAsync(NestedCameraState state)
     {
-        if (_tree is null || !(state.Width > 0) || double.IsInfinity(state.Width))
+        if (_tree is not { } tree || !(state.Width > 0) || double.IsInfinity(state.Width))
         {
             return;
         }
 
         _cameraTouched = false;
         var isRoot = string.IsNullOrWhiteSpace(state.AnchorPath);
-        var folder = isRoot ? _tree.Root : await _tree.RevealAsync(state.AnchorPath);
+        var folder = isRoot ? tree.Root : await tree.RevealAsync(state.AnchorPath);
+
+        // The canvas may have been handed another tree while the folders were
+        // read: a folder of the old one is no camera for it.
         if (folder is null
+            || !ReferenceEquals(tree, _tree)
             || _cameraTouched
             || !isRoot && !ViewAllPath.Equals(folder.FullPath, state.AnchorPath)
             || _viewWidth <= 0)
@@ -238,6 +256,11 @@ public sealed partial class NestedCanvas
         ClampZoom(new Point(_viewWidth / 2, _viewHeight / 2));
         ClampPan();
         AfterCameraMove();
+
+        // A camera put back is one somebody chose, like one they moved: a
+        // resize keeps it rather than framing everything afresh - which an
+        // overview, anchored on This PC, would otherwise lose at once.
+        _cameraTouched = true;
     }
 
     /// <summary>The cell of <paramref name="folder"/> on screen, or null when it is not one of the cells.</summary>
