@@ -88,7 +88,15 @@ public sealed class WorkspaceStore
             await using var stream = File.OpenRead(_statePath);
             return await JsonSerializer.DeserializeAsync<WorkspaceState>(stream, JsonOptions, cancellationToken);
         }
-        catch (Exception ex) when (ex is IOException or JsonException or UnauthorizedAccessException)
+        catch (JsonException)
+        {
+            // The window starts with its defaults, and its first save would
+            // write them over the damaged file - the pinned folders and every
+            // folder's order with it.  Set aside, it can still be mended.
+            StateFiles.Quarantine(_statePath);
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             return null;
         }

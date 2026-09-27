@@ -50,6 +50,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private int _navigationIndex = -1;
     private bool _isInitialized;
+
+    /// <summary>
+    /// Set once the saved workspace has been read and applied.  Until then
+    /// there is nothing of the user's to save, only defaults, and a save -
+    /// the window closed while the workspace was still loading - would write
+    /// those over the pinned folders and orders it had not yet read.
+    /// </summary>
+    private bool _isStateLoaded;
+
     private bool _isDisposed;
 
     /// <summary>
@@ -687,6 +696,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
         }
 
+        _isStateLoaded = true;
+
         _fileSystemService.AttachIcons(HomeItems.Concat(QuickAccess).ToArray());
 
         foreach (var drive in _fileSystemService.GetDrives())
@@ -776,7 +787,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task SaveNowAsync()
     {
-        if (!_isInitialized)
+        if (!_isStateLoaded)
         {
             return;
         }
