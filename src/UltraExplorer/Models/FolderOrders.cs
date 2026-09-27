@@ -198,6 +198,7 @@ public sealed class FolderOrders
             return;
         }
 
+        string? letGo = null;
         if (sort == _default)
         {
             if (!Forget(path))
@@ -213,7 +214,7 @@ public sealed class FolderOrders
             }
             else if (_folders.Count >= MaximumFolders)
             {
-                ForgetOldest();
+                letGo = ForgetOldest();
             }
 
             _folders[path] = new Entry(sort, ++_clock);
@@ -221,6 +222,13 @@ public sealed class FolderOrders
         }
 
         Changed?.Invoke(path);
+
+        // The folder let go of to make room is back in the default, and
+        // whatever shows it has to hear so, or it keeps the order it had.
+        if (letGo is not null)
+        {
+            Changed?.Invoke(letGo);
+        }
     }
 
     /// <summary>"Reset to the default order": its own order let go of.</summary>
@@ -376,11 +384,12 @@ public sealed class FolderOrders
     }
 
     /// <summary>
-    /// Lets go of the folder sorted longest ago.  A walk over at most
-    /// <see cref="MaximumFolders"/> entries, and only when a folder not
-    /// sorted before is sorted with the memory full - far from every click.
+    /// Lets go of the folder sorted longest ago, and says which it was.  A
+    /// walk over at most <see cref="MaximumFolders"/> entries, and only when
+    /// a folder not sorted before is sorted with the memory full - far from
+    /// every click.
     /// </summary>
-    private void ForgetOldest()
+    private string? ForgetOldest()
     {
         string? oldest = null;
         var stamp = long.MaxValue;
@@ -397,6 +406,8 @@ public sealed class FolderOrders
         {
             Forget(oldest);
         }
+
+        return oldest;
     }
 
     private readonly record struct Entry(ItemSort Sort, long Stamp);

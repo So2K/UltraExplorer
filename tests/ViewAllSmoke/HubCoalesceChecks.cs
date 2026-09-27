@@ -30,6 +30,8 @@ internal static partial class Program
             HubRecheckChecks(root);
             HubDrainChecks(root);
             HubRecordChecks(root);
+            HubGoneAboveChecks(root);
+            HubSpellingChecks(root);
             HubRecordCostChecks(root);
             HubRealStreamChecks(root);
         }
@@ -423,6 +425,79 @@ internal static partial class Program
         time.Advance(1000);
         DrainHub(hub, sink);
         Check("a sub-folder's own date moving is told as such", sink.For(a).Single().Kinds == ChangeKinds.DirDate && sink.For(a).Single().Files.IsEmpty);
+    }
+
+    /// <summary>
+    /// A folder renamed or moved away takes the folder the list shows inside
+    /// it along, and the watch names only the folder that went: the list is
+    /// told its folder went too - with its parent gone as well - and nothing
+    /// else is, neither a folder beside it whose name only begins the same,
+    /// nor the nested tree's folders inside, which hear of it through the
+    /// folder that went.  A file renamed is no folder going.
+    /// </summary>
+    private static void HubGoneAboveChecks(string root)
+    {
+        var (hub, time, watch, sink) = FedHub(Path.Combine(root, "gone-above"));
+        using var _ = hub;
+        var list = new object();
+        var beside = new object();
+        var nested = new object();
+        hub.Register(ChangeConsumer.List, Path.Combine(watch.Key, "A", "B", "C"), list);
+        hub.Register(ChangeConsumer.List, Path.Combine(watch.Key, "AB", "C"), beside);
+        hub.Register(ChangeConsumer.Nested, Path.Combine(watch.Key, "A", "B"), nested);
+
+        Feed(hub, watch, (WatchNative.ActionRenamedOld, "A"), (WatchNative.ActionRenamedNew, "Z"));
+        time.Advance(150);
+        DrainHub(hub, sink);
+        Check("a folder renamed away tells the list showing a folder inside it that its folder went, with the folder above it",
+            sink.For(list).Select(change => change.Kinds).SequenceEqual([ChangeKinds.Gone | ChangeKinds.AncestorGone]));
+        Check("and nothing else: not a folder whose name only begins the same, not the tree's folders inside",
+            !sink.For(beside).Any() && !sink.For(nested).Any());
+
+        sink.Clear();
+        hub.FeedForTests(watch, NotifyRecords(true, (WatchNative.ActionRenamedOld, "A", 5, 0x20), (WatchNative.ActionRenamedNew, "Z", 5, 0x20)), details: true);
+        time.Advance(150);
+        DrainHub(hub, sink);
+        Check("a file renamed is no folder going", !sink.For(list).Any());
+
+        hub.Unregister(ChangeConsumer.List, Path.Combine(watch.Key, "A", "B", "C"), list);
+        Check("a list's folder let go of is looked through no more", hub.Registry.ListKeys.Length == 1);
+    }
+
+    /// <summary>
+    /// Two spellings of one folder that differ in case alone are one
+    /// registered path, on the root as in the registry: let go of by either
+    /// spelling, nothing of it stays on the root.  And a path registered
+    /// under a volume since taken out moves to the one put back at its
+    /// letter, even for a target registered before.
+    /// </summary>
+    private static void HubSpellingChecks(string root)
+    {
+        var (hub, _, watch, _) = FedHub(Path.Combine(root, "spelling"));
+        using var __ = hub;
+        var list = new object();
+        var nested = new object();
+        hub.Register(ChangeConsumer.List, Path.Combine(watch.Key, "Case"), list);
+        hub.Register(ChangeConsumer.Nested, Path.Combine(watch.Key, "CASE"), nested);
+        var both = watch.InterestCount;
+        hub.Unregister(ChangeConsumer.List, Path.Combine(watch.Key, "case"), list);
+        hub.Unregister(ChangeConsumer.Nested, Path.Combine(watch.Key, "CASE"), nested);
+        Check($"a folder registered under two spellings differing in case is one path on its root ({both}), and gone from it with its last target ({watch.InterestCount})",
+            both == 1 && watch.InterestCount == 0 && hub.Registry.Count == 0);
+
+        var volumes = new VolumeResolver(letter => letter == 'E'
+            ? new VolumeResolver.Letter(WatchNative.DriveRemovable, null, null)
+            : new VolumeResolver.Letter(WatchNative.DriveNoRootDirectory, null, null));
+        using var removable = new ChangeHub(new ManualTime(), volumes) { ArmFailureForTests = _ => WatchNative.ErrorNotReady };
+        var target = new object();
+        removable.Register(ChangeConsumer.List, @"E:\photos", target);
+        var first = removable.RootFor(@"E:\")!;
+        removable.Drop(first);
+        var second = removable.RootFor(@"E:\")!;
+        removable.Register(ChangeConsumer.List, @"E:\photos", target);
+        Check("a path registered on a volume taken out moves to the one put back at its letter, though its target was registered before",
+            !ReferenceEquals(first, second) && removable.Registry.TryGet(@"E:\photos", out var interest)
+            && ReferenceEquals(interest.Root, second) && second.InterestCount == 1 && first.InterestCount == 0);
     }
 
     /// <summary>

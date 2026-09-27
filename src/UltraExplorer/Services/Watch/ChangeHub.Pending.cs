@@ -40,6 +40,8 @@ public sealed partial class ChangeHub
     private long _contentLatest;
     private long _pollTicks;
     private long _keepTicks;
+    private long _overflowGapTicks;
+    private long _lastRecheckTicks;
     private long _overflows;
 
     private enum HubItemKind : byte
@@ -116,6 +118,14 @@ public sealed partial class ChangeHub
         public byte Recheck;
 
         public long RecheckFrom;
+
+        /// <summary>
+        /// When it last began to wait for a report or a recheck.  A folder
+        /// handed on and never read again - off screen, and never drawn since -
+        /// never reports; once the last recheck would long have come, the
+        /// timing is let go (<see cref="PruneTimingsLocked"/>).
+        /// </summary>
+        public long WaitingSince;
     }
 
     /// <summary>Folders with changes not yet handed on - waiting or due.</summary>
@@ -198,12 +208,14 @@ public sealed partial class ChangeHub
                 {
                     timing.Recheck = 1;
                     timing.RecheckFrom = now;
+                    timing.WaitingSince = now;
                     RecheckLocked(key, now, now + Ticks(NetworkRecheckMilliseconds));
                 }
                 else if (timing.Recheck == 1)
                 {
                     timing.Recheck = 2;
-                    RecheckLocked(key, now, timing.RecheckFrom + Ticks(NetworkLastRecheckMilliseconds));
+                    timing.WaitingSince = now;
+                    RecheckLocked(key, now, timing.RecheckFrom + _lastRecheckTicks);
                 }
                 else
                 {
@@ -293,7 +305,14 @@ public sealed partial class ChangeHub
         }
     }
 
-    /// <summary>Changes under <paramref name="root"/> outgrew its buffer and were lost: the epoch moves on, once.</summary>
+    /// <summary>
+    /// Changes under <paramref name="root"/> outgrew its buffer and were lost:
+    /// the epoch moves on, once - at once, or, within
+    /// <see cref="OverflowGapMilliseconds"/> of the last overflow that moved
+    /// it, when that gap is up.  Put off, never dropped: a change lost after
+    /// the last move may have been missed by a read begun since, and only
+    /// another move has that folder read again.
+    /// </summary>
     internal void OnOverflow(WatchRoot root, DirectoryChangeWatcher watcher)
     {
         if (!ReferenceEquals(root.Watcher, watcher))
@@ -302,6 +321,27 @@ public sealed partial class ChangeHub
         }
 
         Interlocked.Increment(ref _overflows);
+        var now = _time.GetTimestamp();
+        var last = Volatile.Read(ref root.LastOverflowBump);
+        if (last != 0 && now - last < _overflowGapTicks)
+        {
+            Volatile.Write(ref root.OverflowBumpOwed, 1);
+            lock (_gate)
+            {
+                ScheduleLocked(last + _overflowGapTicks);
+            }
+
+            return;
+        }
+
+        BumpForOverflow(root, now);
+    }
+
+    /// <summary>Moves the epoch on for an overflow - and for any put off before it - and hands the bump on when anything registered could be out of date.</summary>
+    private void BumpForOverflow(WatchRoot root, long now)
+    {
+        Volatile.Write(ref root.OverflowBumpOwed, 0);
+        Volatile.Write(ref root.LastOverflowBump, now);
         Interlocked.Increment(ref root.Epoch);
         if (HasInterest(root))
         {
@@ -319,6 +359,8 @@ public sealed partial class ChangeHub
         _contentLatest = Ticks(ContentLatestMilliseconds);
         _pollTicks = Ticks(PollMilliseconds);
         _keepTicks = Ticks(NetworkKeepMilliseconds);
+        _overflowGapTicks = Ticks(OverflowGapMilliseconds);
+        _lastRecheckTicks = Ticks(NetworkLastRecheckMilliseconds);
     }
 
     /// <summary><paramref name="milliseconds"/> in the time provider's timestamp ticks.</summary>
@@ -535,6 +577,10 @@ public sealed partial class ChangeHub
     private void Deliver(PendingChange change, IChangeSink sink)
     {
         FolderChange handed;
+
+        // Looked up before the timing is made: a folder no one is registered
+        // for any more is told nothing, and would never report a refresh.
+        Registry.TryGet(change.Key, out var interest);
         lock (_gate)
         {
             if (_changes.TryGetValue(change.Key, out var current) && ReferenceEquals(current, change))
@@ -548,11 +594,12 @@ public sealed partial class ChangeHub
                 change.First,
                 change.Renames is { } renames ? renames.AsMemory(0, change.RenameCount) : default,
                 change.Files is { } files && !change.FilesIncomplete ? files.AsMemory(0, change.FileCount) : default);
-            if (change.IsNetwork && (change.Kinds & ChangeKinds.Gone) == 0)
+            if (interest is not null && change.IsNetwork && (change.Kinds & ChangeKinds.Gone) == 0)
             {
                 ref var timing = ref CollectionsMarshal.GetValueRefOrAddDefault(_timings, change.Key, out _);
                 timing ??= new FolderTiming();
                 timing.AwaitingReport = true;
+                timing.WaitingSince = _time.GetTimestamp();
                 if (!change.IsRecheck)
                 {
                     timing.Recheck = 0;
@@ -562,7 +609,7 @@ public sealed partial class ChangeHub
 
         try
         {
-            if (Registry.TryGet(change.Key, out var interest))
+            if (interest is not null)
             {
                 var gone = Tell(ChangeConsumer.Nested, interest.Nested, in handed, sink)
                     | Tell(ChangeConsumer.List, interest.List, in handed, sink)
@@ -647,7 +694,13 @@ public sealed partial class ChangeHub
         Settle(change);
     }
 
-    /// <summary>Forgets the timings of folders that may be refreshed again already and wait for nothing, once they have piled up.  Under the gate.</summary>
+    /// <summary>
+    /// Forgets the timings of folders that may be refreshed again already and
+    /// wait for nothing, once they have piled up - or wait for a report or a
+    /// recheck that would long have come if it were coming: a share's folder
+    /// handed on while off screen is read only when it is next drawn, maybe
+    /// never, and by then the share's cache has caught up anyway.  Under the gate.
+    /// </summary>
     private void PruneTimingsLocked(long now)
     {
         if (_timings.Count < _timingsPruneAt)
@@ -657,7 +710,8 @@ public sealed partial class ChangeHub
 
         foreach (var (key, timing) in _timings)
         {
-            if (timing.NextAllowed <= now && timing.Recheck == 0 && !timing.AwaitingReport)
+            var waiting = timing.Recheck != 0 || timing.AwaitingReport;
+            if (timing.NextAllowed <= now && (!waiting || now - timing.WaitingSince >= _lastRecheckTicks))
             {
                 _timings.Remove(key);
             }

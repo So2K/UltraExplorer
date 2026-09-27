@@ -263,14 +263,16 @@ public sealed partial class NestedTree
     /// priority refreshed - no lock.  A folder never read is queued for its
     /// first read; one read before whose contents changed since
     /// (<see cref="NestedFolder.NeedsRefresh"/>) is queued for a refresh, and
-    /// keeps being drawn as it was until the refresh is applied.
+    /// keeps being drawn as it was until the refresh is applied.  A link is
+    /// never read on its own, but one read by name (<see cref="LoadAsync"/>)
+    /// is kept up to date like any folder read.
     /// </summary>
     public void Request(NestedFolder folder, double priority)
     {
         var frame = Frame;
         folder.LastDrawnFrame = frame;
         folder.LastDrawnWidth = (float)priority;
-        if (!folder.CanLoad || !IsReadingOnDemand || _disposed)
+        if (folder.IsComputer || folder.IsReparsePoint && !folder.IsLoaded || !IsReadingOnDemand || _disposed)
         {
             return;
         }
@@ -800,8 +802,11 @@ public sealed partial class NestedTree
             var path = folder.FullPath;
 
             // Where changes are not watched as they happen, the directory's own
-            // time is what polling compares.
-            if (folder.Watch is { } watch && (watch.Kind == WatchKind.Polling || watch.IsNetwork))
+            // time is what polling compares: a volume that refuses a watch, a
+            // share - whose watch is let go when nothing shows it - and any
+            // volume whose watch is down, which is polled until it is back.
+            if (folder.Watch is { } watch
+                && (watch.Kind == WatchKind.Polling || watch.IsNetwork || watch.Kind != WatchKind.None && watch.State != WatchState.Armed))
             {
                 directoryTicks = NestedDirectoryReader.DirectoryWriteTicks(path);
             }

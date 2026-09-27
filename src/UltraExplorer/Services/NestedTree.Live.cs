@@ -161,11 +161,15 @@ public sealed partial class NestedTree : IChangeSink
 
     /// <summary>
     /// A watch that is polled rather than watched - a volume that refuses to be
-    /// watched, a share whose watch is down - is due its look.  The widest
-    /// folders of it on screen, <see cref="FoldersPerPoll"/> at most, have the
-    /// directory's own last-write time compared, off this thread, with the one
-    /// taken when they were read; a folder whose time moved on is touched, and
-    /// comes back as a change like any other.
+    /// watched, a watch that is down - is due its look.  The widest folders of
+    /// it on screen, <see cref="FoldersPerPoll"/> at most, have the directory's
+    /// own last-write time compared, off this thread, with the one taken when
+    /// they were read; a folder whose time moved on is touched, and comes back
+    /// as a change like any other.  A folder read while the watch was up took
+    /// no time to compare: it is touched to be read once more, which takes
+    /// one now the watch is down - and catches what changed since it went
+    /// down.  One whose time cannot be had at all is left alone, rather than
+    /// read again at every look.
     /// </summary>
     void IChangeSink.PollDue(WatchRoot root)
     {
@@ -177,7 +181,7 @@ public sealed partial class NestedTree : IChangeSink
         var picked = new List<NestedFolder>(FoldersPerPoll);
         foreach (var folder in DrawnFoldersOf(root))
         {
-            if (!folder.IsLoaded || folder.DirWriteTicks == 0 || !WasDrawnRecently(folder))
+            if (!folder.IsLoaded || !WasDrawnRecently(folder))
             {
                 continue;
             }
@@ -224,8 +228,10 @@ public sealed partial class NestedTree : IChangeSink
                     var now = NestedDirectoryReader.DirectoryWriteTicks(path);
                     if (now != 0 && now != ticks)
                     {
+                        // No time kept is not a change seen: that read waits
+                        // its turn like a change heard.
                         Interlocked.Increment(ref state.Tree._pollsChanged);
-                        state.Hub.Touch(path, immediate: true);
+                        state.Hub.Touch(path, immediate: ticks != 0);
                     }
                 }
             },
@@ -278,7 +284,8 @@ public sealed partial class NestedTree : IChangeSink
     /// <item>the folder itself went: nothing, unless the view is on it or
     /// inside it, when its parent is read again at once so it leaves the
     /// screen - its parent's own change would be read only if the parent's
-    /// cell were drawn, and a cell bigger than the view never is;</item>
+    /// cell were drawn, and a cell bigger than the view never is.  Gone with
+    /// a folder above it, nothing at all: that folder's own change does it;</item>
     /// <item>files grew or were written to, and the hub knows their new sizes
     /// and times: those are put into the listing as they are, with no read;</item>
     /// <item>only a sub-folder's own date moved: nothing, unless the folders
@@ -302,12 +309,16 @@ public sealed partial class NestedTree : IChangeSink
         var kinds = change.Kinds;
         if ((kinds & ChangeKinds.Gone) != 0)
         {
-            if (folder.Parent is { IsComputer: false } parent && parent.IsLoaded && IsInView(folder))
+            // Gone with a folder above it, the parent went too and cannot be
+            // read: the folder that went is told by its own change, and its
+            // parent - still there - is what is read again.
+            if ((kinds & ChangeKinds.AncestorGone) == 0
+                && folder.Parent is { IsComputer: false } parent && parent.IsLoaded && IsInView(folder))
             {
                 Refresh(parent);
             }
 
-            if ((kinds & ~ChangeKinds.Gone) == 0)
+            if ((kinds & ~(ChangeKinds.Gone | ChangeKinds.AncestorGone)) == 0)
             {
                 return;
             }
@@ -318,13 +329,18 @@ public sealed partial class NestedTree : IChangeSink
             NoteRenames(folder, change.Renames.Span);
         }
 
+        // Files patched in place leave everything else as it was: not taken
+        // when a sub-folder's own date moved in the same change and the
+        // folder is ordered by date, which only a read puts right.
         var structural = (kinds & ChangeKinds.Structural) != 0;
-        if (!structural && (kinds & ChangeKinds.Content) != 0 && TryPatchFiles(folder, change.Files.Span))
+        var byDate = SortOf(folder).Column == SortColumn.Modified;
+        if (!structural && (kinds & ChangeKinds.Content) != 0 && ((kinds & ChangeKinds.DirDate) == 0 || !byDate)
+            && TryPatchFiles(folder, change.Files.Span))
         {
             return;
         }
 
-        if (!structural && (kinds & ChangeKinds.Content) == 0 && SortOf(folder).Column != SortColumn.Modified)
+        if (!structural && (kinds & ChangeKinds.Content) == 0 && !byDate)
         {
             return;
         }
@@ -360,7 +376,8 @@ public sealed partial class NestedTree : IChangeSink
     /// which under an order by size or date moves the files; the folder then
     /// goes out with the next batch of applied reads, so the canvas redraws its
     /// cell like any folder read.  False when there is nothing to put in, a
-    /// file is not in the listing, or a read of the folder is on its way.
+    /// file is not in the listing, a file was hidden and no longer is, or a
+    /// read of the folder is on its way.
     /// </summary>
     private bool TryPatchFiles(NestedFolder folder, ReadOnlySpan<FileDelta> deltas)
     {
@@ -375,6 +392,16 @@ public sealed partial class NestedTree : IChangeSink
         {
             var place = SearchFiles(files, deltas[index].Name);
             if (place < 0 || !string.Equals(files[place].Name, deltas[index].Name, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            // The watch leaves out a file that became hidden or system, but
+            // one that stopped being so - attrib -h - comes like any other
+            // change: shown now, or counted apart no more, it is placed again
+            // only by a read.
+            var hidden = (deltas[index].Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
+            if (hidden != files[place].IsHidden)
             {
                 return false;
             }
@@ -666,11 +693,15 @@ public sealed partial class NestedTree : IChangeSink
             }
 
             // A sub-folder sorted by itself keeps its order under its new
-            // name, as do the folders inside it; a file's rename is no
-            // business of the orders, and a lookup by name says which it is.
-            if (_orders.Count > 0 && FindChild(folder, pair.OldName) is { } renamed)
+            // name, as do the folders inside it.  Moved whether or not the
+            // listing has the old name: renames in a chain - A to tmp, B to
+            // A, tmp to B - name folders the listing has not caught up with,
+            // and a name no order has is nothing to move.  Only a name the
+            // listing has as a file is left out: its rename is no business
+            // of the orders, and a lookup by name says which it is.
+            if (_orders.Count > 0 && !HoldsFile(folder, pair.OldName))
             {
-                _orders.Move(renamed.FullPath, Path.Combine(folder.FullPath, pair.NewName));
+                _orders.Move(Path.Combine(folder.FullPath, pair.OldName), Path.Combine(folder.FullPath, pair.NewName));
             }
         }
     }

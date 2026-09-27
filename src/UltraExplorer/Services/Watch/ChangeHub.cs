@@ -41,9 +41,10 @@ namespace UltraExplorer.Services.Watch;
 /// <see cref="Driver"/> once.</para>
 ///
 /// <para><b>Missed changes.</b>  An overflow - more changed than the buffer
-/// held - moves the root's <see cref="WatchRoot.Epoch"/> on, once; so does
-/// every arm and re-arm.  Every folder read under an older epoch is then
-/// read again when next drawn, and nothing walks the folders to make it so.</para>
+/// held - moves the root's <see cref="WatchRoot.Epoch"/> on, once, and one
+/// that follows within half a second moves it on when the half second is up;
+/// so does every arm and re-arm.  Every folder read under an older epoch is
+/// then read again when next drawn, and nothing walks the folders to make it so.</para>
 ///
 /// <para><b>Threads.</b>  Every public member is safe on any thread;
 /// <see cref="Drain"/> is meant for the UI thread and calls the sink there.
@@ -87,6 +88,14 @@ public sealed partial class ChangeHub : IDisposable
 
     /// <summary>How often a polled root's drawn folders are looked at.</summary>
     internal const double PollMilliseconds = 5_000;
+
+    /// <summary>
+    /// The least time between two epochs an overflow moves on: one overflow
+    /// after another - a share that answers every read with one - puts the
+    /// next off until this has passed, rather than having every folder drawn
+    /// read again as fast as the overflows come.
+    /// </summary>
+    internal const double OverflowGapMilliseconds = 500;
 
     /// <summary>How long a share's watch is kept after it was last drawn, when the list and graph do not show it.</summary>
     internal const double NetworkKeepMilliseconds = 30_000;

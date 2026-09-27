@@ -125,6 +125,17 @@ public sealed partial class ChangeHub
         var stale = false;
         lock (root.Gate)
         {
+            // The first read can fail between the watch being opened and this
+            // lock being taken, and the failure, finding no watcher here yet,
+            // is dropped (OnWatchFailed): an arm that found its watch already
+            // ended failed, and is retried and polled like any failed arm,
+            // rather than counted armed with nothing listening.
+            if (error == 0 && watcher!.HasEnded)
+            {
+                error = watcher.EndedWith is not 0 and var ended ? ended : WatchNative.ErrorInvalidFunction;
+                watcher = null;
+            }
+
             if (generation != root.Generation || root.IsDropped || _disposed || root.Watcher is not null)
             {
                 stale = true;
@@ -241,9 +252,10 @@ public sealed partial class ChangeHub
     }
 
     /// <summary>
-    /// The timer's pass over the roots: starts the retries that are due,
-    /// posts the polls that are, lets go the shares nothing has drawn for
-    /// long enough, and returns when it next needs to look.
+    /// The timer's pass over the roots: moves on the epochs overflows put
+    /// off, starts the retries that are due, posts the polls that are, lets
+    /// go the shares nothing has drawn for long enough, and returns when it
+    /// next needs to look.
     /// </summary>
     private long TendRoots(long now)
     {
@@ -253,6 +265,19 @@ public sealed partial class ChangeHub
             if (root.IsDropped)
             {
                 continue;
+            }
+
+            if (Volatile.Read(ref root.OverflowBumpOwed) != 0)
+            {
+                var bumpAt = Volatile.Read(ref root.LastOverflowBump) + _overflowGapTicks;
+                if (bumpAt > now)
+                {
+                    next = Math.Min(next, bumpAt);
+                }
+                else if (Interlocked.Exchange(ref root.OverflowBumpOwed, 0) != 0)
+                {
+                    BumpForOverflow(root, now);
+                }
             }
 
             var retryAt = Volatile.Read(ref root.RetryAt);
@@ -318,10 +343,15 @@ public sealed partial class ChangeHub
         }
 
         var due = Unset;
+        if (Volatile.Read(ref root.OverflowBumpOwed) != 0)
+        {
+            due = Volatile.Read(ref root.LastOverflowBump) + _overflowGapTicks;
+        }
+
         var retryAt = Volatile.Read(ref root.RetryAt);
         if (root.State == WatchState.Off && retryAt != 0)
         {
-            due = retryAt;
+            due = Math.Min(due, retryAt);
         }
 
         if (Polls(root))

@@ -1091,18 +1091,44 @@ public sealed partial class NestedTree
     /// <summary>
     /// A file by name among files in name order: a binary search, and a plain
     /// scan for a name culture order and the file system disagree about.
+    /// Culture order calls some different names one - "café.txt" written
+    /// with one character for the é and with two, which a folder can hold
+    /// side by side - so a name it finds is checked, and its neighbours equal
+    /// to it looked through for the file that really has the name.
     /// </summary>
     private static int SearchFiles(IReadOnlyList<NestedFile> files, string name)
     {
+        var comparer = StringComparer.CurrentCultureIgnoreCase;
         var low = 0;
         var high = files.Count - 1;
         while (low <= high)
         {
             var middle = (low + high) / 2;
-            var order = StringComparer.CurrentCultureIgnoreCase.Compare(files[middle].Name, name);
+            var order = comparer.Compare(files[middle].Name, name);
             if (order == 0)
             {
-                return middle;
+                if (string.Equals(files[middle].Name, name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return middle;
+                }
+
+                for (var index = middle - 1; index >= 0 && comparer.Compare(files[index].Name, name) == 0; index--)
+                {
+                    if (string.Equals(files[index].Name, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return index;
+                    }
+                }
+
+                for (var index = middle + 1; index < files.Count && comparer.Compare(files[index].Name, name) == 0; index++)
+                {
+                    if (string.Equals(files[index].Name, name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return index;
+                    }
+                }
+
+                break;
             }
 
             if (order < 0)

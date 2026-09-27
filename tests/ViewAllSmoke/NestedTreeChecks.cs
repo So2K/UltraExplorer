@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Watch;
 
 namespace ViewAllSmoke;
 
@@ -245,6 +246,11 @@ internal static partial class Program
             !link.CanLoad && link.LoadState == NestedLoadState.NotLoaded && tree.PendingCount == 0);
         await tree.LoadAsync(link);
         Check("but a link asked for by name is read", link.IsLoaded);
+        readsBefore = disk.Reads;
+        link.IsStale = true;
+        tree.Request(link, 1_000);
+        var linkRead = SpinWait.SpinUntil(() => disk.Reads > readsBefore && tree.PendingCount == 0 && !link.NeedsRefresh, 2_000);
+        Check("and kept up to date like any folder read: out of date and drawn, it is read again", linkRead && link.IsLoaded);
 
         // ---- a folder with more sub-folders than one listing holds ---------------------------
         var huge = Enumerable.Range(0, NestedTree.MaximumChildren)
@@ -318,6 +324,102 @@ internal static partial class Program
         }
 
         Check("and a later load of it completes", retried);
+
+        await NestedTwinNameChecks();
+        await NestedLiveChangeChecks();
+    }
+
+    /// <summary>
+    /// "café.txt" written with one character for the é and with two: two
+    /// files to the file system, which a folder can hold side by side, and
+    /// one name to culture order, which listings are sorted in.  Each is
+    /// found as itself, never its twin.
+    /// </summary>
+    private static async Task NestedTwinNameChecks()
+    {
+        const string Composed = "caf\u00e9.txt";
+        const string Decomposed = "cafe\u0301.txt";
+        var disk = new FakeDisk();
+
+        // In the order the real reader gives them: culture order calls them
+        // equal, and ordinal order puts the plain e first.
+        disk.AddFile(@"T:\twins", Decomposed, 1);
+        disk.AddFile(@"T:\twins", Composed, 2);
+        using var tree = new NestedTree(disk.Read);
+        tree.SetRoots([new NestedRoot(@"T:\", "T:", NestedFolderKind.Drive)]);
+        var twins = await tree.RevealAsync(@"T:\twins");
+        if (twins is not null)
+        {
+            await tree.LoadAsync(twins);
+        }
+
+        var composedAt = twins is null ? -1 : tree.FindFileIndex(twins, Composed);
+        var decomposedAt = twins is null ? -1 : tree.FindFileIndex(twins, Decomposed);
+        Check($"a file whose name culture order calls the same as another's is found as itself, not its twin ({composedAt}, {decomposedAt})",
+            twins is { IsLoaded: true } && composedAt >= 0 && decomposedAt >= 0 && composedAt != decomposedAt
+            && twins.Files[composedAt].Name == Composed && twins.Files[decomposedAt].Name == Decomposed);
+    }
+
+    /// <summary>
+    /// What the tree makes of the changes the hub hands it, with no hub: a
+    /// file's new size put in with no read - but not for a file that stopped
+    /// being hidden, nor past a sub-folder's date in a folder ordered by
+    /// date - and folders renamed in a chain keeping their own orders.
+    /// </summary>
+    private static async Task NestedLiveChangeChecks()
+    {
+        var disk = new FakeDisk();
+        disk.AddFile(@"P:\files", "shown.txt", 1);
+        disk.AddFile(@"P:\files", "secret.txt", 2, hidden: true);
+        disk.Folder(@"P:\files\sub");
+        disk.Folder(@"P:\chain\A");
+        disk.Folder(@"P:\chain\B");
+        using var tree = new NestedTree(disk.Read);
+        tree.SetRoots([new NestedRoot(@"P:\", "P:", NestedFolderKind.Drive)]);
+        var files = await tree.RevealAsync(@"P:\files");
+        var chain = await tree.RevealAsync(@"P:\chain");
+        if (files is null || chain is null)
+        {
+            Check("the folders to change are in the tree", false);
+            return;
+        }
+
+        await tree.LoadAsync(files);
+        await tree.LoadAsync(chain);
+        static FolderChange Sizes(NestedFolder folder, ChangeKinds kinds, string name, long length) =>
+            new(folder.FullPath, kinds, Stopwatch.GetTimestamp(), default, new[] { new FileDelta(name, length, 0) { Attributes = FileAttributes.Archive } });
+
+        var patches = tree.LivePatches;
+        tree.OnFolderChanged(files, Sizes(files, ChangeKinds.Content, "shown.txt", 10));
+        Check("a file's new size from the watch is put in with no read",
+            tree.LivePatches == patches + 1 && !files.NeedsRefresh && files.AllFiles.Single(file => file.Name == "shown.txt").Length == 10);
+
+        tree.OnFolderChanged(files, Sizes(files, ChangeKinds.Content, "secret.txt", 20));
+        Check("a hidden file the watch says is hidden no more is read, not patched still hidden",
+            tree.LivePatches == patches + 1 && files.NeedsRefresh);
+
+        await tree.RefreshAsync(files);
+        tree.Orders.SetFolder(files.FullPath, new ItemSort(SortColumn.Modified, true));
+        tree.OnFolderChanged(files, Sizes(files, ChangeKinds.Content | ChangeKinds.DirDate, "shown.txt", 11));
+        Check("ordered by date, a sub-folder's date moving along with a file's size has the folder read",
+            tree.LivePatches == patches + 1 && files.NeedsRefresh);
+
+        await tree.RefreshAsync(files);
+        tree.Orders.ResetFolder(files.FullPath);
+        tree.OnFolderChanged(files, Sizes(files, ChangeKinds.Content | ChangeKinds.DirDate, "shown.txt", 12));
+        Check("ordered by name, the file's size is still put in with no read",
+            tree.LivePatches == patches + 2 && !files.NeedsRefresh);
+
+        // A and B swap names through tmp: the listing, not read again yet,
+        // has never heard of tmp.
+        var byDate = new ItemSort(SortColumn.Modified, true);
+        var bySize = new ItemSort(SortColumn.Size, true);
+        tree.Orders.SetFolder(@"P:\chain\A", byDate);
+        tree.Orders.SetFolder(@"P:\chain\B", bySize);
+        RenamePair[] swap = [new("A", "tmp"), new("B", "A"), new("tmp", "B")];
+        tree.OnFolderChanged(chain, new FolderChange(chain.FullPath, ChangeKinds.Structural, Stopwatch.GetTimestamp(), swap, default));
+        Check("two folders swapping names through a third keep their own orders, each under its new name",
+            tree.Orders.SortOf(@"P:\chain\B") == byDate && tree.Orders.SortOf(@"P:\chain\A") == bySize && !tree.Orders.HasOwnOrder(@"P:\chain\tmp"));
     }
 
     /// <summary>The real reader against real folders, then the tree on top of it.</summary>

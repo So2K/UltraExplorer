@@ -41,7 +41,7 @@ public static class NestedDirectoryReader
                     entry.FileName.ToString(),
                     entry.Attributes,
                     entry.IsDirectory ? 0 : entry.Length,
-                    entry.LastWriteTimeUtc.UtcTicks,
+                    WriteTicks(ref entry),
                     entry.IsDirectory,
                     entry.IsDirectory && (entry.Attributes & FileAttributes.ReparsePoint) != 0 && IsLink(ref entry)),
                 options)
@@ -131,6 +131,26 @@ public static class NestedDirectoryReader
             return time.Year <= 1601 ? 0 : time.Ticks;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// An entry's last-write time as UTC ticks, or zero when it has none worth
+    /// the name: a time of zero - which would read as 1601 - or one past what
+    /// a date can hold, which a tool or a damaged volume can leave on a file
+    /// and which would otherwise throw and fail the whole folder's read, every
+    /// time it was read.  The same as <see cref="DirectoryWriteTicks"/> says.
+    /// </summary>
+    private static long WriteTicks(ref FileSystemEntry entry)
+    {
+        try
+        {
+            var time = entry.LastWriteTimeUtc.UtcDateTime;
+            return time.Year <= 1601 ? 0 : time.Ticks;
+        }
+        catch (ArgumentOutOfRangeException)
         {
             return 0;
         }

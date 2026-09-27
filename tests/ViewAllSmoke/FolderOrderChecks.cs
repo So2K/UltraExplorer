@@ -128,12 +128,17 @@ internal static partial class Program
         Check("a rename of a folder with no order of its own changes nothing", moves.Count == 1 && renamed.Count == 4);
 
         var bounded = new FolderOrders();
+        var boundedEvents = new List<string?>();
+        bounded.Changed += boundedEvents.Add;
         for (var index = 0; index < FolderOrders.MaximumFolders + 10; index++)
         {
             bounded.SetFolder($@"C:\f{index}", byDate);
         }
 
         var oldestGone = Enumerable.Range(0, 10).All(index => bounded.SortOf($@"C:\f{index}") == ItemSort.Default);
+        Check("a folder let go of to make room is said to have changed, so whatever shows it puts it back in the default",
+            Enumerable.Range(0, 10).All(index => boundedEvents.Count(path => path == $@"C:\f{index}") == 2)
+            && boundedEvents.Count(path => path == @"C:\f10") == 1);
         bounded.SetFolder(@"C:\f10", bySize);
         bounded.SetFolder(@"C:\new", byDate);
         var saved = bounded.Saved();

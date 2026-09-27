@@ -122,6 +122,7 @@ internal sealed unsafe class DirectoryChangeWatcher
     private bool _details;
     private bool _stopping;
     private bool _released;
+    private int _endedWith;
 
     private DirectoryChangeWatcher(SafeFileHandle handle, ThreadPoolBoundHandle bound, int size, bool details, IChangeRecordSink sink)
     {
@@ -142,6 +143,36 @@ internal sealed unsafe class DirectoryChangeWatcher
     public bool HasDetails => Volatile.Read(ref _details);
 
     public int BufferBytes => _size;
+
+    /// <summary>
+    /// Whether the watch has ended - stopped, or failed on its own - so that
+    /// nothing more will be heard from it.  A watch can fail between
+    /// <see cref="Open"/> returning it and its owner taking it in, when
+    /// whoever the failure is told to does not know it yet: the owner asks
+    /// this, under its own lock, before it counts the watch as running.
+    /// </summary>
+    public bool HasEnded
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _stopping;
+            }
+        }
+    }
+
+    /// <summary>The Windows error the watch failed with on its own; zero while it runs, or when it was stopped.</summary>
+    public int EndedWith
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _endedWith;
+            }
+        }
+    }
 
     /// <summary>
     /// While set and not signalled, a completion waits before it takes its
@@ -374,9 +405,20 @@ internal sealed unsafe class DirectoryChangeWatcher
             {
                 // Success with nothing in the buffer is how Windows says the
                 // changes outgrew it; they are gone, and a fresh read begins.
+                // One overflow on the heels of another - a stream past the
+                // buffer, or a share that answers every read so - is asked
+                // again as a stream is, a moment later, rather than at once
+                // round and round.
                 overflowed = true;
                 Overflows++;
-                failure = Issue();
+                if (streaming)
+                {
+                    Gather();
+                }
+                else
+                {
+                    failure = Issue();
+                }
             }
             else if (_details && WatchNative.IsRefusal(error))
             {
@@ -391,6 +433,7 @@ internal sealed unsafe class DirectoryChangeWatcher
             if (failure != 0)
             {
                 _stopping = true;
+                _endedWith = failure;
                 _handle.Dispose();
                 if (_outstanding == null)
                 {
@@ -438,6 +481,7 @@ internal sealed unsafe class DirectoryChangeWatcher
             if (failure != 0)
             {
                 _stopping = true;
+                _endedWith = failure;
                 _handle.Dispose();
                 Release();
             }

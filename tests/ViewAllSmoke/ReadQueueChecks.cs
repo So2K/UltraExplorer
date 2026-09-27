@@ -289,7 +289,10 @@ internal static partial class Program
     {
         using var disk = new GatedDisk();
         disk.Disk.Folder(@"Q:\f\inner");
-        var watch = new WatchRoot(@"Q:\", WatchKind.Local, isNetwork: false);
+
+        // Armed, as a local disk's watch is: one that is down has every read
+        // take the directory's own time, from the real disk.
+        var watch = new WatchRoot(@"Q:\", WatchKind.Local, isNetwork: false) { State = WatchState.Armed };
         using var tree = new NestedTree(disk.Disk.Read) { WatchRootFor = path => path == @"Q:\" ? watch : null };
         tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
         var q = tree.Find(@"Q:\")!;
@@ -813,8 +816,9 @@ internal static partial class Program
     // ---- the directory's own time ----------------------------------------------------------
 
     /// <summary>
-    /// On a polled volume or a share, a read takes the directory's own time
-    /// first, for polling to compare; on a watched local disk it takes nothing.
+    /// On a polled volume, a share, or a local disk whose watch is down, a
+    /// read takes the directory's own time first, for polling to compare; on
+    /// a watched local disk it takes nothing.
     /// </summary>
     private static async Task ReadDirectoryTimeChecks()
     {
@@ -823,9 +827,15 @@ internal static partial class Program
         Directory.CreateDirectory(Path.Combine(sub, "inner"));
         try
         {
-            foreach (var (kind, isNetwork, taken) in new[] { (WatchKind.Polling, false, true), (WatchKind.Network, true, true), (WatchKind.Local, false, false) })
+            foreach (var (kind, isNetwork, state, taken, what) in new[]
+                     {
+                         (WatchKind.Polling, false, WatchState.Polling, true, "polling"),
+                         (WatchKind.Network, true, WatchState.Off, true, "network"),
+                         (WatchKind.Local, false, WatchState.Off, true, "local, its watch down,"),
+                         (WatchKind.Local, false, WatchState.Armed, false, "local")
+                     })
             {
-                var watch = new WatchRoot(root, kind, isNetwork);
+                var watch = new WatchRoot(root, kind, isNetwork) { State = state };
                 using var tree = new NestedTree { WatchRootFor = _ => watch };
                 tree.SetRoots([new NestedRoot(root, "root", NestedFolderKind.Drive)]);
                 var top = tree.Find(root)!;
@@ -834,7 +844,7 @@ internal static partial class Program
                 await tree.LoadAsync(folder);
                 var expected = Directory.GetLastWriteTimeUtc(sub).Ticks;
                 Check(taken
-                        ? $"a read on a {kind.ToString().ToLowerInvariant()} root keeps the directory's own time"
+                        ? $"a read on a {what} root keeps the directory's own time"
                         : "a read on a watched local disk takes no time of its own",
                     taken ? folder.DirWriteTicks == expected && top.DirWriteTicks == Directory.GetLastWriteTimeUtc(root).Ticks : folder.DirWriteTicks == 0);
             }

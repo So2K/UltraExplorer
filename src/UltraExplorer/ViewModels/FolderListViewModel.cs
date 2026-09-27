@@ -937,6 +937,14 @@ public sealed class FolderListViewModel : ObservableObject
             {
                 return true;
             }
+
+            // The root itself, as the list spells it: a share's root is
+            // \\server\share, without the separator its prefix ends in.
+            if (prefix.EndsWith(Path.DirectorySeparatorChar)
+                && prefix.AsSpan(0, prefix.Length - 1).Equals(path, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
         }
 
         return false;

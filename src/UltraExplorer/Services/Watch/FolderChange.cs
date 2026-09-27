@@ -20,7 +20,18 @@ public enum ChangeKinds : byte
     DirDate = 4,
 
     /// <summary>The folder itself was removed or renamed away: the change is keyed by its own path, not its parent's.</summary>
-    Gone = 8
+    Gone = 8,
+
+    /// <summary>
+    /// Comes with <see cref="Gone"/> when it was a folder above this one that
+    /// was renamed or moved away, taking this one with it.  The watch names
+    /// only the folder that went; this is told for the folders the folder
+    /// list shows, since the list keeps nothing above them - and so to anyone
+    /// else registered for the same path.  Such a folder's parent went too,
+    /// and is not there to be read again: whoever keeps the folders above
+    /// hears of the one that went by its own change, and may leave this be.
+    /// </summary>
+    AncestorGone = 16
 }
 
 /// <summary>Which of the views a registration and a change are for.  Each is told separately and none waits for another.</summary>

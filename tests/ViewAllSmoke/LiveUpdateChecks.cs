@@ -31,6 +31,7 @@ internal static partial class Program
         RunOnSta("live updates on a dispatcher", LiveScenarioChecks);
         RunOnSta("live updates in the canvas's frame", LiveFrameChecks);
         RunOnSta("live updates when polled", LivePollChecks);
+        RunOnSta("live updates when a watch is down", LivePollDownChecks);
         RunOnSta("live updates for a drive about to go", LiveDeviceChecks);
         return Task.CompletedTask;
     }
@@ -488,6 +489,54 @@ internal static partial class Program
             ((IChangeSink)tree).PollDue(polled);
             var times = await LiveTimes(3_000, () => folder.AllFiles.Length == 1);
             Check($"a poll that finds the directory moved on has it read again in {times[0]} ms", tree.LivePolls.Changed >= 1 && times[0] >= 0);
+        }
+        finally
+        {
+            TryDelete(baseDirectory);
+        }
+    }
+
+    /// <summary>
+    /// A local volume whose watch went down is polled until it is back.  Its
+    /// folders were read while the watch was up and took no time of their
+    /// own: the first look has each drawn one read once more, which takes it
+    /// - and brings in what changed while nothing was listening.
+    /// </summary>
+    private static async Task LivePollDownChecks()
+    {
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerLivePollDown", Guid.NewGuid().ToString("N"));
+        var inner = Path.Combine(baseDirectory, "inner");
+        Directory.CreateDirectory(inner);
+        try
+        {
+            using var hub = new ChangeHub(TimeProvider.System);
+            using var tree = new NestedTree();
+            hub.Driver.Fallback = DispatcherFrameDriver.ForCurrentThread((ref FrameBudget budget) => hub.Drain(ref budget, tree), () => hub.HasWork);
+            tree.Changes = hub;
+            var local = new WatchRoot(baseDirectory, WatchKind.Local, isNetwork: false) { State = WatchState.Armed };
+            tree.WatchRootFor = _ => local;
+            tree.SetRoots([new NestedRoot(baseDirectory, "L", NestedFolderKind.Drive)]);
+            var folder = await tree.RevealAsync(inner);
+            if (folder is not null)
+            {
+                await tree.LoadAsync(folder);
+            }
+
+            Check("a folder read while its volume's watch is up keeps no time of its own", folder is { IsLoaded: true, DirWriteTicks: 0 });
+            if (folder is null)
+            {
+                return;
+            }
+
+            // The watch fails, and the volume is polled meanwhile.
+            local.State = WatchState.Off;
+            tree.Request(folder, 600);
+            var reads = 0;
+            tree.FolderLoaded += loaded => reads += ReferenceEquals(loaded, folder) ? 1 : 0;
+            ((IChangeSink)tree).PollDue(local);
+            var times = await LiveTimes(3_000, () => reads >= 1 && folder.DirWriteTicks != 0);
+            Check($"with the watch down, the first look reads it once more ({times[0]} ms), which keeps its time",
+                times[0] >= 0 && folder.DirWriteTicks == Directory.GetLastWriteTimeUtc(inner).Ticks);
         }
         finally
         {

@@ -14,7 +14,9 @@ namespace UltraExplorer.Services.Watch;
 /// change of every registered spelling of that folder.
 ///
 /// <para>A record whose own path is registered - a folder removed or renamed
-/// away - also marks that folder <see cref="ChangeKinds.Gone"/>.  A rename's
+/// away - also marks that folder <see cref="ChangeKinds.Gone"/>, and a folder
+/// renamed away marks the folder list's folder too when it is inside
+/// (<see cref="ChangeKinds.AncestorGone"/>).  A rename's
 /// two halves in the same folder become one <see cref="RenamePair"/>; across
 /// folders they are a removal from one and an addition to the other.  A folder
 /// spelt with a short 8.3 name (PROGRA~1), which Windows sometimes reports
@@ -108,6 +110,25 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
             }
 
             hit = true;
+        }
+
+        // A folder renamed or moved away takes everything inside it along,
+        // and the watch tells only the folder's own path.  The folder list
+        // keeps nothing above the folder it shows, so a list showing one
+        // somewhere inside is told its folder went too; the nested tree and
+        // the tree canvas keep the folders above theirs, and hear of the one
+        // that went through their own registrations of it.  A handful of
+        // list paths are looked through, never every path registered.
+        if (action == WatchNative.ActionRenamedOld && (!record.HasDetails || record.IsDirectory))
+        {
+            foreach (var listed in hub.Registry.ListKeys)
+            {
+                if (root.IsInside(listed, name))
+                {
+                    hub.Note(listed, ChangeKinds.Gone | ChangeKinds.AncestorGone, root, in record, ReadOnlySpan<char>.Empty, ReadOnlySpan<char>.Empty);
+                    hit = true;
+                }
+            }
         }
 
         if (hit)

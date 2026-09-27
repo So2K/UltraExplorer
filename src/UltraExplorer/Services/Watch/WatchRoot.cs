@@ -198,6 +198,16 @@ public sealed class WatchRoot
     /// <summary>Set while an <see cref="IChangeSink.EpochBumped"/> for the root waits to be handed on, so a burst of overflows is one.</summary>
     internal int BumpQueued;
 
+    /// <summary>When an overflow last moved the epoch on, as a hub timestamp; zero before the first.</summary>
+    internal long LastOverflowBump;
+
+    /// <summary>
+    /// Set when an overflow came too soon after the last one to move the
+    /// epoch on at once: the timer moves it on once the least gap has passed
+    /// (<see cref="ChangeHub.OverflowGapMilliseconds"/>).
+    /// </summary>
+    internal int OverflowBumpOwed;
+
     /// <summary>Set while an <see cref="IChangeSink.PollDue"/> for the root waits to be handed on.</summary>
     internal int PollQueued;
 
@@ -233,18 +243,22 @@ public sealed class WatchRoot
             return;
         }
 
+        // Spellings are told apart ignoring case, as the registry tells its
+        // paths apart: two that differ in case alone are one registered path,
+        // and would otherwise be told every change twice, or one of them kept
+        // here after the registry let the path go.
         if (!_interests.TryGetValue(inner, out var known))
         {
             _interests[inner] = key;
         }
         else if (known is string single)
         {
-            if (!single.Equals(key, StringComparison.Ordinal))
+            if (!single.Equals(key, StringComparison.OrdinalIgnoreCase))
             {
                 _interests[inner] = new[] { single, key };
             }
         }
-        else if (Array.IndexOf((string[])known, key) < 0)
+        else if (!HasSpelling((string[])known, key))
         {
             _interests[inner] = (string[])[.. (string[])known, key];
         }
@@ -260,7 +274,7 @@ public sealed class WatchRoot
 
         if (known is string single)
         {
-            if (single.Equals(key, StringComparison.Ordinal))
+            if (single.Equals(key, StringComparison.OrdinalIgnoreCase))
             {
                 _interests.TryRemove(inner, out _);
             }
@@ -268,8 +282,46 @@ public sealed class WatchRoot
             return;
         }
 
-        var kept = ((string[])known).Where(other => !other.Equals(key, StringComparison.Ordinal)).ToArray();
-        _interests[inner] = kept.Length == 1 ? kept[0] : kept;
+        var kept = ((string[])known).Where(other => !other.Equals(key, StringComparison.OrdinalIgnoreCase)).ToArray();
+        if (kept.Length == 0)
+        {
+            _interests.TryRemove(inner, out _);
+        }
+        else
+        {
+            _interests[inner] = kept.Length == 1 ? kept[0] : kept;
+        }
+    }
+
+    /// <summary>Whether <paramref name="spellings"/> has <paramref name="key"/>, ignoring case.</summary>
+    private static bool HasSpelling(string[] spellings, string key)
+    {
+        foreach (var spelling in spellings)
+        {
+            if (spelling.Equals(key, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Whether a registered path is somewhere inside <paramref name="inner"/> -
+    /// a folder as a record names it, relative to the watched directory - and
+    /// not that folder itself.  No string is made unless the path is spelt
+    /// with a <c>subst</c> letter.
+    /// </summary>
+    internal bool IsInside(string key, ReadOnlySpan<char> inner)
+    {
+        if (inner.IsEmpty || InnerOf(key) is not { } place)
+        {
+            return false;
+        }
+
+        var span = place.Span;
+        return span.Length > inner.Length && span[inner.Length] == '\\' && span.StartsWith(inner, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

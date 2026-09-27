@@ -27,6 +27,7 @@ internal sealed class ChangeRegistry
     private readonly ConcurrentDictionary<string, Interest> _paths = new(PathComparer.Instance);
     private readonly ConcurrentDictionary<string, Interest>.AlternateLookup<ReadOnlySpan<char>> _lookup;
     private readonly Lock _gate = new();
+    private volatile string[] _listKeys = [];
     private int _nestedTargets;
 
     public ChangeRegistry() => _lookup = _paths.GetAlternateLookup<ReadOnlySpan<char>>();
@@ -84,6 +85,15 @@ internal sealed class ChangeRegistry
     public int NestedTargets => Volatile.Read(ref _nestedTargets);
 
     /// <summary>
+    /// The paths the folder list has registered - one per list, as a rule -
+    /// for a watcher's thread to look through when a folder is renamed or
+    /// moved away: the list keeps nothing above its own folder, so a folder
+    /// above it going is told to it by walking these, not every path
+    /// registered.  Replaced whole, never changed in place.
+    /// </summary>
+    public string[] ListKeys => _listKeys;
+
+    /// <summary>
     /// Whether anyone is registered for <paramref name="path"/>, and the path
     /// as it was registered.  Any thread, no lock, no allocation.
     /// </summary>
@@ -98,7 +108,8 @@ internal sealed class ChangeRegistry
     /// Registers <paramref name="target"/> for <paramref name="key"/>, which is
     /// under <paramref name="root"/> (null for a path no volume holds); false
     /// when it already was.  A path first registered under a root since
-    /// dropped moves to the new one.
+    /// dropped moves to the new one - even when this target already was
+    /// registered for it.
     /// </summary>
     public bool Add(ChangeConsumer consumer, string key, object target, WatchRoot? root)
     {
@@ -110,11 +121,29 @@ internal sealed class ChangeRegistry
                 interest[consumer] = target;
                 _paths[key] = interest;
                 root?.AddInterest(key);
+                if (consumer == ChangeConsumer.List)
+                {
+                    _listKeys = [.. _listKeys, key];
+                }
             }
             else
             {
                 var slot = interest[consumer];
-                if (Contains(slot, target))
+                var known = Contains(slot, target);
+
+                // A drive taken out and put back at the same letter is a new
+                // root, and the dropped one's watch hears nothing any more: a
+                // path still under the dropped one moves, whoever registers
+                // it again.  Otherwise the root a path was first registered
+                // under is the one it stays under while this target is known.
+                if (!ReferenceEquals(interest.Root, root) && (!known || interest.Root is { IsDropped: true }))
+                {
+                    interest.Root?.RemoveInterest(key);
+                    interest.Root = root;
+                    root?.AddInterest(key);
+                }
+
+                if (known)
                 {
                     return false;
                 }
@@ -125,11 +154,9 @@ internal sealed class ChangeRegistry
                     TargetList list => new TargetList([.. list.Items, target]),
                     _ => new TargetList([slot, target])
                 };
-                if (!ReferenceEquals(interest.Root, root))
+                if (consumer == ChangeConsumer.List && slot is null)
                 {
-                    interest.Root?.RemoveInterest(key);
-                    interest.Root = root;
-                    root?.AddInterest(key);
+                    _listKeys = [.. _listKeys, key];
                 }
             }
 
@@ -158,6 +185,10 @@ internal sealed class ChangeRegistry
             if (consumer == ChangeConsumer.Nested)
             {
                 _nestedTargets--;
+            }
+            else if (consumer == ChangeConsumer.List && interest.List is null)
+            {
+                _listKeys = [.. _listKeys.Where(listed => !listed.Equals(key, StringComparison.OrdinalIgnoreCase))];
             }
 
             Forget(key, interest);
