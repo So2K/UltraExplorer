@@ -4,6 +4,7 @@ using System.ComponentModel;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Watch;
 
 namespace UltraExplorer.ViewModels;
 
@@ -20,11 +21,32 @@ namespace UltraExplorer.ViewModels;
 /// The list reads the directory itself rather than the canvas, so it shows what
 /// is really on disk whether or not the folder has been opened out on the
 /// canvas, and clicking a row that has no node yet reveals one.
+///
+/// It keeps up with the disk by itself too: its folder is registered with the
+/// change hub (<see cref="Changes"/>), and a change there reads the folder
+/// again and merges what it found into the rows already shown - rows that went
+/// are taken out, new ones are put in at their place and fade in, and a row
+/// whose size or date moved is updated where it is - so the scroll and what is
+/// lit stay as they were.  Nothing about what is selected decides whether it
+/// hears of a change; a file selected shows its folder, and the folder is
+/// watched like any other.
 /// </summary>
 public sealed class FolderListViewModel : ObservableObject
 {
     /// <summary>Rows that get a real Shell icon; the rest keep the glyph.</summary>
     private const int IconBudget = 300;
+
+    /// <summary>
+    /// Rows a change on disk may add, take out or move one at a time before the
+    /// list is refilled in one go instead.  The list box does a few
+    /// microseconds of work for each row it is told of, so a thousand is a few
+    /// milliseconds; past that a refill is cheaper, and a change that big is
+    /// not one anybody follows row by row anyway.
+    /// </summary>
+    private const int MaximumMergedRows = 1000;
+
+    /// <summary>How long a new row keeps its fade: longer than the fade itself, so it has always played.</summary>
+    private static readonly TimeSpan NewRowTime = TimeSpan.FromMilliseconds(600);
 
     private readonly Func<string, ItemSort, CancellationToken, Task<ViewAllDirectorySnapshot>> _read;
     private readonly Func<string, bool, Task> _activate;
@@ -32,6 +54,9 @@ public sealed class FolderListViewModel : ObservableObject
     private readonly ShellIconService _icons;
 
     private readonly List<FolderListItem> _all = [];
+
+    /// <summary>The rows shown, by path: how the shared selection finds its rows without walking the list.</summary>
+    private readonly Dictionary<string, FolderListItem> _byPath = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Folders the list has been in, newest last; what Back walks.</summary>
     private readonly List<string> _history = [];
@@ -54,6 +79,26 @@ public sealed class FolderListViewModel : ObservableObject
 
     /// <summary>The order the rows were read for: which of them were kept, when the folder had more than a read holds.</summary>
     private ItemSort _readSort = ItemSort.Default;
+
+    private ChangeHub? _changes;
+
+    /// <summary>The folder registered with <see cref="_changes"/>, which is <see cref="FolderPath"/> once it is set.</summary>
+    private string _registeredPath = string.Empty;
+
+    /// <summary>Counts the list's full reads: a read for a change that finds it has moved on was overtaken by one.</summary>
+    private int _loadGeneration;
+
+    private bool _liveReading;
+    private bool _liveAgain;
+
+    /// <summary>A change came while the list was hidden: it is read afresh when it is shown.</summary>
+    private bool _staleWhileHidden;
+
+    /// <summary>The folder's own last-write time as a read for a change or a poll last found it; zero before either.</summary>
+    private long _listedWriteTicks;
+
+    private readonly List<FolderListItem> _newRows = [];
+    private System.Windows.Threading.DispatcherTimer? _newRowsTimer;
 
     private bool _typeNamesWaiting;
 
@@ -114,11 +159,34 @@ public sealed class FolderListViewModel : ObservableObject
         get => _isVisible;
         set
         {
-            if (SetProperty(ref _isVisible, value) && value && _all.Count == 0)
+            if (SetProperty(ref _isVisible, value) && value && (_all.Count == 0 || _staleWhileHidden))
             {
-                // Nothing was read while it was hidden, so read it now.
+                // Nothing was read while it was hidden, or the folder changed
+                // meanwhile, so read it now.
                 _ = ReloadAsync();
             }
+        }
+    }
+
+    /// <summary>
+    /// The change hub the list's folder is registered with, or null while
+    /// nothing watches the disk (a test's list).  The folder is registered
+    /// whether or not the list is showing: a change while it is hidden is
+    /// remembered, and the folder is read afresh when it is shown.
+    /// </summary>
+    internal ChangeHub? Changes
+    {
+        get => _changes;
+        set
+        {
+            if (ReferenceEquals(_changes, value))
+            {
+                return;
+            }
+
+            UnregisterFolder();
+            _changes = value;
+            RegisterFolder();
         }
     }
 
@@ -135,6 +203,10 @@ public sealed class FolderListViewModel : ObservableObject
         {
             if (SetProperty(ref _folderPath, value))
             {
+                UnregisterFolder();
+                RegisterFolder();
+                _staleWhileHidden = false;
+                _listedWriteTicks = 0;
                 OnPropertyChanged(nameof(CanGoUp));
                 OnPropertyChanged(nameof(CanGoBack));
                 (UpCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
@@ -291,6 +363,78 @@ public sealed class FolderListViewModel : ObservableObject
     }
 
     /// <summary>
+    /// The selection the whole window shares.  The rows lit in the list are
+    /// its paths that are rows here; a path filtered out of the list, or past
+    /// what one read holds, stays selected all the same.
+    /// </summary>
+    public ItemSelection? SharedSelection { get; init; }
+
+    /// <summary>
+    /// The rows the shared selection lights changed - it changed, from
+    /// somewhere other than the list - and the list box should show them.
+    /// </summary>
+    public event Action? SelectionRowsChanged;
+
+    /// <summary>The rows are about to be replaced: what the list box then says about its selection is not the user's doing.</summary>
+    public event Action? RowsReplacing;
+
+    /// <summary>The rows were replaced, and the shared selection's rows should be lit among the new ones.</summary>
+    public event Action? RowsReplaced;
+
+    /// <summary>The row for a path, when it is shown.</summary>
+    public FolderListItem? RowFor(string? path) =>
+        path is not null && _byPath.TryGetValue(path, out var row) ? row : null;
+
+    /// <summary>
+    /// The rows the shared selection lights: whichever is smaller is walked,
+    /// the selection or the rows, so ten thousand selected files in another
+    /// folder cost nothing here.
+    /// </summary>
+    public IReadOnlyList<FolderListItem> SelectedRows()
+    {
+        if (SharedSelection is not { Count: > 0 } selection || _byPath.Count == 0 || selection.CountIn(FolderPath) == 0)
+        {
+            return [];
+        }
+
+        var rows = new List<FolderListItem>(Math.Min(selection.Count, _byPath.Count));
+        if (selection.Count <= _byPath.Count)
+        {
+            foreach (var path in selection.Paths)
+            {
+                if (_byPath.TryGetValue(path, out var row))
+                {
+                    rows.Add(row);
+                }
+            }
+        }
+        else
+        {
+            foreach (var row in Items)
+            {
+                if (selection.Contains(row.FullPath))
+                {
+                    rows.Add(row);
+                }
+            }
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// The shared selection changed.  A change the list made itself is on
+    /// screen already; any other is handed to the list box to show.
+    /// </summary>
+    public void OnSelectionChanged(ItemSelection selection)
+    {
+        if (selection.LastSource != SelectionSource.List)
+        {
+            SelectionRowsChanged?.Invoke();
+        }
+    }
+
+    /// <summary>
     /// Stops the list following the canvas while something the list itself did is
     /// still settling.  Clicking a folder row selects that folder on the canvas,
     /// and following that selection would take the list straight into the folder
@@ -348,6 +492,32 @@ public sealed class FolderListViewModel : ObservableObject
             return;
         }
 
+        GoTo(
+            folder,
+            folder.Length == 0
+                ? "No folder"
+                : node is { IsDirectory: true } ? node.DisplayName : node?.Parent?.DisplayName ?? folder,
+            node);
+    }
+
+    /// <summary>
+    /// Points the list at a folder by path, with <paramref name="focus"/>'s
+    /// row picked out: the folder several selected items share, which the
+    /// list shows with all of them lit.
+    /// </summary>
+    public void SetTarget(string folderPath, ViewAllNodeViewModel? focus)
+    {
+        if (_held > 0 || string.Equals(folderPath, FolderPath, StringComparison.OrdinalIgnoreCase))
+        {
+            SelectExisting(focus);
+            return;
+        }
+
+        GoTo(folderPath, NameOf(folderPath), focus);
+    }
+
+    private void GoTo(string folder, string title, ViewAllNodeViewModel? focus)
+    {
         if (FolderPath.Length > 0)
         {
             _history.Add(FolderPath);
@@ -358,14 +528,12 @@ public sealed class FolderListViewModel : ObservableObject
         }
 
         FolderPath = folder;
-        Title = folder.Length == 0
-            ? "No folder"
-            : node is { IsDirectory: true } ? node.DisplayName : node?.Parent?.DisplayName ?? folder;
+        Title = title;
 
         _filter = string.Empty;
         OnPropertyChanged(nameof(Filter));
 
-        _ = ReloadAsync(node);
+        _ = ReloadAsync(focus);
     }
 
     /// <summary>
@@ -466,11 +634,13 @@ public sealed class FolderListViewModel : ObservableObject
         _load?.Cancel();
         _load?.Dispose();
         _load = null;
+        _loadGeneration++;
 
         if (FolderPath.Length == 0 || !IsVisible)
         {
             _all.Clear();
-            Items.Clear();
+            _byPath.Clear();
+            ReplaceRows([]);
             CountText = string.Empty;
             EmptyText = FolderPath.Length == 0 ? "Nothing is selected." : string.Empty;
             return;
@@ -490,6 +660,7 @@ public sealed class FolderListViewModel : ObservableObject
             }
 
             _readSort = sort;
+            _staleWhileHidden = false;
 
             _all.Clear();
             foreach (var entry in snapshot.Entries)
@@ -518,7 +689,8 @@ public sealed class FolderListViewModel : ObservableObject
             or UnauthorizedAccessException or DirectoryNotFoundException)
         {
             _all.Clear();
-            Items.Clear();
+            _byPath.Clear();
+            ReplaceRows([]);
             CountText = string.Empty;
             EmptyText = exception is UnauthorizedAccessException
                 ? "Access denied."
@@ -534,6 +706,13 @@ public sealed class FolderListViewModel : ObservableObject
 
             cancellation.Dispose();
         }
+
+        // A change that came while this read was under way may have come
+        // after the directory was listed: it is read once more, merged.
+        if (_liveAgain && _load is null && !_liveReading)
+        {
+            _ = RefreshLiveAsync();
+        }
     }
 
     private void SelectExisting(ViewAllNodeViewModel? node)
@@ -543,8 +722,7 @@ public sealed class FolderListViewModel : ObservableObject
             return;
         }
 
-        var match = Items.FirstOrDefault(item =>
-            string.Equals(item.FullPath, node.FullPath, StringComparison.OrdinalIgnoreCase));
+        var match = RowFor(node.FullPath);
 
         // Assigned to the field, not the property: this is the canvas telling the
         // list what is selected, and answering by driving the canvas back to it
@@ -558,11 +736,33 @@ public sealed class FolderListViewModel : ObservableObject
 
     private void ApplyFilter()
     {
+        var rows = OrderedRows(out var typeNamesPending);
+        ReplaceRows(rows);
+        UpdateEmptyText();
+
+        if (typeNamesPending)
+        {
+            _ = ReorderWhenTypeNamesArriveAsync();
+        }
+    }
+
+    /// <summary>What to say when no row is shown, and nothing when one is.</summary>
+    private void UpdateEmptyText() =>
+        EmptyText = Items.Count == 0
+            ? _all.Count == 0 ? "This folder is empty." : $"Nothing matches “{_filter.Trim()}”."
+            : string.Empty;
+
+    /// <summary>
+    /// The rows that survive the filter, in the order they are shown, with
+    /// the lookup by path filled for them and icons asked for the first ones.
+    /// </summary>
+    private List<FolderListItem> OrderedRows(out bool typeNamesPending)
+    {
         var query = _filter.Trim();
 
         // Read as folders then files, each by name from A: the default order
         // is the listing as it came.
-        var typeNamesPending = false;
+        typeNamesPending = false;
         IEnumerable<FolderListItem> matched = query.Length == 0
             ? _sort.IsDefault ? _all : ViewAllEntryOrder.Sort(_all, item => item.Entry, _sort, out typeNamesPending)
             : _all
@@ -574,10 +774,12 @@ public sealed class FolderListViewModel : ObservableObject
                 .Select(pair => pair.Item);
 
         var rows = new List<FolderListItem>(_all.Count);
+        _byPath.Clear();
         foreach (var item in matched)
         {
             item.IsOnCanvas = _isOnCanvas(item.FullPath);
             rows.Add(item);
+            _byPath.TryAdd(item.FullPath, item);
 
             if (rows.Count <= IconBudget && item.Icon is null)
             {
@@ -587,10 +789,239 @@ public sealed class FolderListViewModel : ObservableObject
             }
         }
 
-        _rows.ReplaceAll(rows);
-        EmptyText = Items.Count == 0
-            ? _all.Count == 0 ? "This folder is empty." : $"Nothing matches “{query}”."
-            : string.Empty;
+        return rows;
+    }
+
+    private Task Activate(FolderListItem? item, bool open)
+        => item is null ? Task.CompletedTask : _activate(item.FullPath, open);
+
+    // ---- changes on disk ---------------------------------------------------------
+
+    private void RegisterFolder()
+    {
+        if (_changes is { } hub && FolderPath.Length > 0)
+        {
+            _registeredPath = FolderPath;
+            hub.Register(ChangeConsumer.List, _registeredPath, this);
+        }
+    }
+
+    private void UnregisterFolder()
+    {
+        if (_changes is { } hub && _registeredPath.Length > 0)
+        {
+            hub.Unregister(ChangeConsumer.List, _registeredPath, this);
+        }
+
+        _registeredPath = string.Empty;
+    }
+
+    /// <summary>
+    /// Something changed in the list's folder (the change hub, once per burst
+    /// of changes).  Shown, the folder is read again and merged into the rows;
+    /// hidden, it is noted and read when the list is shown.  The folder itself
+    /// gone - deleted, renamed, moved away - takes the list to the nearest
+    /// folder above it that is still there.
+    /// </summary>
+    internal void OnFolderChanged(in FolderChange change)
+    {
+        if (FolderPath.Length == 0 || !string.Equals(change.Key, FolderPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        LiveChangesTaken++;
+        if ((change.Kinds & ChangeKinds.Gone) != 0)
+        {
+            _ = LeaveGoneFolderAsync(FolderPath);
+            return;
+        }
+
+        RefreshForChange();
+    }
+
+    /// <summary>Changes under <paramref name="root"/> may have been missed: the list's folder, if it is under it, is read again.</summary>
+    internal void OnEpochBumped(WatchRoot root)
+    {
+        if (FolderPath.Length > 0 && IsUnder(FolderPath, root))
+        {
+            RefreshForChange();
+        }
+    }
+
+    /// <summary>
+    /// A watch that is polled is due its look: when the list's folder is under
+    /// it, its last-write time is compared, off this thread, with the one the
+    /// last look found, and a folder that moved on is read again.  The first
+    /// look at a folder only notes its time.
+    /// </summary>
+    internal void OnPollDue(WatchRoot root)
+    {
+        if (FolderPath.Length == 0 || !IsUnder(FolderPath, root) || !IsVisible)
+        {
+            return;
+        }
+
+        var path = FolderPath;
+        var ticks = _listedWriteTicks;
+        _ = PollAsync();
+
+        async Task PollAsync()
+        {
+            long now;
+            try
+            {
+                now = await Task.Run(() => NestedDirectoryReader.DirectoryWriteTicks(path));
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+            {
+                return;
+            }
+
+            if (now == 0 || !string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            _listedWriteTicks = now;
+            if (ticks != 0 && now != ticks)
+            {
+                RefreshForChange();
+            }
+        }
+    }
+
+    /// <summary>Changes taken in for the list's folder, for tests.</summary>
+    internal int LiveChangesTaken { get; private set; }
+
+    /// <summary>Reads for changes merged into the rows, for tests.</summary>
+    internal int LiveMerges { get; private set; }
+
+    /// <summary>Of those, the ones too big to merge, which refilled the rows instead.</summary>
+    internal int LiveRefills { get; private set; }
+
+    private void RefreshForChange()
+    {
+        if (!IsVisible)
+        {
+            _staleWhileHidden = true;
+            return;
+        }
+
+        _ = RefreshLiveAsync();
+    }
+
+    private static bool IsUnder(string path, WatchRoot root)
+    {
+        foreach (var prefix in root.Prefixes)
+        {
+            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                && (path.Length == prefix.Length || prefix.EndsWith(Path.DirectorySeparatorChar) || path[prefix.Length] == Path.DirectorySeparatorChar))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Reads the folder again for a change and merges what it found into the
+    /// rows.  One read at a time: a change that comes while one is under way
+    /// has it followed by another, and a full read under way - a new folder,
+    /// a new order - is left to finish and followed by one.  A read that finds
+    /// the list has moved to another folder meanwhile is dropped.
+    /// </summary>
+    private async Task RefreshLiveAsync()
+    {
+        if (_liveReading || _load is not null)
+        {
+            _liveAgain = true;
+            return;
+        }
+
+        _liveReading = true;
+        try
+        {
+            do
+            {
+                _liveAgain = false;
+                var path = FolderPath;
+                var sort = _sort;
+                var generation = _loadGeneration;
+                ViewAllDirectorySnapshot snapshot;
+                long writeTicks;
+                try
+                {
+                    writeTicks = await Task.Run(() => NestedDirectoryReader.DirectoryWriteTicks(path));
+                    snapshot = await _read(path, sort, CancellationToken.None);
+                }
+                catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+                {
+                    // Gone between the change and the read, most likely.
+                    if (generation == _loadGeneration && string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _ = LeaveGoneFolderAsync(path);
+                    }
+
+                    return;
+                }
+
+                if (generation != _loadGeneration || _load is not null || !string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+
+                _listedWriteTicks = writeTicks;
+                Merge(snapshot, sort);
+            }
+            while (_liveAgain && IsVisible);
+        }
+        finally
+        {
+            _liveReading = false;
+        }
+    }
+
+    /// <summary>
+    /// Puts a new read of the folder into the list without starting it again:
+    /// a row still there keeps its object - its icon, its highlight, its place
+    /// on screen - with its size and date brought up to date; a new one is
+    /// made and fades in; the rows shown then follow the new ones a row at a
+    /// time (<see cref="MergeRows"/>).
+    /// </summary>
+    private void Merge(ViewAllDirectorySnapshot snapshot, ItemSort sort)
+    {
+        LiveMerges++;
+        _readSort = sort;
+        var previous = new Dictionary<string, FolderListItem>(_all.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var item in _all)
+        {
+            previous.TryAdd(item.FullPath, item);
+        }
+
+        _all.Clear();
+        foreach (var entry in snapshot.Entries)
+        {
+            var isDirectory = entry.Kind is ViewAllEntryKind.Drive or ViewAllEntryKind.Folder;
+            if (previous.Remove(entry.FullPath, out var kept) && kept.IsDirectory == isDirectory)
+            {
+                kept.Entry = entry;
+                _all.Add(kept);
+                continue;
+            }
+
+            var added = new FolderListItem(entry) { IsNew = true };
+            _newRows.Add(added);
+            _all.Add(added);
+        }
+
+        _isTruncated = snapshot.IsTruncated;
+        CountText = $"{_all.Count:N0}{(_isTruncated ? "+" : string.Empty)}";
+        var rows = OrderedRows(out var typeNamesPending);
+        MergeRows(rows);
+        UpdateEmptyText();
+        EndNewRowsLater();
 
         if (typeNamesPending)
         {
@@ -598,8 +1029,178 @@ public sealed class FolderListViewModel : ObservableObject
         }
     }
 
-    private Task Activate(FolderListItem? item, bool open)
-        => item is null ? Task.CompletedTask : _activate(item.FullPath, open);
+    /// <summary>
+    /// Brings the rows shown to <paramref name="rows"/> with as few steps as
+    /// the list box has to be told of: the rows that went are taken out, a row
+    /// that moved - its date changed under an order by date - is taken out and
+    /// put back in its place, and the new ones are put in where they belong.
+    /// A row kept is never touched, so the scroll stays where it was and what
+    /// is lit stays lit.  A change bigger than <see cref="MaximumMergedRows"/>
+    /// refills the list in one go instead.
+    /// </summary>
+    private void MergeRows(List<FolderListItem> rows)
+    {
+        var shown = _rows;
+        var wanted = new Dictionary<FolderListItem, int>(rows.Count, ReferenceEqualityComparer.Instance);
+        for (var index = 0; index < rows.Count; index++)
+        {
+            wanted[rows[index]] = index;
+        }
+
+        // Which shown rows stay where they are: those still wanted, in the
+        // order they are wanted in.  A kept row behind one that is now after
+        // it has moved.
+        var leaving = new HashSet<FolderListItem>(ReferenceEqualityComparer.Instance);
+        var furthest = -1;
+        foreach (var row in shown)
+        {
+            if (!wanted.TryGetValue(row, out var place) || place < furthest)
+            {
+                leaving.Add(row);
+                continue;
+            }
+
+            furthest = place;
+        }
+
+        var arriving = rows.Count - (shown.Count - leaving.Count);
+        if (shown.Count == 0 || leaving.Count + arriving > MaximumMergedRows)
+        {
+            LiveRefills++;
+            ReplaceRows(rows);
+            return;
+        }
+
+        for (var index = shown.Count - 1; index >= 0; index--)
+        {
+            if (leaving.Contains(shown[index]))
+            {
+                shown.RemoveAt(index);
+            }
+        }
+
+        var litArrived = false;
+        for (var index = 0; index < rows.Count; index++)
+        {
+            if (index < shown.Count && ReferenceEquals(shown[index], rows[index]))
+            {
+                continue;
+            }
+
+            shown.Insert(index, rows[index]);
+            litArrived |= SharedSelection?.Contains(rows[index].FullPath) == true;
+        }
+
+        // A row that is selected and only just came - or moved - has to be lit;
+        // the list box lights what it is told to.
+        if (litArrived)
+        {
+            SelectionRowsChanged?.Invoke();
+        }
+    }
+
+    /// <summary>Ends the fade of the rows that came with this change a moment from now.</summary>
+    private void EndNewRowsLater()
+    {
+        if (_newRows.Count == 0)
+        {
+            return;
+        }
+
+        if (_newRowsTimer is null)
+        {
+            _newRowsTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Background) { Interval = NewRowTime };
+            _newRowsTimer.Tick += (_, _) =>
+            {
+                _newRowsTimer!.Stop();
+                foreach (var row in _newRows)
+                {
+                    row.IsNew = false;
+                }
+
+                _newRows.Clear();
+            };
+        }
+
+        _newRowsTimer.Stop();
+        _newRowsTimer.Start();
+    }
+
+    /// <summary>
+    /// The list's folder went from disk.  The list goes to the nearest folder
+    /// above it that is still there, as Explorer does when the folder it shows
+    /// is deleted; a folder only renamed or replaced in the same place and back
+    /// already is simply read again.
+    /// </summary>
+    private async Task LeaveGoneFolderAsync(string path)
+    {
+        string? nearest;
+        try
+        {
+            nearest = await Task.Run(() =>
+            {
+                if (Directory.Exists(path))
+                {
+                    return path;
+                }
+
+                for (var parent = ParentOf(path); parent is not null; parent = ParentOf(parent))
+                {
+                    if (Directory.Exists(parent))
+                    {
+                        return parent;
+                    }
+                }
+
+                return null;
+            });
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return;
+        }
+
+        if (!string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        if (string.Equals(nearest, path, StringComparison.OrdinalIgnoreCase))
+        {
+            RefreshForChange();
+            return;
+        }
+
+        if (nearest is null)
+        {
+            return;
+        }
+
+        LeftGoneFolders++;
+        await NavigateAsync(nearest, remember: false);
+    }
+
+    /// <summary>Times the list left a folder that went from disk, for tests.</summary>
+    internal int LeftGoneFolders { get; private set; }
+
+    /// <summary>
+    /// The rows, replaced in one go, with the list box told before and after:
+    /// whatever it drops from its selection meanwhile - rows filtered away,
+    /// another folder - is its own doing, not the user's, and the shared
+    /// selection's rows are lit again among the new ones.
+    /// </summary>
+    private void ReplaceRows(List<FolderListItem> rows)
+    {
+        RowsReplacing?.Invoke();
+        try
+        {
+            _rows.ReplaceAll(rows);
+        }
+        finally
+        {
+            RowsReplaced?.Invoke();
+        }
+    }
 
     /// <summary>
     /// The rows, refilled in one go.  Row by row, an observable collection

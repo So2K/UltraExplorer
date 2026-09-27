@@ -26,8 +26,8 @@ internal sealed class IconAtlasOptions
     /// <summary>The most slices there can be: Direct3D 11's limit for a texture array.</summary>
     public int MaximumSlices { get; init; } = 2048;
 
-    /// <summary>At most this many new icons are copied to the GPU in one frame.</summary>
-    public int UploadsPerFrame { get; init; } = 64;
+    /// <summary>At most this many new icons are copied to the GPU in one frame: the frame's budget for them (<see cref="Controls.FrameBudgets.IconUploads"/>).</summary>
+    public int UploadsPerFrame { get; init; } = Controls.FrameBudgets.IconUploads;
 
     /// <summary>Extraction threads to start with.</summary>
     public int WorkerCount { get; init; } = IconExtractor.DefaultWorkerCount;
@@ -206,7 +206,9 @@ internal sealed class IconAtlas : IDisposable
     /// <summary>
     /// Raised on an extraction thread when finished icons start waiting for
     /// <see cref="ProcessArrivals(IconAtlasTexture?, ID3D11DeviceContext?, int)"/>,
-    /// once until that next runs - the canvas asks for a frame of its labels.
+    /// once until that next runs - the canvas wakes its frame loop, which
+    /// takes them in with its next frame of labels: however many icons arrive
+    /// between two frames, one wake and no dispatcher operation of their own.
     /// Must not block.
     /// </summary>
     public event Action? ArrivalsPending;

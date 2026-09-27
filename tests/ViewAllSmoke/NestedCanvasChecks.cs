@@ -115,10 +115,12 @@ internal static partial class Program
     {
         Section("nested read queue");
 
+        // A slot for each of the first reads, and seven more folders to wait.
+        const int Slots = NestedTree.LocalReadSlots;
         var disk = new FakeDisk();
-        for (var index = 0; index < 10; index++)
+        for (var index = 0; index < Slots + 7; index++)
         {
-            disk.Folder($@"Q:\c{index}\sub");
+            disk.Folder($@"Q:\c{index:D2}\sub");
         }
 
         using var gate = new SemaphoreSlim(0);
@@ -145,40 +147,43 @@ internal static partial class Program
             tree.Request(c[index], priority: index);
         }
 
-        Check("three reads run at once and the rest wait",
-            c.Take(3).All(folder => folder.LoadState == NestedLoadState.Loading)
-            && c.Skip(3).All(folder => folder.LoadState == NestedLoadState.Queued));
-        Check("the tree counts all of them as pending", tree.PendingCount == 10);
+        Check($"{Slots} reads run at once and the rest wait",
+            c.Take(Slots).All(folder => folder.LoadState == NestedLoadState.Loading)
+            && c.Skip(Slots).All(folder => folder.LoadState == NestedLoadState.Queued));
+        Check("the tree counts all of them as pending", tree.PendingCount == c.Length);
 
         // Three pictures go by in which only the two most wanted are asked for again.
+        var second = c[^2];
+        var first = c[^1];
         tree.BeginFrame();
         tree.BeginFrame();
         tree.BeginFrame();
-        tree.Request(c[8], 8);
-        tree.Request(c[9], 9);
+        tree.Request(second, c.Length - 2);
+        tree.Request(first, c.Length - 1);
 
         gate.Release(1);
-        await WaitUntil(() => c.Take(3).Count(folder => folder.IsLoaded) == 1, 3_000);
+        await WaitUntil(() => c.Take(Slots).Count(folder => folder.IsLoaded) == 1, 3_000);
         Check("when a read finishes, the most wanted request still being asked for goes next",
-            c[9].LoadState == NestedLoadState.Loading && c[8].LoadState == NestedLoadState.Queued);
+            first.LoadState == NestedLoadState.Loading && second.LoadState == NestedLoadState.Queued);
         Check("requests not repeated for two pictures are dropped, not read",
-            c.Skip(3).Take(5).All(folder => folder.LoadState == NestedLoadState.NotLoaded));
-        Check("and leave the queue", tree.PendingCount == 4);
+            c.Skip(Slots).Take(5).All(folder => folder.LoadState == NestedLoadState.NotLoaded));
+        Check("and leave the queue", tree.PendingCount == Slots + 1);
 
         gate.Release(100);
         await WaitUntil(() => tree.PendingCount == 0, 5_000);
         Check("everything still wanted is read",
-            c.Take(3).All(folder => folder.IsLoaded) && c[8].IsLoaded && c[9].IsLoaded);
+            c.Take(Slots).All(folder => folder.IsLoaded) && second.IsLoaded && first.IsLoaded);
 
         Volatile.Write(ref gated, 0);
-        tree.Request(c[4], 1);
-        await WaitUntil(() => c[4].IsLoaded, 3_000);
-        Check("a dropped folder can be asked for again", c[4].IsLoaded);
-        Check("the disk was read exactly for what was wanted", disk.Reads == 1 + 5 + 1);
+        var dropped = c[Slots + 1];
+        tree.Request(dropped, 1);
+        await WaitUntil(() => dropped.IsLoaded, 3_000);
+        Check("a dropped folder can be asked for again", dropped.IsLoaded);
+        Check("the disk was read exactly for what was wanted", disk.Reads == 1 + Slots + 2 + 1);
 
         tree.IsReadingOnDemand = false;
-        tree.Request(c[5], 100);
-        Check("with reading on demand off, asking reads nothing", c[5].LoadState == NestedLoadState.NotLoaded && tree.PendingCount == 0);
+        tree.Request(c[Slots + 2], 100);
+        Check("with reading on demand off, asking reads nothing", c[Slots + 2].LoadState == NestedLoadState.NotLoaded && tree.PendingCount == 0);
     }
 
     // ---- the canvas over a small world -------------------------------------------------

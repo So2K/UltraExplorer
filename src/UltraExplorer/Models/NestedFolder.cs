@@ -1,4 +1,5 @@
 using UltraExplorer.Services;
+using UltraExplorer.Services.Watch;
 
 namespace UltraExplorer.Models;
 
@@ -178,17 +179,50 @@ public enum NestedLoadState
 }
 
 /// <summary>
+/// Which read a folder is waiting for or being read by: its first, which
+/// takes it from <see cref="NestedLoadState.NotLoaded"/> to loaded, or a
+/// refresh of one already loaded - drawn with what it had until the new
+/// listing is applied, and so never shown as reading.
+/// </summary>
+internal enum ReadKind : byte
+{
+    None,
+    Load,
+    Refresh
+}
+
+/// <summary>
 /// One folder on the nested canvas.  Deliberately a plain object rather than a
 /// view model: a drive seen whole is tens of thousands of these, and none of
 /// them binds to anything - the canvas draws them itself.
 ///
-/// It is owned by the UI thread.  Background readers see only the path, which
-/// never changes; everything else is written when a finished listing is
-/// handed back to the dispatcher.
+/// It is owned by the UI thread.  The read queue's workers see the path, the
+/// watch and what the folder held when its read began; its place in the
+/// queue and the stamps a read takes (<see cref="QueuedRead"/>,
+/// <see cref="ReadEpoch"/>, <see cref="IsStale"/>) change under the queue's
+/// lock; everything else is written when a finished listing is applied, at
+/// the start of a frame.
 /// </summary>
 public sealed class NestedFolder
 {
     private static readonly NestedFolder[] None = [];
+
+    /// <summary>Where FNV-1a starts: the hash of an empty path.</summary>
+    private const uint HashOrigin = 2166136261u;
+
+    private const uint HashPrime = 16777619u;
+
+    /// <summary>
+    /// Set for a folder made with its path; for one made from its parent's
+    /// listing, joined from the parent's the first time anything asks
+    /// (<see cref="FullPath"/>).
+    /// </summary>
+    private string? _fullPath;
+
+    /// <summary>FNV-1a over the lower-cased path, which is what <see cref="Hue"/> is made of.</summary>
+    private readonly uint _pathHash;
+
+    private volatile bool _isStale;
 
     internal NestedFolder(
         string fullPath,
@@ -200,7 +234,7 @@ public sealed class NestedFolder
         string secondaryText = "",
         long modifiedTicks = 0)
     {
-        FullPath = fullPath;
+        _fullPath = fullPath;
         Name = name;
         Kind = kind;
         Parent = parent;
@@ -209,10 +243,39 @@ public sealed class NestedFolder
         IsReparsePoint = isReparsePoint;
         SecondaryText = secondaryText;
         ModifiedTicks = modifiedTicks;
-        Hue = HueFor(fullPath);
+        Watch = parent?.Watch;
+        _pathHash = Hash(HashOrigin, fullPath);
     }
 
-    public string FullPath { get; }
+    /// <summary>A sub-folder as its parent's listing names it, with no path of its own until one is asked for.</summary>
+    private NestedFolder(NestedFolder parent, string name, bool isHidden, bool isReparsePoint, long modifiedTicks)
+    {
+        Name = name;
+        Kind = NestedFolderKind.Folder;
+        Parent = parent;
+        Depth = parent.Depth + 1;
+        IsHidden = isHidden;
+        IsReparsePoint = isReparsePoint;
+        SecondaryText = string.Empty;
+        ModifiedTicks = modifiedTicks;
+        Watch = parent.Watch;
+        _pathHash = ChildHash(parent, name);
+    }
+
+    /// <summary>
+    /// A sub-folder of <paramref name="parent"/> from its listing.  Reading a
+    /// folder of twenty-five thousand sub-folders makes twenty-five thousand of
+    /// these, most of them never drawn large enough to be named or looked up:
+    /// each one's path is joined only when something needs it, and its hue
+    /// comes from the parent's hash carried on over the name - the same number
+    /// the whole path gives.
+    /// </summary>
+    internal static NestedFolder ChildOf(NestedFolder parent, string name, bool isHidden, bool isReparsePoint, long modifiedTicks) =>
+        new(parent, name, isHidden, isReparsePoint, modifiedTicks);
+
+    /// <summary>The folder's path; for a sub-folder, its parent's joined with its name the first time it is asked for.</summary>
+    public string FullPath => _fullPath ??= Path.Combine(Parent!.FullPath, Name);
+
     public string Name { get; }
     public NestedFolderKind Kind { get; }
     public NestedFolder? Parent { get; }
@@ -252,8 +315,78 @@ public sealed class NestedFolder
     /// <summary>The last failure may pass if tried again.</summary>
     internal bool IsRetryable { get; set; }
 
-    /// <summary>On a share: read one at a time, so a share that hangs cannot starve the local drives.</summary>
-    public bool IsNetwork => FullPath.StartsWith(@"\\", StringComparison.Ordinal);
+    /// <summary>
+    /// On a share: read one at a time per share, so a share that hangs cannot
+    /// starve the local drives.  A share is whatever the watch on it says, or
+    /// else a UNC path or a drive letter mapped to one - a mapped J: included,
+    /// which a test for a leading pair of separators alone took for a local disk.
+    /// </summary>
+    public bool IsNetwork => Watch?.IsNetwork ?? VolumeKinds.IsNetwork(FullPath);
+
+    // ---- the read queue --------------------------------------------------------------
+
+    /// <summary>
+    /// The watch on the volume or share the folder is on, taken from its parent
+    /// when it is made; a drive or root is given its own by the tree.  Null
+    /// while nothing watches for changes.
+    /// </summary>
+    internal WatchRoot? Watch { get; init; }
+
+    /// <summary>
+    /// <see cref="WatchRoot.Epoch"/> as it was when the folder's last read
+    /// began.  An epoch that has moved on since means changes under the root
+    /// may have been missed - the watch overflowed, or was armed again - and
+    /// the folder is read again the next time it is drawn.
+    /// </summary>
+    internal int ReadEpoch { get; set; }
+
+    /// <summary>
+    /// Something in the folder changed after its last read began: it is read
+    /// again the next time it is drawn, and drawn as it was until then.
+    /// Cleared when a read begins, so a change that arrives while the read is
+    /// still going sets it again and is not lost.  Written from any thread.
+    /// </summary>
+    internal bool IsStale
+    {
+        get => _isStale;
+        set => _isStale = value;
+    }
+
+    /// <summary>Whether what was read is out of date: a change was seen, or may have been missed.</summary>
+    internal bool NeedsRefresh => _isStale || Watch is { } watch && ReadEpoch != Volatile.Read(ref watch.Epoch);
+
+    /// <summary>The read the folder is queued for or being read by; <see cref="ReadKind.None"/> when neither.</summary>
+    internal ReadKind QueuedRead { get; set; }
+
+    /// <summary>Where the folder is in the read queue's list of waiting folders, or -1 when it is not waiting.</summary>
+    internal int QueueIndex { get; set; } = -1;
+
+    /// <summary>
+    /// Counts the reads begun for the folder, and the reads given up on: a
+    /// finished read carries the count it began with, and one that no longer
+    /// matches is dropped rather than applied.
+    /// </summary>
+    internal int ReadTicket { get; set; }
+
+    /// <summary>What <see cref="LastDrawnFrame"/> is before the folder is drawn: far enough back that no frame counts it as recent.</summary>
+    internal const long NeverDrawn = long.MinValue / 2;
+
+    /// <summary>
+    /// The last picture (<see cref="NestedTree.Frame"/>) that drew the folder
+    /// large enough to be read: whether a change to it is worth reading now.
+    /// </summary>
+    internal long LastDrawnFrame { get; set; } = NeverDrawn;
+
+    /// <summary>How wide <see cref="LastDrawnFrame"/> drew it, in pixels: how soon a change to it should be read.</summary>
+    internal float LastDrawnWidth { get; set; }
+
+    /// <summary>
+    /// The folder's own last-write time, as UTC ticks, taken just before its
+    /// last read - on a volume that is polled rather than watched, or a share,
+    /// where a directory whose time has moved on since is read again.  Zero
+    /// when it was not taken.
+    /// </summary>
+    internal long DirWriteTicks { get; set; }
 
     public bool IsLoaded => LoadState == NestedLoadState.Loaded;
 
@@ -328,7 +461,7 @@ public sealed class NestedFolder
     public bool IsTruncated { get; internal set; }
 
     /// <summary>A stable hue from the path, so a folder is the same colour every session.</summary>
-    public double Hue { get; }
+    public double Hue => _pathHash % 360u;
 
     /// <summary>Last frame the canvas wanted this folder read.  Stale requests are dropped.</summary>
     internal long RequestedFrame { get; set; }
@@ -372,14 +505,47 @@ public sealed class NestedFolder
     public override string ToString() => FullPath;
 
     /// <summary>FNV-1a over the lower-cased path: string.GetHashCode changes every run.</summary>
-    private static double HueFor(string path)
+    internal static double HueFor(string path) => Hash(HashOrigin, path) % 360u;
+
+    private static uint Hash(uint hash, string text)
     {
-        var hash = 2166136261u;
-        foreach (var character in path)
+        foreach (var character in text)
         {
-            hash = (hash ^ char.ToLowerInvariant(character)) * 16777619u;
+            hash = (hash ^ char.ToLowerInvariant(character)) * HashPrime;
         }
 
-        return hash % 360u;
+        return hash;
     }
+
+    /// <summary>
+    /// The hash of the path <see cref="Path.Combine(string, string)"/> makes
+    /// of the parent's and <paramref name="name"/>, without making it: the
+    /// parent's hash carried on over a separator where Combine puts one, then
+    /// over the name - or the name's alone, where Combine returns it alone.
+    /// </summary>
+    private static uint ChildHash(NestedFolder parent, string name)
+    {
+        var parentPath = parent.FullPath;
+        if (name.Length == 0)
+        {
+            return parent._pathHash;
+        }
+
+        var rooted = IsSeparator(name[0]) || name.Length >= 2 && char.IsAsciiLetter(name[0]) && name[1] == ':';
+        if (parentPath.Length == 0 || rooted)
+        {
+            return Hash(HashOrigin, name);
+        }
+
+        var hash = parent._pathHash;
+        if (!IsSeparator(parentPath[^1]))
+        {
+            hash = (hash ^ char.ToLowerInvariant(Path.DirectorySeparatorChar)) * HashPrime;
+        }
+
+        return Hash(hash, name);
+    }
+
+    private static bool IsSeparator(char character) =>
+        character == Path.DirectorySeparatorChar || character == Path.AltDirectorySeparatorChar;
 }

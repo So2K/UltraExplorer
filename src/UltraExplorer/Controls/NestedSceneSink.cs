@@ -102,12 +102,72 @@ internal abstract class SceneSink
 /// Each call is exactly the <see cref="NestedRaster"/> calls the canvas made
 /// before sinks existed, with the same arguments in the same order, so the
 /// pixels are the same to the bit.
+///
+/// <para>It can paint part of a frame, too: <see cref="Begin"/> with a clip
+/// paints only the pixels inside it and leaves the rest of the buffer alone -
+/// for a frame after some folders were read, when only their cells changed
+/// and everything else in the bitmap is already the picture.</para>
 /// </summary>
 internal sealed class RasterSink(NestedRaster raster) : SceneSink
 {
+    // Where the clip starts in the frame: the raster is attached to the clip
+    // alone, so every coordinate is moved by this much on the way in.
+    private int _clipLeft;
+    private int _clipTop;
+    private bool _clipped;
+
+    /// <summary>
+    /// Attaches the raster to <paramref name="clip"/> of the frame in
+    /// <paramref name="buffer"/>: every call up to <see cref="End"/> paints
+    /// the pixels inside it, exactly as a frame painted whole paints them
+    /// there, and nothing outside it.
+    ///
+    /// <para>The raster already clips everything to its own bounds; attached
+    /// at the clip's corner, those bounds are the clip, and the shapes are
+    /// moved by the corner to meet it.  Moving a shape leaves its pixels as
+    /// they were because the corner is at an even number of pixels (the
+    /// canvas aligns clips to eight): edges are snapped with
+    /// <see cref="NestedRaster.Px"/>, whose <see cref="Math.Round(double)"/>
+    /// takes halves to the even neighbour, and an even shift keeps which
+    /// neighbour that is.  Corners and shading come from differences of
+    /// snapped edges, which no shift changes.  The one thing a shift can
+    /// change is an edge within a rounding error of a half pixel - about
+    /// 10^-15 of one - which the subtraction can carry across it: a pixel's
+    /// difference at odds far below anything a frame will ever meet, and gone
+    /// at the next whole frame.  A clip that is the whole frame moves nothing,
+    /// and is the frame as it always was.</para>
+    /// </summary>
+    public void Begin(IntPtr buffer, int strideBytes, System.Windows.Int32Rect clip)
+    {
+        raster.Attach(buffer + ((nint)clip.Y * strideBytes + (nint)clip.X * 4), clip.Width, clip.Height, strideBytes);
+        _clipLeft = clip.X;
+        _clipTop = clip.Y;
+        _clipped = clip.X != 0 || clip.Y != 0;
+    }
+
+    /// <summary>Lets go of the buffer <see cref="Begin"/> attached.</summary>
+    public void End()
+    {
+        raster.Detach();
+        _clipLeft = 0;
+        _clipTop = 0;
+        _clipped = false;
+    }
+
     public override void Clear(uint colour) => raster.Clear(colour);
 
-    public override void Fill(int x0, int y0, int x1, int y1, uint colour) => raster.Fill(x0, y0, x1, y1, colour);
+    public override void Fill(int x0, int y0, int x1, int y1, uint colour)
+    {
+        if (_clipped)
+        {
+            x0 -= _clipLeft;
+            x1 -= _clipLeft;
+            y0 -= _clipTop;
+            y1 -= _clipTop;
+        }
+
+        raster.Fill(x0, y0, x1, y1, colour);
+    }
 
     public override void Cell(
         double left,
@@ -126,16 +186,28 @@ internal sealed class RasterSink(NestedRaster raster) : SceneSink
         uint header,
         uint stripeColour)
     {
-        raster.FillFramed(left, top, right, bottom, radius, rim, body);
+        // Unclipped, both are nought and nothing moves.  The title band's
+        // edges are worked out where the whole frame works them out, and only
+        // then moved to the clip.
+        double dx = _clipLeft, dy = _clipTop;
+        raster.FillFramed(left - dx, top - dy, right - dx, bottom - dy, radius, rim, body);
         if (double.IsNaN(headerBottom))
         {
             return;
         }
 
-        raster.FillRounded(left + 1, top + 1, right - 1, headerBottom, Math.Max(0, radius - 1), header, roundBottom: false);
+        if (_clipped)
+        {
+            raster.FillRounded(left + 1 - dx, top + 1 - dy, right - 1 - dx, headerBottom - dy, Math.Max(0, radius - 1), header, roundBottom: false);
+        }
+        else
+        {
+            raster.FillRounded(left + 1, top + 1, right - 1, headerBottom, Math.Max(0, radius - 1), header, roundBottom: false);
+        }
+
         if (hasStripe)
         {
-            raster.Fill(stripeLeft, stripeTop, stripeRight, stripeBottom, stripeColour);
+            Fill(stripeLeft, stripeTop, stripeRight, stripeBottom, stripeColour);
         }
     }
 
@@ -152,7 +224,8 @@ internal sealed class RasterSink(NestedRaster raster) : SceneSink
         uint body,
         uint stripe)
     {
-        raster.FillRounded(left, top, right, bottom, radius, body);
-        raster.Fill(stripeLeft, stripeTop, stripeRight, stripeBottom, stripe);
+        double dx = _clipLeft, dy = _clipTop;
+        raster.FillRounded(left - dx, top - dy, right - dx, bottom - dy, radius, body);
+        Fill(stripeLeft, stripeTop, stripeRight, stripeBottom, stripe);
     }
 }

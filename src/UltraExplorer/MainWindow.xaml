@@ -1025,9 +1025,10 @@
                         </Border>
 
                         <Grid Grid.Row="2">
-                            <ListBox x:Name="FolderListItems"
+                            <controls:SelectionListBox x:Name="FolderListItems"
                                      ItemsSource="{Binding Tree.FolderList.Items}"
-                                     SelectedItem="{Binding Tree.FolderList.Selected, Mode=TwoWay}"
+                                     SelectionMode="Extended"
+                                     SelectionChanged="FolderListItems_SelectionChanged"
                                      Background="Transparent"
                                      Foreground="{StaticResource TextBrush}"
                                      BorderThickness="0"
@@ -1038,7 +1039,7 @@
                                      PreviewMouseLeftButtonDown="FolderListItems_PreviewMouseLeftButtonDown"
                                      PreviewMouseLeftButtonUp="FolderListItems_PreviewMouseLeftButtonUp"
                                      PreviewMouseRightButtonUp="FolderListItems_PreviewMouseRightButtonUp">
-                                <ListBox.ItemContainerStyle>
+                                <controls:SelectionListBox.ItemContainerStyle>
                                     <Style TargetType="ListBoxItem">
                                         <Setter Property="Padding" Value="0" />
                                         <Setter Property="Background" Value="Transparent" />
@@ -1060,9 +1061,29 @@
                                                 </ControlTemplate>
                                             </Setter.Value>
                                         </Setter>
+                                        <Style.Triggers>
+                                            <!-- A row that appeared on disk while the folder was shown fades in. -->
+                                            <DataTrigger Binding="{Binding IsNew}" Value="True">
+                                                <DataTrigger.EnterActions>
+                                                    <BeginStoryboard>
+                                                        <Storyboard>
+                                                            <DoubleAnimation Storyboard.TargetProperty="Opacity"
+                                                                             From="0"
+                                                                             To="1"
+                                                                             Duration="0:0:0.15"
+                                                                             FillBehavior="Stop">
+                                                                <DoubleAnimation.EasingFunction>
+                                                                    <CubicEase EasingMode="EaseOut" />
+                                                                </DoubleAnimation.EasingFunction>
+                                                            </DoubleAnimation>
+                                                        </Storyboard>
+                                                    </BeginStoryboard>
+                                                </DataTrigger.EnterActions>
+                                            </DataTrigger>
+                                        </Style.Triggers>
                                     </Style>
-                                </ListBox.ItemContainerStyle>
-                                <ListBox.ItemTemplate>
+                                </controls:SelectionListBox.ItemContainerStyle>
+                                <controls:SelectionListBox.ItemTemplate>
                                     <DataTemplate>
                                         <Grid>
                                             <Grid.ColumnDefinitions>
@@ -1098,8 +1119,8 @@
                                                        VerticalAlignment="Center" />
                                         </Grid>
                                     </DataTemplate>
-                                </ListBox.ItemTemplate>
-                            </ListBox>
+                                </controls:SelectionListBox.ItemTemplate>
+                            </controls:SelectionListBox>
 
                             <TextBlock Text="{Binding Tree.FolderList.EmptyText}"
                                        Foreground="{StaticResource TextMutedBrush}"

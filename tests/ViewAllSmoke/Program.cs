@@ -90,6 +90,22 @@ internal static partial class Program
         await GpuTextChecks();
         await GpuRectChecks();
         await GpuLabelChecks();
+        await FrameWorkChecks();
+
+        // Each work package's own checks, run from here so that none of them
+        // needs this file: empty until the package fills its file in.
+        await ReadQueueChecks();
+        await IconInboxChecks();
+        await LabelCostChecks();
+        await FrameScopeChecks();
+        await WatchChecks();
+        await HubCoalesceChecks();
+        await LiveUpdateChecks();
+        await CameraMotionChecks();
+        await NestedCameraChecks();
+        await TransitionChecks();
+        await NestedSelectionChecks();
+        await ItemSelectionChecks();
     }
 
     // ---- fixture -----------------------------------------------------------

@@ -34,6 +34,24 @@ public sealed class WorkspaceState
     public string? CanvasRenderer { get; set; }
 
     /// <summary>
+    /// What a left drag on the nested canvas does where it picks nothing up:
+    /// "select" draws a selection rectangle, "pan" moves the view as it used
+    /// to.  Missing or not understood, it is select.
+    /// </summary>
+    public string? NestedLeftDrag { get; set; } = LeftDragSetting(Controls.NestedLeftDrag.SelectArea);
+
+    /// <summary>Whether the one-time hint that left-drag now selects has been shown.</summary>
+    public bool NestedLeftDragHintShown { get; set; }
+
+    public static Controls.NestedLeftDrag ParseLeftDrag(string? setting) =>
+        string.Equals(setting?.Trim(), "pan", StringComparison.OrdinalIgnoreCase)
+            ? Controls.NestedLeftDrag.Pan
+            : Controls.NestedLeftDrag.SelectArea;
+
+    public static string LeftDragSetting(Controls.NestedLeftDrag drag) =>
+        drag == Controls.NestedLeftDrag.Pan ? "pan" : "select";
+
+    /// <summary>
     /// Version 1 stored a colour label and a note per canvas node.  They are
     /// migrated into the path-keyed folder mark store on first load and then
     /// stop being written.

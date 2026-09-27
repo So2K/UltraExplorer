@@ -5,6 +5,7 @@ using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Media;
 using UltraExplorer.Controls;
+using UltraExplorer.Models;
 
 namespace UltraExplorer.Rendering.Gpu;
 
@@ -245,14 +246,16 @@ internal sealed class GpuLabelTarget : LabelTarget
     public override void FillRounded(Rect bounds, double radius, Color colour) => AddRounded(bounds, radius, colour);
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public override bool DrawIcon(string path, string extension, Rect bounds)
+    public override bool DrawIcon(NestedFolder folder, int fileIndex, in NestedFile file, Rect bounds)
     {
         if (_icons is null || _frame is null || _iconTexture is null)
         {
             return false;
         }
 
-        var slot = _icons.SlotFor(path, extension);
+        // The folder's path and the name apart: no path is made for a file,
+        // and none at all for a type whose icon is the same for every file.
+        var slot = _icons.SlotFor(folder.FullPath, file.Name, file.Extension);
         if (slot < 0)
         {
             return false;

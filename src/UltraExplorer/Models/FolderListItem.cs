@@ -9,10 +9,33 @@ namespace UltraExplorer.Models;
 /// </summary>
 public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObject
 {
+    private ViewAllEntryDescriptor _entry = entry;
     private ImageSource? _icon;
     private bool _isOnCanvas;
+    private bool _isNew;
 
-    public ViewAllEntryDescriptor Entry { get; } = entry;
+    /// <summary>
+    /// What the row shows.  Replaced in place when the folder is read again
+    /// and the object is still there with a new size or date: the row keeps
+    /// its place, its icon and its highlight, and only the text that changed
+    /// is drawn again.
+    /// </summary>
+    public ViewAllEntryDescriptor Entry
+    {
+        get => _entry;
+        internal set
+        {
+            if (_entry == value)
+            {
+                return;
+            }
+
+            _entry = value;
+
+            // Everything the row shows comes from the entry.
+            OnPropertyChanged(string.Empty);
+        }
+    }
 
     public string FullPath => Entry.FullPath;
     public string DisplayName => Entry.DisplayName;
@@ -41,6 +64,18 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
     {
         get => _isOnCanvas;
         set => SetProperty(ref _isOnCanvas, value);
+    }
+
+    /// <summary>
+    /// The row appeared while the folder was being shown - something new on
+    /// disk, not a row of a folder just opened - and fades in rather than
+    /// popping up (the row style's trigger).  Cleared again a moment later, so
+    /// a row scrolled back into view later is simply there.
+    /// </summary>
+    public bool IsNew
+    {
+        get => _isNew;
+        set => SetProperty(ref _isNew, value);
     }
 }
 

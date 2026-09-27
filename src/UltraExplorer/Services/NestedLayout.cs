@@ -100,6 +100,126 @@ public readonly record struct NestedGrid(
         var lastRow = Math.Min(Rows - 1, (int)Math.Floor((bottom - Top) / StepY));
         return (firstColumn, lastColumn, firstRow, lastRow);
     }
+
+    /// <summary>
+    /// Exactly the children a rectangle touches - a selection rectangle's hits
+    /// - as a block of rows and columns, in constant time however many there
+    /// are.  See <see cref="GridBlock.Touching"/> for the rule.
+    /// </summary>
+    public GridBlock Touching(double left, double top, double right, double bottom) =>
+        GridBlock.Touching(Count, Columns, Rows, Left, Top, StepX, StepY, Scale, Scale * NestedLayout.CellHeight, left, top, right, bottom);
+}
+
+/// <summary>
+/// A block of a grid: every item whose row and column both fall in these
+/// ranges.  What a selection rectangle drawn over a folder touches is always
+/// such a block, because the items are laid out on a regular grid - so a
+/// rectangle over fifty thousand tiles is four numbers, whatever it covers,
+/// and whether a tile is in it is a division and four comparisons.
+/// </summary>
+/// <param name="FirstColumn">The first column in the block.</param>
+/// <param name="LastColumn">The last column in the block; less than <paramref name="FirstColumn"/> when it is empty.</param>
+/// <param name="FirstRow">The first row in the block.</param>
+/// <param name="LastRow">The last row in the block; less than <paramref name="FirstRow"/> when it is empty.</param>
+public readonly record struct GridBlock(int FirstColumn, int LastColumn, int FirstRow, int LastRow)
+{
+    public static readonly GridBlock Empty = new(0, -1, 0, -1);
+
+    public bool IsEmpty => LastColumn < FirstColumn || LastRow < FirstRow;
+
+    /// <summary>Whether item <paramref name="index"/> of a row-major grid <paramref name="columns"/> wide is in the block.</summary>
+    public bool Contains(int index, int columns)
+    {
+        if (IsEmpty || columns <= 0 || index < 0)
+        {
+            return false;
+        }
+
+        var row = index / columns;
+        var column = index - row * columns;
+        return row >= FirstRow && row <= LastRow && column >= FirstColumn && column <= LastColumn;
+    }
+
+    /// <summary>
+    /// How many of a row-major grid's <paramref name="count"/> items are in
+    /// the block: its rows times its columns, less what the last row - which
+    /// may be short - does not have.
+    /// </summary>
+    public int CountIn(int count, int columns)
+    {
+        if (IsEmpty || count <= 0 || columns <= 0)
+        {
+            return 0;
+        }
+
+        var lastRow = (count - 1) / columns;
+        var lastRowItems = count - lastRow * columns;
+        var total = 0;
+        var fullEnd = Math.Min(LastRow, lastRow - 1);
+        if (fullEnd >= FirstRow)
+        {
+            total += (fullEnd - FirstRow + 1) * (LastColumn - FirstColumn + 1);
+        }
+
+        if (FirstRow <= lastRow && lastRow <= LastRow)
+        {
+            total += Math.Max(0, Math.Min(LastColumn, lastRowItems - 1) - FirstColumn + 1);
+        }
+
+        return total;
+    }
+
+    /// <summary>
+    /// The block of a regular grid's items that a rectangle touches.  An item
+    /// is touched when the two overlap with some area: an item from
+    /// <c>a</c> to <c>a + w</c> along an axis touches the rectangle's
+    /// <c>[low, high]</c> when <c>a &lt; high</c> and <c>a + w &gt; low</c>,
+    /// so sharing only an edge does not count, and a rectangle with no area
+    /// touches nothing.  Worked out per axis from the step, not by trying
+    /// items: the first column is the first whose right edge is past the
+    /// rectangle's left, the last the last whose left edge is before its
+    /// right.  Positions far outside the grid are clamped before they are
+    /// turned into whole numbers, so a pointer a million grids away never
+    /// overflows one.
+    /// </summary>
+    public static GridBlock Touching(
+        int count,
+        int columns,
+        int rows,
+        double gridLeft,
+        double gridTop,
+        double stepX,
+        double stepY,
+        double itemWidth,
+        double itemHeight,
+        double left,
+        double top,
+        double right,
+        double bottom)
+    {
+        if (count <= 0 || columns <= 0 || rows <= 0 || !(right > left) || !(bottom > top) || !(stepX > 0) || !(stepY > 0))
+        {
+            return Empty;
+        }
+
+        var firstColumn = Clamp(Math.Floor((left - gridLeft - itemWidth) / stepX) + 1, columns);
+        var lastColumn = Clamp(Math.Ceiling((right - gridLeft) / stepX) - 1, columns);
+        var firstRow = Clamp(Math.Floor((top - gridTop - itemHeight) / stepY) + 1, rows);
+        var lastRow = Clamp(Math.Ceiling((bottom - gridTop) / stepY) - 1, rows);
+        if (firstColumn > lastColumn || firstRow > lastRow)
+        {
+            return Empty;
+        }
+
+        var block = new GridBlock(
+            Math.Max(0, firstColumn),
+            Math.Min(columns - 1, lastColumn),
+            Math.Max(0, firstRow),
+            Math.Min(rows - 1, lastRow));
+        return block.IsEmpty ? Empty : block;
+
+        static int Clamp(double value, int size) => (int)Math.Clamp(value, -1, size);
+    }
 }
 
 /// <summary>
@@ -176,6 +296,13 @@ public readonly record struct NestedFileGrid(
         var lastRow = Math.Min(Rows - 1, (int)Math.Floor((bottom - Top) / StepY));
         return (firstColumn, lastColumn, firstRow, lastRow);
     }
+
+    /// <summary>
+    /// Exactly the tiles a rectangle touches, as a block of rows and columns;
+    /// see <see cref="GridBlock.Touching"/>.
+    /// </summary>
+    public GridBlock Touching(double left, double top, double right, double bottom) =>
+        GridBlock.Touching(Count, Columns, Rows, Left, Top, StepX, StepY, TileWidth, TileHeight, left, top, right, bottom);
 }
 
 /// <summary>

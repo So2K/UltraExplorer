@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Media;
+using UltraExplorer.Models;
 
 namespace UltraExplorer.Controls;
 
@@ -101,7 +102,32 @@ internal abstract class LabelTarget
     /// is drawn without it - its name moves left into the room - and drawn
     /// again when the icon comes.
     /// </summary>
-    /// <param name="path">The file's full path, for types whose icon differs from file to file.</param>
-    /// <param name="extension">Its extension, lower case and without the dot, or empty.</param>
-    public abstract bool DrawIcon(string path, string extension, Rect bounds);
+    /// <param name="folder">The folder the file is in.</param>
+    /// <param name="fileIndex">
+    /// The file's index among <paramref name="folder"/>'s shown files.  With
+    /// the folder it names the file without a path: a target that needs one,
+    /// for the kinds of file whose icon differs from file to file, makes it
+    /// from the folder's path and the file's name, and only for those.
+    /// </param>
+    /// <param name="file">The file itself; its <see cref="NestedFile.Extension"/> is lower case and without the dot, or empty.</param>
+    public abstract bool DrawIcon(NestedFolder folder, int fileIndex, in NestedFile file, Rect bounds);
+
+    /// <summary>
+    /// The calls that follow, up to the next <see cref="BeginLabel"/> or the
+    /// end of the frame, are one label's: a folder's title, pill or note
+    /// (<paramref name="fileIndex"/> -1), or one file's name with its icon,
+    /// mark and size.  Every label is begun this way, in painting order.
+    ///
+    /// <para>A target may keep what it drew for a label and, when a later
+    /// frame draws the same label with the same calls - a frame at rest that
+    /// only an arriving icon asked for, say - draw it again from what it kept
+    /// rather than record it anew.  The canvas makes the calls either way, in
+    /// the same order, so a target can always tell.  One that keeps nothing
+    /// ignores this.</para>
+    /// </summary>
+    /// <param name="folder">The folder whose title it is, or whose file.</param>
+    /// <param name="fileIndex">The file's index among the folder's shown files, or -1 for the folder's own label.</param>
+    public virtual void BeginLabel(NestedFolder folder, int fileIndex)
+    {
+    }
 }

@@ -3,10 +3,14 @@ using UltraExplorer.Models;
 
 namespace UltraExplorer.Services;
 
+/// <summary>A drive that answered as ready: the name the navigation pane shows it by, its root, and whether it is a share.</summary>
+public readonly record struct ReadyDrive(string Name, string Path, bool IsNetwork);
+
 /// <summary>
-/// Shell-level helpers: navigation pane content, recursive search and the
-/// watcher used to keep an open branch current.  Directory enumeration for the
-/// graph itself lives in <see cref="ViewAllFileSystemService"/>.
+/// Shell-level helpers: navigation pane content and recursive search.
+/// Directory enumeration for the graph itself lives in
+/// <see cref="ViewAllFileSystemService"/>; keeping what is shown current as
+/// the disk changes is the change hub's (<see cref="Watch.ChangeHub"/>).
 /// </summary>
 public sealed class FileSystemService(ShellIconService iconService)
 {
@@ -105,23 +109,39 @@ public sealed class FileSystemService(ShellIconService iconService)
         return candidates.Where(item => Directory.Exists(item.Path)).ToArray();
     }
 
-    public IReadOnlyList<FavoriteItemViewModel> GetDrives()
-        => DriveInfo.GetDrives()
-            .Where(drive => drive.IsReady)
+    public IReadOnlyList<FavoriteItemViewModel> GetDrives() => GetDrives(ListReadyDrives());
+
+    /// <summary>The navigation pane's items for drives already listed (<see cref="ListReadyDrives"/>).</summary>
+    public IReadOnlyList<FavoriteItemViewModel> GetDrives(IReadOnlyList<ReadyDrive> drives)
+        => drives
             .Select(drive =>
             {
-                var label = SafeVolumeLabel(drive);
                 var item = new FavoriteItemViewModel
                 {
-                    Name = $"{label} ({drive.Name.TrimEnd('\\')})",
-                    Path = drive.RootDirectory.FullName,
-                    Glyph = drive.DriveType == DriveType.Network ? "\uE968" : "\uEDA2",
+                    Name = drive.Name,
+                    Path = drive.Path,
+                    Glyph = drive.IsNetwork ? "\uE968" : "\uEDA2",
                     AccentHex = "#9AA4B2",
                     Kind = SidebarItemKind.Drive
                 };
                 item.Icon = iconService.GetSmallIcon(item.Path, isDirectory: true);
                 return item;
             })
+            .ToArray();
+
+    /// <summary>
+    /// The drives that are ready, named as the navigation pane names them.
+    /// Asking a drive whether it is ready, and for its label, can take seconds
+    /// for a disc spinning up or a share that has gone, so a caller that can
+    /// wait - a volume arriving or leaving - asks off the UI thread.
+    /// </summary>
+    public static IReadOnlyList<ReadyDrive> ListReadyDrives()
+        => DriveInfo.GetDrives()
+            .Where(drive => drive.IsReady)
+            .Select(drive => new ReadyDrive(
+                $"{SafeVolumeLabel(drive)} ({drive.Name.TrimEnd('\\')})",
+                drive.RootDirectory.FullName,
+                drive.DriveType == DriveType.Network))
             .ToArray();
 
     /// <summary>WSL distributions and the Explorer network view, when present.</summary>
@@ -174,23 +194,6 @@ public sealed class FileSystemService(ShellIconService iconService)
         }
     }
 
-    public static FileSystemWatcher CreateWatcher(string path, Action changed)
-    {
-        var watcher = new FileSystemWatcher(path)
-        {
-            IncludeSubdirectories = false,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.Size | NotifyFilters.LastWrite,
-            EnableRaisingEvents = true
-        };
-
-        FileSystemEventHandler onChange = (_, _) => changed();
-        RenamedEventHandler onRename = (_, _) => changed();
-        watcher.Created += onChange;
-        watcher.Changed += onChange;
-        watcher.Deleted += onChange;
-        watcher.Renamed += onRename;
-        return watcher;
-    }
 
     public static string FormatSize(long bytes)
     {

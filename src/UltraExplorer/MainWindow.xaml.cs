@@ -46,6 +46,7 @@ public partial class MainWindow : Window
     private Point _overviewDragNodeOrigin;
     private bool _overviewDragMoved;
     private bool _folderListClickWasOnSelection;
+    private bool _folderListMouseDown;
     private bool _addressMayComplete;
     private bool _addressCompleting;
     private readonly DispatcherTimer _folderListRenameTimer = new(DispatcherPriority.Input)
@@ -100,6 +101,7 @@ public partial class MainWindow : Window
         Overview.Index = _viewModel.Tree.SpatialIndex;
         Harness.Index = _viewModel.Tree.SpatialIndex;
         AttachNested();
+        AttachSelection();
 
         StateChanged += (_, _) =>
         {
@@ -112,6 +114,7 @@ public partial class MainWindow : Window
         if (picker is not null)
         {
             AttachPicker(picker);
+            ConfigurePickerSelection();
         }
     }
 
@@ -144,6 +147,7 @@ public partial class MainWindow : Window
         // the caller asked for is already filtered when it appears.
         await ApplyPickerRulesAsync();
         await _viewModel.InitializeAsync(_pickerStartFolder);
+        Nested.LeftDrag = _viewModel.LeftDrag;
         await InitializeNestedAsync();
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
@@ -202,6 +206,7 @@ public partial class MainWindow : Window
         }
 
         FocusCanvas();
+        await RunSelectionDemoAsync();
     }
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
@@ -215,6 +220,7 @@ public partial class MainWindow : Window
                 .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
                 .RemoveValueChanged(Editor, OnViewportLocationChanged);
             DetachNodeDrag();
+            DetachSelection();
             DetachNested();
             _capture?.Dispose();
             _viewModel.Dispose();
@@ -523,6 +529,7 @@ public partial class MainWindow : Window
         // Down arrow moves into the list, so typing and picking is one gesture.
         if (e.Key == Key.Down && Keyboard.Modifiers == ModifierKeys.None && FolderListItems.Items.Count > 0)
         {
+            NoteListInput();
             FolderListItems.SelectedIndex = 0;
             (FolderListItems.ItemContainerGenerator.ContainerFromIndex(0) as ListBoxItem)?.Focus();
             e.Handled = true;
@@ -559,15 +566,24 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Remembers whether the row was already the selected one before this click,
-    /// because the list itself selects it on the way down and by button-up the
-    /// answer is always yes.
+    /// Remembers whether the row was already the one selected row before this
+    /// click, because the list itself selects it on the way down and by
+    /// button-up the answer is always yes.  A click with Ctrl or Shift is
+    /// never the start of a rename.  From here until the button comes up,
+    /// what the list box selects is the user's doing (see
+    /// <see cref="FolderListItems_SelectionChanged"/>).
     /// </summary>
     private void FolderListItems_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
-        => _folderListClickWasOnSelection =
+    {
+        _folderListMouseDown = true;
+        NoteListInput();
+        _folderListClickWasOnSelection =
             RowUnder(e) is { } row
+            && Keyboard.Modifiers == ModifierKeys.None
+            && FolderListItems.SelectedItems.Count == 1
             && ReferenceEquals(FolderListItems.SelectedItem, row)
             && FolderListItems.IsKeyboardFocusWithin;
+    }
 
     /// <summary>
     /// A plain click takes the canvas to the row and nothing else: it does not
@@ -582,7 +598,11 @@ public partial class MainWindow : Window
     /// </summary>
     private void FolderListItems_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
-        if (e.ClickCount != 1 || RowUnder(e) is not { } item)
+        _folderListMouseDown = false;
+
+        // With Ctrl or Shift the click was about the selection - the list box
+        // has made it, and the canvas shows it - not about going anywhere.
+        if (e.ClickCount != 1 || RowUnder(e) is not { } item || Keyboard.Modifiers != ModifierKeys.None)
         {
             return;
         }
@@ -620,10 +640,21 @@ public partial class MainWindow : Window
             return;
         }
 
+        // A row outside the selection becomes the selection, as in Explorer;
+        // one inside it keeps the whole set, and the menu is for all of it.
         e.Handled = true;
+        var selection = _viewModel.Tree.Selection;
+        if (!selection.Contains(item.FullPath))
+        {
+            using (_viewModel.Tree.FolderList.HoldFolder())
+            {
+                selection.ReplaceSingle(item.FullPath, item.IsDirectory, item.Entry.SizeBytes ?? 0, SelectionSource.List);
+            }
+        }
+
         _viewModel.Tree.FolderList.Highlight(item);
         ShowContextMenu(
-            [item.FullPath],
+            selection.Count > 0 ? selection.Paths : [item.FullPath],
             FolderListItems,
             e.GetPosition(FolderListItems),
             includeCanvasCommands: false);
@@ -697,7 +728,7 @@ public partial class MainWindow : Window
     private void FolderListRename_Tick(object? sender, EventArgs e)
     {
         _folderListRenameTimer.Stop();
-        if (FolderListItems.SelectedItem is FolderListItem)
+        if (FolderListItems.SelectedItems.Count == 1 && FolderListItems.SelectedItem is FolderListItem)
         {
             _viewModel.RenameCommand.Execute(null);
         }
@@ -931,7 +962,7 @@ public partial class MainWindow : Window
             }
         }
 
-        if (_viewModel.Tree.SelectedNodes.Any(node => node.IsDirectory))
+        if (_viewModel.Tree.Selection.FolderCount > 0)
         {
             entries.Add(new ShellMenuEntry(HideFromCanvasCommandId, "Hide from canvas"));
         }
@@ -1313,6 +1344,7 @@ public partial class MainWindow : Window
         AddSortItems(menu);
         if (IsNested)
         {
+            AddLeftDragItems(menu);
             AddRendererItems(menu);
         }
 
@@ -1929,64 +1961,6 @@ public partial class MainWindow : Window
     }
 
     // ---- Win32 -------------------------------------------------------------
-
-    /// <summary>
-    /// Reports the maximize button as HTMAXBUTTON so Windows 11 shows its Snap
-    /// Layouts flyout, and turns the resulting non-client clicks back into a
-    /// normal maximize toggle.
-    /// </summary>
-    private IntPtr HandleWindowMessage(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
-    {
-        switch (msg)
-        {
-            // Left to the rest of the chain: WPF applies MinWidth/MinHeight to
-            // the same structure afterwards and re-stores it whole, so what is
-            // written here survives.
-            case WmGetMinMaxInfo:
-                ClampMaximizedBounds(hwnd, lParam);
-                return IntPtr.Zero;
-
-            case WmNcHitTest:
-                if (IsOverMaximizeButton(lParam))
-                {
-                    SetMaximizeHover(true);
-                    handled = true;
-                    return new IntPtr(HtMaxButton);
-                }
-
-                SetMaximizeHover(false);
-
-                // Maximized, the top edge of the window is the top edge of the
-                // screen - the easiest place there is to throw the pointer at.
-                // WindowChrome still called that band a resize border, and a
-                // resize border on a maximized window does nothing, so every
-                // quick grab at the very top missed.  There it is the caption,
-                // except over the caption buttons, whose top pixel must still
-                // close the window.
-                if (WindowState == WindowState.Maximized && TopBandHit(lParam) is { } code)
-                {
-                    handled = true;
-                    return new IntPtr(code);
-                }
-
-                return IntPtr.Zero;
-
-            case WmNcLeftButtonDown when wParam.ToInt32() == HtMaxButton:
-                handled = true;
-                return IntPtr.Zero;
-
-            case WmNcLeftButtonUp when wParam.ToInt32() == HtMaxButton:
-                handled = true;
-                ToggleMaximized();
-                return IntPtr.Zero;
-
-            case WmNcMouseLeave:
-                SetMaximizeHover(false);
-                return IntPtr.Zero;
-        }
-
-        return IntPtr.Zero;
-    }
 
     /// <summary>
     /// Keeps a maximized window inside the monitor work area.

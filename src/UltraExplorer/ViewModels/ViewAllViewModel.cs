@@ -6,6 +6,7 @@ using System.Windows.Threading;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Watch;
 
 namespace UltraExplorer.ViewModels;
 
@@ -13,8 +14,16 @@ namespace UltraExplorer.ViewModels;
 /// The View All canvas: every drive is an independent root and one graph node
 /// is exactly one file-system object.  Expansion is lazy, layout is incremental
 /// and only the nodes inside the viewport are handed to the editor.
+///
+/// It is also where changes on disk come in for the whole window (see
+/// <see cref="IChangeSink"/>): the change hub hands each changed folder to
+/// whoever registered it - the nested canvas's tree, the folder list, the
+/// tree canvas - and each of them brings itself up to date on its own, none
+/// waiting for another.  What is selected has no say in what is watched; the
+/// selection only follows what changed, letting go of what went and
+/// following what was renamed.
 /// </summary>
-public sealed class ViewAllViewModel : ObservableObject, IDisposable
+public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSink
 {
     private readonly ViewAllGraphService _graph;
     private readonly ViewAllViewportService _viewportService = new();
@@ -23,15 +32,29 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     private readonly ShellIconService _icons;
     private readonly DispatcherTimer _renderThrottle;
     private readonly DispatcherTimer _saveDebounce;
-    private readonly DispatcherTimer _watcherDebounce;
-    private FileSystemWatcher? _activeWatcher;
-    private string _watchedPath = string.Empty;
+    private ChangeHub? _changes;
+
+    /// <summary>The tree canvas's folders registered with the hub, by path: the ones with children on the tree.</summary>
+    private Dictionary<string, ViewAllNodeViewModel> _graphInterest = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Tree canvas folders that changed while nothing needed them current: read again when they are next shown.</summary>
+    private readonly HashSet<string> _graphStale = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Tree canvas folders being read again for a change, and the ones changed again meanwhile.</summary>
+    private readonly HashSet<string> _graphRefreshing = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _graphChangedAgain = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The change last taken for the selection, so one change handed to three consumers is taken once.</summary>
+    private (string Key, long First, ChangeKinds Kinds) _lastChange;
 
     private bool _isInitialized;
     private bool _isDisposed;
     private bool _isBusy;
     private bool _isSyncingSelection;
+    private bool _treeSelectionPending;
     private int _selectTicket;
+    private int _marqueePreview = -1;
+    private bool _focusRecordsNavigation = true;
     private ViewAllNodeViewModel? _activeNode;
     private ViewAllNodeViewModel? _dropTarget;
     private ViewAllNodeViewModel? _runTarget;
@@ -83,12 +106,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         _marks.MarkChanged += OnMarkChanged;
 
         SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
+        Selection.Changed += OnSelectionChanged;
 
         FolderList = new FolderListViewModel(
             (path, sort, cancellation) => _graph.ReadDirectoryAsync(path, cancellation, sort),
             ActivateListItemAsync,
             path => _graph.TryGetNode(path, out _),
-            icons);
+            icons)
+        {
+            SharedSelection = Selection
+        };
 
         _renderThrottle = new DispatcherTimer(DispatcherPriority.Background)
         {
@@ -116,19 +143,6 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             await SaveAsync();
         };
 
-        _watcherDebounce = new DispatcherTimer(DispatcherPriority.Background)
-        {
-            Interval = TimeSpan.FromMilliseconds(450)
-        };
-        _watcherDebounce.Tick += async (_, _) =>
-        {
-            _watcherDebounce.Stop();
-            if (!string.IsNullOrEmpty(_watchedPath))
-            {
-                await RefreshPathAsync(_watchedPath);
-            }
-        };
-
         ToggleSelectedCommand = new AsyncRelayCommand(ToggleSelectedAsync);
         CollapseAllCommand = new RelayCommand(CollapseAll);
         RefreshSelectedCommand = new AsyncRelayCommand(RefreshSelectedAsync);
@@ -140,6 +154,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     public ObservableCollection<ViewAllEdgeViewModel> RenderEdges { get; } = [];
 
+    /// <summary>
+    /// The selection the whole window shares - both canvases, the folder
+    /// list and every command.  Paths, not nodes: a rectangle over ten
+    /// thousand files on the nested canvas selects ten thousand paths the
+    /// graph has no nodes for, and only the focus is ever given one.
+    /// </summary>
+    public ItemSelection Selection { get; } = new();
+
+    /// <summary>
+    /// The selection as the tree canvas's editor sees it: the nodes of the
+    /// selected paths that have nodes, bound to Nodify.  Kept whole only
+    /// while the tree canvas is on screen; while it is not, only the focus,
+    /// and it is filled again when the tree comes back.  What Nodify itself
+    /// puts in it - a click, a rubber band - becomes one change of
+    /// <see cref="Selection"/>.
+    /// </summary>
     public ObservableCollection<ViewAllNodeViewModel> SelectedNodes { get; } = [];
 
     public ICommand ToggleSelectedCommand { get; }
@@ -157,11 +187,57 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     public event Action? GraphInvalidated;
 
     /// <summary>
-    /// Raised after a directory was read again because something in it changed
-    /// - a file operation, the folder watcher, F5.  The nested canvas keeps its
-    /// own tree and listens here rather than to the graph.
+    /// Raised after a directory was read again because the window changed
+    /// something in it - a file operation - or F5 asked.  What else shows the
+    /// folder hears of it through the change hub (<see cref="ChangeHub.Touch"/>),
+    /// like any change on disk; this is for whoever wants to know as well.
     /// </summary>
     public event Action<string>? PathRefreshed;
+
+    /// <summary>
+    /// F5 on a folder: everything read in and below it is to be taken as out
+    /// of date, not only the folder itself.  The nested canvas's tree listens,
+    /// and reads again what is on screen (<see cref="NestedTree.RefreshDeep"/>).
+    /// </summary>
+    public event Action<string>? DeepRefreshRequested;
+
+    /// <summary>
+    /// The change hub the window watches the disk through, owned by the
+    /// window's view model, or null (a test's view model).  The folder list's
+    /// folder and every folder the tree canvas shows the children of are
+    /// registered with it; the nested canvas's tree registers its own.
+    /// </summary>
+    public ChangeHub? Changes
+    {
+        get => _changes;
+        set
+        {
+            if (ReferenceEquals(_changes, value))
+            {
+                return;
+            }
+
+            if (_changes is { } previous)
+            {
+                foreach (var (path, node) in _graphInterest)
+                {
+                    previous.Unregister(ChangeConsumer.Graph, path, node);
+                }
+
+                _graphInterest.Clear();
+            }
+
+            _changes = value;
+            FolderList.Changes = value;
+            SyncGraphInterest();
+        }
+    }
+
+    /// <summary>
+    /// Where the hub's changes to the nested canvas's folders go: the nested
+    /// tree, set by the window that draws it.  Null while there is none.
+    /// </summary>
+    public IChangeSink? NestedChanges { get; set; }
 
     /// <summary>
     /// How far the layout carried the folder the user just opened or closed.
@@ -247,8 +323,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// not done; the view model only remembers that it is behind.
     ///
     /// The rest carries on exactly as before: the selection,
-    /// <see cref="ActiveNode"/> and the status texts, the folder list, the
-    /// watcher, hidden folders and saving.  The node count keeps being kept
+    /// <see cref="ActiveNode"/> and the status texts, the folder list, hidden
+    /// folders and saving.  A change on disk in a folder the tree shows is
+    /// read at once only when a selected item is in it; the rest are read
+    /// again when the tree comes back.  The node count keeps being kept
     /// too - it is one pass over the graph, and the status bar reads it whenever
     /// nothing is selected, whichever canvas is showing.
     ///
@@ -273,8 +351,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             {
                 _renderThrottle.Stop();
                 _fillTimer.Stop();
+                SyncSelectionMirror();
                 return;
             }
+
+            // The editor's selection is the whole of it again.
+            SyncSelectionMirror();
 
             // Settling announces a change when it finds one, and that already
             // rebuilds everything below; otherwise it is done here.
@@ -299,6 +381,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
                 _isOverviewStale = true;
                 RebuildRenderSet();
             }
+
+            // Folders that changed on disk while the tree was away.
+            RefreshStaleGraph();
         }
     }
 
@@ -363,14 +448,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             if (SetProperty(ref _activeNode, value))
             {
                 OnPropertyChanged(nameof(ActivePath));
-                FolderList.SetTarget(_activeNode);
+                RetargetFolderList();
                 UpdateStatus();
-                AttachWatcher(value);
             }
         }
     }
 
     public string ActivePath => _activeNode?.FullPath ?? string.Empty;
+
+    /// <summary>
+    /// Whether the focus moving right now is going somewhere, for back and
+    /// forward: true except while a selection that is not a navigation - a
+    /// range, a rectangle, a pick in the list - moves it.  Read while
+    /// <see cref="ActivePath"/> is being announced.
+    /// </summary>
+    public bool FocusRecordsNavigation => _focusRecordsNavigation;
 
     public bool IsBusy
     {
@@ -529,6 +621,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // Opening a folder that changed on disk while it was not wanted
+        // current reads it again, which opens it.
+        if (!node.IsExpanded && await RefreshIfStaleAsync(node))
+        {
+            ScheduleSave();
+            return;
+        }
+
         var result = await _graph.ToggleAsync(node);
         if (result.IsTruncated)
         {
@@ -547,7 +647,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return node;
         }
 
-        await _graph.ExpandAsync(node);
+        // A folder that changed on disk while it was not wanted current is
+        // read again, which opens it.
+        var refreshed = !node.IsExpanded && await RefreshIfStaleAsync(node);
+        if (!refreshed)
+        {
+            await _graph.ExpandAsync(node);
+        }
+
         ScheduleSave();
         return node;
     }
@@ -625,33 +732,54 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     /// <summary>
     /// Takes the selected folders and everything under them off the canvas.
+    /// Only folders can be hidden, so only they are given nodes - a selection
+    /// of ten thousand files and three folders makes three.
     ///
     /// The selection is cleared afterwards, and not as a courtesy: a selected
     /// node is realized whatever the culling says, so a folder hidden while it
     /// is still selected would stay on screen.
     /// </summary>
-    public void HideSelected()
+    public async Task HideSelectedAsync()
     {
-        var targets = SelectedNodes.Where(node => node.IsDirectory).ToArray();
-        if (targets.Length == 0)
+        var folders = Selection.Items.Where(item => item.IsDirectory).Select(item => item.Path).ToArray();
+        var targets = new List<ViewAllNodeViewModel>(folders.Length);
+        foreach (var path in folders)
+        {
+            if (TryGetNode(path, out var known))
+            {
+                targets.Add(known);
+            }
+            else if (await MaterializeAsync(path) is { IsDirectory: true } made)
+            {
+                targets.Add(made);
+            }
+        }
+
+        if (targets.Count == 0)
         {
             MessageRequested?.Invoke("Select a folder to hide.", false);
             return;
         }
 
-        SelectedNodes.Clear();
         foreach (var node in targets)
         {
             _graph.Hide(node);
         }
 
-        ActiveNode = targets[0].Parent ?? ActiveNode;
+        var parent = targets[0].Parent;
+        Selection.Apply(new SelectionEdit
+        {
+            Clear = true,
+            Anchor = parent?.FullPath,
+            Focus = parent?.FullPath,
+            Source = SelectionSource.Command
+        });
         OnPropertyChanged(nameof(HiddenPaths));
         OnPropertyChanged(nameof(HiddenCount));
         MessageRequested?.Invoke(
-            targets.Length == 1
+            targets.Count == 1
                 ? $"{targets[0].DisplayName} hidden — bring it back from the canvas menu"
-                : $"{targets.Length} folders hidden — bring them back from the canvas menu",
+                : $"{targets.Count} folders hidden — bring them back from the canvas menu",
             false);
         RebuildRenderSet();
         InvalidateCanvas();
@@ -802,6 +930,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         ScheduleSave();
     }
 
+    /// <summary>
+    /// F5 on a folder.  The tree canvas reads the branch again here and now;
+    /// everything else that shows the folder hears of it through the change
+    /// hub at once, like any change on disk - the list merges it in, the
+    /// nested canvas reads it again - and the nested canvas's tree is asked
+    /// to take everything it read below the folder as out of date too
+    /// (<see cref="DeepRefreshRequested"/>).
+    /// </summary>
     public async Task RefreshAsync(ViewAllNodeViewModel node)
     {
         if (!node.IsDirectory)
@@ -809,22 +945,34 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return;
         }
 
+        _changes?.Touch(node.FullPath, immediate: true);
+        DeepRefreshRequested?.Invoke(node.FullPath);
+        NoteGraphReadDirectly(node.FullPath);
         await _graph.RefreshBranchAsync(node);
         ScheduleSave();
         PathRefreshed?.Invoke(node.FullPath);
     }
 
     /// <summary>
-    /// Re-reads a directory if it is currently part of the graph.  One that has
-    /// never been read has nothing to re-read, but it can still hold children
-    /// brought in by name - a folder selected on the nested canvas, say - and
-    /// those are checked against the disk instead, so deleting or renaming one
-    /// does not leave its node behind for the next reveal to find.
+    /// Re-reads a directory the window has just changed - a file operation.
+    /// Everything else that shows it - the list, the nested canvas - hears of
+    /// it through the change hub at once (<see cref="ChangeHub.Touch"/>), as
+    /// it hears of any change on disk, and with the hub's spacing between two
+    /// reads of one folder when the watch reports the same change a moment
+    /// later.  The tree canvas reads it here and now if it has it: what the
+    /// operation does next - reveal what it made - finds it there.
+    /// One that has never been read has nothing to re-read, but it can still
+    /// hold children brought in by name - a folder selected on the nested
+    /// canvas, say - and those are checked against the disk instead, so
+    /// deleting or renaming one does not leave its node behind for the next
+    /// reveal to find.
     /// </summary>
     public async Task RefreshPathAsync(string path)
     {
+        _changes?.Touch(path, immediate: true);
         if (_graph.TryGetNode(path, out var node))
         {
+            NoteGraphReadDirectly(path);
             if (node.AreChildrenLoaded)
             {
                 await _graph.RefreshBranchAsync(node);
@@ -835,13 +983,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
                 ScheduleSave();
             }
 
-            ReleaseRemovedSelection(node);
+            ReleaseRemovedFocus(node);
         }
 
-        // The list reads the directory itself, so a change the canvas has just
-        // picked up means nothing to it until it is told.  Creating a file and
-        // watching it appear on the canvas but not in the list was the giveaway.
-        if (string.Equals(path, FolderList.FolderPath, StringComparison.OrdinalIgnoreCase))
+        await PruneSelectionAsync(path);
+
+        // With no hub the list is not told of the change by anything else.
+        if (_changes is null && string.Equals(path, FolderList.FolderPath, StringComparison.OrdinalIgnoreCase))
         {
             await FolderList.ReloadAsync();
         }
@@ -850,58 +998,64 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// After a refresh took nodes out of the graph, nothing may stay selected
-    /// that is no longer there: the selection falls back to the folder that
-    /// was refreshed, so a second Delete does not aim at something gone.
+    /// After a refresh built a branch's nodes anew, the focus may be a node
+    /// the graph no longer has: the one with its path takes its place, and
+    /// when there is none - it is gone from disk - and nothing else is
+    /// selected, the folder that was refreshed does, so a second Delete does
+    /// not aim at something gone.  The editor's copy of the selection is
+    /// brought up to date with the new nodes.
     /// </summary>
-    private void ReleaseRemovedSelection(ViewAllNodeViewModel refreshed)
+    private void ReleaseRemovedFocus(ViewAllNodeViewModel refreshed)
     {
-        // A refresh of an open branch builds its nodes anew, so a selected
-        // node may simply have been replaced by one with the same path: that
-        // one takes its place.  Only what is not there at all is let go.
-        var changed = false;
-        _isSyncingSelection = true;
-        try
-        {
-            foreach (var node in SelectedNodes.ToArray())
-            {
-                if (_graph.TryGetNode(node.FullPath, out var current) && ReferenceEquals(current, node))
-                {
-                    continue;
-                }
-
-                changed = true;
-                var index = SelectedNodes.IndexOf(node);
-                SelectedNodes.RemoveAt(index);
-                node.IsSelected = false;
-                if (current is not null)
-                {
-                    SelectedNodes.Insert(index, current);
-                    current.IsSelected = true;
-                }
-            }
-        }
-        finally
-        {
-            _isSyncingSelection = false;
-        }
-
         if (ActiveNode is { } active
             && !(_graph.TryGetNode(active.FullPath, out var replacement) && ReferenceEquals(replacement, active)))
         {
             if (replacement is not null)
             {
-                ActiveNode = replacement;
+                SetActive(replacement, records: false);
             }
-            else if (_graph.TryGetNode(refreshed.FullPath, out var folder))
+            else if (Selection.Count == 0 || Selection.Count == 1 && Selection.Contains(active.FullPath))
             {
-                SelectOnly(folder);
+                if (_graph.TryGetNode(refreshed.FullPath, out var folder))
+                {
+                    SelectOnly(folder);
+                }
             }
         }
-        else if (changed)
+
+        SyncSelectionMirror();
+    }
+
+    /// <summary>
+    /// A folder was read again: whatever was selected directly in it and is
+    /// no longer on disk is let go, in one change.  The folder is listed once,
+    /// off the UI thread - a folder of ten thousand selected files is one
+    /// read, not ten thousand questions - and only when something in it is
+    /// selected at all.
+    /// </summary>
+    private async Task PruneSelectionAsync(string folder)
+    {
+        if (Selection.CountIn(folder) == 0)
         {
-            UpdateStatus();
+            return;
         }
+
+        HashSet<string> present;
+        try
+        {
+            present = await Task.Run(() => new HashSet<string>(Directory.EnumerateFileSystemEntries(folder), StringComparer.OrdinalIgnoreCase));
+        }
+        catch (DirectoryNotFoundException)
+        {
+            present = [];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // Unreadable is not the same as empty: nothing is let go.
+            return;
+        }
+
+        Selection.RemoveMissingUnder(folder, present.Contains);
     }
 
     public async Task LoadMoreAsync(ViewAllNodeViewModel node)
@@ -1043,22 +1197,29 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         return node;
     }
 
-    /// <summary>Adds a path to the selection, or takes it out - Ctrl+click on the nested canvas.</summary>
-    public async Task ToggleSelectionAsync(string path)
+    /// <summary>
+    /// Adds a path to the selection, or takes it out, with the anchor and the
+    /// focus on it - Ctrl+click.  One change; the focus is given a node the
+    /// way every focus is (see <see cref="OnSelectionChanged"/>).
+    /// </summary>
+    public Task ToggleSelectionAsync(string path)
     {
-        var ticket = ++_selectTicket;
-        var node = TryGetNode(path, out var known)
-            ? known
-            : await RevealPathAsync(path, focus: false, select: false);
-        if (node is null || ticket != _selectTicket || !IsExactly(node, path))
+        if (string.IsNullOrWhiteSpace(path))
         {
-            return;
+            return Task.CompletedTask;
         }
 
-        if (!SelectedNodes.Remove(node))
+        var selected = Selection.Contains(path);
+        var isDirectory = TryGetNode(path, out var known) ? known.IsDirectory : Directory.Exists(path);
+        Selection.Apply(new SelectionEdit
         {
-            SelectedNodes.Add(node);
-        }
+            Added = selected ? [] : [new SelectionItem(path, isDirectory, known?.Entry.SizeBytes ?? 0)],
+            Removed = selected ? [path] : [],
+            Anchor = path,
+            Focus = path,
+            Source = SelectionSource.Canvas
+        });
+        return Task.CompletedTask;
     }
 
     private static bool IsExactly(ViewAllNodeViewModel node, string path)
@@ -1082,28 +1243,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         return node is not null && IsExactly(node, path) ? node : null;
     }
 
+    /// <summary>
+    /// One node alone, anchor and focus on it: a click on the tree, a row
+    /// picked, going somewhere.  One change of <see cref="Selection"/>, and a
+    /// navigation for back and forward.
+    /// </summary>
     public void SelectOnly(ViewAllNodeViewModel node)
     {
         // Any selection made now outranks a click still reading its way down.
         _selectTicket++;
-        _isSyncingSelection = true;
-        try
-        {
-            foreach (var selected in SelectedNodes.Where(item => item != node).ToArray())
-            {
-                selected.IsSelected = false;
-            }
+        Selection.ReplaceSingle(node.FullPath, node.IsDirectory, node.Entry.SizeBytes ?? 0, SelectionSource.Navigation);
 
-            SelectedNodes.Clear();
-            SelectedNodes.Add(node);
-            node.IsSelected = true;
-        }
-        finally
-        {
-            _isSyncingSelection = false;
-        }
-
-        ActiveNode = node;
+        // The same node again, or the path spelled another way: the focus is
+        // this node whatever the selection made of it.
+        SetActive(node, records: true);
+        SyncSelectionMirror();
     }
 
     public void Activate(ViewAllNodeViewModel node)
@@ -1127,25 +1281,31 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     /// <summary>
     /// Strictly what the user selected.  Destructive commands use this, so an
     /// empty canvas selection can never be turned into "delete the folder I am
-    /// merely looking at".
+    /// merely looking at".  The same list until the selection changes.
     /// </summary>
-    public IReadOnlyList<string> SelectedPaths
-        => SelectedNodes.Count > 0
-            ? SelectedNodes.Select(node => node.FullPath).ToArray()
-            : [];
+    public IReadOnlyList<string> SelectedPaths => Selection.Paths;
 
     /// <summary>Selection, falling back to the focused node for read-only commands.</summary>
     public IReadOnlyList<string> SelectedOrActivePaths
-        => SelectedPaths.Count > 0
-            ? SelectedPaths
+        => Selection.Count > 0
+            ? Selection.Paths
             : ActiveNode is null ? [] : [ActiveNode.FullPath];
 
-    /// <summary>The folder that a new item or a paste should land in.</summary>
+    /// <summary>
+    /// The folder that a new item or a paste should land in: with several
+    /// items selected in one folder, that folder, as in an Explorer window;
+    /// otherwise the focus - a folder itself, a file's folder.
+    /// </summary>
     public string? TargetDirectory
     {
         get
         {
-            var node = SelectedNodes.LastOrDefault() ?? ActiveNode;
+            if (Selection.Count > 1 && Selection.Container is { } container)
+            {
+                return container;
+            }
+
+            var node = ActiveNode;
             if (node is null)
             {
                 return null;
@@ -1197,11 +1357,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
     }
 
-    public void ApplyAccent(IEnumerable<ViewAllNodeViewModel> nodes, string? accentHex)
+    /// <summary>Colours every path given - the selection's, which need not have nodes.</summary>
+    public void ApplyAccent(IEnumerable<string> paths, string? accentHex)
     {
-        foreach (var node in nodes)
+        foreach (var path in paths)
         {
-            _marks.SetAccent(node.FullPath, accentHex);
+            _marks.SetAccent(path, accentHex);
         }
 
         ScheduleSave();
@@ -1319,22 +1480,20 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         _isDisposed = true;
         _renderThrottle.Stop();
         _saveDebounce.Stop();
-        _watcherDebounce.Stop();
-        _activeWatcher?.Dispose();
-        _activeWatcher = null;
+        Changes = null;
         _graph.GraphChanged -= OnGraphChanged;
         _graph.NodeCreated -= OnNodeCreated;
         _fillTimer.Stop();
         _graph.LayoutChanged -= OnLayoutChanged;
         _marks.MarkChanged -= OnMarkChanged;
         SelectedNodes.CollectionChanged -= OnSelectedNodesChanged;
+        Selection.Changed -= OnSelectionChanged;
         _graph.Dispose();
     }
 
     private async Task ToggleSelectedAsync()
     {
-        var target = SelectedNodes.LastOrDefault() ?? ActiveNode;
-        if (target is not null)
+        if (ActiveNode is { } target)
         {
             await ToggleAsync(target);
         }
@@ -1342,8 +1501,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
     private async Task RefreshSelectedAsync()
     {
-        var target = SelectedNodes.LastOrDefault() ?? ActiveNode;
-        if (target is not null)
+        if (ActiveNode is { } target)
         {
             await RefreshAsync(target.IsDirectory ? target : target.Parent ?? target);
         }
@@ -1358,58 +1516,386 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>
-    /// Only the branch the user is looking at is watched.  One watcher keeps the
-    /// open folder current without the cost of watching a whole drive.
-    /// </summary>
-    private void AttachWatcher(ViewAllNodeViewModel? node)
+    // ---- changes on disk -----------------------------------------------------------
+    //
+    // The change hub hands each changed folder, once per burst of changes, to
+    // whoever registered it.  The three consumers are independent: the nested
+    // canvas's tree reads again what is on screen, the list merges a new read
+    // into its rows, the tree canvas reads the branch again when anybody can
+    // see it.  Before any of them, the selection follows the change once.
+
+    void IChangeSink.FolderChanged(ChangeConsumer consumer, object target, in FolderChange change)
     {
-        // Loaded or not: the list beside the canvas shows this folder either
-        // way, and the nested canvas draws what is in it without opening it.
-        var path = node is { IsDirectory: true } ? node.FullPath : string.Empty;
-        if (string.Equals(path, _watchedPath, StringComparison.OrdinalIgnoreCase))
+        if (_isDisposed)
         {
             return;
         }
 
-        _watcherDebounce.Stop();
-        _activeWatcher?.Dispose();
-        _activeWatcher = null;
-        _watchedPath = path;
-
-        if (string.IsNullOrEmpty(path) || !Directory.Exists(path))
+        if (_lastChange != (change.Key, change.FirstTicks, change.Kinds))
         {
+            _lastChange = (change.Key, change.FirstTicks, change.Kinds);
+            FollowChangeWithSelection(change);
+        }
+
+        switch (consumer)
+        {
+            case ChangeConsumer.Nested:
+                NestedChanges?.FolderChanged(consumer, target, change);
+                break;
+            case ChangeConsumer.List when ReferenceEquals(target, FolderList):
+                FolderList.OnFolderChanged(change);
+                break;
+            case ChangeConsumer.Graph when target is ViewAllNodeViewModel node:
+                OnGraphFolderChanged(node, change);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Changes under <paramref name="root"/> may have been missed - its watch
+    /// overflowed or was armed again - so everything that shows a folder under
+    /// it takes itself as out of date: the nested canvas's tree by its epoch,
+    /// the list by reading its folder again, the tree canvas by reading the
+    /// branches it shows under the root, now if it is on screen and otherwise
+    /// when it comes back.
+    /// </summary>
+    void IChangeSink.EpochBumped(WatchRoot root)
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        NestedChanges?.EpochBumped(root);
+        FolderList.OnEpochBumped(root);
+        foreach (var (path, node) in _graphInterest)
+        {
+            if (IsUnder(path, root))
+            {
+                MarkGraphChanged(node);
+            }
+        }
+    }
+
+    /// <summary>A watch that is polled is due its look: the nested canvas's tree looks at what it has on screen, the list at its folder.</summary>
+    void IChangeSink.PollDue(WatchRoot root)
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        NestedChanges?.PollDue(root);
+        FolderList.OnPollDue(root);
+    }
+
+    private static bool IsUnder(string path, WatchRoot root)
+    {
+        foreach (var prefix in root.Prefixes)
+        {
+            if (path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+                && (path.Length == prefix.Length || prefix.EndsWith(Path.DirectorySeparatorChar) || path[prefix.Length] == Path.DirectorySeparatorChar))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The selection's part in a change, taken once however many consumers the
+    /// change goes to.  Something selected in the folder that is no longer on
+    /// disk is let go (<see cref="PruneSelectionAsync"/>, one listing off this
+    /// thread); something selected that was renamed within the folder is
+    /// selected under its new name - as Explorer keeps a renamed item selected
+    /// - and whatever mark the old name carried moves with it.
+    /// </summary>
+    private void FollowChangeWithSelection(in FolderChange change)
+    {
+        if (!change.Renames.IsEmpty)
+        {
+            foreach (var pair in change.Renames.Span)
+            {
+                FollowRename(Path.Combine(change.Key, pair.OldName), Path.Combine(change.Key, pair.NewName));
+            }
+        }
+
+        if ((change.Kinds & (ChangeKinds.Structural | ChangeKinds.Gone)) != 0 && Selection.CountIn(change.Key) > 0)
+        {
+            _ = PruneSelectionAsync(change.Key);
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="oldPath"/> is <paramref name="newPath"/> now: the
+    /// selection - the item itself, and for a folder anything selected inside
+    /// it - and the marks on them take the new name, in one change each.
+    /// </summary>
+    private void FollowRename(string oldPath, string newPath)
+    {
+        static string? Renamed(string path, string oldPath, string newPath) =>
+            string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase)
+                ? newPath
+                : path.Length > oldPath.Length
+                    && path.StartsWith(oldPath, StringComparison.OrdinalIgnoreCase)
+                    && path[oldPath.Length] == Path.DirectorySeparatorChar
+                        ? string.Concat(newPath, path.AsSpan(oldPath.Length))
+                        : null;
+
+        // Only a selection that could hold something of it is looked through:
+        // the item itself, something directly in it, or a selection small
+        // enough to look through for something deeper.
+        if (Selection.Count > 0 && (Selection.Contains(oldPath) || Selection.CountIn(oldPath) > 0 || Selection.Count <= 4096))
+        {
+            List<string>? removed = null;
+            List<SelectionItem>? added = null;
+            foreach (var path in Selection.Paths)
+            {
+                if (Renamed(path, oldPath, newPath) is { } moved && Selection.TryGetItem(path, out var item))
+                {
+                    (removed ??= []).Add(path);
+                    (added ??= []).Add(item with { Path = moved });
+                }
+            }
+
+            if (removed is not null)
+            {
+                RenamesFollowed++;
+                Selection.Apply(new SelectionEdit
+                {
+                    Added = added!,
+                    Removed = removed,
+                    Anchor = Selection.Anchor is { } anchor ? Renamed(anchor, oldPath, newPath) ?? anchor : null,
+                    Focus = Selection.Focus is { } focus ? Renamed(focus, oldPath, newPath) ?? focus : null,
+                    Source = SelectionSource.Command
+                });
+            }
+        }
+
+        foreach (var (path, mark) in _marks.Snapshot())
+        {
+            if (Renamed(path, oldPath, newPath) is not { } moved)
+            {
+                continue;
+            }
+
+            _marks.SetAccent(moved, mark.AccentHex);
+            _marks.SetNote(moved, mark.Note);
+            _marks.SetAccent(path, null);
+            _marks.SetNote(path, null);
+        }
+    }
+
+    /// <summary>Renames the selection followed, for tests.</summary>
+    internal int RenamesFollowed { get; private set; }
+
+    // ---- the tree canvas's part ------------------------------------------------------
+
+    /// <summary>
+    /// Registers with the hub every folder the tree canvas holds children of -
+    /// read, or brought in by name - and takes off the ones it no longer does,
+    /// after every change of the graph.  One pass over the nodes, which the
+    /// graph's change already makes to count them.
+    /// </summary>
+    private void SyncGraphInterest()
+    {
+        if (_changes is not { } hub || _isDisposed)
+        {
+            return;
+        }
+
+        var wanted = new Dictionary<string, ViewAllNodeViewModel>(Math.Max(_graphInterest.Count, 16), StringComparer.OrdinalIgnoreCase);
+        foreach (var node in _graph.Nodes)
+        {
+            if (node.IsDirectory && (node.AreChildrenLoaded || node.Children.Count > 0))
+            {
+                wanted[node.FullPath] = node;
+            }
+        }
+
+        foreach (var (path, node) in _graphInterest)
+        {
+            if (!wanted.TryGetValue(path, out var kept) || !ReferenceEquals(kept, node))
+            {
+                hub.Unregister(ChangeConsumer.Graph, path, node);
+            }
+        }
+
+        foreach (var (path, node) in wanted)
+        {
+            if (!_graphInterest.TryGetValue(path, out var had) || !ReferenceEquals(had, node))
+            {
+                hub.Register(ChangeConsumer.Graph, path, node);
+            }
+        }
+
+        _graphInterest = wanted;
+    }
+
+    /// <summary>Tree canvas folders registered with the hub right now, for tests.</summary>
+    internal int GraphInterestCount => _graphInterest.Count;
+
+    /// <summary>
+    /// When the tree canvas last read a folder here and now - F5, a file
+    /// operation - on the <see cref="System.Diagnostics.Stopwatch"/>'s clock:
+    /// the change the hub brings a moment later for the same thing is already
+    /// in what was read.
+    /// </summary>
+    private readonly Dictionary<string, long> _graphReadDirectly = new(StringComparer.OrdinalIgnoreCase);
+
+    private void NoteGraphReadDirectly(string path)
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (_graphReadDirectly.Count > 64)
+        {
+            foreach (var (key, at) in _graphReadDirectly)
+            {
+                if (System.Diagnostics.Stopwatch.GetElapsedTime(at, now) > GraphEchoWindow)
+                {
+                    _graphReadDirectly.Remove(key);
+                }
+            }
+        }
+
+        _graphReadDirectly[path] = now;
+        _graphStale.Remove(path);
+    }
+
+    /// <summary>How far back a change may have begun and still be taken as what a direct read already has.</summary>
+    private static readonly TimeSpan GraphEchoWindow = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// A folder the tree canvas shows the children of changed on disk.  It is
+    /// read again now if anybody can see the difference - the tree canvas is on
+    /// screen, or something selected is in the folder, where a node gone or
+    /// renamed would leave a command aiming at nothing - and otherwise marked,
+    /// and read again when the tree comes back or the folder is opened.  A
+    /// change that began before the folder was last read here and now is
+    /// already in what was read.
+    /// </summary>
+    private void OnGraphFolderChanged(ViewAllNodeViewModel node, in FolderChange change)
+    {
+        if (!_graph.TryGetNode(node.FullPath, out var live) || !ReferenceEquals(live, node))
+        {
+            return;
+        }
+
+        if ((change.Kinds & ~ChangeKinds.DirDate) == 0 && _sort.Column != SortColumn.Modified)
+        {
+            return;
+        }
+
+        if (_graphReadDirectly.TryGetValue(node.FullPath, out var readAt)
+            && change.FirstTicks <= readAt
+            && System.Diagnostics.Stopwatch.GetElapsedTime(change.FirstTicks, readAt) <= GraphEchoWindow)
+        {
+            return;
+        }
+
+        MarkGraphChanged(node);
+    }
+
+    private void MarkGraphChanged(ViewAllNodeViewModel node)
+    {
+        if (_isCanvasShown || Selection.CountIn(node.FullPath) > 0)
+        {
+            _ = RefreshGraphNodeAsync(node);
+        }
+        else
+        {
+            _graphStale.Add(node.FullPath);
+        }
+    }
+
+    /// <summary>
+    /// Reads a tree canvas folder again for a change: the branch, keeping what
+    /// was open below it, or - for a folder only holding children brought in
+    /// by name - those checked against the disk.  Never inside the change's
+    /// frame, and one at a time per folder: a change during the read has it
+    /// read once more afterwards.
+    /// </summary>
+    private async Task RefreshGraphNodeAsync(ViewAllNodeViewModel node)
+    {
+        var path = node.FullPath;
+        _graphStale.Remove(path);
+        if (!_graphRefreshing.Add(path))
+        {
+            _graphChangedAgain.Add(path);
             return;
         }
 
         try
         {
-            _activeWatcher = FileSystemService.CreateWatcher(path, OnWatchedPathChanged);
+            do
+            {
+                _graphChangedAgain.Remove(path);
+                await Task.Yield();
+                if (_isDisposed || !_graph.TryGetNode(path, out var live))
+                {
+                    return;
+                }
+
+                GraphRefreshesForChanges++;
+                if (live.AreChildrenLoaded)
+                {
+                    await _graph.RefreshBranchAsync(live);
+                    ScheduleSave();
+                }
+                else if (await _graph.PruneMissingChildrenAsync(live) > 0)
+                {
+                    ScheduleSave();
+                }
+
+                ReleaseRemovedFocus(live);
+            }
+            while (_graphChangedAgain.Contains(path));
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException or ObjectDisposedException)
         {
-            _watchedPath = string.Empty;
+            // Gone, or the window is closing: its parent's change takes it off the tree.
+        }
+        finally
+        {
+            _graphRefreshing.Remove(path);
         }
     }
 
-    private void OnWatchedPathChanged()
+    /// <summary>Tree canvas folders read again for changes on disk, for tests.</summary>
+    internal int GraphRefreshesForChanges { get; private set; }
+
+    /// <summary>Tree canvas folders that changed while nothing needed them, for tests.</summary>
+    internal int GraphStaleCount => _graphStale.Count;
+
+    /// <summary>The folders that changed while the tree canvas was away, read again now that it is back.</summary>
+    private void RefreshStaleGraph()
     {
-        var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null || _isDisposed)
+        if (_graphStale.Count == 0 || _isDisposed)
         {
             return;
         }
 
-        _ = dispatcher.InvokeAsync(() =>
+        foreach (var path in _graphStale.ToArray())
         {
-            if (_isDisposed)
+            if (_graph.TryGetNode(path, out var node))
             {
-                return;
+                _ = RefreshGraphNodeAsync(node);
             }
+        }
 
-            _watcherDebounce.Stop();
-            _watcherDebounce.Start();
-        }, DispatcherPriority.Background);
+        _graphStale.Clear();
+    }
+
+    /// <summary>A folder about to be opened that changed while it was not wanted current: read again, which opens it; false when it had not changed.</summary>
+    private async Task<bool> RefreshIfStaleAsync(ViewAllNodeViewModel node)
+    {
+        if (!node.AreChildrenLoaded || !_graphStale.Remove(node.FullPath))
+        {
+            return false;
+        }
+
+        await _graph.RefreshBranchAsync(node);
+        return true;
     }
 
     /// <summary>
@@ -1505,6 +1991,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
 
         _visibleNodeCount = visible;
         _isOverviewStale = true;
+        SyncGraphInterest();
 
         if (!_isCanvasShown)
         {
@@ -1602,6 +2089,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         InvalidateCanvas();
     }
 
+    /// <summary>
+    /// The editor's copy of the selection changed.  Changed from here - the
+    /// mirror being brought up to date - there is nothing to do; changed by
+    /// Nodify itself - a click, Ctrl+click, a rubber band adding nodes one at
+    /// a time - the whole of it becomes one change of <see cref="Selection"/>,
+    /// once the band has finished adding, rather than one per node.
+    /// </summary>
     private void OnSelectedNodesChanged(object? sender, NotifyCollectionChangedEventArgs e)
     {
         if (_isSyncingSelection)
@@ -1619,11 +2113,214 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             added.IsSelected = true;
         }
 
-        if (SelectedNodes.LastOrDefault() is { } last)
+        if (_treeSelectionPending)
         {
-            ActiveNode = last;
+            return;
         }
 
+        _treeSelectionPending = true;
+        Dispatcher.CurrentDispatcher.InvokeAsync(TakeTreeSelection, DispatcherPriority.Background);
+    }
+
+    /// <summary>What Nodify selected, as one replacement of the shared selection.</summary>
+    private void TakeTreeSelection()
+    {
+        _treeSelectionPending = false;
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        var nodes = SelectedNodes.ToArray();
+        var focus = nodes.Length > 0 ? nodes[^1].FullPath : null;
+        Selection.Apply(new SelectionEdit
+        {
+            Clear = true,
+            Added = [.. nodes.Select(node => new SelectionItem(node.FullPath, node.IsDirectory, node.Entry.SizeBytes ?? 0))],
+            Anchor = focus,
+            Focus = focus,
+            RecordsNavigation = nodes.Length == 1,
+            Source = SelectionSource.Tree
+        });
+    }
+
+    /// <summary>
+    /// The selection changed, once for the whole of a gesture.  A click
+    /// still reading its way down is outranked; the focus gets its node -
+    /// at once when the graph has one, otherwise by a light reveal that the
+    /// next change outranks in turn; the status bar and the list follow; the
+    /// editor's copy is brought up to date.  What is watched on disk does not
+    /// depend on any of it.  Nothing here
+    /// costs more than the change itself, however much is selected.
+    /// </summary>
+    private void OnSelectionChanged(ItemSelection selection)
+    {
+        var ticket = ++_selectTicket;
+        var records = selection.LastRecordsNavigation;
+        if (selection.Focus is { } focus && !(_activeNode is { } current && string.Equals(current.FullPath, focus, StringComparison.OrdinalIgnoreCase)))
+        {
+            if (TryGetNode(focus, out var node))
+            {
+                SetActive(node, records);
+            }
+            else
+            {
+                _ = FocusAsync(focus, ticket, records, holdList: selection.LastSource == SelectionSource.List);
+            }
+        }
+        else
+        {
+            RetargetFolderList();
+        }
+
+        UpdateStatus();
+        SyncSelectionMirror();
+        FolderList.OnSelectionChanged(selection);
+        ScheduleSave();
+    }
+
+    /// <summary>
+    /// Gives the focus its node, without selecting anything or moving a
+    /// canvas.  While the list is what picked it, the list keeps its folder
+    /// meanwhile, as a click on a row always has.  A path found gone is let
+    /// go of, and its folder read again.
+    /// </summary>
+    private async Task FocusAsync(string path, int ticket, bool records, bool holdList)
+    {
+        using var hold = holdList ? FolderList.HoldFolder() : null;
+        ViewAllNodeViewModel? node;
+        try
+        {
+            node = await MaterializeAsync(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return;
+        }
+
+        if (ticket != _selectTicket || _isDisposed)
+        {
+            return;
+        }
+
+        if (node is null)
+        {
+            if (!Directory.Exists(path) && !File.Exists(path))
+            {
+                Selection.Remove([path], SelectionSource.Command);
+                if (Path.GetDirectoryName(path) is { Length: > 0 } parent)
+                {
+                    await RefreshPathAsync(parent);
+                }
+            }
+
+            return;
+        }
+
+        SetActive(node, records);
+        SyncSelectionMirror();
+    }
+
+    /// <summary>The focus moves to <paramref name="node"/>, as a navigation or not.</summary>
+    private void SetActive(ViewAllNodeViewModel node, bool records)
+    {
+        _focusRecordsNavigation = records;
+        try
+        {
+            ActiveNode = node;
+        }
+        finally
+        {
+            _focusRecordsNavigation = true;
+        }
+    }
+
+    /// <summary>
+    /// Points the list at what is selected: the folder several selected
+    /// items share, with them lit; otherwise the focus, as it always was - a
+    /// folder is gone into, a file's folder shown with its row lit.
+    /// </summary>
+    private void RetargetFolderList()
+    {
+        if (Selection.Count > 1 && Selection.Container is { } container)
+        {
+            FolderList.SetTarget(container, _activeNode);
+            return;
+        }
+
+        FolderList.SetTarget(_activeNode);
+    }
+
+    /// <summary>
+    /// Brings the editor's copy of the selection up to date, one node at a
+    /// time and only what changed: every selected path the graph has a node
+    /// for while the tree canvas is on screen, only the focus while it is not.
+    /// </summary>
+    private void SyncSelectionMirror()
+    {
+        var wanted = new HashSet<ViewAllNodeViewModel>();
+        if (_isCanvasShown)
+        {
+            foreach (var path in Selection.Paths)
+            {
+                if (TryGetNode(path, out var node))
+                {
+                    wanted.Add(node);
+                }
+            }
+        }
+        else if (Selection.Focus is { } focus && Selection.Contains(focus) && TryGetNode(focus, out var focused))
+        {
+            wanted.Add(focused);
+        }
+
+        if (wanted.Count == SelectedNodes.Count && SelectedNodes.All(wanted.Contains))
+        {
+            return;
+        }
+
+        _isSyncingSelection = true;
+        try
+        {
+            var present = new HashSet<ViewAllNodeViewModel>();
+            for (var index = SelectedNodes.Count - 1; index >= 0; index--)
+            {
+                var node = SelectedNodes[index];
+                if (!wanted.Contains(node) || !present.Add(node))
+                {
+                    SelectedNodes.RemoveAt(index);
+                    node.IsSelected = wanted.Contains(node);
+                }
+            }
+
+            foreach (var node in wanted)
+            {
+                node.IsSelected = true;
+                if (present.Add(node))
+                {
+                    SelectedNodes.Add(node);
+                }
+            }
+        }
+        finally
+        {
+            _isSyncingSelection = false;
+        }
+    }
+
+    /// <summary>
+    /// While a rectangle is drawn on the nested canvas, the status bar says
+    /// how many items it would select; -1 when it is let go, and the status
+    /// is the selection's again.
+    /// </summary>
+    public void ShowSelectionPreview(int count)
+    {
+        if (_marqueePreview == count)
+        {
+            return;
+        }
+
+        _marqueePreview = count;
         UpdateStatus();
     }
 
@@ -1649,7 +2346,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         var set = _viewportService.BuildRenderSet(
             _graph.Index,
             _graph.Edges,
-            SelectedNodes,
+            AlwaysRealized(viewport),
             viewport,
             _viewportZoom,
             _visibleNodeCount);
@@ -1706,6 +2403,30 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
+    /// The nodes the editor keeps whatever the culling says: the selected
+    /// ones in view - a rubber band over thousands of nodes must not force a
+    /// container for each one off screen - and the focus.
+    /// </summary>
+    private List<ViewAllNodeViewModel> AlwaysRealized(Rect viewport)
+    {
+        var realized = new List<ViewAllNodeViewModel>();
+        foreach (var node in SelectedNodes)
+        {
+            if (node.IsTreeVisible && node.HasLayoutPosition && viewport.IntersectsWith(node.Bounds))
+            {
+                realized.Add(node);
+            }
+        }
+
+        if (_activeNode is { IsTreeVisible: true } active && !realized.Contains(active))
+        {
+            realized.Add(active);
+        }
+
+        return realized;
+    }
+
+    /// <summary>
     /// Brings <paramref name="target"/> towards <paramref name="desired"/>, adding
     /// at most <paramref name="budget"/> items and returning how many are still
     /// waiting.
@@ -1750,14 +2471,25 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
         return pending;
     }
 
+    /// <summary>
+    /// The status bar, from the selection's running totals: nothing here
+    /// walks the selection, so it costs the same for one item as for ten
+    /// thousand.  While a rectangle is being drawn, what it would select.
+    /// </summary>
     private void UpdateStatus()
     {
-        var selected = SelectedNodes.Count;
+        if (_marqueePreview >= 0)
+        {
+            StatusCountText = _marqueePreview == 1 ? "1 item selected" : $"{_marqueePreview:N0} items selected";
+            StatusPathText = ActiveNode?.FullPath ?? string.Empty;
+            return;
+        }
+
+        var selected = Selection.Count;
         if (selected > 1)
         {
-            var folders = SelectedNodes.Count(node => node.IsDirectory);
-            var bytes = SelectedNodes.Where(node => node.IsFile && node.Entry.SizeBytes.HasValue)
-                .Sum(node => node.Entry.SizeBytes ?? 0);
+            var folders = Selection.FolderCount;
+            var bytes = Selection.TotalBytes;
             StatusCountText = folders > 0
                 ? $"{selected:N0} items selected  ·  {folders:N0} folders  ·  {FileSystemService.FormatSize(bytes)}"
                 : $"{selected:N0} items selected  ·  {FileSystemService.FormatSize(bytes)}";
@@ -1765,7 +2497,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var node = SelectedNodes.FirstOrDefault() ?? ActiveNode;
+        var node = selected == 1 && TryGetNode(Selection.Paths[0], out var only) ? only : ActiveNode;
         if (node is null)
         {
             StatusCountText = $"{LogicalNodeCount:N0} nodes";

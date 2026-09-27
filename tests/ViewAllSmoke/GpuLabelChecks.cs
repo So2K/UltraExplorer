@@ -168,6 +168,9 @@ internal static partial class Program
         frame.SceneChanged();
 
         // The icon is found on the atlas's worker: frames until it is there.
+        // A file of a made-up type, in a drive's root, as the canvas names it.
+        var iconFolder = new NestedFolder(@"Q:\", "Q:", NestedFolderKind.Drive, null);
+        var iconFile = new NestedFile("icon.fake", false, 0);
         var iconBounds = new Rect(180, 20, 32, 32);
         var drawnIcon = false;
         var clock = Stopwatch.StartNew();
@@ -177,7 +180,7 @@ internal static partial class Program
             target.Begin(frame, set, width, height, 1, 1, snap: true);
             text = target.Text("Il", 40, Color.FromRgb(0xF2, 0xF2, 0xF2), double.PositiveInfinity, LabelFace.Regular, scaled: true);
             target.DrawText(text, new Point(10, 10));
-            drawnIcon = target.DrawIcon(@"Q:\icon.fake", "fake", iconBounds);
+            drawnIcon = target.DrawIcon(iconFolder, 0, iconFile, iconBounds);
             target.End();
             if (drawnIcon)
             {

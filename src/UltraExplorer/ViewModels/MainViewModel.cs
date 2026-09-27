@@ -1,10 +1,13 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
+using UltraExplorer.Controls;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Watch;
 
 namespace UltraExplorer.ViewModels;
 
@@ -39,6 +42,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly EverythingSearchService _everything = new();
     private readonly List<string> _navigationHistory = [];
 
+    /// <summary>
+    /// How the window hears of changes on disk: one hub for every view, with
+    /// one watch per volume or share, whatever is selected (see
+    /// <see cref="Changes"/>).
+    /// </summary>
+    private readonly ChangeHub _changes = new(TimeProvider.System);
+
     private CancellationTokenSource? _searchCancellation;
     private int _navigationIndex = -1;
     private bool _isInitialized;
@@ -57,6 +67,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string? _savedRenderer;
     private bool _sortSavePending;
     private string _nestedZoomLabel = "Fit";
+    private Controls.NestedLeftDrag _leftDrag = Controls.NestedLeftDrag.SelectArea;
+    private bool _leftDragHintShown;
     private readonly bool _isPickerSession;
     private string? _dialogTitle;
 
@@ -80,6 +92,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Tree = new ViewAllViewModel(_marks, _iconService, treeStatePath);
         Tree.PropertyChanged += OnTreePropertyChanged;
         Tree.MessageRequested += OnTreeMessage;
+
+        // The hub's changes go to the tree view model, which hands each to
+        // whoever registered its folder.  The nested canvas takes them in at
+        // the start of its frames while it draws; otherwise one dispatcher
+        // operation at input priority takes in everything that is due.
+        _changes.Driver.Fallback = DispatcherFrameDriver.ForCurrentThread(
+            (ref FrameBudget budget) => _changes.Drain(ref budget, Tree),
+            () => _changes.HasWork);
+        Tree.Changes = _changes;
 
         BackCommand = new RelayCommand(GoBack);
         ForwardCommand = new RelayCommand(GoForward);
@@ -124,7 +145,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             () => Tree.FolderList.IsVisible = !Tree.FolderList.IsVisible);
         CollapseAllCommand = new RelayCommand(() => Tree.CollapseAll());
         RelayoutCommand = new RelayCommand(() => Tree.RelayoutCanvas());
-        HideSelectedCommand = new RelayCommand(() => Tree.HideSelected());
+        HideSelectedCommand = new AsyncRelayCommand(Tree.HideSelectedAsync);
         ReturnToLayoutCommand = new RelayCommand(() => Tree.ReturnSelectionToLayout());
         ShowAllHiddenCommand = new RelayCommand(() => Tree.ShowAllHidden());
         ShowHiddenCommand = new RelayCommand<string>(path =>
@@ -339,6 +360,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             System.Windows.Threading.DispatcherPriority.ApplicationIdle);
     }
 
+    /// <summary>
+    /// What a left drag does on the nested canvas where it does not pick
+    /// something up: select an area, as in Explorer (the default), or pan, as
+    /// the canvas used to.  Remembered with the workspace.
+    /// </summary>
+    public Controls.NestedLeftDrag LeftDrag
+    {
+        get => _leftDrag;
+        set
+        {
+            if (SetProperty(ref _leftDrag, value))
+            {
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the hint that left-drag now selects has been shown - once, at
+    /// the first rectangle drawn, and never again.
+    /// </summary>
+    public bool LeftDragHintShown
+    {
+        get => _leftDragHintShown;
+        set
+        {
+            if (_leftDragHintShown != value)
+            {
+                _leftDragHintShown = value;
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
     /// <summary>The zoom shown on the canvas controls, from whichever canvas is showing.</summary>
     public string ZoomLabel => IsNestedLayout ? _nestedZoomLabel : Tree.ZoomLabel;
 
@@ -363,6 +418,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     /// <summary>Shell icons, shared by every view in the window.</summary>
     public ShellIconService Icons => _iconService;
+
+    /// <summary>
+    /// The window's change hub.  Every view registers the folders it shows -
+    /// the nested canvas's tree every folder it read, the list its folder, the
+    /// tree canvas the folders it shows children of - and hears of changes in
+    /// them from here, whatever is selected.  The window's own file operations
+    /// touch it (<see cref="ViewAllViewModel.RefreshPathAsync"/>), so what they
+    /// change is read again once, together with what the watch saw.
+    /// </summary>
+    public ChangeHub Changes => _changes;
 
     public bool IsPinned(string path)
         => QuickAccess.Any(item => item.IsCustom && ViewAllPath.Equals(item.Path, path));
@@ -495,6 +560,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
             _savedRenderer = state.CanvasRenderer;
             Rendering.Gpu.GpuBootstrap.SetSettingPreference(Renderer);
+            _leftDrag = WorkspaceState.ParseLeftDrag(state.NestedLeftDrag);
+            _leftDragHintShown = state.NestedLeftDragHintShown;
 
             // Handed to the tree before it builds its first layout, so the
             // drives open already in the remembered order.
@@ -568,6 +635,34 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public void ShowContextMenuFor(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
         => ContextMenuRequested?.Invoke(paths, origin, point);
 
+    /// <summary>
+    /// A volume arrived or left: the navigation pane's drives are listed
+    /// again.  Which drives are ready is asked off the UI thread - a disc
+    /// spinning up takes seconds to say - and the list is only replaced when
+    /// it changed.
+    /// </summary>
+    public async Task RefreshDrivesAsync()
+    {
+        var ready = await Task.Run(FileSystemService.ListReadyDrives);
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        var same = ready.Count == Drives.Count
+            && ready.Select(drive => drive.Path).SequenceEqual(Drives.Select(item => item.Path), StringComparer.OrdinalIgnoreCase);
+        if (!same)
+        {
+            Drives.Clear();
+            foreach (var drive in _fileSystemService.GetDrives(ready))
+            {
+                Drives.Add(drive);
+            }
+
+            UpdateSidebarSelection();
+        }
+    }
+
     public async Task DropIntoPathAsync(
         IReadOnlyList<string> paths,
         string targetDirectory,
@@ -615,11 +710,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var layout = _savedLayout;
         string? sort = (_isPickerSession ? ItemSort.Default : _sort).ToSetting();
         var renderer = _savedRenderer;
+        var leftDrag = WorkspaceState.LeftDragSetting(_leftDrag);
+        var hintShown = _leftDragHintShown;
         if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
         {
             layout = current.CanvasLayout;
             sort = current.CanvasSort;
             renderer = current.CanvasRenderer;
+            leftDrag = current.NestedLeftDrag;
+            hintShown = current.NestedLeftDragHintShown;
         }
 
         var state = new WorkspaceState
@@ -630,6 +729,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             CanvasLayout = layout,
             CanvasSort = sort,
             CanvasRenderer = renderer,
+            NestedLeftDrag = leftDrag,
+            NestedLeftDragHintShown = hintShown,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))
@@ -661,6 +762,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Tree.MessageRequested -= OnTreeMessage;
         Address.Dispose();
         Tree.Dispose();
+        _changes.Dispose();
     }
 
     private void OnTreePropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -691,7 +793,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(SearchPlaceholder));
                 Address.SetPath(Tree.ActivePath);
                 UpdateSidebarSelection();
-                RecordNavigation(Tree.ActivePath);
+
+                // Sweeping out a range or a rectangle moves the focus too,
+                // and is not going anywhere: only a click or a navigation
+                // is a step back and forward can retrace.
+                if (Tree.FocusRecordsNavigation)
+                {
+                    RecordNavigation(Tree.ActivePath);
+                }
+
                 break;
         }
     }
@@ -986,6 +1096,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Toast.ShowBusy($"{verb} {safePaths.Length} item(s)…");
             await _shellService.CopyOrMoveAsync(safePaths, targetDirectory, move);
+            if (move)
+            {
+                // Moved away: nothing that was selected there is any more.
+                Tree.Selection.Remove(safePaths, SelectionSource.Command);
+            }
+
             await Tree.RefreshPathAsync(targetDirectory);
             if (move)
             {
@@ -1097,14 +1213,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task DeleteSelectionAsync(bool permanently)
     {
-        var paths = Tree.SelectedPaths;
-        if (paths.Count == 0)
+        // What is selected and still there: a file deleted from outside since
+        // it was selected is not the Shell's to be asked about.
+        var paths = Tree.SelectedPaths.Where(path => File.Exists(path) || Directory.Exists(path)).ToArray();
+        if (paths.Length == 0)
         {
+            if (Tree.SelectedPaths.Count > 0)
+            {
+                Tree.Selection.Remove(Tree.SelectedPaths, SelectionSource.Command);
+            }
+
             return;
         }
 
         if (permanently
-            && ConfirmRequested?.Invoke("Permanently delete", $"Permanently delete {paths.Count} item(s)? This cannot be undone.") != true)
+            && ConfirmRequested?.Invoke("Permanently delete", $"Permanently delete {paths.Length} item(s)? This cannot be undone.") != true)
         {
             return;
         }
@@ -1119,6 +1242,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Toast.ShowBusy(permanently ? "Deleting permanently…" : "Moving to Recycle Bin…");
             await _shellService.DeleteAsync(paths, permanently);
+
+            // Let go of explicitly: a folder the nested canvas selected in
+            // need not have a node for its refresh to prune.
+            Tree.Selection.Remove(paths, SelectionSource.Command);
             foreach (var parent in parents)
             {
                 await Tree.RefreshPathAsync(parent!);
@@ -1137,23 +1264,72 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// Properties of everything selected: one sheet for the lot, as Explorer
+    /// shows for several items in one folder; for items spread over several
+    /// folders, which the Shell has no one sheet for, the first one's.
+    /// </summary>
     private void ShowProperties()
     {
-        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path)
+        var paths = Tree.SelectedOrActivePaths;
+        if (paths.Count == 0)
         {
-            try
+            return;
+        }
+
+        try
+        {
+            if (paths.Count > 1 && ShellSelection.ShowProperties(paths))
             {
-                NativeShellService.ShowProperties(path);
+                return;
             }
-            catch (Exception ex)
-            {
-                Toast.ShowError(ex.Message);
-            }
+
+            NativeShellService.ShowProperties(paths[0]);
+        }
+        catch (Exception ex)
+        {
+            Toast.ShowError(ex.Message);
         }
     }
 
+    /// <summary>Above this many files, opening them all is asked about first.</summary>
+    private const int OpenWithoutAsking = 15;
+
+    /// <summary>
+    /// Opens what is selected: with several items, every selected file - past
+    /// fifteen only once the user says so, as Explorer asks; with one, the
+    /// focus, a folder going in on the tree and a file opening.
+    /// </summary>
     private void OpenSelection()
     {
+        if (Tree.Selection.Count > 1)
+        {
+            var files = Tree.Selection.Items.Where(item => !item.IsDirectory).Select(item => item.Path).ToArray();
+            if (files.Length > 0)
+            {
+                if (files.Length > OpenWithoutAsking
+                    && ConfirmRequested?.Invoke("Open", $"Open all {files.Length:N0} selected files?") != true)
+                {
+                    return;
+                }
+
+                foreach (var file in files)
+                {
+                    try
+                    {
+                        NativeShellService.Open(file);
+                    }
+                    catch (Exception ex)
+                    {
+                        Toast.ShowError($"Could not open {Path.GetFileName(file)}: {ex.Message}");
+                        return;
+                    }
+                }
+
+                return;
+            }
+        }
+
         if (Tree.ActiveNode is { } node)
         {
             if (node.IsDirectory)
@@ -1189,9 +1365,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task ToggleHiddenItemsAsync()
         => await Tree.SetShowHiddenItemsAsync(!Tree.ShowHiddenItems);
 
+    /// <summary>Explorer, on the folder the selection is in with all of it selected there, or on the one item.</summary>
     private void ShowSelectionInExplorer()
     {
-        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path)
+        var paths = Tree.SelectedOrActivePaths;
+        if (paths.Count > 1 && ShellSelection.ShowInExplorer(paths))
+        {
+            return;
+        }
+
+        if (paths.FirstOrDefault() is { } path)
         {
             try
             {
@@ -1240,15 +1423,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void SetSelectionAccent(string? accentHex)
     {
-        var nodes = Tree.SelectedNodes.Count > 0
-            ? Tree.SelectedNodes.ToArray()
-            : Tree.ActiveNode is null ? [] : [Tree.ActiveNode];
-        if (nodes.Length == 0)
+        var paths = Tree.SelectedOrActivePaths;
+        if (paths.Count == 0)
         {
             return;
         }
 
-        Tree.ApplyAccent(nodes, string.IsNullOrEmpty(accentHex) ? null : accentHex);
+        Tree.ApplyAccent(paths, string.IsNullOrEmpty(accentHex) ? null : accentHex);
     }
 
     private Task EditSelectionNoteAsync()
@@ -1381,4 +1562,101 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         await Tree.RevealPathAsync(result.FullPath);
         CloseSearch();
     }
+}
+
+/// <summary>
+/// The Shell's own answers for several items at once, which it gives only for
+/// items in one folder: one properties sheet for all of them, and an Explorer
+/// window on the folder with all of them selected.  False when the items are
+/// spread over several folders, or the Shell will not, and the caller falls
+/// back to the first item alone.
+/// </summary>
+internal static class ShellSelection
+{
+    private static readonly Guid IidDataObject = new("0000010e-0000-0000-C000-000000000046");
+
+    public static bool ShowProperties(IReadOnlyList<string> paths) =>
+        WithItems(paths, (folder, items) =>
+        {
+            var iid = IidDataObject;
+            if (SHCreateDataObject(folder, (uint)items.Length, items, IntPtr.Zero, ref iid, out var data) != 0 || data == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            try
+            {
+                return SHMultiFileProperties(data, 0) == 0;
+            }
+            finally
+            {
+                Marshal.Release(data);
+            }
+        });
+
+    public static bool ShowInExplorer(IReadOnlyList<string> paths) =>
+        WithItems(paths, (folder, items) => SHOpenFolderAndSelectItems(folder, (uint)items.Length, items, 0) == 0);
+
+    /// <summary>
+    /// The folder the paths share and each item as the Shell names it inside
+    /// that folder, for as long as <paramref name="action"/> runs.
+    /// </summary>
+    private static bool WithItems(IReadOnlyList<string> paths, Func<IntPtr, IntPtr[], bool> action)
+    {
+        var parent = Path.GetDirectoryName(paths[0]);
+        if (string.IsNullOrEmpty(parent)
+            || paths.Any(path => !string.Equals(Path.GetDirectoryName(path), parent, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        var owned = new List<IntPtr>(paths.Count + 1);
+        try
+        {
+            if (SHParseDisplayName(parent, IntPtr.Zero, out var folder, 0, out _) != 0 || folder == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            owned.Add(folder);
+            var items = new IntPtr[paths.Count];
+            for (var index = 0; index < paths.Count; index++)
+            {
+                if (SHParseDisplayName(paths[index], IntPtr.Zero, out var item, 0, out _) != 0 || item == IntPtr.Zero)
+                {
+                    return false;
+                }
+
+                owned.Add(item);
+                items[index] = ILFindLastID(item);
+            }
+
+            return action(folder, items);
+        }
+        finally
+        {
+            foreach (var pidl in owned)
+            {
+                ILFree(pidl);
+            }
+        }
+    }
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHParseDisplayName(string name, IntPtr bindContext, out IntPtr pidl, uint attributesIn, out uint attributesOut);
+
+    [DllImport("shell32.dll")]
+    private static extern IntPtr ILFindLastID(IntPtr pidl);
+
+    [DllImport("shell32.dll")]
+    private static extern void ILFree(IntPtr pidl);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHCreateDataObject(IntPtr folder, uint count, IntPtr[] items, IntPtr inner, ref Guid iid, out IntPtr dataObject);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHMultiFileProperties(IntPtr dataObject, uint flags);
+
+    [DllImport("shell32.dll")]
+    private static extern int SHOpenFolderAndSelectItems(IntPtr folder, uint count, IntPtr[] items, uint flags);
 }

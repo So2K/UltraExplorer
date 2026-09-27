@@ -32,6 +32,15 @@ public sealed class FolderMarkService
 
     private readonly ConcurrentDictionary<string, FolderMark> _marks = new(StringComparer.OrdinalIgnoreCase);
 
+    // The folders that hold a mark, rebuilt whole with every change - marks
+    // change a few times a session, and are asked about thousands of times a
+    // frame - and handed out as a set nobody changes once it is published,
+    // so the canvas reads it on the UI thread without a lock while a mark is
+    // set on another.
+    private readonly Lock _markedFoldersGate = new();
+    private volatile HashSet<string> _markedFolders = new(StringComparer.OrdinalIgnoreCase);
+    private static long _pathsNormalised;
+
     public FolderMarkService(string? statePath = null)
     {
         StatePath = statePath ?? AppPaths.State("folder-marks.json");
@@ -60,6 +69,101 @@ public sealed class FolderMarkService
 
         return _marks.TryGetValue(IsKeyForm(path) ? path : Key(path), out var mark) ? mark : FolderMark.None;
     }
+
+    /// <summary>
+    /// Every folder that holds a mark directly inside it - on one of its files
+    /// or sub-folders - by the canonical path marks are kept under, which is
+    /// the one a <see cref="Models.NestedFolder.FullPath"/> is written in.
+    /// The nested canvas asks this before it looks up any of a folder's files:
+    /// nearly every folder holds none, and for those no file needs a path
+    /// made, normalised or looked up at all.
+    /// </summary>
+    public IReadOnlySet<string> MarkedFolders => _markedFolders;
+
+    /// <summary>
+    /// The mark of one of the nested canvas's folders, looked up by its path
+    /// as it is: a folder's path is its parent's joined to the name its
+    /// listing gave it, which is the form marks are kept under, so nothing is
+    /// normalised - not even checked for being normalised - however many are
+    /// drawn.  A root's path came from outside the tree, as its drive or
+    /// share was given, and goes the long way; there are only a few.
+    /// </summary>
+    public FolderMark Get(Models.NestedFolder folder)
+    {
+        if (_marks.IsEmpty)
+        {
+            return FolderMark.None;
+        }
+
+        if (IsRoot(folder))
+        {
+            return Get(folder.FullPath);
+        }
+
+        return _marks.TryGetValue(folder.FullPath, out var mark) ? mark : FolderMark.None;
+    }
+
+    /// <summary>
+    /// Whether anything directly inside <paramref name="folder"/> - a file or
+    /// a sub-folder - carries a mark (<see cref="MarkedFolders"/>).
+    /// </summary>
+    public bool HasMarksIn(Models.NestedFolder folder)
+    {
+        var marked = _markedFolders;
+        return marked.Count > 0 && marked.Contains(KeyOf(folder));
+    }
+
+    /// <summary>
+    /// The mark of the entry called <paramref name="name"/> directly inside
+    /// <paramref name="folder"/> - one of its files - without making its
+    /// path: the folder's path and the name are joined on the stack and
+    /// looked up as they are, and only in a folder that holds a mark at all.
+    /// </summary>
+    public FolderMark GetIn(Models.NestedFolder folder, string name)
+    {
+        if (!HasMarksIn(folder))
+        {
+            return FolderMark.None;
+        }
+
+        var directory = KeyOf(folder);
+        var separator = directory.EndsWith(Path.DirectorySeparatorChar) ? 0 : 1;
+        var length = directory.Length + separator + name.Length;
+        char[]? rented = null;
+        var path = length <= 512 ? stackalloc char[length] : (rented = ArrayPool<char>.Shared.Rent(length)).AsSpan(0, length);
+        try
+        {
+            directory.AsSpan().CopyTo(path);
+            if (separator != 0)
+            {
+                path[directory.Length] = Path.DirectorySeparatorChar;
+            }
+
+            name.AsSpan().CopyTo(path[(directory.Length + separator)..]);
+            return _marks.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(path, out var mark) ? mark : FolderMark.None;
+        }
+        finally
+        {
+            if (rented is not null)
+            {
+                ArrayPool<char>.Shared.Return(rented);
+            }
+        }
+    }
+
+    /// <summary>
+    /// For tests: how many paths have been normalised to find or keep a mark
+    /// under, since the process started.  A frame of the nested canvas must
+    /// add none.
+    /// </summary>
+    internal static long PathsNormalised => Interlocked.Read(ref _pathsNormalised);
+
+    /// <summary>A folder at the top of the canvas's tree - a drive, a share, a folder added as a root - or This PC itself.</summary>
+    private static bool IsRoot(Models.NestedFolder folder) => folder.Parent is null || folder.Parent.IsComputer;
+
+    /// <summary>The key a canvas folder's marks are kept under: its path as it is, or for a root not already in that form, normalised.</summary>
+    private static string KeyOf(Models.NestedFolder folder) =>
+        IsRoot(folder) && !IsKeyForm(folder.FullPath) ? Key(folder.FullPath) : folder.FullPath;
 
     /// <summary>
     /// Whether normalising <paramref name="path"/> would hand it back as it
@@ -176,6 +280,7 @@ public sealed class FolderMarkService
         }
 
         _marks[Key(path)] = mark;
+        IndexMarkedFolders();
     }
 
     public async Task LoadAsync(CancellationToken cancellationToken = default)
@@ -198,6 +303,8 @@ public sealed class FolderMarkService
             {
                 _marks[Key(pair.Key)] = pair.Value;
             }
+
+            IndexMarkedFolders();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or ArgumentException)
         {
@@ -252,11 +359,35 @@ public sealed class FolderMarkService
             _marks[key] = mark;
         }
 
+        IndexMarkedFolders();
         MarkChanged?.Invoke(key, mark);
+    }
+
+    /// <summary>
+    /// <see cref="MarkedFolders"/> made again from every mark there is.
+    /// Under a lock, so two marks set at once on two threads cannot publish a
+    /// set that lacks one of them: the second to take the lock sees both.
+    /// </summary>
+    private void IndexMarkedFolders()
+    {
+        lock (_markedFoldersGate)
+        {
+            var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var pair in _marks)
+            {
+                if (!pair.Value.IsEmpty && Path.GetDirectoryName(pair.Key) is { Length: > 0 } parent)
+                {
+                    folders.Add(parent);
+                }
+            }
+
+            _markedFolders = folders;
+        }
     }
 
     private static string Key(string path)
     {
+        Interlocked.Increment(ref _pathsNormalised);
         try
         {
             return Models.ViewAllPath.Normalize(path);

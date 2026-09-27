@@ -40,7 +40,6 @@ public partial class MainWindow
     private DispatcherTimer? _filterTimer;
     private const int FilterBeaconLimit = 150;
     private bool _nestedCameraRestored;
-    private readonly HashSet<string> _iconsAsked = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Slices of the nested tree's background pass, waiting for frames to run in (see <see cref="PostSortSlice"/>).</summary>
     private readonly Queue<Action> _sortSlices = new();
@@ -65,10 +64,21 @@ public partial class MainWindow
     private void AttachNested()
     {
         _nestedTree.PostBackground = PostSortSlice;
+
+        // Changes on disk: before the drives go in, so every drive takes its
+        // watch from the hub.  The tree registers what it reads; the canvas
+        // takes the hub's changes in at the start of its frames and hands them
+        // to the tree view model, which gives the tree its own.
+        _nestedTree.Changes = _viewModel.Changes;
+        _viewModel.Tree.NestedChanges = _nestedTree;
+        Nested.AttachChanges(_viewModel.Changes, _viewModel.Tree);
+        AttachDevices();
+
         Nested.Tree = _nestedTree;
         Nested.MarkLookup = _viewModel.Marks.Get;
         Nested.IconLookup = LookUpFileIcon;
-        Nested.SelectRequested += OnNestedSelectRequested;
+        Nested.IconArrivals = _viewModel.Icons.CanvasArrivals;
+        _nestedTree.FolderLoaded += OnFolderLoadedForIcons;
         Nested.OpenRequested += OnNestedOpenRequested;
         Nested.ContextMenuRequested += OnNestedContextMenuRequested;
         Nested.DragRequested += OnNestedDragRequested;
@@ -99,8 +109,7 @@ public partial class MainWindow
 
         _viewModel.PropertyChanged += OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
-        _viewModel.Tree.SelectedNodes.CollectionChanged += OnTreeSelectionChangedForNested;
-        _viewModel.Tree.PathRefreshed += OnTreePathRefreshed;
+        _viewModel.Tree.DeepRefreshRequested += OnTreeDeepRefreshRequested;
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.SearchResults.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
@@ -113,11 +122,16 @@ public partial class MainWindow
         _beaconTimer?.Stop();
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
-        _viewModel.Tree.SelectedNodes.CollectionChanged -= OnTreeSelectionChangedForNested;
-        _viewModel.Tree.PathRefreshed -= OnTreePathRefreshed;
+        _viewModel.Tree.DeepRefreshRequested -= OnTreeDeepRefreshRequested;
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.SearchResults.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.Marks.MarkChanged -= OnMarkChangedForNested;
+        _nestedTree.FolderLoaded -= OnFolderLoadedForIcons;
+        Nested.IconArrivals = null;
+        Nested.AttachChanges(null, null);
+        DetachDevices();
+        _viewModel.Tree.NestedChanges = null;
+        _nestedTree.Changes = null;
         _sortSlices.Clear();
         UnhookSortSlices();
         _nestedTree.Dispose();
@@ -295,28 +309,9 @@ public partial class MainWindow
     }
 
     // ---- selection, both ways ---------------------------------------------
-
-    private async void OnNestedSelectRequested(string path, bool additive)
-    {
-        try
-        {
-            if (additive)
-            {
-                await _viewModel.Tree.ToggleSelectionAsync(path);
-            }
-            else if (await _viewModel.Tree.SelectPathAsync(path) is null
-                     && !Directory.Exists(path) && !File.Exists(path))
-            {
-                // A cell for something that is gone: read its folder again
-                // rather than select anything in its place.
-                await RefreshStaleAsync(path);
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        {
-            _viewModel.Toast.ShowError(ex.Message);
-        }
-    }
+    //
+    // The canvas's gestures reach the shared selection as edits, and every
+    // other change reaches the canvas, in MainWindow.Selection.cs.
 
     private async Task RefreshStaleAsync(string path)
     {
@@ -376,8 +371,6 @@ public partial class MainWindow
             _viewModel.Toast.ShowError($"Could not follow {folder.Name}: {ex.Message}");
         }
     }
-
-    private void OnTreeSelectionChangedForNested(object? sender, NotifyCollectionChangedEventArgs e) => SyncNestedSelection();
 
     private void OnTreePropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
     {
@@ -510,8 +503,7 @@ public partial class MainWindow
         await Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
     }
 
-    private void SyncNestedSelection() =>
-        Nested.SetSelection(_viewModel.Tree.SelectedPaths, _viewModel.Tree.ActivePath);
+    private void SyncNestedSelection() => Nested.LoadSelection(_viewModel.Tree.Selection);
 
     /// <summary>
     /// The nested version of "bring this node into view".  Navigation - the
@@ -577,18 +569,17 @@ public partial class MainWindow
         }
     }
 
-    private async void OnTreePathRefreshed(string path)
+    /// <summary>
+    /// F5: the folder is read again at once, and whatever the canvas read below
+    /// it is out of date too - read again as it is drawn.  A change on disk, or
+    /// a file operation of the window's own, needs nothing from here: the
+    /// change hub brings it to the tree like any other.
+    /// </summary>
+    private void OnTreeDeepRefreshRequested(string path)
     {
         if (_nestedTree.Find(path) is { } folder)
         {
-            try
-            {
-                await _nestedTree.RefreshAsync(folder);
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or IOException or UnauthorizedAccessException)
-            {
-                // The window is closing, or the folder went; nothing to redraw.
-            }
+            _nestedTree.RefreshDeep(folder);
         }
     }
 
@@ -749,30 +740,9 @@ public partial class MainWindow
                 return;
             }
 
-            var path = target.Path;
-            if (tree.SelectedPaths.Contains(path, StringComparer.OrdinalIgnoreCase)
-                && tree.TryGetNode(path, out var selected))
-            {
-                tree.Activate(selected);
-            }
-            else if (await tree.SelectPathAsync(path) is null)
-            {
-                if (!Directory.Exists(path) && !File.Exists(path))
-                {
-                    await RefreshStaleAsync(path);
-                }
-
-                return;
-            }
-
-            // Something else was selected while this one was being read: its
-            // menu would act on that, not on what was right-clicked.
-            if (!ViewAllPath.Equals(tree.ActivePath, path))
-            {
-                return;
-            }
-
-            _viewModel.ShowContextMenuFor(tree.SelectedPaths, Nested, point);
+            // The whole selection when the item is part of it (see
+            // MainWindow.Selection.cs).
+            await ShowNestedItemMenuAsync(target, point);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -790,11 +760,7 @@ public partial class MainWindow
             return;
         }
 
-        var selected = _viewModel.Tree.SelectedPaths;
-        string[] paths = selected.Count > 1 && selected.Contains(path, StringComparer.OrdinalIgnoreCase)
-            ? [.. selected]
-            : [path];
-
+        var paths = NestedDragPaths(path);
         _nestedDragPaths = paths;
         try
         {
@@ -883,28 +849,22 @@ public partial class MainWindow
     }
 
     /// <summary>
-    /// A file's icon for the canvas: whatever the icon service already has, and
-    /// a request for the rest that repaints the canvas when it arrives.  Icons
-    /// are per extension, so a folder of a thousand photos asks once.
+    /// A file's icon for the canvas, the file named by its folder and its
+    /// index among the folder's shown files: whatever the icon service already
+    /// has, and a question for the rest, whose answer arrives in the canvas's
+    /// icon inbox (<see cref="ShellIconService.GetForCanvas"/>).  Icons are
+    /// per type, looked up by the file's shared extension, so a folder of a
+    /// thousand photos asks once and a frame of their names builds nothing;
+    /// only programs, shortcuts and icon files are asked about one by one.
     /// </summary>
-    private ImageSource? LookUpFileIcon(string path)
-    {
-        var icons = _viewModel.Icons;
-        var icon = icons.GetCached(path, isDirectory: false);
-        if (icon is not null)
-        {
-            return icon;
-        }
+    private ImageSource? LookUpFileIcon(NestedFolder folder, int index) => _viewModel.Icons.GetForCanvas(folder, index);
 
-        var extension = Path.GetExtension(path);
-        var key = extension is ".exe" or ".lnk" or ".ico" || string.IsNullOrEmpty(extension) ? path : extension;
-        if (_iconsAsked.Count < 20_000 && _iconsAsked.Add(key))
-        {
-            icons.Request(path, isDirectory: false, _ => Nested.RefreshIcons());
-        }
-
-        return null;
-    }
+    /// <summary>
+    /// A folder was read: the types among its files are asked for behind
+    /// everything on screen, so their icons are usually there before any of
+    /// its names is big enough to carry one.
+    /// </summary>
+    private void OnFolderLoadedForIcons(NestedFolder folder) => _viewModel.Icons.Prefetch(folder);
 
     // ---- the name filter ---------------------------------------------------------
 
