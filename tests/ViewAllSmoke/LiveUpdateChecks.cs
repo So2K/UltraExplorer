@@ -512,8 +512,11 @@ internal static partial class Program
             }
 
             await LiveWait(() => root.Handle is { IsInvalid: false } && notifications.RegisteredCount > 0, 3_000);
-            Check("armed, its handle is registered for the device's messages", root.Handle is { IsInvalid: false } && notifications.RegisteredCount == 1);
+            Check("armed, its handle is registered for the device's messages", root.Handle is { IsInvalid: false } && notifications.RegisteredCount == 1
+                && ReferenceEquals(notifications.RegisteredHandleFor(root), root.Handle));
             var notification = notifications.NotificationFor(root);
+            var firstHandle = root.Handle;
+            var registrations = notifications.Registrations;
             using (var message = new HandleMessage(notification))
             {
                 var outcome = notifications.OnDeviceChange(0x8001, message.Pointer);
@@ -524,8 +527,15 @@ internal static partial class Program
                 Check("the removal called off, the watch is armed again", outcome == DeviceChange.WatchRearmed);
             }
 
-            await LiveWait(() => root.Handle is { IsInvalid: false } && notifications.RegisteredCount == 1, 3_000);
-            Check("on a new handle, registered afresh", root.State == WatchState.Armed && notifications.RegisteredCount == 1 && notifications.NotificationFor(root) != notification);
+            // Registered afresh means one new registration, on the new handle.
+            // Not a new notification number: Windows may hand back the number
+            // of the one let go, as it may a closed handle's, which is why the
+            // handles are compared as objects.
+            await LiveWait(() => root.Handle is { IsInvalid: false } && notifications.RegisteredCount == 1 && notifications.Registrations > registrations, 10_000);
+            var registeredOn = notifications.RegisteredHandleFor(root);
+            Check($"on a new handle, registered afresh ({root.State}, {notifications.RegisteredCount} registered, {notifications.Registrations - registrations} new, notification {(notifications.NotificationFor(root) == notification ? "number reused" : "numbered anew")})",
+                root.State == WatchState.Armed && notifications.RegisteredCount == 1 && notifications.Registrations == registrations + 1
+                && registeredOn is not null && ReferenceEquals(registeredOn, root.Handle) && !ReferenceEquals(registeredOn, firstHandle));
 
             using (var volume = new VolumeMessage())
             {

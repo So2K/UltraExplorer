@@ -304,7 +304,9 @@ public sealed class ViewAllGraphService : IDisposable
 
         var anchor = _typeNamesAnchor;
         _typeNamesAnchor = null;
-        if (_disposed || _layout.Sort.Column != SortColumn.Type)
+        // Whether anything is still ordered by type is not worth working out:
+        // a layout pass that finds nothing to move moves nothing.
+        if (_disposed)
         {
             return;
         }
@@ -410,7 +412,7 @@ public sealed class ViewAllGraphService : IDisposable
 
         try
         {
-            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, Options, loadCancellation.Token, _layout.Sort);
+            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, Options, loadCancellation.Token, _layout.SortFor(node.FullPath));
             loadCancellation.Token.ThrowIfCancellationRequested();
 
             var added = new List<ViewAllNodeViewModel>(snapshot.Entries.Count);
@@ -511,7 +513,7 @@ public sealed class ViewAllGraphService : IDisposable
 
         try
         {
-            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, pageOptions, loadCancellation.Token, _layout.Sort);
+            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, pageOptions, loadCancellation.Token, _layout.SortFor(node.FullPath));
             var added = new List<ViewAllNodeViewModel>();
             ApplySnapshot(node, snapshot, added);
             node.ChildLoadLimit = nextLimit;
@@ -1086,8 +1088,28 @@ public sealed class ViewAllGraphService : IDisposable
         GraphChanged?.Invoke(this, EventArgs.Empty);
     }
 
-    /// <summary>The order each folder's children are laid out in, folders before files.</summary>
+    /// <summary>The order each folder's children are laid out in, folders before files, unless <see cref="SortOf"/> gives it one of its own.</summary>
     public ItemSort Sort => _layout.Sort;
+
+    /// <summary>Each folder's own order, by its path; null, and every folder is in <see cref="Sort"/>.</summary>
+    public Func<string, ItemSort>? SortOf
+    {
+        get => _layout.SortOf;
+        set => _layout.SortOf = value;
+    }
+
+    /// <summary>
+    /// Lays the tree out again after any order changed - the default, or one
+    /// folder's own - keeping what <see cref="SetSort"/> keeps: every hand
+    /// placed position, and <paramref name="anchor"/> where the view is.
+    /// </summary>
+    public void Resort(ItemSort sort, ViewAllNodeViewModel? anchor = null)
+    {
+        ThrowIfDisposed();
+        _layout.Sort = sort;
+        ReflowAnchoredOn(anchor);
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+    }
 
     /// <summary>
     /// Orders every folder's children by <paramref name="sort"/> from now on

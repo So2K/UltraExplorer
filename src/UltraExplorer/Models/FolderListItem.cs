@@ -1,5 +1,6 @@
 using System.Windows.Media;
 using UltraExplorer.Infrastructure;
+using UltraExplorer.Services;
 
 namespace UltraExplorer.Models;
 
@@ -13,6 +14,8 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
     private ImageSource? _icon;
     private bool _isOnCanvas;
     private bool _isNew;
+    private SortColumn _detailColumn;
+    private string? _detail;
 
     /// <summary>
     /// What the row shows.  Replaced in place when the folder is read again
@@ -31,6 +34,7 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
             }
 
             _entry = value;
+            _detail = null;
 
             // Everything the row shows comes from the entry.
             OnPropertyChanged(string.Empty);
@@ -41,6 +45,120 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
     public string DisplayName => Entry.DisplayName;
     public string SecondaryText => Entry.SecondaryText;
     public ViewAllEntryKind Kind => Entry.Kind;
+
+    /// <summary>What the list is ordered by, which decides what <see cref="Detail"/> says.</summary>
+    public SortColumn DetailColumn
+    {
+        get => _detailColumn;
+        set
+        {
+            if (_detailColumn == value)
+            {
+                return;
+            }
+
+            _detailColumn = value;
+            _detail = null;
+            OnPropertyChanged(nameof(Detail));
+        }
+    }
+
+    /// <summary>
+    /// What the row says on its right: the thing the list is ordered by, so
+    /// the order can be read off the rows - when each was written under a
+    /// date order, what kind of file it is under a type order, a file's size
+    /// under a size order - and otherwise what it always said, a folder's
+    /// date and a file's kind and size.  A drive always says what it is.
+    /// Made when first shown and kept - all but a kind of file the Shell has
+    /// not named yet, which is said again when its name is in.
+    /// </summary>
+    public string Detail
+    {
+        get
+        {
+            if (_detail is not null)
+            {
+                return _detail;
+            }
+
+            var detail = DetailFor(_entry, _detailColumn, out var standIn);
+            if (standIn)
+            {
+                // The Shell has not named this kind yet: shown as "XYZ File"
+                // for now, not kept, and shown again once the name is in.
+                _ = ShowTypeNameWhenKnownAsync();
+                return detail;
+            }
+
+            return _detail = detail;
+        }
+    }
+
+    private bool _typeNameWaiting;
+
+    private async Task ShowTypeNameWhenKnownAsync()
+    {
+        if (_typeNameWaiting)
+        {
+            return;
+        }
+
+        _typeNameWaiting = true;
+        try
+        {
+            // Never straight back into the binding that is asking.
+            await Task.Yield();
+            await FileTypeNames.WhenPrefetchedAsync();
+        }
+        finally
+        {
+            _typeNameWaiting = false;
+        }
+
+        _detail = null;
+        OnPropertyChanged(nameof(Detail));
+    }
+
+    private static string DetailFor(ViewAllEntryDescriptor entry, SortColumn column, out bool standIn)
+    {
+        standIn = false;
+        if (entry.Kind == ViewAllEntryKind.Drive)
+        {
+            return entry.SecondaryText;
+        }
+
+        var isFolder = entry.Kind == ViewAllEntryKind.Folder;
+        switch (column)
+        {
+            case SortColumn.Modified when entry.ModifiedUtc > DateTime.MinValue:
+                return entry.ModifiedUtc.ToLocalTime().ToString("g", System.Globalization.CultureInfo.CurrentCulture);
+            case SortColumn.Type when isFolder:
+                return FileTypeNames.Folder;
+            case SortColumn.Type:
+                // The extension exactly as ordering by type reads it - none
+                // for ".gitignore" - so the row names the kind it is ranked by.
+                standIn = !FileTypeNames.TryGet(ViewAllEntryOrder.ExtensionOf(entry.DisplayName), out var name);
+                return name;
+            case SortColumn.Size when !isFolder && entry.SizeBytes is { } size:
+                return FormatSize(size);
+            default:
+                return entry.SecondaryText;
+        }
+    }
+
+    private static string FormatSize(long bytes)
+    {
+        string[] suffixes = ["B", "KB", "MB", "GB", "TB"];
+        double value = bytes;
+        var suffix = 0;
+        while (value >= 1024 && suffix < suffixes.Length - 1)
+        {
+            value /= 1024;
+            suffix++;
+        }
+
+        return suffix == 0 ? $"{bytes:N0} B" : $"{value:0.#} {suffixes[suffix]}";
+    }
     public bool IsDirectory => Kind is ViewAllEntryKind.Drive or ViewAllEntryKind.Folder;
 
     /// <summary>Fallback Segoe Fluent glyph, used until the Shell icon arrives.</summary>

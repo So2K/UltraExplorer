@@ -63,7 +63,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CanvasMode _mode = CanvasMode.ViewAll;
     private CanvasLayout _layout = CanvasLayout.Nested;
     private string _savedLayout = nameof(CanvasLayout.Nested);
-    private ItemSort _sort = ItemSort.Default;
+    private bool _loadingOrders;
     private string? _savedRenderer;
     private bool _sortSavePending;
     private string _nestedZoomLabel = "Fit";
@@ -91,6 +91,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         Tree = new ViewAllViewModel(_marks, _iconService, treeStatePath);
         Tree.PropertyChanged += OnTreePropertyChanged;
+        Tree.Orders.Changed += OnOrdersChanged;
         Tree.MessageRequested += OnTreeMessage;
 
         // The hub's changes go to the tree view model, which hands each to
@@ -304,28 +305,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public bool IsTreeLayout => _layout == CanvasLayout.Tree;
 
     /// <summary>
-    /// The one order every picture of the drives shares - the sub-folders and
-    /// files inside each cell of the nested canvas, each folder's children on
-    /// the tree, and the rows of the folder list - chosen like Explorer's
-    /// column headers and remembered with the rest of the workspace.  The tree
-    /// and the list are ordered from here; the nested canvas has a tree of its
-    /// own, which the window keeps in step through this property's change.
+    /// Which order each folder is shown in, and which way its grids fill -
+    /// the sub-folders and files inside each cell of the nested canvas, each
+    /// folder's children on the tree, and the rows of the folder list -
+    /// chosen like Explorer's column headers and remembered with the rest of
+    /// the workspace.  The tree and the list are ordered from here, and the
+    /// window hands the same orders to the nested canvas's tree.
     ///
-    /// A file dialog starts from names from A and never writes its choice
-    /// back: being somebody else's dialog is no reason to rearrange the
-    /// user's own window.
+    /// A file dialog starts from names from A in every folder and never
+    /// writes its choices back: being somebody else's dialog is no reason to
+    /// rearrange the user's own window.
     /// </summary>
+    public FolderOrders Orders => Tree.Orders;
+
+    /// <summary>The default order (<see cref="FolderOrders.Default"/>): what every folder without an order of its own is shown in.</summary>
     public ItemSort Sort
     {
-        get => _sort;
-        set
-        {
-            if (!SetProperty(ref _sort, value))
-            {
-                return;
-            }
+        get => Orders.Default;
+        set => Orders.SetDefault(value);
+    }
 
-            Tree.Sort = value;
+    private void OnOrdersChanged(string? folder)
+    {
+        OnPropertyChanged(nameof(Sort));
+        if (!_loadingOrders)
+        {
             SaveSortWhenIdle();
         }
     }
@@ -564,13 +568,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _leftDragHintShown = state.NestedLeftDragHintShown;
 
             // Handed to the tree before it builds its first layout, so the
-            // drives open already in the remembered order.
-            var sort = _isPickerSession ? ItemSort.Default : ItemSort.FromSetting(state.CanvasSort);
-            if (sort != _sort)
+            // drives open already in the remembered orders.  A file dialog
+            // starts from names from A in every folder, but reads its grids
+            // the way the user chose and sorts a folder the way the user's
+            // headers do: those are how the canvas works, not an order.
+            _loadingOrders = true;
+            try
             {
-                _sort = sort;
-                Tree.Sort = sort;
-                OnPropertyChanged(nameof(Sort));
+                Orders.Load(
+                    _isPickerSession ? ItemSort.Default : ItemSort.FromSetting(state.CanvasSort),
+                    FolderOrders.ParseScope(state.CanvasSortScope),
+                    FolderOrders.ParseFlow(state.CanvasLayoutOrder),
+                    _isPickerSession ? null : state.FolderSorts);
+            }
+            finally
+            {
+                _loadingOrders = false;
             }
 
             foreach (var legacy in state.Nodes)
@@ -708,7 +721,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // back the ones it read at its start over a choice made meanwhile in
         // the window.
         var layout = _savedLayout;
-        string? sort = (_isPickerSession ? ItemSort.Default : _sort).ToSetting();
+        string? sort = (_isPickerSession ? ItemSort.Default : Orders.Default).ToSetting();
+        string? scope = FolderOrders.ScopeSetting(Orders.Scope);
+        string? flow = FolderOrders.FlowSetting(Orders.Flow);
+        var folderSorts = _isPickerSession ? null : Orders.Saved();
         var renderer = _savedRenderer;
         var leftDrag = WorkspaceState.LeftDragSetting(_leftDrag);
         var hintShown = _leftDragHintShown;
@@ -716,6 +732,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             layout = current.CanvasLayout;
             sort = current.CanvasSort;
+            scope = current.CanvasSortScope;
+            flow = current.CanvasLayoutOrder;
+            folderSorts = current.FolderSorts;
             renderer = current.CanvasRenderer;
             leftDrag = current.NestedLeftDrag;
             hintShown = current.NestedLeftDragHintShown;
@@ -728,6 +747,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             IsFolderListVisible = Tree.FolderList.IsVisible,
             CanvasLayout = layout,
             CanvasSort = sort,
+            CanvasSortScope = scope,
+            CanvasLayoutOrder = flow,
+            FolderSorts = folderSorts,
             CanvasRenderer = renderer,
             NestedLeftDrag = leftDrag,
             NestedLeftDragHintShown = hintShown,

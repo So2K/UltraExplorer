@@ -203,6 +203,15 @@ public sealed class FolderListViewModel : ObservableObject
         {
             if (SetProperty(ref _folderPath, value))
             {
+                // A folder has an order of its own: the list is read in it.
+                // Nothing to reorder - the rows of the folder before are
+                // about to be replaced.
+                if (SortOf?.Invoke(value) is { } own && own != _sort)
+                {
+                    _sort = own;
+                    OnPropertyChanged(nameof(Sort));
+                }
+
                 UnregisterFolder();
                 RegisterFolder();
                 _staleWhileHidden = false;
@@ -368,6 +377,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// what one read holds, stays selected all the same.
     /// </summary>
     public ItemSelection? SharedSelection { get; init; }
+
+    /// <summary>
+    /// A folder's own order, by its path: taken as the list goes to the
+    /// folder, before it is read.  Null, and the list keeps <see cref="Sort"/>
+    /// from folder to folder.
+    /// </summary>
+    public Func<string, ItemSort>? SortOf { get; init; }
 
     /// <summary>
     /// The rows the shared selection lights changed - it changed, from
@@ -778,6 +794,7 @@ public sealed class FolderListViewModel : ObservableObject
         foreach (var item in matched)
         {
             item.IsOnCanvas = _isOnCanvas(item.FullPath);
+            item.DetailColumn = _sort.Column;
             rows.Add(item);
             _byPath.TryAdd(item.FullPath, item);
 

@@ -167,9 +167,10 @@ public sealed partial class ChangeHub
     /// <summary>
     /// Tells the hub a folder was just read again: how long the read took on
     /// its worker and the apply on the UI thread, and whether the listing
-    /// differed from the last.  Sets how soon the folder may be refreshed
-    /// again - <c>max(250 ms, 10 × read + 20 × apply)</c>, so a folder that
-    /// is slow to read or apply is refreshed less often - and, on a share,
+    /// differed from the last.  Sets how soon a change heard from now on may
+    /// fall due - <c>max(250 ms, 10 × read + 20 × apply)</c>, so a folder that
+    /// is slow to read or apply is refreshed less often; a change already
+    /// pending keeps its time - and, on a share,
     /// asks for the folder to be read again after 2 and 10.5 seconds when a
     /// refresh the hub asked for found nothing new: the share's client may
     /// have answered from its cache.
@@ -210,11 +211,14 @@ public sealed partial class ChangeHub
                 }
             }
 
-            if (_changes.TryGetValue(key, out var pending))
-            {
-                Settle(pending);
-            }
-
+            // A change already pending keeps the due time it has: it was heard
+            // before this refresh was reported, and the refresh may not have
+            // been one the hub asked for - the tree reads a folder again when
+            // a sub-folder of it on screen goes, or when it is drawn out of
+            // date - so it may never have reached the folder list or the tree
+            // canvas.  Held back to the gap, a folder renamed inside the list's
+            // folder reached the list a quarter of a second after the canvas.
+            // Only what is heard from now on waits for the gap (Note, Touch).
             PruneTimingsLocked(now);
         }
     }
@@ -409,7 +413,8 @@ public sealed partial class ChangeHub
     /// When a pending change falls due: at once when touched so; otherwise the
     /// earlier of its lanes' quiet spell after the last event and longest wait
     /// after the first, or its recheck - but never before the folder may be
-    /// refreshed again.  Under the gate.
+    /// refreshed again, as it stood when the change was last heard or asked
+    /// for.  Under the gate.
     /// </summary>
     private long DueOf(PendingChange change)
     {
@@ -603,7 +608,14 @@ public sealed partial class ChangeHub
         return gone;
     }
 
-    /// <summary>Asks for a share's folder to be read again at <paramref name="at"/>, as a change of its own.  Under the gate.</summary>
+    /// <summary>
+    /// Asks for a share's folder to be read again at <paramref name="at"/>,
+    /// as a change of its own.  A change already pending - heard while the
+    /// folder was being read - keeps the time it has, as <see cref="ReportRefresh"/>
+    /// leaves it, and the recheck rides on it: settled again, it would be
+    /// held to the gap the report just set, and a rename on a share would
+    /// reach the folder list a quarter of a second after the canvas.  Under the gate.
+    /// </summary>
     private void RecheckLocked(string key, long now, long at)
     {
         if (!Registry.TryFind(key, out var registered))
@@ -612,7 +624,8 @@ public sealed partial class ChangeHub
         }
 
         var change = PendingFor(registered, network: true);
-        if (change.Kinds == 0)
+        var heard = change.Kinds != 0;
+        if (!heard)
         {
             change.IsRecheck = true;
             change.First = now;
@@ -620,6 +633,17 @@ public sealed partial class ChangeHub
 
         change.Kinds |= ChangeKinds.Structural;
         change.RecheckAt = Math.Min(change.RecheckAt, at);
+        if (heard)
+        {
+            if (!change.IsDue && at < change.Due)
+            {
+                change.Due = at;
+                ScheduleLocked(at);
+            }
+
+            return;
+        }
+
         Settle(change);
     }
 

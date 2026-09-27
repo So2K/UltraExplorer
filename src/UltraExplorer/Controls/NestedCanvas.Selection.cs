@@ -591,8 +591,7 @@ public sealed partial class NestedCanvas
         var endX = cell is { } c ? (marquee.Pointer.X - c.X) / c.W : marquee.StartX;
         var endY = cell is { } d ? (marquee.Pointer.Y - d.Y) / d.W : marquee.StartY;
 
-        var touched = marquee.Folders.CountIn(container.Children.Count, container.Grid.Columns)
-            + marquee.Files.CountIn(container.Files.Count, container.FileGrid.Columns);
+        var touched = container.Grid.CountIn(marquee.Folders) + container.FileGrid.CountIn(marquee.Files);
         var added = new List<SelectionItem>(marquee.Mode == NestedSelectMode.Toggle ? 0 : touched);
         var removed = new List<string>();
         var replace = marquee.Mode == NestedSelectMode.Replace;
@@ -628,7 +627,7 @@ public sealed partial class NestedCanvas
         {
             for (var column = block.FirstColumn; column <= block.LastColumn; column++)
             {
-                var index = row * grid.Columns + column;
+                var index = grid.IndexOf(row, column);
                 if (index >= children.Count || matches is not null && !NestedMarquee.Bit(matches, index))
                 {
                     continue;
@@ -666,7 +665,7 @@ public sealed partial class NestedCanvas
             var centreY = tiles.Top + row * tiles.StepY + halfHeight;
             for (var column = block.FirstColumn; column <= block.LastColumn; column++)
             {
-                var index = row * tiles.Columns + column;
+                var index = tiles.IndexOf(row, column);
                 if (index >= files.Count || matches is not null && !NestedMarquee.Bit(matches, index))
                 {
                     continue;

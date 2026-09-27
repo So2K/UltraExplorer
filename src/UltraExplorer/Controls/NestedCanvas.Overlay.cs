@@ -199,7 +199,7 @@ public sealed partial class NestedCanvas
         {
             for (var column = firstColumn; column <= lastColumn; column++)
             {
-                var index = row * grid.Columns + column;
+                var index = grid.IndexOf(row, column);
                 if (index >= children.Count)
                 {
                     break;
@@ -225,7 +225,7 @@ public sealed partial class NestedCanvas
         {
             for (var column = firstColumn; column <= lastColumn; column++)
             {
-                var index = row * grid.Columns + column;
+                var index = grid.IndexOf(row, column);
                 if (index >= children.Count)
                 {
                     break;
@@ -304,7 +304,7 @@ public sealed partial class NestedCanvas
             {
                 for (var column = firstColumn; column <= lastColumn; column++)
                 {
-                    var index = row * grid.Columns + column;
+                    var index = grid.IndexOf(row, column);
                     if (index >= files.Count)
                     {
                         break;
@@ -328,7 +328,7 @@ public sealed partial class NestedCanvas
             {
                 for (var column = firstColumn; column <= lastColumn; column++)
                 {
-                    var index = row * grid.Columns + column;
+                    var index = grid.IndexOf(row, column);
                     if (index >= files.Count)
                     {
                         break;
@@ -368,7 +368,7 @@ public sealed partial class NestedCanvas
                 var start = -1;
                 for (var column = firstColumn; column <= lastColumn + 1; column++)
                 {
-                    var index = row * grid.Columns + column;
+                    var index = grid.IndexOf(row, column);
                     var selected = column <= lastColumn && index < files.Count && IsSelected(index);
                     if (selected && start < 0)
                     {

@@ -32,12 +32,13 @@ namespace UltraExplorer.Services.Watch;
 /// spell after the last one and a longest wait after the first - 150 and
 /// 500 ms for names on a local volume, 300 and 1,000 on a share, 1 and 3 s for
 /// sizes and dates only - so a single change shows in about 150 ms and a
-/// steady stream of them still refreshes every half second.  A folder that
-/// was refreshed is not due again before
+/// steady stream of them still refreshes every half second.  A change heard
+/// in a folder after it was refreshed is not due before
 /// <c>max(250 ms, 10 × read + 20 × apply)</c> has passed
 /// (<see cref="ReportRefresh"/>), which spaces the refreshes of a big folder
-/// being extracted into.  One timer, set for the earliest due time, moves due
-/// folders to an inbox and wakes the <see cref="Driver"/> once.</para>
+/// being extracted into; one already pending keeps its time.  One timer, set
+/// for the earliest due time, moves due folders to an inbox and wakes the
+/// <see cref="Driver"/> once.</para>
 ///
 /// <para><b>Missed changes.</b>  An overflow - more changed than the buffer
 /// held - moves the root's <see cref="WatchRoot.Epoch"/> on, once; so does

@@ -850,9 +850,10 @@
                                 </Button>
                             </Grid>
 
-                            <!-- The order of every cell's contents, left to right and
-                                 top to bottom: a click sorts by the column, a second
-                                 click turns it round. -->
+                            <!-- The order of the current folder's contents - the one
+                                 the selection is in, or the one in view - or every folder's, as
+                                 Canvas options says: a click sorts by the column, a
+                                 second click turns it round. -->
                             <StackPanel x:Name="SortHeaders"
                                         Grid.Column="1"
                                         Orientation="Horizontal"
@@ -1113,7 +1114,7 @@
                                                        VerticalAlignment="Center"
                                                        Margin="4,0,6,0" />
                                             <TextBlock Grid.Column="2"
-                                                       Text="{Binding SecondaryText}"
+                                                       Text="{Binding Detail}"
                                                        Foreground="{StaticResource TextMutedBrush}"
                                                        FontSize="10"
                                                        VerticalAlignment="Center" />

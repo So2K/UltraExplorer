@@ -931,13 +931,25 @@ public sealed partial class NestedCanvas
             right -= font * 0.4;
         }
 
-        if (job.W >= 190)
+        // A folder ordered by date or type is being read for exactly that, so
+        // its tiles say it where they are narrower, and leave the name less.
+        var column = folder.PlacedSort.Column;
+        var asked = column is SortColumn.Modified or SortColumn.Type;
+        var nameRoom = font * (asked ? 3.5 : 5);
+        if (job.W >= (asked ? 120 : 190) && FileDetailText(column, file, dateOnly: false) is { Length: > 0 } text)
         {
-            var size = target.Text(FormatSize(file.Length), font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
-            if (right - size.Width - cursor > font * 5)
+            var detail = target.Text(text, font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+
+            // A date and a time that leave the name no room give up the time.
+            if (right - detail.Width - cursor <= nameRoom && column == SortColumn.Modified)
             {
-                right -= size.Width;
-                target.DrawText(size, new Point(right, job.Y + (job.H - size.Height) / 2));
+                detail = target.Text(FileDetailText(SortColumn.Modified, file, dateOnly: true), font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+            }
+
+            if (right - detail.Width - cursor > nameRoom)
+            {
+                right -= detail.Width;
+                target.DrawText(detail, new Point(right, job.Y + (job.H - detail.Height) / 2));
                 right -= font * 0.6;
             }
         }
@@ -1020,9 +1032,18 @@ public sealed partial class NestedCanvas
 
         public string Detail { get; set; } = string.Empty;
 
+        /// <summary>The counts <see cref="Detail"/> is made of, for a title with no room for its date as well.</summary>
+        public string DetailCounts { get; set; } = string.Empty;
+
+        /// <summary>The date <see cref="Detail"/> ends in, or nothing.</summary>
+        public string DetailDate { get; set; } = string.Empty;
+
         public int DetailFolders { get; set; } = -1;
 
         public int DetailFiles { get; set; } = -1;
+
+        /// <summary>The folder's time the detail shows, or zero when it shows none.</summary>
+        public long DetailTicks { get; set; } = -1;
 
         public CultureInfo? DetailCulture { get; set; }
 
@@ -1180,6 +1201,94 @@ public sealed partial class NestedCanvas
 
     private static readonly string[] SizeSuffixes = ["B", "KB", "MB", "GB", "TB"];
 
+    /// <summary>
+    /// What a file's tile says on its right, by what its folder is ordered
+    /// by - the thing a person sorting by it is looking for: when it was
+    /// written for a date order, what kind of file it is for a type order,
+    /// its size otherwise, as it always said.  Every text is made once and
+    /// kept, never once per frame.
+    /// </summary>
+    internal string FileDetailText(SortColumn column, in NestedFile file, bool dateOnly) => column switch
+    {
+        SortColumn.Modified => DateText(file.ModifiedTicks, dateOnly),
+        SortColumn.Type => TypeText(file.Extension),
+        _ => FormatSize(file.Length)
+    };
+
+    /// <summary>
+    /// A time in UTC ticks as the culture writes a date and a time, or only
+    /// the date, in local time; nothing for a time nobody gave.  Kept by the
+    /// minute, which is all the text shows.
+    /// </summary>
+    internal string DateText(long utcTicks, bool dateOnly)
+    {
+        if (utcTicks <= 0 || utcTicks > DateTime.MaxValue.Ticks)
+        {
+            return string.Empty;
+        }
+
+        var minute = utcTicks / TimeSpan.TicksPerMinute;
+        var texts = dateOnly ? _dayTexts : _minuteTexts;
+        if (texts.TryGet(minute, out var known))
+        {
+            return known;
+        }
+
+        var local = new DateTime(utcTicks, DateTimeKind.Utc).ToLocalTime();
+        return texts.Add(minute, local.ToString(dateOnly ? "d" : "g", CultureInfo.CurrentCulture));
+    }
+
+    /// <summary>
+    /// Explorer's name for a kind of file, kept per extension.  A kind the
+    /// Shell has not been asked about yet reads "XYZ File" for the moment,
+    /// is asked about in the background, and the tiles are drawn again with
+    /// the real name once it is there - the UI thread never waits for it.
+    /// </summary>
+    private string TypeText(string extension)
+    {
+        if (_typeTexts.TryGetValue(extension, out var known))
+        {
+            return known;
+        }
+
+        if (_typeTexts.Count >= MaximumTypeTexts)
+        {
+            _typeTexts.Clear();
+        }
+
+        if (!FileTypeNames.TryGet(extension, out var name) && !_typeTextsWaiting)
+        {
+            _ = ForgetStandInTypesWhenKnownAsync();
+        }
+
+        _typeTexts[extension] = name;
+        return name;
+    }
+
+    private const int MaximumTypeTexts = 4096;
+    private readonly Dictionary<string, string> _typeTexts = new(StringComparer.Ordinal);
+    private bool _typeTextsWaiting;
+
+    private async Task ForgetStandInTypesWhenKnownAsync()
+    {
+        _typeTextsWaiting = true;
+        try
+        {
+            // Never straight back into the label that asked: names that had
+            // all arrived already would be forgotten before it kept its
+            // stand-in, which would then stay.
+            await Task.Yield();
+            await FileTypeNames.WhenPrefetchedAsync();
+        }
+        finally
+        {
+            _typeTextsWaiting = false;
+        }
+
+        _typeTexts.Clear();
+        RequestFrame(Layers.Labels);
+    }
+
     /// <summary>A file's size as its tile and its tag say it, made once per size rather than once per frame.</summary>
     private string FormatSize(long bytes)
     {
@@ -1291,6 +1400,20 @@ public sealed partial class NestedCanvas
             if (job.W >= 280 && DetailText(folder, facts) is { Length: > 0 } detail)
             {
                 var info = target.Text(detail, font * 0.78, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+
+                // Counts and a date that leave the name no room give up the
+                // counts - the date is what the order is about - and then try
+                // the counts alone, the way a tile gives up a time.
+                if (right - info.Width - cursor <= font * 6 && ReferenceEquals(detail, facts.Detail)
+                    && facts.DetailDate.Length > 0 && facts.DetailCounts.Length > 0)
+                {
+                    info = target.Text(facts.DetailDate, font * 0.78, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+                    if (right - info.Width - cursor <= font * 6)
+                    {
+                        info = target.Text(facts.DetailCounts, font * 0.78, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+                    }
+                }
+
                 if (right - info.Width - cursor > font * 6)
                 {
                     right -= info.Width;
@@ -1408,7 +1531,7 @@ public sealed partial class NestedCanvas
     }
 
     /// <summary>What a title says on its right: a drive's free space, or how many folders and files a folder holds.</summary>
-    private string DetailText(NestedFolder folder) => DetailText(folder, null);
+    internal string DetailText(NestedFolder folder) => DetailText(folder, null);
 
     /// <summary>
     /// <see cref="DetailText(NestedFolder)"/>, kept on the folder's facts with
@@ -1440,16 +1563,31 @@ public sealed partial class NestedCanvas
             return string.Empty;
         }
 
+        // Where the folder it is in is ordered by date, when it was written
+        // is what places it, and the title says it.  Not for a folder whose
+        // own contents are by date and nothing more: its date comes from its
+        // parent's listing, which a write inside it reads again only while
+        // the parent is ordered by date - the title would show a time the
+        // newest file in it had already passed.
+        var ticks = folder.Parent is { IsComputer: false } parent && parent.PlacedSort.Column == SortColumn.Modified
+            ? folder.ModifiedTicks
+            : 0;
         facts ??= FactsOf(folder);
         var culture = CultureInfo.CurrentCulture;
-        if (facts.DetailFolders == folders && facts.DetailFiles == files && ReferenceEquals(facts.DetailCulture, culture))
+        if (facts.DetailFolders == folders && facts.DetailFiles == files && facts.DetailTicks == ticks
+            && ReferenceEquals(facts.DetailCulture, culture))
         {
             return facts.Detail;
         }
 
-        facts.Detail = CountsText(folders, files);
+        var counts = CountsText(folders, files);
+        var date = DateText(ticks, dateOnly: false);
+        facts.Detail = date.Length == 0 ? counts : counts.Length == 0 ? date : string.Concat(counts, "  ·  ", date);
+        facts.DetailCounts = counts;
+        facts.DetailDate = date;
         facts.DetailFolders = folders;
         facts.DetailFiles = files;
+        facts.DetailTicks = ticks;
         facts.DetailCulture = culture;
         return facts.Detail;
     }

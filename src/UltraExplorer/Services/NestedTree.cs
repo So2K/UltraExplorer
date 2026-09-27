@@ -43,15 +43,20 @@ public sealed record NestedRoot(string FullPath, string Name, NestedFolderKind K
 /// leave it; their results come back through the synchronisation context and
 /// are applied there.
 ///
-/// Every folder's sub-folders and files are placed in one order, <see cref="Sort"/>,
-/// row by row.  Changing it re-places nothing at once - a tree read deep can
-/// be tens of thousands of folders, and doing them all in one go would stall
-/// the window.  Instead each folder remembers which order it was placed for,
-/// anything about to be drawn or looked at is placed again first
-/// (<see cref="EnsureLayout"/>), and a pass in small background slices brings
-/// the rest up to date behind it.  The listings themselves stay in name order
-/// for ever, which is what keeps finding a folder or a file by name a binary
-/// search whatever the canvas shows.
+/// Every folder's sub-folders and files are placed in its own order,
+/// <see cref="SortOf"/> - the folder's own if it was sorted by itself, the
+/// default otherwise (see <see cref="FolderOrders"/>) - filling its grids a
+/// column or a row at a time as <see cref="Orders"/> says.  Sorting one
+/// folder places that one folder again, there and then.  A change that can
+/// reach every folder - the default, the scope, the way grids fill -
+/// re-places nothing at once: a tree read deep can be tens of thousands of
+/// folders, and doing them all in one go would stall the window.  Instead
+/// each folder remembers which order it was placed for, anything about to
+/// be drawn or looked at is placed again first (<see cref="EnsureLayout"/>),
+/// and a pass in small background slices brings the rest up to date behind
+/// it.  The listings themselves stay in name order for ever, which is what
+/// keeps finding a folder or a file by name a binary search whatever the
+/// canvas shows.
 /// </summary>
 public sealed partial class NestedTree : IDisposable
 {
@@ -79,6 +84,8 @@ public sealed partial class NestedTree : IDisposable
             LoadState = NestedLoadState.Loaded
         };
         PostBackground = DefaultPostBackground();
+        _orders = new FolderOrders();
+        _orders.Changed += OnOrdersChanged;
         InitialiseReading();
     }
 
@@ -129,22 +136,47 @@ public sealed partial class NestedTree : IDisposable
     public event Action<NestedFolder>? FolderLoaded;
 
     /// <summary>
-    /// Raised by <see cref="SetSort"/> the moment the order changes, before a
-    /// single folder has been placed for it: every folder is still where the
-    /// last picture showed it, which is when the canvas has to note what it is
-    /// looking at if the view is to stay still while the contents move.
+    /// Raised the moment any order changes - a folder's own, the default, the
+    /// scope or the way grids fill - before a single folder has been placed
+    /// for it: every folder is still where the last picture showed it, which
+    /// is when the canvas has to note what it is looking at if the view is to
+    /// stay still while the contents move.
     /// </summary>
     public event Action? SortChanged;
 
-    /// <summary>The order sub-folders and files are placed in, row by row, inside every folder but This PC.</summary>
-    public ItemSort Sort => _sort;
+    /// <summary>
+    /// Which order each folder is shown in, and which way its grids fill.
+    /// The tree's own until the window hands it the one the rest of the
+    /// window shares; every change to it places folders again here.
+    /// </summary>
+    public FolderOrders Orders
+    {
+        get => _orders;
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            if (ReferenceEquals(_orders, value))
+            {
+                return;
+            }
+
+            _orders.Changed -= OnOrdersChanged;
+            _orders = value;
+            _orders.Changed += OnOrdersChanged;
+            OnOrdersChanged(null);
+        }
+    }
+
+    /// <summary>The default order: what every folder without one of its own is placed in (<see cref="FolderOrders.Default"/>).</summary>
+    public ItemSort Sort => _orders.Default;
 
     /// <summary>
-    /// Bumped by every change of <see cref="Sort"/>.  A folder whose stamp is
-    /// this number has been placed for the current order; any other stamp
-    /// means it is placed for an earlier one and must be brought up to date,
-    /// by <see cref="EnsureLayout"/>, before anything reads where its
-    /// children are.
+    /// Bumped by every change of order.  A folder whose stamp is this number
+    /// has been placed for the current orders; any other stamp means it may
+    /// be placed for an earlier one and must be brought up to date, by
+    /// <see cref="EnsureLayout"/>, before anything reads where its children
+    /// are - which for a folder whose own order did not change is a look at
+    /// what it was placed in, and the stamp moved on.
     /// </summary>
     public int SortGeneration { get; private set; }
 
@@ -439,6 +471,9 @@ public sealed partial class NestedTree : IDisposable
         // Cancelled but not disposed: reads still in flight observe the token
         // after this, and a disposed source would throw at them instead.
         _lifetime.Cancel();
+
+        // The orders are the window's and outlive the tree.
+        _orders.Changed -= OnOrdersChanged;
 
         // Nobody will look at the folders again; whoever waits for the order
         // to settle need not wait for ever.

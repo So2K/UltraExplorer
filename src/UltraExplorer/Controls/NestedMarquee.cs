@@ -162,11 +162,11 @@ internal sealed class NestedMarquee
 
     /// <summary>Whether the rectangle touches sub-folder <paramref name="index"/>, and it matches the filter if there is one.</summary>
     public bool HitsFolder(int index) =>
-        Folders.Contains(index, Container.Grid.Columns) && (FolderMatches is null || Bit(FolderMatches, index));
+        Container.Grid.Holds(Folders, index) && (FolderMatches is null || Bit(FolderMatches, index));
 
     /// <summary>Whether the rectangle touches file tile <paramref name="index"/>, and it matches the filter if there is one.</summary>
     public bool HitsFile(int index) =>
-        Files.Contains(index, Container.FileGrid.Columns) && (FileMatches is null || Bit(FileMatches, index));
+        Container.FileGrid.Holds(Files, index) && (FileMatches is null || Bit(FileMatches, index));
 
     /// <summary>Whether a sub-folder of the container is lit: its state before the drag and the rectangle, by the mode.</summary>
     public bool IsFolderSelected(int index) => IsSelected(Bit(BaseFolders, index), HitsFolder(index));
@@ -185,16 +185,21 @@ internal sealed class NestedMarquee
     /// <summary>
     /// How many of the container's items will be selected when the drag is
     /// let go: in constant time for a replacement with no filter, otherwise
-    /// row by row over the blocks with the base bits beside them.
+    /// line by line of the reading order over the blocks with the base bits
+    /// beside them - each line of a block is one run of places in a row.
     /// </summary>
     public int CountSelected()
     {
+        var grid = Container.Grid;
+        var tiles = Container.FileGrid;
         var total = 0;
-        total += CountZone(Folders, Container.Grid.Columns, Container.Children.Count, BaseFolders, FolderMatches);
-        total += CountZone(Files, Container.FileGrid.Columns, Container.Files.Count, BaseFiles, FileMatches);
+        total += CountZone(grid.InReadingOrder(Folders), grid.Stride, Container.Children.Count, BaseFolders, FolderMatches);
+        total += CountZone(tiles.InReadingOrder(Files), tiles.Stride, Container.Files.Count, BaseFiles, FileMatches);
         return total;
     }
 
+    /// <param name="block">The block as lines of the reading order (<see cref="GridBlock.InReadingOrder"/>).</param>
+    /// <param name="columns">Places along one line: the grid's <see cref="NestedGrid.Stride"/>.</param>
     private int CountZone(GridBlock block, int columns, int count, ulong[] before, ulong[]? matches)
     {
         var baseCount = PopCount(before, 0, count);

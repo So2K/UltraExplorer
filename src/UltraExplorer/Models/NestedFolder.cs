@@ -399,7 +399,7 @@ public sealed class NestedFolder
     /// </summary>
     internal NestedFolder[] AllChildren { get; set; } = None;
 
-    /// <summary>The sub-folders on the canvas, in the order they are shown, row by row; empty until read.</summary>
+    /// <summary>The sub-folders on the canvas, in the order they are shown, as <see cref="Grid"/> reads; empty until read.</summary>
     public IReadOnlyList<NestedFolder> Children { get; internal set; } = None;
 
     /// <summary>Where <see cref="Children"/> sit inside this cell.</summary>
@@ -408,7 +408,7 @@ public sealed class NestedFolder
     /// <summary>Every file that was read, hidden ones included, in name order.</summary>
     internal NestedFile[] AllFiles { get; set; } = [];
 
-    /// <summary>The files on the canvas, in the order they are shown, row by row; empty until read.</summary>
+    /// <summary>The files on the canvas, in the order they are shown, as <see cref="FileGrid"/> reads; empty until read.</summary>
     public IReadOnlyList<NestedFile> Files { get; internal set; } = [];
 
     /// <summary>Where <see cref="Files"/> sit inside this cell, below the sub-folders.</summary>
@@ -433,6 +433,17 @@ public sealed class NestedFolder
     /// pass over the whole tree reaches it, whichever comes first.
     /// </summary>
     internal int LayoutSortGeneration { get; set; } = -1;
+
+    /// <summary>
+    /// The order this folder's children and files were last placed in.  A
+    /// change of order anywhere moves every folder's stamp on, and a folder
+    /// whose own order is still the one it was placed in - most of them,
+    /// when one folder is sorted - needs only the stamp, not placing again.
+    /// </summary>
+    internal ItemSort PlacedSort { get; set; }
+
+    /// <summary>Whether this folder's grids were last made to fill a column at a time (see <see cref="NestedGrid.DownFirst"/>).</summary>
+    internal bool PlacedDownFirst { get; set; }
 
     /// <summary>Files that were counted but not listed, past <see cref="NestedTree.MaximumFiles"/>.</summary>
     public int UnlistedFileCount { get; internal set; }

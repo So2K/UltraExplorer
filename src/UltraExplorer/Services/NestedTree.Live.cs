@@ -324,7 +324,7 @@ public sealed partial class NestedTree : IChangeSink
             return;
         }
 
-        if (!structural && (kinds & ChangeKinds.Content) == 0 && _sort.Column != SortColumn.Modified)
+        if (!structural && (kinds & ChangeKinds.Content) == 0 && SortOf(folder).Column != SortColumn.Modified)
         {
             return;
         }
@@ -645,7 +645,11 @@ public sealed partial class NestedTree : IChangeSink
 
     // ---- renames ---------------------------------------------------------------------
 
-    /// <summary>Remembers renames within a folder until its next listing is applied; a handful at most.</summary>
+    /// <summary>
+    /// Remembers renames within a folder until its next listing is applied,
+    /// a handful at most; a renamed sub-folder's own order, if it has one,
+    /// goes to its new name at once (<see cref="FolderOrders.Move"/>).
+    /// </summary>
     private void NoteRenames(NestedFolder folder, ReadOnlySpan<RenamePair> pairs)
     {
         if (!_renames.TryGetValue(folder, out var noted))
@@ -659,6 +663,14 @@ public sealed partial class NestedTree : IChangeSink
             if (noted.Count < 16)
             {
                 noted.Add(pair);
+            }
+
+            // A sub-folder sorted by itself keeps its order under its new
+            // name, as do the folders inside it; a file's rename is no
+            // business of the orders, and a lookup by name says which it is.
+            if (_orders.Count > 0 && FindChild(folder, pair.OldName) is { } renamed)
+            {
+                _orders.Move(renamed.FullPath, Path.Combine(folder.FullPath, pair.NewName));
             }
         }
     }

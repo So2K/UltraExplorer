@@ -13,18 +13,26 @@ namespace UltraExplorer.Services;
 /// when it is.
 /// </summary>
 /// <param name="Count">How many children the grid holds.</param>
-/// <param name="Columns">Children per row; rows fill left to right.</param>
-/// <param name="Rows">Number of rows, the last one possibly short.</param>
+/// <param name="Columns">Children per row.</param>
+/// <param name="Rows">Number of rows.</param>
 /// <param name="Scale">A child's size as a fraction of the parent's.</param>
 /// <param name="Left">Left edge of the first column.</param>
 /// <param name="Top">Top edge of the first row.</param>
+/// <param name="DownFirst">
+/// Whether the children fill the first column top to bottom, then the next
+/// one, as Explorer's List view reads - the last column possibly short -
+/// rather than the first row left to right, then the next, the last row
+/// possibly short.  Only which place an index gets depends on it; the size
+/// of the grid and of its cells does not.
+/// </param>
 public readonly record struct NestedGrid(
     int Count,
     int Columns,
     int Rows,
     double Scale,
     double Left,
-    double Top)
+    double Top,
+    bool DownFirst = false)
 {
     public static readonly NestedGrid Empty = new(0, 0, 0, 0, 0, 0);
 
@@ -45,9 +53,30 @@ public readonly record struct NestedGrid(
     /// <summary>Height of every row together.</summary>
     public double Height => Rows == 0 ? 0 : Rows * Scale * NestedLayout.CellHeight + (Rows - 1) * Gap;
 
+    /// <summary>
+    /// How many children follow one another along one line of the reading
+    /// order: a column's worth when the grid is read down first, a row's
+    /// otherwise.  Child <c>n</c> is at place <c>n % Stride</c> on line <c>n / Stride</c>.
+    /// </summary>
+    public int Stride => DownFirst ? Rows : Columns;
+
     /// <summary>Top-left of child <paramref name="index"/> in the parent's unit frame.</summary>
     public (double X, double Y) Origin(int index) =>
-        (Left + index % Columns * StepX, Top + index / Columns * StepY);
+        DownFirst
+            ? (Left + index / Rows * StepX, Top + index % Rows * StepY)
+            : (Left + index % Columns * StepX, Top + index / Columns * StepY);
+
+    /// <summary>
+    /// The child at a row and a column, which may be past the last one - the
+    /// caller compares with <see cref="Count"/>.  Along a row it only ever
+    /// grows with the column, whichever way the grid is read, so a walk
+    /// along a row can stop at the first place past the end.
+    /// </summary>
+    public int IndexOf(int row, int column) => DownFirst ? column * Rows + row : row * Columns + column;
+
+    /// <summary>The row and the column of child <paramref name="index"/>.</summary>
+    public (int Row, int Column) PlaceOf(int index) =>
+        DownFirst ? (index % Rows, index / Rows) : (index / Columns, index % Columns);
 
     /// <summary>
     /// The child a point in the parent's unit frame falls in, or -1 when it is
@@ -74,9 +103,18 @@ public readonly record struct NestedGrid(
             return -1;
         }
 
-        var index = row * Columns + column;
+        var index = IndexOf(row, column);
         return index < Count ? index : -1;
     }
+
+    /// <summary>A block of places (see <see cref="Touching"/>) as lines of the reading order: see <see cref="GridBlock.InReadingOrder"/>.</summary>
+    public GridBlock InReadingOrder(GridBlock block) => block.InReadingOrder(DownFirst);
+
+    /// <summary>Whether child <paramref name="index"/> sits in a block of places.</summary>
+    public bool Holds(GridBlock block, int index) => InReadingOrder(block).Contains(index, Stride);
+
+    /// <summary>How many of the children sit in a block of places.</summary>
+    public int CountIn(GridBlock block) => InReadingOrder(block).CountIn(Count, Stride);
 
     /// <summary>
     /// Every child that could touch the rectangle, as a range of rows and
@@ -126,6 +164,16 @@ public readonly record struct GridBlock(int FirstColumn, int LastColumn, int Fir
     public static readonly GridBlock Empty = new(0, -1, 0, -1);
 
     public bool IsEmpty => LastColumn < FirstColumn || LastRow < FirstRow;
+
+    /// <summary>
+    /// The block as lines of a grid's reading order, for <see cref="Contains"/>
+    /// and <see cref="CountIn"/>, which read a grid row by row.  A grid read
+    /// down first is a grid read across whose rows are its columns: the same
+    /// block with its rows and columns swapped, measured by a column's length
+    /// rather than a row's (the grid's <see cref="NestedGrid.Stride"/>).
+    /// </summary>
+    public GridBlock InReadingOrder(bool downFirst) =>
+        downFirst ? new GridBlock(FirstRow, LastRow, FirstColumn, LastColumn) : this;
 
     /// <summary>Whether item <paramref name="index"/> of a row-major grid <paramref name="columns"/> wide is in the block.</summary>
     public bool Contains(int index, int columns)
@@ -228,18 +276,20 @@ public readonly record struct GridBlock(int FirstColumn, int LastColumn, int Fir
 /// folder they need no room inside themselves and are packed far more densely.
 /// </summary>
 /// <param name="Count">How many files the grid holds.</param>
-/// <param name="Columns">Tiles per row; files fill rows left to right.</param>
+/// <param name="Columns">Tiles per row.</param>
 /// <param name="Rows">Number of rows.</param>
 /// <param name="TileWidth">A tile's width, as a fraction of the folder's width.</param>
 /// <param name="Left">Left edge of the first column.</param>
 /// <param name="Top">Top edge of the first row.</param>
+/// <param name="DownFirst">Whether files fill each column top to bottom before the next, as <see cref="NestedGrid.DownFirst"/>.</param>
 public readonly record struct NestedFileGrid(
     int Count,
     int Columns,
     int Rows,
     double TileWidth,
     double Left,
-    double Top)
+    double Top,
+    bool DownFirst = false)
 {
     public static readonly NestedFileGrid Empty = new(0, 0, 0, 0, 0, 0);
 
@@ -253,8 +303,20 @@ public readonly record struct NestedFileGrid(
 
     public double StepY => TileHeight + Gap;
 
+    /// <summary>Tiles along one line of the reading order, as <see cref="NestedGrid.Stride"/>.</summary>
+    public int Stride => DownFirst ? Rows : Columns;
+
     public (double X, double Y) Origin(int index) =>
-        (Left + index % Columns * StepX, Top + index / Columns * StepY);
+        DownFirst
+            ? (Left + index / Rows * StepX, Top + index % Rows * StepY)
+            : (Left + index % Columns * StepX, Top + index / Columns * StepY);
+
+    /// <summary>The tile at a row and a column, possibly past the last, as <see cref="NestedGrid.IndexOf"/>.</summary>
+    public int IndexOf(int row, int column) => DownFirst ? column * Rows + row : row * Columns + column;
+
+    /// <summary>The row and the column of tile <paramref name="index"/>.</summary>
+    public (int Row, int Column) PlaceOf(int index) =>
+        DownFirst ? (index % Rows, index / Rows) : (index / Columns, index % Columns);
 
     public int IndexAt(double x, double y)
     {
@@ -275,9 +337,15 @@ public readonly record struct NestedFileGrid(
             return -1;
         }
 
-        var index = row * Columns + column;
+        var index = IndexOf(row, column);
         return index < Count ? index : -1;
     }
+
+    public GridBlock InReadingOrder(GridBlock block) => block.InReadingOrder(DownFirst);
+
+    public bool Holds(GridBlock block, int index) => InReadingOrder(block).Contains(index, Stride);
+
+    public int CountIn(GridBlock block) => InReadingOrder(block).CountIn(Count, Stride);
 
     public (int FirstColumn, int LastColumn, int FirstRow, int LastRow) Overlapping(
         double left,
@@ -402,6 +470,32 @@ public static class NestedLayout
     public static NestedGrid GridFor(int count) => GridFor(count, ContentHeight);
 
     /// <summary>
+    /// <see cref="GridFor(int, double)"/> read down first when
+    /// <paramref name="downFirst"/> says so.  The rows are the same either
+    /// way, and so is the size of a child; read down first, the columns are
+    /// only as many as the rows need - four children in three columns of two
+    /// rows fill two of them, where across they fill a row and a half - and
+    /// the block is centred on what it really takes.
+    /// </summary>
+    public static NestedGrid GridFor(int count, double height, bool downFirst)
+    {
+        var grid = GridFor(count, height);
+        if (!downFirst || grid.IsEmpty)
+        {
+            return grid;
+        }
+
+        var columns = (grid.Count + grid.Rows - 1) / grid.Rows;
+        var width = columns * grid.Scale + (columns - 1) * grid.Gap;
+        return grid with
+        {
+            Columns = columns,
+            Left = Padding + (ContentWidth - width) / 2,
+            DownFirst = true
+        };
+    }
+
+    /// <summary>
     /// The grid that gives <paramref name="count"/> equal sub-folders the largest
     /// size at which all of them fit in a strip <paramref name="height"/> tall
     /// directly under the header.
@@ -503,6 +597,22 @@ public static class NestedLayout
 
         var bestRows = (count + bestColumns - 1) / bestColumns;
         return new NestedFileGrid(count, bestColumns, bestRows, tileWidth, Padding, top);
+    }
+
+    /// <summary>
+    /// <see cref="FileGridFor(int, double, double)"/> read down first when
+    /// <paramref name="downFirst"/> says so: the same rows and tiles, and
+    /// only as many columns as the rows need.
+    /// </summary>
+    public static NestedFileGrid FileGridFor(int count, double top, double height, bool downFirst)
+    {
+        var grid = FileGridFor(count, top, height);
+        if (!downFirst || grid.IsEmpty)
+        {
+            return grid;
+        }
+
+        return grid with { Columns = (grid.Count + grid.Rows - 1) / grid.Rows, DownFirst = true };
     }
 
     /// <summary>The largest child size that fits <paramref name="columns"/> by <paramref name="rows"/> in a strip.</summary>

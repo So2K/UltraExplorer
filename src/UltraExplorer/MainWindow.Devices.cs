@@ -178,7 +178,7 @@ internal sealed class VolumeNotifications : IDisposable
     private readonly ChangeHub _hub;
     private readonly Dispatcher _dispatcher;
     private readonly Dictionary<IntPtr, WatchRoot> _byNotification = [];
-    private readonly Dictionary<WatchRoot, IntPtr> _byRoot = [];
+    private readonly Dictionary<WatchRoot, Registration> _byRoot = [];
     private readonly List<WatchRoot> _waitingForWindow = [];
     private IntPtr _window;
     private bool _disposed;
@@ -195,7 +195,18 @@ internal sealed class VolumeNotifications : IDisposable
     internal int RegisteredCount => _byRoot.Count;
 
     /// <summary>The notification registered on a watch's handle, or zero; for tests, which hand it back in the messages they make up.</summary>
-    internal IntPtr NotificationFor(WatchRoot root) => _byRoot.GetValueOrDefault(root);
+    internal IntPtr NotificationFor(WatchRoot root) => _byRoot.TryGetValue(root, out var registration) ? registration.Notification : IntPtr.Zero;
+
+    /// <summary>
+    /// The watch handle a root's notification was registered on, or null; for
+    /// tests.  Compared by reference: Windows hands out the numbers of closed
+    /// handles and of unregistered notifications again, so a number alone
+    /// cannot tell a registration on a new handle from one left on the old.
+    /// </summary>
+    internal SafeHandle? RegisteredHandleFor(WatchRoot root) => _byRoot.TryGetValue(root, out var registration) ? registration.Handle : null;
+
+    /// <summary>Notifications registered since this was made, for tests.</summary>
+    internal int Registrations { get; private set; }
 
     /// <summary>The window the notifications are sent to; watches armed before it had one are registered now.</summary>
     public void SetWindow(IntPtr window)
@@ -352,7 +363,8 @@ internal sealed class VolumeNotifications : IDisposable
             if (notification != IntPtr.Zero)
             {
                 _byNotification[notification] = root;
-                _byRoot[root] = notification;
+                _byRoot[root] = new Registration(notification, handle);
+                Registrations++;
             }
         }
         finally
@@ -364,12 +376,15 @@ internal sealed class VolumeNotifications : IDisposable
     private void Unregister(WatchRoot root)
     {
         _waitingForWindow.Remove(root);
-        if (_byRoot.Remove(root, out var notification))
+        if (_byRoot.Remove(root, out var registration))
         {
-            _byNotification.Remove(notification);
-            UnregisterDeviceNotification(notification);
+            _byNotification.Remove(registration.Notification);
+            UnregisterDeviceNotification(registration.Notification);
         }
     }
+
+    /// <summary>A notification, and the watch handle it was registered on.</summary>
+    private readonly record struct Registration(IntPtr Notification, SafeHandle Handle);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct BroadcastHeader

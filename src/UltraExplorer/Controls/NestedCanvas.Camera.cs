@@ -626,6 +626,40 @@ public sealed partial class NestedCanvas
     /// <summary>How much of the view's width a folder takes up for a change of order to hold it, rather than the folder around it, still.</summary>
     private const double FillsViewShare = 0.75;
 
+    /// <summary>
+    /// The folder the view is on, by the rule a change of order holds still
+    /// (see <see cref="OnTreeSortChanged"/>): the anchor when it fills most
+    /// of the view, otherwise the deepest folder covering the whole of it.
+    /// Null for an overview of This PC, which is no folder.  A walk up from
+    /// the anchor through the rectangles of the last picture, so it is cheap
+    /// enough to ask after every move of the camera.
+    /// </summary>
+    public NestedFolder? FolderInView
+    {
+        get
+        {
+            if (_tree is null || !_hasCamera || _anchor is null || _viewWidth <= 0)
+            {
+                return null;
+            }
+
+            if (_aw >= _viewWidth * FillsViewShare)
+            {
+                return _anchor.IsComputer ? null : _anchor;
+            }
+
+            for (var folder = _anchor; folder is not null; folder = folder.Parent)
+            {
+                if (_chain.TryGetValue(folder, out var rect) && Covers(rect.X, rect.Y, rect.W))
+                {
+                    return folder.IsComputer ? null : folder;
+                }
+            }
+
+            return null;
+        }
+    }
+
     private void AfterCameraMove()
     {
         _lastMotion = System.Diagnostics.Stopwatch.GetTimestamp();

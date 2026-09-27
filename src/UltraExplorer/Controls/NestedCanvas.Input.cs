@@ -882,18 +882,28 @@ public sealed partial class NestedCanvas
         {
             var folder = current.Folder;
             var files = folder.FileGrid;
-            var nextFile = Step(current.FileIndex, files.Columns, key);
+            var nextFile = Step(current.FileIndex, files.Columns, files.Rows, files.DownFirst, folder.Files.Count, key);
             if (nextFile >= 0 && nextFile < folder.Files.Count)
             {
                 return (folder, nextFile);
             }
 
-            // Up from the first row of files is the last row of sub-folders
-            // above them, the one nearest along the row.
-            if (key == Key.Up && folder.Children.Count > 0 && current.FileIndex < files.Columns)
+            if (key == Key.Up && folder.Children.Count > 0)
             {
-                var (fx, _) = files.Origin(current.FileIndex);
-                return (Nearest(folder.Children, folder.Grid, fx + files.TileWidth / 2, lastRow: true), -1);
+                // Read down first, up from the first file is the sub-folder
+                // before it in the order: the last one.
+                if (files.DownFirst)
+                {
+                    return current.FileIndex == 0 ? (folder.Children[^1], -1) : null;
+                }
+
+                // Across, up from the first row of files is the last row of
+                // sub-folders above them, the one nearest along the row.
+                if (current.FileIndex < files.Columns)
+                {
+                    var (fx, _) = files.Origin(current.FileIndex);
+                    return (Nearest(folder.Children, folder.Grid, fx + files.TileWidth / 2, lastRow: true), -1);
+                }
             }
 
             return null;
@@ -901,10 +911,19 @@ public sealed partial class NestedCanvas
 
         var parent = current.Folder.Parent!;
         var grid = parent.Grid;
-        var next = Step(current.Folder.Index, grid.Columns, key);
+        var next = Step(current.Folder.Index, grid.Columns, grid.Rows, grid.DownFirst, parent.Children.Count, key);
         if (next >= 0 && next < parent.Children.Count)
         {
             return (parent.Children[next], -1);
+        }
+
+        // Read down first, down from the last sub-folder is the first file,
+        // the next item in the order.
+        if (grid.DownFirst)
+        {
+            return key == Key.Down && parent.Files.Count > 0 && current.Folder.Index == parent.Children.Count - 1
+                ? (parent, 0)
+                : null;
         }
 
         // Down past the last row of sub-folders is the first row of the files under them.
@@ -929,13 +948,41 @@ public sealed partial class NestedCanvas
         return children[first + column];
     }
 
-    private static int Step(int index, int columns, Key key) => key switch
+    /// <summary>
+    /// The place an arrow moves to in a grid of <paramref name="count"/>
+    /// items, before it is checked against the ends.  Read across, left and
+    /// right are the item before and after and up and down a row's length
+    /// away; read down first, up and down are the item before and after and
+    /// left and right a column's length away - and right from a row the
+    /// short last column does not reach is its last item, as Explorer's
+    /// List view has it, rather than nowhere.
+    /// </summary>
+    internal static int Step(int index, int columns, int rows, bool downFirst, int count, Key key)
     {
-        Key.Left => index - 1,
-        Key.Right => index + 1,
-        Key.Up => index - columns,
-        _ => index + columns
-    };
+        if (!downFirst)
+        {
+            return key switch
+            {
+                Key.Left => index - 1,
+                Key.Right => index + 1,
+                Key.Up => index - columns,
+                _ => index + columns
+            };
+        }
+
+        switch (key)
+        {
+            case Key.Up:
+                return index - 1;
+            case Key.Down:
+                return index + 1;
+            case Key.Left:
+                return index - rows;
+            default:
+                var next = index + rows;
+                return next >= count && rows > 0 && index / rows < (count - 1) / rows ? count - 1 : next;
+        }
+    }
 
     /// <summary>
     /// Brings what an arrow key moved to into view.  Readable but off screen,

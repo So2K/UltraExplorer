@@ -181,6 +181,25 @@ internal static partial class Program
         at = FirstDelivery(hub, time, sink, 5000);
         Check($"however quick the read, the next refresh waits 250 ms ({at} ms)", at == 250);
 
+        // A refresh reported while a change is already pending - the tree read
+        // the folder again on its own, because a sub-folder of it on screen
+        // went - leaves that change its time: the folder list has not seen it.
+        sink.Clear();
+        time.Advance(1_000);
+        Feed(hub, watch, (4, @"A\old"), (5, @"A\new"));
+        time.Advance(100);
+        hub.ReportRefresh(path, 1, 0.1, listingChanged: true);
+        at = FirstDelivery(hub, time, sink, 5000);
+        Check($"a change heard before a refresh was reported keeps its time: handed on {100 + at} ms after it was heard (150), not held to the gap",
+            at == 50 && sink.Changes.Count == 1);
+
+        // What is heard after the report still waits for the gap.
+        sink.Clear();
+        hub.ReportRefresh(path, 1, 0.1, listingChanged: true);
+        Feed(hub, watch, (1, @"A\three.txt"));
+        at = FirstDelivery(hub, time, sink, 5000);
+        Check($"a change heard after the report waits for the gap ({at} ms)", at == 250);
+
         // A steady stream into a folder refreshed as soon as it is due.
         sink.Clear();
         var refreshes = new List<double>();
@@ -273,6 +292,24 @@ internal static partial class Program
         sink.Clear();
         hub.ReportRefresh(path, 3, 1, listingChanged: true);
         Check("a recheck that finds the change ends the rechecks", FirstDelivery(hub, time, sink, 30_000) < 0);
+
+        // A change heard on a share while its folder was being read keeps its
+        // time when the read found nothing new: the recheck the report asks
+        // for rides on it rather than holding it to the gap.
+        var (share, shareTime, shareRoot, shareSink) = FedHub(Path.Combine(root, "recheck-heard"), WatchKind.Network);
+        using var ___ = share;
+        var sharePath = Path.Combine(shareRoot.Key, "A");
+        share.Register(ChangeConsumer.Nested, sharePath, folder);
+        Feed(share, shareRoot, (1, @"A\one.txt"));
+        FirstDelivery(share, shareTime, shareSink, 2000);
+        shareSink.Clear();
+        shareTime.Advance(100);
+        Feed(share, shareRoot, (4, @"A\old"), (5, @"A\new"));
+        shareTime.Advance(100);
+        share.ReportRefresh(sharePath, 1, 0.1, listingChanged: false);
+        var heardAt = FirstDelivery(share, shareTime, shareSink, 5000);
+        Check($"on a share, a change heard during a read that found nothing keeps its time: handed on {100 + heardAt} ms after it was heard (300), not held to the gap",
+            heardAt == 200 && shareSink.Changes.Count == 1);
 
         // A local folder is never rechecked.
         var (local, localTime, localRoot, localSink) = FedHub(Path.Combine(root, "recheck-local"));

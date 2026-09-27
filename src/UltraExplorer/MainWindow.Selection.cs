@@ -98,6 +98,9 @@ public partial class MainWindow
     /// <summary>Any other change: the canvas takes it in, unless it is not the picture on show.</summary>
     private void OnSharedSelectionChanged(ItemSelection selection)
     {
+        // The headers are for the folder selected, or the one the selection is in.
+        UpdateSortHeaders();
+
         if (!_applyingCanvasSelection && IsNested && _nestedReady)
         {
             Nested.LoadSelection(selection);

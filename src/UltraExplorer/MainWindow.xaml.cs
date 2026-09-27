@@ -205,7 +205,13 @@ public partial class MainWindow : Window
             return;
         }
 
-        FocusCanvas();
+        // A test copy on the other monitor must not take the keyboard: focusing
+        // an element activates its window, which ShowActivated alone does not stop.
+        if (!IsTestWindow)
+        {
+            FocusCanvas();
+        }
+
         await RunSelectionDemoAsync();
     }
 
@@ -1170,9 +1176,11 @@ public partial class MainWindow : Window
             "Ctrl+V");
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
+        // Sort by orders the folder clicked in; outside every folder, all of them.
+        var sortFolder = area is { IsDirectory: true } ? area.FullPath : null;
         if (IsNested)
         {
-            AddSortItems(menu);
+            AddSortItems(menu, sortFolder);
             AddHiddenFolderItems(menu);
             AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
             AddLayoutItems(menu);
@@ -1183,7 +1191,7 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
         AddCommandItem(menu, "Collapse every branch", "\uE72B", _viewModel.CollapseAllCommand);
         AddCommandItem(menu, "Tidy the layout", "\uE8AB", _viewModel.RelayoutCommand);
-        AddSortItems(menu);
+        AddSortItems(menu, sortFolder);
         AddHiddenFolderItems(menu);
         AddCommandItem(menu, "Folder list", "\uE8FD", _viewModel.ToggleFolderListCommand);
         AddCommandItem(menu, "Minimap", "\uE81E", _viewModel.ToggleMinimapCommand);
@@ -1192,15 +1200,36 @@ public partial class MainWindow : Window
     }
 
     /// <summary>
-    /// Explorer's "Sort by": the four columns, then which way round, each a
-    /// checkable item showing the current choice.  Picking another column
-    /// starts it its own way - names and types from A, dates and sizes from
-    /// the newest and largest - as a click on its header would.
+    /// Explorer's "Sort by" for <paramref name="folder"/> - every folder when
+    /// there is none, or when folders are all sorted the same: the four
+    /// columns, then which way round, each a checkable item showing the
+    /// current choice.  Picking another column starts it its own way - names
+    /// and types from A, dates and sizes from the newest and largest - as a
+    /// click on its header would.  While each folder has its own order, the
+    /// folder's order can be made every folder's, or let go of for the
+    /// default.
     /// </summary>
-    private void AddSortItems(ItemsControl menu)
+    private void AddSortItems(ItemsControl menu, string? folder)
     {
-        var sort = _viewModel.Sort;
+        var orders = _viewModel.Orders;
+        var perFolder = orders.Scope == SortScope.PerFolder;
+        if (!perFolder)
+        {
+            folder = null;
+        }
+
+        var sort = orders.SortOf(folder);
         var group = new MenuItem { Header = "Sort by" };
+        if (perFolder)
+        {
+            group.Items.Add(new MenuItem
+            {
+                Header = folder is null ? "Every folder without its own order" : $"This folder: {FolderName(folder)}",
+                IsEnabled = false
+            });
+            group.Items.Add(new Separator());
+        }
+
         foreach (var column in Enum.GetValues<SortColumn>())
         {
             var item = new MenuItem
@@ -1212,9 +1241,10 @@ public partial class MainWindow : Window
             var chosen = column;
             item.Click += (_, _) =>
             {
-                if (_viewModel.Sort.Column != chosen)
+                var now = orders.SortOf(folder);
+                if (now.Column != chosen)
                 {
-                    _viewModel.Sort = _viewModel.Sort.Click(chosen);
+                    orders.Choose(folder, now.Click(chosen));
                 }
             };
             group.Items.Add(item);
@@ -1230,11 +1260,79 @@ public partial class MainWindow : Window
                 IsChecked = sort.Descending == descending
             };
             var way = descending;
-            item.Click += (_, _) => _viewModel.Sort = _viewModel.Sort with { Descending = way };
+            item.Click += (_, _) => orders.Choose(folder, orders.SortOf(folder) with { Descending = way });
             group.Items.Add(item);
         }
 
+        if (perFolder)
+        {
+            group.Items.Add(new Separator());
+            var everywhere = new MenuItem
+            {
+                Header = "Use this order for all folders",
+                IsEnabled = orders.Count > 0 || sort != orders.Default,
+                ToolTip = "Every folder in this order, and every folder's own order let go of"
+            };
+            everywhere.Click += (_, _) => orders.UseEverywhere(orders.SortOf(folder));
+            group.Items.Add(everywhere);
+
+            var reset = new MenuItem
+            {
+                Header = "Reset this folder to the default order",
+                IsEnabled = folder is not null && orders.HasOwnOrder(folder),
+                ToolTip = $"Back to {ItemSort.Describe(orders.Default.Column)}, {DirectionText(orders.Default.Column, orders.Default.Descending)}, as every folder without its own order"
+            };
+            reset.Click += (_, _) =>
+            {
+                if (folder is not null)
+                {
+                    orders.ResetFolder(folder);
+                }
+            };
+            group.Items.Add(reset);
+        }
+
         menu.Items.Add(group);
+    }
+
+    /// <summary>
+    /// Canvas options ▸ Order and Sort: which way a folder's items fill its
+    /// grid - down each column, as a list reads (the default), or along each
+    /// row as before - and whether a header sorts the folder it is used on
+    /// (the default) or every folder the same, as before.
+    /// </summary>
+    private void AddArrangeItems(ItemsControl menu)
+    {
+        var orders = _viewModel.Orders;
+        var flow = new MenuItem { Header = "Order" };
+        foreach (var (choice, name, tip) in new[]
+        {
+            (LayoutOrder.DownThenAcross, "Down, then across", "Each folder's items go down the first column, then down the next, as a list reads"),
+            (LayoutOrder.AcrossThenDown, "Across, then down", "Each folder's items go along the first row, then along the next")
+        })
+        {
+            var item = new MenuItem { Header = name, IsCheckable = true, IsChecked = orders.Flow == choice, ToolTip = tip };
+            var chosen = choice;
+            item.Click += (_, _) => orders.Flow = chosen;
+            flow.Items.Add(item);
+        }
+
+        menu.Items.Add(flow);
+
+        var scope = new MenuItem { Header = "Sort" };
+        foreach (var (choice, name, tip) in new[]
+        {
+            (SortScope.PerFolder, "Each folder separately", "A header or Sort by orders the folder it is used on; every other folder keeps its own order"),
+            (SortScope.AllFolders, "All folders the same", "A header or Sort by orders every folder; the folders' own orders wait until this is switched back")
+        })
+        {
+            var item = new MenuItem { Header = name, IsCheckable = true, IsChecked = orders.Scope == choice, ToolTip = tip };
+            var chosen = choice;
+            item.Click += (_, _) => orders.Scope = chosen;
+            scope.Items.Add(item);
+        }
+
+        menu.Items.Add(scope);
     }
 
     /// <summary>
@@ -1341,7 +1439,8 @@ public partial class MainWindow : Window
         }
 
         AddCheckableItem(menu, "Hidden items", _viewModel.Tree.ShowHiddenItems, _viewModel.ToggleHiddenItemsCommand);
-        AddSortItems(menu);
+        AddSortItems(menu, SortFolder());
+        AddArrangeItems(menu);
         if (IsNested)
         {
             AddLeftDragItems(menu);

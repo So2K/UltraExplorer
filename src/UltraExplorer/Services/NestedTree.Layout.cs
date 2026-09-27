@@ -7,9 +7,9 @@ using UltraExplorer.Models;
 namespace UltraExplorer.Services;
 
 // Placing: which children are cells - the hidden, the user's hidden and
-// the ones asked for by name - where each one goes in the current order,
+// the ones asked for by name - where each one goes in its folder's order,
 // and the background pass that places the whole tree again, a few
-// milliseconds at a time, after the order changes.
+// milliseconds at a time, after a change that can reach every folder.
 public sealed partial class NestedTree
 {
     private readonly HashSet<string> _userHidden = new(StringComparer.OrdinalIgnoreCase);
@@ -38,15 +38,7 @@ public sealed partial class NestedTree
     /// </summary>
     private static readonly long MinimumSliceTicks = Stopwatch.Frequency / 2000;
 
-    private ItemSort _sort = ItemSort.Default;
-
-    /// <summary>
-    /// The order each <see cref="SortGeneration"/> stood for, by generation.
-    /// A folder placed for an order that has since come back - names from A,
-    /// after a look at the dates - needs only its stamp brought up to date,
-    /// not placing again.
-    /// </summary>
-    private readonly List<ItemSort> _sortHistory = [ItemSort.Default];
+    private FolderOrders _orders;
 
     /// <summary>Folders the background pass after a change of order has still to visit, shallowest first.</summary>
     private readonly Queue<NestedFolder> _sortSweep = new();
@@ -80,7 +72,7 @@ public sealed partial class NestedTree
 
     /// <summary>
     /// Whether reads look up their files' type names before they come back,
-    /// which is while the order is by type: read by the reading threads.
+    /// which is while any folder is ordered by type: read by the reading threads.
     /// </summary>
     private volatile bool _warmTypeNames;
 
@@ -158,27 +150,90 @@ public sealed partial class NestedTree
     }
 
     /// <summary>
-    /// Orders every folder's sub-folders and files by <paramref name="sort"/>
-    /// from now on.  Nothing is placed again here: <see cref="SortChanged"/>
-    /// is raised, and a background pass starts that re-places every folder
-    /// read so far, shallowest first, a few milliseconds at a time, and raises
-    /// <see cref="Changed"/> once at the end if it moved something on the
-    /// canvas.  Whatever is drawn or looked at before the pass gets to it is
-    /// placed on the spot by <see cref="EnsureLayout"/>.  With no
-    /// <see cref="PostBackground"/> - a thread with nothing to post to - the
-    /// whole pass runs here, straight after the event.
+    /// Orders every folder without an order of its own by <paramref name="sort"/>
+    /// from now on: the default of <see cref="Orders"/>, placed as any change
+    /// that can reach every folder is (see <see cref="OnOrdersChanged"/>).
     /// </summary>
-    public void SetSort(ItemSort sort)
+    public void SetSort(ItemSort sort) => _orders.SetDefault(sort);
+
+    /// <summary>The order a folder is placed in: its own, or the default; This PC's drives always keep theirs.</summary>
+    public ItemSort SortOf(NestedFolder folder) =>
+        folder.IsComputer ? ItemSort.Default : _orders.HasFolderOrders ? _orders.SortOf(folder.FullPath) : _orders.Default;
+
+    /// <summary>
+    /// Whether a folder's grids fill a column at a time.  This PC's drives
+    /// always go along a row: they are the first row of cells, however the
+    /// folders inside them are read.
+    /// </summary>
+    private bool DownFirstIn(NestedFolder folder) => !folder.IsComputer && _orders.DownFirst;
+
+    /// <summary>
+    /// An order changed.  One folder's own (<paramref name="path"/>): that
+    /// folder is placed again here and now, if it has been read - it is the
+    /// one being looked at, and it is one folder - and every other folder
+    /// finds on its next look that it is still placed in its order.  Anything
+    /// else: nothing is placed again here; <see cref="SortChanged"/> is
+    /// raised, and a background pass starts that re-places every folder read
+    /// so far whose order is not the one it was placed in, shallowest first,
+    /// a few milliseconds at a time, and raises <see cref="Changed"/> once at
+    /// the end if it moved something on the canvas.  Whatever is drawn or
+    /// looked at before the pass gets to it is placed on the spot by
+    /// <see cref="EnsureLayout"/>.  With no <see cref="PostBackground"/> - a
+    /// thread with nothing to post to - the whole pass runs here, straight
+    /// after the event.
+    /// </summary>
+    private void OnOrdersChanged(string? path)
     {
-        if (sort == _sort)
+        var started = Stopwatch.GetTimestamp();
+        try
+        {
+            TakeOrderChange(path);
+        }
+        finally
+        {
+            LastOrderChangeMilliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+        }
+    }
+
+    /// <summary>
+    /// What the last change of order cost here, the canvas's part included -
+    /// it notes what it is looking at on <see cref="SortChanged"/> - and
+    /// nothing of the rest of the window's.  For the bench, which times a
+    /// click on a header as a whole and needs the canvas's share of it apart.
+    /// </summary>
+    internal double LastOrderChangeMilliseconds { get; private set; }
+
+    private void TakeOrderChange(string? path)
+    {
+        _warmTypeNames = _orders.Uses(SortColumn.Type);
+        if (_disposed)
         {
             return;
         }
 
-        _sort = sort;
+        if (path is not null)
+        {
+            // Not read yet, or not in the tree at all: it is placed in its
+            // order when it is read.  Placed in that order already - its own
+            // order set to what it showed anyway - nothing moves.
+            if (Find(path) is not { LayoutSortGeneration: >= 0 } folder
+                || folder.PlacedSort == SortOf(folder) && folder.PlacedDownFirst == DownFirstIn(folder))
+            {
+                return;
+            }
+
+            // A new generation all the same: whatever keeps something by the
+            // order the tree is in - the canvas's list of matches, say -
+            // knows to look again.  Every other folder's next look finds it
+            // placed in its own order and only moves its stamp on.
+            SortGeneration++;
+            SortChanged?.Invoke();
+            EnsureLayout(folder);
+            RaiseChanged();
+            return;
+        }
+
         SortGeneration++;
-        _sortHistory.Add(sort);
-        _warmTypeNames = sort.Column == SortColumn.Type;
 
         // A pass already under way starts again from the top; a slice it has
         // already queued simply carries on with the new list.  Queued before
@@ -189,10 +244,7 @@ public sealed partial class NestedTree
         _sortFirst.Clear();
         _sortMovedCanvas = false;
         _placedOnDemandTicks = 0;
-        if (!_disposed)
-        {
-            _sortSweep.Enqueue(Root);
-        }
+        _sortSweep.Enqueue(Root);
 
         SortChanged?.Invoke();
         ScheduleSortSlice();
@@ -364,12 +416,16 @@ public sealed partial class NestedTree
 
     /// <summary>
     /// Decides which children are cells and where each one goes, in the
-    /// current <see cref="Sort"/>, and stamps the folder as placed for it.
-    /// Under names from A this is exactly what it always was: the listing's
-    /// own order, and the listing itself as the files whenever none is hidden.
+    /// folder's order (<see cref="SortOf"/>), and stamps the folder as placed
+    /// for it.  Under names from A this is exactly what it always was: the
+    /// listing's own order, and the listing itself as the files whenever none
+    /// is hidden.
     /// </summary>
     private void ApplyVisibleChildren(NestedFolder folder)
     {
+        var sort = SortOf(folder);
+        var downFirst = DownFirstIn(folder);
+
         // Only folders with a hidden or forced child look paths up; the rest
         // decide by attribute alone, which is what keeps placing a folder of
         // fifty thousand sub-folders cheap.
@@ -413,16 +469,17 @@ public sealed partial class NestedTree
         // This PC's drives keep the order they were given in; everywhere else
         // the chosen order applies.  Names from A is the order the listings
         // already have, so it asks for nothing at all.
-        var listingOrder = _sort.IsDefault || folder.IsComputer;
+        var listingOrder = sort.IsDefault || folder.IsComputer;
         IReadOnlyList<NestedFile> files;
         if (!listingOrder)
         {
             // Only which cell and which tile each one gets changes: the grids
             // depend on how many there are, not on which is which.
-            OrderFolders(visible);
+            OrderFolders(visible, sort);
             files = OrderFiles(
                 folder.AllFiles,
-                _includeHidden || folder.HiddenFileCount == 0 ? null : ShownIndices(folder.AllFiles, IsShown));
+                _includeHidden || folder.HiddenFileCount == 0 ? null : ShownIndices(folder.AllFiles, IsShown),
+                sort);
         }
         else if (_includeHidden || folder.HiddenFileCount == 0)
         {
@@ -438,7 +495,7 @@ public sealed partial class NestedTree
         // them: the folder grid is fitted into its share first, then the files
         // get every bit of height the folders did not actually use.
         var (folderHeight, _) = NestedLayout.Split(visible.Count, files.Count);
-        var grid = NestedLayout.GridFor(visible.Count, folderHeight);
+        var grid = NestedLayout.GridFor(visible.Count, folderHeight, downFirst);
         for (var index = 0; index < visible.Count; index++)
         {
             var child = visible[index];
@@ -457,9 +514,12 @@ public sealed partial class NestedTree
         folder.FileGrid = NestedLayout.FileGridFor(
             files.Count,
             NestedLayout.HeaderHeight + used,
-            NestedLayout.ContentHeight - used);
+            NestedLayout.ContentHeight - used,
+            downFirst);
         folder.UnlistedFileCount = Math.Max(0, folder.FileCount - folder.AllFiles.Length);
         folder.LayoutSortGeneration = SortGeneration;
+        folder.PlacedSort = sort;
+        folder.PlacedDownFirst = downFirst;
     }
 
     /// <summary>
@@ -537,7 +597,7 @@ public sealed partial class NestedTree
     }
 
     /// <summary>
-    /// Places a folder for the current order if it is not yet; true when it
+    /// Places a folder for its current order if it is not yet; true when it
     /// actually had to be placed again, rather than being up to date or only
     /// needing its stamp moved on.
     /// </summary>
@@ -549,15 +609,20 @@ public sealed partial class NestedTree
             return false;
         }
 
-        // Placed for an order that is the current one again, or with too
-        // little in it for any order to differ - one sub-folder and one file
-        // go where they go - or This PC, whose drives are never reordered:
-        // the places are right, only the stamp is old.
-        if (_sortHistory[stamp] == _sort
+        // Placed in the order it has now - another folder was sorted, or
+        // its own order came back - or with too little in it for any order
+        // to differ - one sub-folder and one file go where they go - or This
+        // PC, whose drives are never reordered: the places are right, only
+        // the stamp is old.
+        var sort = SortOf(folder);
+        var downFirst = DownFirstIn(folder);
+        if (folder.PlacedSort == sort && folder.PlacedDownFirst == downFirst
             || folder.IsComputer
             || folder.Children.Count < 2 && folder.Files.Count < 2)
         {
             folder.LayoutSortGeneration = SortGeneration;
+            folder.PlacedSort = sort;
+            folder.PlacedDownFirst = downFirst;
             return false;
         }
 
@@ -713,11 +778,11 @@ public sealed partial class NestedTree
     }
 
     /// <summary>
-    /// Puts the shown sub-folders in the current order.  Only names from Z
-    /// and dates move folders: a folder has no size and every folder has the
+    /// Puts the shown sub-folders in <paramref name="sort"/>.  Only names from
+    /// Z and dates move folders: a folder has no size and every folder has the
     /// same type, so under those two they tie, and ties stay in name order.
     /// </summary>
-    private void OrderFolders(List<NestedFolder> visible)
+    private static void OrderFolders(List<NestedFolder> visible, ItemSort sort)
     {
         var count = visible.Count;
         if (count < 2)
@@ -725,14 +790,14 @@ public sealed partial class NestedTree
             return;
         }
 
-        if (_sort.Column == SortColumn.Name)
+        if (sort.Column == SortColumn.Name)
         {
             // Only names from Z get here, and they are the listing backwards.
             visible.Reverse();
             return;
         }
 
-        if (_sort.Column != SortColumn.Modified)
+        if (sort.Column != SortColumn.Modified)
         {
             return;
         }
@@ -743,7 +808,7 @@ public sealed partial class NestedTree
         {
             for (var index = 0; index < count; index++)
             {
-                keys[index] = KeyOf(visible[index].ModifiedTicks);
+                keys[index] = KeyOf(visible[index].ModifiedTicks, sort.Descending);
             }
 
             if (!SortByKeys(keys, order, count))
@@ -788,7 +853,7 @@ public sealed partial class NestedTree
     }
 
     /// <summary>
-    /// The shown files in the current order: the listing itself when every
+    /// The shown files in <paramref name="sort"/>: the listing itself when every
     /// file is shown and the order comes out as name order anyway - every
     /// file the same type, or the same date - and otherwise the listing with
     /// the order to walk it in.  An index per file rather than a copy of every
@@ -797,13 +862,13 @@ public sealed partial class NestedTree
     /// </summary>
     /// <param name="all">Every file the folder read, in name order.</param>
     /// <param name="shownFrom">The indices of the shown ones, in name order; null when all of them are.</param>
-    private IReadOnlyList<NestedFile> OrderFiles(NestedFile[] all, int[]? shownFrom)
+    private IReadOnlyList<NestedFile> OrderFiles(NestedFile[] all, int[]? shownFrom, ItemSort sort)
     {
         var count = shownFrom?.Length ?? all.Length;
         int[]? order = null;
         if (count >= 2)
         {
-            switch (_sort.Column)
+            switch (sort.Column)
             {
                 case SortColumn.Name:
                     // Only names from Z get here, and they are the listing backwards.
@@ -817,13 +882,13 @@ public sealed partial class NestedTree
 
                 case SortColumn.Modified:
                 case SortColumn.Size:
-                    var byDate = _sort.Column == SortColumn.Modified;
+                    var byDate = sort.Column == SortColumn.Modified;
                     var keys = ArrayPool<long>.Shared.Rent(count);
                     order = new int[count];
                     for (var index = 0; index < count; index++)
                     {
                         var file = all[shownFrom is null ? index : shownFrom[index]];
-                        keys[index] = KeyOf(byDate ? file.ModifiedTicks : file.Length);
+                        keys[index] = KeyOf(byDate ? file.ModifiedTicks : file.Length, sort.Descending);
                     }
 
                     if (!SortByKeys(keys, order, count))
@@ -835,7 +900,7 @@ public sealed partial class NestedTree
                     break;
 
                 default:
-                    order = TypeOrder(all, shownFrom, count);
+                    order = TypeOrder(all, shownFrom, count, sort.Descending);
                     break;
             }
         }
@@ -858,8 +923,8 @@ public sealed partial class NestedTree
         return new NestedFileOrder(all, order, isNameOrder: false);
     }
 
-    /// <summary>A key that sorts the current way round: largest first by flipping every bit, which cannot overflow.</summary>
-    private long KeyOf(long value) => _sort.Descending ? ~value : value;
+    /// <summary>A key that sorts the chosen way round: largest first by flipping every bit, which cannot overflow.</summary>
+    private static long KeyOf(long value, bool descending) => descending ? ~value : value;
 
     /// <summary>
     /// Fills <paramref name="order"/> with the first <paramref name="count"/>
@@ -905,7 +970,7 @@ public sealed partial class NestedTree
     /// handful of kinds - and then the files are sorted by rank and index
     /// packed into one number, so no string is compared per file at all.
     /// </summary>
-    private int[]? TypeOrder(NestedFile[] all, int[]? shownFrom, int count)
+    private int[]? TypeOrder(NestedFile[] all, int[]? shownFrom, int count, bool descending)
     {
         var kinds = _typeKinds;
         var slots = _typeSlots;
@@ -970,7 +1035,6 @@ public sealed partial class NestedTree
             }
 
             var keys = ArrayPool<long>.Shared.Rent(count);
-            var descending = _sort.Descending;
             for (var index = 0; index < count; index++)
             {
                 var kindRank = ranks[slotOf[index]];

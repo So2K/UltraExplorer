@@ -191,6 +191,11 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     private Dictionary<(string Folder, string Name), FileFacts> _oldFileFacts = new(ReferenceKeyComparer.Instance);
     private readonly NumberTexts _sizeTexts = new(8192);
     private readonly NumberTexts _detailTexts = new(2048);
+
+    // A file's time as its tile says it, by the minute: with the time, and
+    // the date alone where a tile is too narrow for both.
+    private readonly NumberTexts _minuteTexts = new(8192);
+    private readonly NumberTexts _dayTexts = new(4096);
     private readonly NumberTexts _noteTexts = new(256);
     private double _minCell = MinimumCellPixels;
 
@@ -449,10 +454,10 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     }
 
     /// <summary>
-    /// The order sub-folders and files are placed in, row by row, in every
-    /// folder; the tree's, which is where it lives.  Setting it keeps the
-    /// folder being looked at where it is on screen and reorders what is
-    /// inside it.
+    /// The default order sub-folders and files are placed in: every folder's
+    /// that has none of its own (see <see cref="NestedTree.Orders"/>).  The
+    /// tree's, which is where it lives.  Setting it keeps the folder being
+    /// looked at where it is on screen and reorders what is inside it.
     /// </summary>
     public ItemSort Sort
     {

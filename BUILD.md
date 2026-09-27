@@ -10,6 +10,18 @@ dotnet build UltraExplorer.sln -c Debug
 
 Both configurations build with `0 Warning(s), 0 Error(s)`.
 
+## Install
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Launch
+```
+
+Publishes Release into `%LOCALAPPDATA%\Programs\UltraExplorer` and adds an
+UltraExplorer shortcut to the Start menu, so Windows Search and launchers find
+it. Run it again to update: it closes the installed copy (which saves its
+state), replaces it and, with `-Launch`, starts it. `-Desktop` also adds a
+desktop shortcut. Settings stay in `%LOCALAPPDATA%\UltraExplorer`.
+
 ## Run
 
 ```powershell
@@ -152,7 +164,7 @@ failure is written next to the output as `*.error.txt`.
 
 `ULTRAEXPLORER_TEST_WINDOW=1` opens an ordinary copy the same way — on the
 other monitor, without taking the keyboard — to try a build beside the
-everyday one.
+everyday one. `ViewAllSmoke --only <Group,...>` runs only the named check groups.
 
 ## Where state lives
 

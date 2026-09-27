@@ -68,14 +68,14 @@ public partial class MainWindow
 
         public void Switch(MainWindow window, ItemSort sort)
         {
-            // The canvas's part first, on its own, then the rest of what a
-            // click does - the tree, the list, the headers - which finds the
-            // canvas's tree already in the new order.
+            // One change of the orders the window shares reaches everything
+            // a click does - the canvas's tree, the tree view, the list, the
+            // headers - so the whole is timed here and the canvas's part is
+            // the tree's own measure of its handler.
             var watch = Stopwatch.StartNew();
-            window._nestedTree.SetSort(sort);
-            WorstCanvasMilliseconds = Math.Max(WorstCanvasMilliseconds, watch.Elapsed.TotalMilliseconds);
             window._viewModel.Sort = sort;
             watch.Stop();
+            WorstCanvasMilliseconds = Math.Max(WorstCanvasMilliseconds, window._nestedTree.LastOrderChangeMilliseconds);
             Clicks++;
             if (window._nestedTree.IsSorting)
             {
@@ -1170,16 +1170,25 @@ public partial class MainWindow
             new("13-sort-date", @"C:\Windows", 0.92, 1, Sort: new ItemSort(SortColumn.Modified, true)),
             new("14-sort-size-files", @"C:\Windows\System32", 0.92, 6, Sort: new ItemSort(SortColumn.Size, true)),
             new("15-sort-type-files", @"C:\Windows\System32", 0.92, 6, Sort: new ItemSort(SortColumn.Type, false)),
+            new("16-own-order-windows", @"C:\Windows", 0.92, 1, Sort: new ItemSort(SortColumn.Modified, true), Own: true),
+            new("17-across-system32-files", @"C:\Windows\System32", 0.92, 6, Across: true),
         ];
 
         // The same views with the strip over the canvas, headers and all: the
         // pictures above stay the canvas alone, to compare pixel for pixel.
         var withStrip = Path.Combine(folder, "with-strip");
         Directory.CreateDirectory(withStrip);
-        foreach (var (name, path, fill, zoom, filter, sort) in scenes)
+        var orders = _viewModel.Orders;
+        foreach (var (name, path, fill, zoom, filter, sort, own, across) in scenes)
         {
             Nested.SetFilter(filter);
-            _viewModel.Sort = sort ?? ItemSort.Default;
+            orders.Flow = across ? LayoutOrder.AcrossThenDown : LayoutOrder.DownThenAcross;
+            orders.UseEverywhere(own ? ItemSort.Default : sort ?? ItemSort.Default);
+            if (own && path is not null && sort is { } folderSort)
+            {
+                orders.SetFolder(ViewAllPath.Normalize(path), folderSort);
+            }
+
             if (path is null)
             {
                 Nested.FitAll(animated: false);
@@ -1209,18 +1218,25 @@ public partial class MainWindow
 
         // Written now: the run exits before the window is ever idle enough
         // to write it by itself.
-        _viewModel.Sort = ItemSort.Default;
+        orders.UseEverywhere(ItemSort.Default);
+        orders.Flow = LayoutOrder.DownThenAcross;
         await _viewModel.SaveNowAsync();
     }
 
-    /// <summary>One view the snapshots render: where, how far in, and with what filter and order.</summary>
+    /// <summary>
+    /// One view the snapshots render: where, how far in, and with what filter
+    /// and order - every folder's, or with <paramref name="Own"/> the folder's
+    /// own alone - read down first unless <paramref name="Across"/>.
+    /// </summary>
     private sealed record SnapshotScene(
         string Name,
         string? Path,
         double Fill,
         double Zoom,
         string Filter = "",
-        ItemSort? Sort = null);
+        ItemSort? Sort = null,
+        bool Own = false,
+        bool Across = false);
 
     private void Save(FrameworkElement element, string path)
     {

@@ -308,9 +308,13 @@ internal static partial class Program
         var sink = new WatchSink();
         var calling = Environment.CurrentManagedThreadId;
         var armedOn = 0;
-        hub.RootArmed += _ => armedOn = Environment.CurrentManagedThreadId;
+        hub.RootArmed += _ => Volatile.Write(ref armedOn, Environment.CurrentManagedThreadId);
         var watch = hub.AddRootForTests(folder);
-        Check("a watch arms off the calling thread", WaitFor(() => watch.State == WatchState.Armed) && armedOn != 0 && armedOn != calling);
+        // The state is set under the root's lock and the event raised after
+        // it, on the arming thread: both are waited for, or the check reads
+        // the thread a moment before the event has named it.
+        var armedThread = WaitFor(() => watch.State == WatchState.Armed && Volatile.Read(ref armedOn) != 0) ? Volatile.Read(ref armedOn) : 0;
+        Check($"a watch arms off the calling thread ({watch.State}, armed on thread {armedThread}, called from {calling})", armedThread != 0 && armedThread != calling);
         Check($"and asks for extended records on NTFS ({watch.Watcher?.HasDetails}), in {watch.ArmMilliseconds:F2} ms", watch.Watcher?.HasDetails == true && watch.Handle is { IsInvalid: false });
         Check("arming moves the epoch on", watch.Epoch == 1);
 

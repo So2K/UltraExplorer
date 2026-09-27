@@ -28,6 +28,12 @@ internal static partial class Program
             return PickerComClient.Run(args);
         }
 
+        var only = Array.FindIndex(args, argument => argument.Equals("--only", StringComparison.OrdinalIgnoreCase));
+        if (only >= 0 && only + 1 < args.Length)
+        {
+            _only = args[only + 1].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        }
+
         var fixtureRoot = Path.Combine(Path.GetTempPath(), "UltraExplorerSmoke", Guid.NewGuid().ToString("N"));
         try
         {
@@ -52,61 +58,73 @@ internal static partial class Program
 
     private static async Task RunAsync(string fixtureRoot)
     {
-        await PathHelpers(fixtureRoot);
-        await LazyExpansion(fixtureRoot);
-        await CollapseAndReExpand(fixtureRoot);
-        await RefreshKeepsExpansion(fixtureRoot);
-        await TruncationAndLoadMore(fixtureRoot);
-        await LayoutIsStableAndNonOverlapping(fixtureRoot);
-        await ViewportCulling(fixtureRoot);
-        await DropTargets(fixtureRoot);
-        await Persistence(fixtureRoot);
-        await DepthScale();
-        await RealFolderExpansion();
-        await Performance();
-        await Marks(fixtureRoot);
-        await PickerFilters();
-        await PickerCommandLine();
-        await PickerNames();
-        await PickerSessionRules(fixtureRoot);
-        await PickerValidation(fixtureRoot);
-        await PickerGraphRules(fixtureRoot);
-        await HiddenBranches(fixtureRoot);
-        await TidyLayout(fixtureRoot);
-        await Harness(fixtureRoot);
-        await TidyTree();
-        await FolderList();
-        await AddressBar();
-        await FolderColours(fixtureRoot);
-        await EverythingSearch();
-        await ProgramTargets();
-        await NestedLayoutChecks();
-        await NestedTreeChecks();
-        await NestedReaderChecks(fixtureRoot);
-        await NestedCanvasChecks();
-        await GpuDeviceChecks();
-        await LightReveal(fixtureRoot);
-        await GpuIconAtlasChecks();
-        await GpuTextChecks();
-        await GpuRectChecks();
-        await GpuLabelChecks();
-        await FrameWorkChecks();
+        await Group(() => PathHelpers(fixtureRoot));
+        await Group(() => LazyExpansion(fixtureRoot));
+        await Group(() => CollapseAndReExpand(fixtureRoot));
+        await Group(() => RefreshKeepsExpansion(fixtureRoot));
+        await Group(() => TruncationAndLoadMore(fixtureRoot));
+        await Group(() => LayoutIsStableAndNonOverlapping(fixtureRoot));
+        await Group(() => ViewportCulling(fixtureRoot));
+        await Group(() => DropTargets(fixtureRoot));
+        await Group(() => Persistence(fixtureRoot));
+        await Group(DepthScale);
+        await Group(RealFolderExpansion);
+        await Group(Performance);
+        await Group(() => Marks(fixtureRoot));
+        await Group(PickerFilters);
+        await Group(PickerCommandLine);
+        await Group(PickerNames);
+        await Group(() => PickerSessionRules(fixtureRoot));
+        await Group(() => PickerValidation(fixtureRoot));
+        await Group(() => PickerGraphRules(fixtureRoot));
+        await Group(() => HiddenBranches(fixtureRoot));
+        await Group(() => TidyLayout(fixtureRoot));
+        await Group(() => Harness(fixtureRoot));
+        await Group(TidyTree);
+        await Group(FolderList);
+        await Group(AddressBar);
+        await Group(() => FolderColours(fixtureRoot));
+        await Group(EverythingSearch);
+        await Group(ProgramTargets);
+        await Group(NestedLayoutChecks);
+        await Group(NestedTreeChecks);
+        await Group(() => NestedReaderChecks(fixtureRoot));
+        await Group(NestedCanvasChecks);
+        await Group(GpuDeviceChecks);
+        await Group(() => LightReveal(fixtureRoot));
+        await Group(GpuIconAtlasChecks);
+        await Group(GpuTextChecks);
+        await Group(GpuRectChecks);
+        await Group(GpuLabelChecks);
+        await Group(FrameWorkChecks);
 
         // Each work package's own checks, run from here so that none of them
         // needs this file: empty until the package fills its file in.
-        await ReadQueueChecks();
-        await IconInboxChecks();
-        await LabelCostChecks();
-        await FrameScopeChecks();
-        await WatchChecks();
-        await HubCoalesceChecks();
-        await LiveUpdateChecks();
-        await CameraMotionChecks();
-        await NestedCameraChecks();
-        await TransitionChecks();
-        await NestedSelectionChecks();
-        await ItemSelectionChecks();
+        await Group(ReadQueueChecks);
+        await Group(IconInboxChecks);
+        await Group(LabelCostChecks);
+        await Group(FrameScopeChecks);
+        await Group(WatchChecks);
+        await Group(HubCoalesceChecks);
+        await Group(LiveUpdateChecks);
+        await Group(CameraMotionChecks);
+        await Group(NestedCameraChecks);
+        await Group(TransitionChecks);
+        await Group(NestedSelectionChecks);
+        await Group(ItemSelectionChecks);
+        await Group(FolderOrderChecks);
     }
+
+    /// <summary>
+    /// Runs one group of checks, or skips it when the command line names
+    /// others: <c>--only NestedSelectionChecks,FolderOrderChecks</c> runs
+    /// just the groups whose call mentions one of the names, for going over
+    /// one piece of work again without the whole suite.
+    /// </summary>
+    private static Task Group(Func<Task> group, [System.Runtime.CompilerServices.CallerArgumentExpression(nameof(group))] string name = "") =>
+        _only is null || _only.Any(wanted => name.Contains(wanted, StringComparison.OrdinalIgnoreCase)) ? group() : Task.CompletedTask;
+
+    private static string[]? _only;
 
     // ---- fixture -----------------------------------------------------------
 

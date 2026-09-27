@@ -393,7 +393,7 @@ internal static partial class Program
             pointer.Up(MouseButton.Left, body + new Vector(12, 9));
 
             // In the gap between two sub-folders: the folder around them.
-            var next = canvas.ScreenRectOf(sel.Children[1])!.Value;
+            var next = canvas.ScreenRectOf(sel.Children[sel.Grid.IndexOf(0, 1)])!.Value;
             var gap = new Point((childCell.Right + next.Left) / 2, childCell.Top + childCell.Height / 2);
             pointer.Down(MouseButton.Left, gap);
             pointer.Move(gap + new Vector(0, 20));
@@ -742,6 +742,25 @@ internal static partial class Program
     private static void SelectionKeyChecks(NestedCanvas canvas, NestedTree tree)
     {
         Section("nested selection: keys");
+
+        // Rows first, as the grids were read before there was a choice; the
+        // same keys read down first are checked with the orders of folders.
+        tree.Orders.Flow = LayoutOrder.AcrossThenDown;
+        tree.FlushSortWork();
+        try
+        {
+            SelectionKeyChecksAcross(canvas, tree);
+        }
+        finally
+        {
+            tree.Orders.Flow = LayoutOrder.DownThenAcross;
+            tree.FlushSortWork();
+            Render(canvas);
+        }
+    }
+
+    private static void SelectionKeyChecksAcross(NestedCanvas canvas, NestedTree tree)
+    {
         var sel = tree.Find(SelectionRoot)!;
         canvas.FlyTo(sel, 0.9, animated: false);
         Render(canvas);

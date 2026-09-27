@@ -18,12 +18,32 @@ public sealed class WorkspaceState
     public string CanvasLayout { get; set; } = "Nested";
 
     /// <summary>
-    /// The order folders and files are shown in, as <see cref="ItemSort.ToSetting"/>
+    /// The order folders and files are shown in when a folder has none of
+    /// its own (<see cref="FolderOrders.Default"/>), as <see cref="ItemSort.ToSetting"/>
     /// writes it - "Name", "Modified-desc" and so on.  Missing or not
     /// understood, it is names from A, which is what every workspace written
-    /// before there was a choice meant.
+    /// before there was a choice meant.  A workspace written before folders
+    /// had their own orders called this the one order of every folder, and
+    /// it still is for every folder of such a workspace.
     /// </summary>
     public string? CanvasSort { get; set; } = ItemSort.Default.ToSetting();
+
+    /// <summary>
+    /// "PerFolder" - a header sorts the folder it is used on - or
+    /// "AllFolders", one order for every folder as before (<see cref="FolderOrders.Scope"/>).
+    /// Missing or not understood, it is PerFolder.
+    /// </summary>
+    public string? CanvasSortScope { get; set; }
+
+    /// <summary>
+    /// "DownThenAcross" - a folder's items fill a column at a time - or
+    /// "AcrossThenDown", a row at a time as before (<see cref="FolderOrders.Flow"/>).
+    /// Missing or not understood, it is DownThenAcross.
+    /// </summary>
+    public string? CanvasLayoutOrder { get; set; }
+
+    /// <summary>The folders sorted on their own, the least recently sorted first; at most <see cref="FolderOrders.MaximumFolders"/>.</summary>
+    public List<FolderSortState>? FolderSorts { get; set; }
 
     /// <summary>
     /// What draws the nested canvas: "Auto" - the GPU wherever it can be

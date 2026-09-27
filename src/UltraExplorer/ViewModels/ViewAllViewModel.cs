@@ -68,7 +68,6 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     private bool _isOverviewStale;
     private bool _isCanvasShown = true;
     private bool _graphChangedWhileHidden;
-    private ItemSort _sort = ItemSort.Default;
 
     /// <summary>The order changed while the tree canvas was away, and the tree is still laid out in the one before.</summary>
     private bool _isSortBehind;
@@ -103,7 +102,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         _graph.NodeCreated += OnNodeCreated;
         _graph.LayoutChanged += OnLayoutChanged;
         _graph.LayoutShifted += delta => ViewShiftRequested?.Invoke(delta);
+        _graph.SortOf = Orders.SortOf;
         _marks.MarkChanged += OnMarkChanged;
+        Orders.Changed += OnOrdersChanged;
 
         SelectedNodes.CollectionChanged += OnSelectedNodesChanged;
         Selection.Changed += OnSelectionChanged;
@@ -114,7 +115,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             path => _graph.TryGetNode(path, out _),
             icons)
         {
-            SharedSelection = Selection
+            SharedSelection = Selection,
+            SortOf = Orders.SortOf
         };
 
         _renderThrottle = new DispatcherTimer(DispatcherPriority.Background)
@@ -369,11 +371,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             if (_isSortBehind && !_isDisposed)
             {
                 _isSortBehind = false;
-                if (_graph.Sort != _sort)
-                {
-                    _graph.SetSort(_sort, _activeNode);
-                    settled = true;
-                }
+                _graph.Resort(Orders.Default, _activeNode);
+                settled = true;
             }
 
             if (!settled)
@@ -869,49 +868,58 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     }
 
     /// <summary>
-    /// The order each folder's children are laid out in on the tree, folders
-    /// before files as always, and the order of the rows in the folder list.
-    /// A change lays the tree out again the way opening a folder does - every
-    /// position the user chose kept, and the view panned by however far the
-    /// folder being looked at was carried, so it stays where it was and its
-    /// children change places beneath it.  The list is reordered without
-    /// reading anything again.
+    /// Which order each folder's children are laid out in on the tree,
+    /// folders before files as always, and the rows of the folder list are
+    /// in: each folder's own, or the default (see <see cref="FolderOrders"/>).
+    /// The window shares these with the nested canvas.
+    /// </summary>
+    public FolderOrders Orders { get; } = new();
+
+    /// <summary>
+    /// The default order (<see cref="FolderOrders.Default"/>): what every
+    /// folder without an order of its own is shown in.
+    /// </summary>
+    public ItemSort Sort
+    {
+        get => Orders.Default;
+        set => Orders.SetDefault(value);
+    }
+
+    /// <summary>
+    /// An order changed.  The list takes its folder's order, reordering the
+    /// rows already read without reading anything again.  The tree is laid
+    /// out again the way opening a folder does - every position the user
+    /// chose kept, and the view panned by however far the folder being
+    /// looked at was carried, so it stays where it was and its children
+    /// change places beneath it.
     ///
     /// While the tree canvas is not on screen the tree is left as it is and
-    /// laid out in the new order when it comes back (see <see cref="IsCanvasShown"/>):
+    /// laid out in the new orders when it comes back (see <see cref="IsCanvasShown"/>):
     /// a tree opened wide is milliseconds to lay out again, which a click on a
     /// header over the nested canvas has no business spending on a picture
     /// nobody can see.
     /// </summary>
-    public ItemSort Sort
+    private void OnOrdersChanged(string? folder)
     {
-        get => _sort;
-        set
+        FolderList.Sort = Orders.SortOf(FolderList.FolderPath);
+        OnPropertyChanged(nameof(Sort));
+        if (_isDisposed)
         {
-            if (!SetProperty(ref _sort, value))
-            {
-                return;
-            }
-
-            FolderList.Sort = value;
-            if (_isDisposed)
-            {
-                return;
-            }
-
-            if (!_isCanvasShown)
-            {
-                _isSortBehind = true;
-                return;
-            }
-
-            // The folder in view is the open one selected, or else the folder
-            // the selection sits in: that is what reorders, so that is what
-            // is held still.
-            var held = _activeNode is { IsDirectory: true, IsExpanded: true } open ? open : _activeNode?.Parent ?? _activeNode;
-            _graph.SetSort(value, held);
-            InvalidateCanvas();
+            return;
         }
+
+        if (!_isCanvasShown)
+        {
+            _isSortBehind = true;
+            return;
+        }
+
+        // The folder in view is the open one selected, or else the folder
+        // the selection sits in: that is what reorders, so that is what
+        // is held still.
+        var held = _activeNode is { IsDirectory: true, IsExpanded: true } open ? open : _activeNode?.Parent ?? _activeNode;
+        _graph.Resort(Orders.Default, held);
+        InvalidateCanvas();
     }
 
     /// <summary>Throws away every hand-placed position and rebuilds the tree.</summary>
@@ -1781,7 +1789,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
-        if ((change.Kinds & ~ChangeKinds.DirDate) == 0 && _sort.Column != SortColumn.Modified)
+        if ((change.Kinds & ~ChangeKinds.DirDate) == 0 && Orders.SortOf(node.FullPath).Column != SortColumn.Modified)
         {
             return;
         }

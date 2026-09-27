@@ -871,7 +871,7 @@ public sealed partial class NestedCanvas
         {
             for (var column = firstColumn; column <= lastColumn; column++)
             {
-                var index = row * grid.Columns + column;
+                var index = grid.IndexOf(row, column);
                 if (index >= children.Count)
                 {
                     break;
@@ -955,7 +955,7 @@ public sealed partial class NestedCanvas
         {
             for (var column = firstColumn; column <= lastColumn; column++)
             {
-                var index = row * grid.Columns + column;
+                var index = grid.IndexOf(row, column);
                 if (index >= files.Count)
                 {
                     break;

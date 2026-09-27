@@ -48,17 +48,23 @@ public partial class MainWindow
 
     private bool IsNested => _viewModel.IsNestedLayout;
 
-    /// <summary>The canvas that is showing, for keyboard focus.</summary>
+    /// <summary>
+    /// The canvas that is showing, for keyboard focus.  A test copy or a
+    /// diagnostics run that is not the active window only has the canvas
+    /// remembered as where the keyboard goes when it is clicked into: moving
+    /// the keyboard there now would activate the window, and take the
+    /// keyboard from whatever the user is typing into on the other screen.
+    /// </summary>
     private void FocusCanvas()
     {
-        if (IsNested)
+        UIElement canvas = IsNested ? Nested : Editor;
+        if (!IsActive && (IsTestWindow || IsDiagnosticsRun))
         {
-            Nested.Focus();
+            FocusManager.SetFocusedElement(this, canvas);
+            return;
         }
-        else
-        {
-            Editor.Focus();
-        }
+
+        canvas.Focus();
     }
 
     private void AttachNested()
@@ -242,9 +248,10 @@ public partial class MainWindow
             .Where(root => root.IsDrive)
             .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
 
-        // The remembered order before the first drive goes in, so nothing is
-        // ever placed in name order only to be placed again.
-        _nestedTree.SetSort(_viewModel.Sort);
+        // The remembered orders before the first drive goes in, so nothing is
+        // ever placed in name order only to be placed again.  The same orders
+        // as the tree and the list: a folder sorted anywhere is sorted everywhere.
+        _nestedTree.Orders = _viewModel.Orders;
         SyncNestedRoots();
         _nestedTree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
         _nestedTree.SetUserHidden(_viewModel.Tree.HiddenPaths);
@@ -379,6 +386,9 @@ public partial class MainWindow
             case nameof(ViewAllViewModel.ActivePath):
                 SyncNestedSelection();
                 ScheduleBeacons();
+
+                // On the tree the active folder is the current one when nothing is selected.
+                UpdateSortHeaders();
                 break;
             case nameof(ViewAllViewModel.HiddenPaths):
                 _nestedTree.SetUserHidden(_viewModel.Tree.HiddenPaths);
@@ -411,14 +421,16 @@ public partial class MainWindow
                     _ = EnterTreeAsync();
                 }
 
+                // The other picture decides the current folder its own way.
+                UpdateSortHeaders();
                 break;
             case nameof(MainViewModel.IsSearchOpen):
                 ScheduleBeacons();
                 break;
             case nameof(MainViewModel.Sort):
-                // The canvas keeps what it is looking at where it is; the tree
+                // Any order changed.  The tree follows the orders itself: the
+                // canvas keeps what it is looking at where it is, and the tree
                 // places what is on screen at once and the rest behind it.
-                _nestedTree.SetSort(_viewModel.Sort);
                 UpdateSortHeaders();
                 break;
         }
@@ -426,23 +438,126 @@ public partial class MainWindow
 
     // ---- the order ---------------------------------------------------------------
 
-    /// <summary>A header over the canvas: sort by its column, or turn the order round if it already is.</summary>
+    /// <summary>
+    /// A header over the canvas: sort the current folder (<see cref="SortFolder"/>)
+    /// by its column, or turn its order round if it already is - or every
+    /// folder, when folders are all sorted the same or there is no folder.
+    /// </summary>
     private void SortHeader_Click(object sender, RoutedEventArgs e)
     {
         if (sender is FrameworkElement { Tag: string tag } && Enum.TryParse<SortColumn>(tag, out var column))
         {
-            _viewModel.Sort = _viewModel.Sort.Click(column);
+            var folder = SortFolder();
+            var orders = _viewModel.Orders;
+            orders.Choose(folder, orders.SortOf(folder).Click(column));
         }
     }
 
     /// <summary>
-    /// Lights the header the canvas is ordered by and points its arrow the way
-    /// the order runs - up for A to Z, oldest or smallest first; down for the
-    /// other way - as Explorer's column headers do.
+    /// The folder the headers show and change the order of.  With several
+    /// things selected, the one with the focus decides.  Null for none -
+    /// This PC in view with nothing selected - where a header orders every
+    /// folder.
+    ///
+    /// On the nested canvas: the folder the selected item sits in - a file
+    /// or a sub-folder alike, since both are items of the folder around
+    /// them, as a row picked in Explorer is and a header click there sorts
+    /// the list it is in - else the folder in view.  In a folder of
+    /// sub-folders nearly every click selects one of them, and a header
+    /// clicked next is about the folder being looked at, not the inside of
+    /// whichever sub-folder was clicked last.  The selection only decides
+    /// while it is in what the view is on - the folder in view or something
+    /// inside it: a drive selected at the start, or a file picked in another
+    /// folder an hour ago, is not what anybody sorting the folder in front
+    /// of them means.  A particular sub-folder is sorted by flying into it,
+    /// or from Sort by on its own background.
+    ///
+    /// On the tree: the folder selected, whose children open out around it,
+    /// else the folder the selected files are in, else the active one.
+    /// </summary>
+    private string? SortFolder()
+    {
+        // Worked out once per change of the selection: this is asked after
+        // every move of the camera.
+        var selection = _viewModel.Tree.Selection;
+        if (selection.Version != _sortSelectionVersion)
+        {
+            _sortSelectionVersion = selection.Version;
+            _sortSelectionFolder = null;
+            _sortSelectionContainer = null;
+            if (selection.Count > 0)
+            {
+                var primary = selection.Focus is { } focus && selection.Contains(focus) ? focus : selection.Paths[0];
+                if (selection.TryGetItem(primary, out var item))
+                {
+                    _sortSelectionContainer = Path.GetDirectoryName(primary);
+                    _sortSelectionFolder = item.IsDirectory ? primary : _sortSelectionContainer;
+                }
+            }
+        }
+
+        if (IsNested)
+        {
+            var container = _sortSelectionContainer;
+            var inView = Nested.FolderInView?.FullPath;
+            return container is not null && (inView is null || IsSameOrInside(container, inView)) ? container : inView;
+        }
+
+        if (_sortSelectionFolder is { } selected)
+        {
+            return selected;
+        }
+
+        return _viewModel.Tree.ActiveNode is { } node
+            ? node.IsDirectory ? node.FullPath : node.Parent?.FullPath
+            : null;
+    }
+
+    /// <summary>Whether <paramref name="path"/> is <paramref name="folder"/> or somewhere inside it.</summary>
+    private static bool IsSameOrInside(string path, string folder) =>
+        path.StartsWith(folder, StringComparison.OrdinalIgnoreCase)
+        && (path.Length == folder.Length || folder.EndsWith(Path.DirectorySeparatorChar) || path[folder.Length] == Path.DirectorySeparatorChar);
+
+    private long _sortSelectionVersion = -1;
+
+    /// <summary>The selected folder, or the folder the selected file is in: what the tree's headers sort.</summary>
+    private string? _sortSelectionFolder;
+
+    /// <summary>The folder the selected item is in, file or folder: what the nested canvas's headers sort.</summary>
+    private string? _sortSelectionContainer;
+
+    // What the headers last showed: they are brought up to date on every
+    // move of the camera, and nearly always nothing they show has changed.
+    private string? _headerFolder;
+    private ItemSort _headerSort;
+    private SortScope _headerScope;
+    private bool _headersShown;
+
+    /// <summary>
+    /// Lights the header the current folder is ordered by and points its
+    /// arrow the way the order runs - up for A to Z, oldest or smallest
+    /// first; down for the other way - as Explorer's column headers do.
+    /// Called whenever the folder or an order may have changed; does nothing
+    /// when neither did.
     /// </summary>
     private void UpdateSortHeaders()
     {
-        var sort = _viewModel.Sort;
+        var orders = _viewModel.Orders;
+        var folder = orders.Scope == SortScope.AllFolders ? null : SortFolder();
+        var sort = orders.SortOf(folder);
+        if (_headersShown && sort == _headerSort && orders.Scope == _headerScope
+            && string.Equals(folder, _headerFolder, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _headersShown = true;
+        _headerFolder = folder;
+        _headerSort = sort;
+        _headerScope = orders.Scope;
+        var where = folder is null
+            ? orders.Scope == SortScope.AllFolders ? string.Empty : " in every folder"
+            : $" in {FolderName(folder)}";
         (Button Header, TextBlock Arrow, SortColumn Column)[] headers =
         [
             (SortByName, SortByNameArrow, SortColumn.Name),
@@ -459,17 +574,21 @@ public partial class MainWindow
                 header.Foreground = (Brush)FindResource("TextBrush");
                 arrow.Text = sort.Descending ? "\uE70D" : "\uE70E";
                 arrow.Visibility = Visibility.Visible;
-                header.ToolTip = $"Sorted by {name}, {DirectionText(column, sort.Descending)} (click to reverse)";
+                header.ToolTip = $"Sorted by {name}, {DirectionText(column, sort.Descending)}{where} (click to reverse)";
             }
             else
             {
                 // Back to the style's muted text, which its hover can light.
                 header.ClearValue(ForegroundProperty);
                 arrow.Visibility = Visibility.Hidden;
-                header.ToolTip = $"Sort by {name} (click again to reverse)";
+                header.ToolTip = $"Sort by {name}{where} (click again to reverse)";
             }
         }
     }
+
+    /// <summary>A folder's name as a menu or a tip says it: its own name, or the whole of a drive's.</summary>
+    private static string FolderName(string path) =>
+        Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } name ? name : path;
 
     /// <summary>Which way an order runs, in the words its column would use.</summary>
     private static string DirectionText(SortColumn column, bool descending) => column switch
@@ -557,6 +676,9 @@ public partial class MainWindow
     private void OnNestedCameraChanged()
     {
         _viewModel.NestedZoomLabel = Nested.ZoomText;
+
+        // With nothing selected, the headers are for the folder in view.
+        UpdateSortHeaders();
         _nestedSaveTimer?.Stop();
         _nestedSaveTimer?.Start();
     }

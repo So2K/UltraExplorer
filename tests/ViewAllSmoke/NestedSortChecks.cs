@@ -711,6 +711,10 @@ internal static partial class Program
 
         var disk = BuildSortCanvasWorld();
         using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+
+        // Where a slot is, and which way the keys go from it, are checked
+        // along rows here; read down first, by the checks of folders' own orders.
+        tree.Orders.Flow = LayoutOrder.AcrossThenDown;
         tree.SetRoots(
         [
             new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive, "1.2 TB free"),
@@ -1408,6 +1412,11 @@ internal static partial class Program
             Check("while it is showing, a change of order lays it out at once",
                 RowMajor(folder.Children).Select(child => child.DisplayName)
                     .SequenceEqual(ExpectedEntryOrder(folder.Children.Select(child => child.Entry), ItemSort.Default).Select(entry => entry.DisplayName)));
+
+            model.Orders.SetFolder(folder.FullPath, largest);
+            Check("a folder's own order lays out that folder's children on the tree at once",
+                model.Sort == ItemSort.Default && RowMajor(folder.Children).Select(child => child.DisplayName).SequenceEqual(expected));
+            model.Orders.ResetFolder(folder.FullPath);
         }
         finally
         {
@@ -1684,9 +1693,50 @@ internal static partial class Program
             Check("ordered by type before the kinds are named, the list and the tree order by the stand-ins, and ask nothing here",
                 Rows().SequenceEqual(standIns) && Nodes().SequenceEqual(standIns) && askedHere == 0);
 
+            // What each row says under a type order: the stand-in for now,
+            // and the real name as soon as it is in - said again, since the
+            // list shows what a row said until the row tells it otherwise.
+            var fileRows = list.Items.Where(item => !item.IsDirectory).ToList();
+            var toldAgain = new HashSet<FolderListItem>();
+            void OnRowChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+            {
+                if (e.PropertyName == nameof(FolderListItem.Detail) && sender is FolderListItem row)
+                {
+                    lock (toldAgain)
+                    {
+                        toldAgain.Add(row);
+                    }
+                }
+            }
+
+            foreach (var row in fileRows)
+            {
+                row.PropertyChanged += OnRowChanged;
+            }
+
+            Check("a row says the stand-in of its kind while the name is looked up",
+                fileRows.Count == names.Length && fileRows.All(row => row.Detail == KindOf(row.DisplayName, real: false)));
+
             gate.Set();
             Check("once the names are in, both take their places by the real names",
                 await Until(() => Rows().SequenceEqual(real) && Nodes().SequenceEqual(real), 5_000) && askedHere == 0);
+            bool ToldAgain(FolderListItem row)
+            {
+                lock (toldAgain)
+                {
+                    return toldAgain.Contains(row);
+                }
+            }
+
+            Check("and every row that said a stand-in says the real name, and tells the list so",
+                await Until(
+                    () => fileRows.All(row => row.Detail == KindOf(row.DisplayName, real: true))
+                        && fileRows.Where(row => new NestedFile(row.DisplayName, false, 0).Extension.Length > 0).All(ToldAgain),
+                    5_000));
+            foreach (var row in fileRows)
+            {
+                row.PropertyChanged -= OnRowChanged;
+            }
             Check("and the tree canvas and the list order a kind the same way as each other", Rows().SequenceEqual(Nodes()));
 
             list.Sort = ItemSort.Default;

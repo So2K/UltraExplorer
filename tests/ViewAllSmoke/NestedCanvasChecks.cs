@@ -259,7 +259,7 @@ internal static partial class Program
         Check($"at mid zoom every folder on screen is hit by its title band ({midHits.Tested:N0})",
             midHits.Tested >= 250 && midHits.HeaderMisses == 0 && midHits.CentreMisses == 0);
         var first = canvas.ScreenRectOf(mixed.Children[0])!.Value;
-        var second = canvas.ScreenRectOf(mixed.Children[1])!.Value;
+        var second = canvas.ScreenRectOf(mixed.Children[mixed.Grid.IndexOf(0, 1)])!.Value;
         Check("a point between two sub-folders hits their parent",
             ReferenceEquals(canvas.HitTest(new Point((first.Right + second.Left) / 2, first.Top + first.Height / 2))?.Folder, mixed));
         Check("a point on the title band is on the header",
@@ -466,14 +466,14 @@ internal static partial class Program
         string? selected = null;
         canvas.SelectRequested += (path, _) => selected = path;
         canvas.SetSelection([mixed.Children[0].FullPath], mixed.Children[0].FullPath);
-        Check("Right selects the next sub-folder",
-            canvas.HandleKey(Key.Right, ModifierKeys.None) && selected == mixed.Children[1].FullPath);
+        Check("Right selects the sub-folder to its right",
+            canvas.HandleKey(Key.Right, ModifierKeys.None) && selected == mixed.Children[mixed.Grid.IndexOf(0, 1)].FullPath);
         Check("Down selects the one a row below",
-            canvas.HandleKey(Key.Down, ModifierKeys.None) && selected == mixed.Children[1 + mixed.Grid.Columns].FullPath);
+            canvas.HandleKey(Key.Down, ModifierKeys.None) && selected == mixed.Children[mixed.Grid.IndexOf(1, 1)].FullPath);
         Check("Backspace selects the parent", canvas.HandleKey(Key.Back, ModifierKeys.None) && selected == mixed.FullPath);
         canvas.SetSelection([mixed.PathOf(mixed.Files[0])], mixed.PathOf(mixed.Files[0]));
-        Check("Right on a file selects the next file",
-            canvas.HandleKey(Key.Right, ModifierKeys.None) && selected == mixed.PathOf(mixed.Files[1]));
+        Check("Right on a file selects the file to its right",
+            canvas.HandleKey(Key.Right, ModifierKeys.None) && selected == mixed.PathOf(mixed.Files[mixed.FileGrid.IndexOf(0, 1)]));
         Check("a key with a modifier is not the canvas's", !canvas.HandleKey(Key.Right, ModifierKeys.Control));
 
         // An animated flight runs on render ticks.  A flight lasts at most 1.1 s;

@@ -87,6 +87,15 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
     public ItemSort Sort { get; set; } = ItemSort.Default;
 
     /// <summary>
+    /// Each folder's own order, by its path, when folders have their own;
+    /// null, and every folder is in <see cref="Sort"/>.
+    /// </summary>
+    public Func<string, ItemSort>? SortOf { get; set; }
+
+    /// <summary>The order a folder's children are laid out in.</summary>
+    public ItemSort SortFor(string path) => SortOf?.Invoke(path) ?? Sort;
+
+    /// <summary>
     /// Whether the last <see cref="Arrange"/> ordered some files by type by a
     /// stand-in for a name the Shell had not given yet (see
     /// <see cref="ViewAllEntryOrder.Sort{T}(IEnumerable{T}, Func{T, ViewAllEntryDescriptor}, ItemSort, out bool)"/>):
@@ -409,7 +418,7 @@ public sealed class ViewAllLayoutService(ViewAllLayoutOptions? options = null)
         var children = ViewAllEntryOrder.Sort(
             node.Children.Where(child => child is { IsUserHidden: false, IsTreeVisible: true }),
             child => child.Entry,
-            Sort,
+            SortFor(node.FullPath),
             out var pending);
         TypeNamesPending |= pending;
         return children;
@@ -733,7 +742,8 @@ public static class ViewAllEntryOrder
     /// <summary>
     /// A file name's extension exactly as the nested canvas reads it - lower
     /// case, no dot, none for a name like ".gitignore" - so a type orders the
-    /// same file the same way in every view.
+    /// same file the same way in every view, and a row of the folder list
+    /// names the kind its file is ranked by.
     /// </summary>
-    private static string ExtensionOf(string name) => new NestedFile(name, false, 0).Extension;
+    internal static string ExtensionOf(string name) => new NestedFile(name, false, 0).Extension;
 }
