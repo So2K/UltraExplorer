@@ -1,0 +1,84 @@
+# UltraExplorer
+
+A file manager for Windows that shows your whole disk as one zoomable picture.
+
+Every folder is a cell drawn inside its parent, with its sub-folders and files
+inside it, so the entire This PC fits on one screen and "opening" a folder is
+just zooming into it. It keeps the Windows 11 File Explorer shell around the
+canvas — address bar, navigation pane, the real Shell context menus — so it
+works like the Explorer you know, with a map of everything underneath.
+
+![The nested canvas: C:\Windows sorted by date, newest first, top to bottom](docs/images/canvas.png)
+
+## Features
+
+- **The whole disk on one canvas.** Folders nest inside folders; zoom to any
+  depth without losing your place. Nothing is read up front — a folder is read
+  the moment it is drawn large enough to matter.
+- **Drawn by the GPU.** Direct3D 11 draws every cell and file tile as an
+  instance of one mesh, icons come from one texture atlas, and names from an
+  SDF glyph atlas, so zooming stays smooth on a 4K screen. A CPU renderer takes
+  over where there is no GPU (remote desktop, software rendering).
+- **Sorting like Explorer.** Name, Date modified, Type, Size — ascending or
+  descending — with Explorer-style column headers. Each folder remembers its own
+  order; grids fill top to bottom, then across (switchable). File tiles show the
+  value they are sorted by: size, date or type.
+- **Selection.** Drag a marquee inside a folder, Shift+click a range, Ctrl+click
+  to toggle, Shift+arrows, Ctrl+A. The canvas and the folder list share one
+  selection, and copy, cut, delete, drag-and-drop and the context menu act on
+  all of it.
+- **Live.** Every change on disk shows up on the canvas and in the list within a
+  moment — one watcher per volume, not per folder.
+- **Find things on a huge map.** Colour marks, notes and pins stay visible as
+  beacons at any zoom, with arrows at the edge for what is off screen. A name
+  filter (`report`, `*.png`, `a;b`) lights up matches.
+- **Layers.** Hide files to see only the folder structure, or turn off icons,
+  details, counts, hidden items and marks.
+- **A tree canvas too.** Switch to a node-graph view of the same folders at any
+  time (Settings → View).
+- **Replaces the Open/Save dialog** for programs that ask for it (see
+  [BUILD.md](BUILD.md#file-dialog-mode)).
+
+## Install
+
+**Download:** grab `UltraExplorer-win-x64.zip` from the
+[latest release](../../releases/latest), unzip it anywhere and run
+`UltraExplorer.exe`. It is a single self-contained file: no .NET install needed.
+
+**From source** (Windows 10 1903+ / 11, x64, [.NET 10 SDK](https://dotnet.microsoft.com/download)):
+
+```powershell
+git clone <this repository>
+cd UltraExplorer
+powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Launch
+```
+
+That builds a Release copy into `%LOCALAPPDATA%\Programs\UltraExplorer` and adds
+an **UltraExplorer** shortcut to the Start menu, so Windows Search and launchers
+find it. Run it again to update. Settings live in `%LOCALAPPDATA%\UltraExplorer`.
+
+## Using it
+
+| | |
+|---|---|
+| Zoom | Ctrl + wheel, or the + / − buttons |
+| Move around | Right or middle drag, Space + drag, wheel / Shift + wheel |
+| Open a folder | Double-click it (the canvas flies into it) |
+| Select | Click, Ctrl + click, Shift + click, or drag a marquee in a folder's open space |
+| Everything / the selection | Shift + 1 / Shift + 2 |
+| Filter by name | Ctrl + Shift + F |
+| Settings | the gear, or Ctrl + , |
+
+Right-click a folder's open space for its own menu: sort this folder, colour,
+note, pin, properties.
+
+## Build and test
+
+See [BUILD.md](BUILD.md): building, the headless test harness (`ViewAllSmoke`,
+about 1,800 checks), the benchmark and snapshot switches, and a self-contained
+publish. [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md) describes how it works inside
+(in Russian).
+
+## License
+
+[MIT](LICENSE) — use it, change it, ship it, commercially or not.

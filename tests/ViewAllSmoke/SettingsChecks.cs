@@ -62,6 +62,7 @@ internal static partial class Program
 
             SortFolderChecks(main, shell);
             FolderMenuChecks(main, shell);
+            await ShellMenuWindowChecks(main, shell);
 
             await SettingsResetChecks(shell);
             SettingsWordsChecks();

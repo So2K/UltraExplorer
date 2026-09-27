@@ -2,53 +2,12 @@ using System.Collections.Specialized;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
-using System.Windows.Interop;
 using Microsoft.VisualBasic.FileIO;
 
 namespace UltraExplorer.Services;
 
 public sealed class NativeShellService
 {
-    /// <summary>
-    /// Shows Explorer's own context menu.  Returns false when the Shell cannot
-    /// build one for this selection, so the caller can fall back to the app menu.
-    /// </summary>
-    public static bool TryShowNativeContextMenu(
-        IReadOnlyList<string> paths,
-        HwndSource source,
-        Point screenPoint,
-        bool extended,
-        IReadOnlyList<ShellMenuEntry>? appCommands,
-        out uint chosenAppCommand)
-        => ShellContextMenu.TryShow(
-            paths,
-            source,
-            (int)Math.Round(screenPoint.X),
-            (int)Math.Round(screenPoint.Y),
-            extended,
-            appCommands,
-            out chosenAppCommand);
-
-    /// <summary>
-    /// The menu Explorer shows on the empty part of a folder, for the folder the
-    /// list is looking at.
-    /// </summary>
-    public static bool TryShowFolderBackgroundMenu(
-        string folderPath,
-        HwndSource source,
-        System.Windows.Point screenPoint,
-        bool extended,
-        IReadOnlyList<ShellMenuEntry>? appCommands,
-        out uint chosenAppCommand)
-        => ShellContextMenu.TryShowForFolderBackground(
-            folderPath,
-            source,
-            (int)screenPoint.X,
-            (int)screenPoint.Y,
-            extended,
-            appCommands,
-            out chosenAppCommand);
-
     /// <summary>
     /// How long Windows waits before two clicks stop being a double-click.  The
     /// user set it; nothing here should second-guess it with a constant.

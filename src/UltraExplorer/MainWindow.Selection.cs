@@ -165,14 +165,15 @@ public partial class MainWindow
     /// A right-click on an item of the canvas: an item outside the selection
     /// becomes the selection, as in Explorer; one inside it keeps the whole
     /// set and takes the focus.  The menu then acts on everything selected -
-    /// the Shell's own for items in one folder.  Its entries of our own read
-    /// the focus's node, so that is waited for, and the menu is not shown if
-    /// something else was selected meanwhile.
+    /// the Shell's own for items in one folder, built while the button was
+    /// down.  Its entries of our own go by path, so nothing waits for the
+    /// window's tree to know the item.  An item found gone - the Shell cannot
+    /// make its menu and it is not on disk - is let go of instead, and its
+    /// folder read again.
     /// </summary>
     private async Task ShowNestedItemMenuAsync(NestedHit target, Point point)
     {
-        var tree = _viewModel.Tree;
-        var selection = tree.Selection;
+        var selection = _viewModel.Tree.Selection;
         var path = target.Path;
         if (!selection.Contains(path))
         {
@@ -183,24 +184,19 @@ public partial class MainWindow
             selection.Apply(new SelectionEdit { Focus = path, Source = SelectionSource.Canvas });
         }
 
-        var version = selection.Version;
-        if (await tree.MaterializeAsync(path) is null)
-        {
-            if (!Directory.Exists(path) && !File.Exists(path))
-            {
-                selection.Remove([path], SelectionSource.Command);
-                await RefreshStaleAsync(path);
-            }
-
-            return;
-        }
-
-        if (selection.Version != version && !selection.Contains(path))
+        if (ShowContextMenu(selection.Paths, Nested, point, includeCanvasCommands: true, fallBack: false))
         {
             return;
         }
 
-        _viewModel.ShowContextMenuFor(selection.Paths, Nested, point);
+        if (!Directory.Exists(path) && !File.Exists(path))
+        {
+            selection.Remove([path], SelectionSource.Command);
+            await RefreshStaleAsync(path);
+            return;
+        }
+
+        ShowSelectionMenu(Nested);
     }
 
     /// <summary>What a drag of <paramref name="path"/> carries: the whole selection if it is part of it, else the item alone.</summary>

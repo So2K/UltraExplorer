@@ -337,6 +337,12 @@ public sealed partial class NestedCanvas
                 _panLast = point;
                 TakeMouse();
                 RequestFrame(Layers.Overlay);
+                if (ContextMenuPressed is { } pressed)
+                {
+                    var (target, onBackground) = MenuTargetAt(point);
+                    pressed(target, onBackground, point);
+                }
+
                 break;
         }
     }
@@ -703,17 +709,26 @@ public sealed partial class NestedCanvas
     /// <summary>A right click that never moved: the menu for what is under it, as the window decides.</summary>
     private void RequestContextMenu(Point point)
     {
-        var hit = PointerHit(point);
-        if (hit is null || hit.Value.Folder.IsComputer)
+        var (target, onBackground) = MenuTargetAt(point);
+        ContextMenuRequested?.Invoke(target, onBackground, point);
+    }
+
+    /// <summary>
+    /// What a right-click at a point is about: null outside every cell or on
+    /// This PC; otherwise what is under it, and whether that is a folder's
+    /// open space - big enough to have one - rather than the folder itself.
+    /// </summary>
+    private (NestedHit? Hit, bool OnBackground) MenuTargetAt(Point point)
+    {
+        if (PointerHit(point) is not { } hit || hit.Folder.IsComputer)
         {
-            ContextMenuRequested?.Invoke(null, true, point);
-            return;
+            return (null, true);
         }
 
-        var onBackground = !hit.Value.IsFile
-            && !hit.Value.IsOnHeader
-            && hit.Value.Bounds.Width * NestedLayout.HeaderHeight >= HeaderGrabPixels;
-        ContextMenuRequested?.Invoke(hit.Value, onBackground, point);
+        var onBackground = !hit.IsFile
+            && !hit.IsOnHeader
+            && hit.Bounds.Width * NestedLayout.HeaderHeight >= HeaderGrabPixels;
+        return (hit, onBackground);
     }
 
     private bool CanGrab(NestedHit hit, Point point)

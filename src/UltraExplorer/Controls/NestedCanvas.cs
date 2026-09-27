@@ -404,6 +404,13 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     /// </summary>
     public event Action<NestedHit?, bool, Point>? ContextMenuRequested;
 
+    /// <summary>
+    /// The right button went down, and may come up again as a right-click:
+    /// what <see cref="ContextMenuRequested"/> would then be raised with, so
+    /// the window can make the menu while the button is held.
+    /// </summary>
+    public event Action<NestedHit?, bool, Point>? ContextMenuPressed;
+
     /// <summary>A folder's title or a file's tile was dragged past the threshold: a real file drag should start.</summary>
     public event Action<string>? DragRequested;
 

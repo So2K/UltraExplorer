@@ -114,6 +114,7 @@ internal static partial class Program
         await Group(ItemSelectionChecks);
         await Group(FolderOrderChecks);
         await Group(LayerChecks);
+        await Group(ShellMenuChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

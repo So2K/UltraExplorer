@@ -22,6 +22,9 @@ it. Run it again to update: it closes the installed copy (which saves its
 state), replaces it and, with `-Launch`, starts it. `-Desktop` also adds a
 desktop shortcut. Settings stay in `%LOCALAPPDATA%\UltraExplorer`.
 
+Pushing a `v*` tag builds a self-contained single-file `UltraExplorer.exe` on
+GitHub Actions (`.github/workflows/release.yml`) and attaches it to a release.
+
 ## Run
 
 ```powershell

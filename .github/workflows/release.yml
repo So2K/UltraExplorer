@@ -1,0 +1,45 @@
+# Builds UltraExplorer on every push and pull request, and publishes a
+# self-contained single-file release when a version tag (v1.2.3) is pushed.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Build the app and the checks
+        run: |
+          dotnet build src/UltraExplorer/UltraExplorer.csproj -c Release -nologo
+          dotnet build tests/ViewAllSmoke/ViewAllSmoke.csproj -c Release -nologo
+
+      - name: Publish a self-contained single file
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          dotnet publish src/UltraExplorer/UltraExplorer.csproj -c Release -r win-x64 -o publish `
+            --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true `
+            -p:EnableCompressionInSingleFile=true -nologo
+          Copy-Item LICENSE, README.md publish/
+          Compress-Archive -Path publish/UltraExplorer.exe, publish/LICENSE, publish/README.md -DestinationPath UltraExplorer-win-x64.zip
+
+      - name: Create the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: UltraExplorer-win-x64.zip
+          generate_release_notes: true

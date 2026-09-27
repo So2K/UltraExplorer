@@ -13,8 +13,29 @@ namespace UltraExplorer;
 
 public partial class App : Application
 {
+    /// <summary>
+    /// The taskbar identity of the everyday copy.  The Start menu shortcut
+    /// that scripts/install.ps1 makes carries the same id, so a pinned button
+    /// and the running window are one taskbar entry.
+    /// </summary>
+    internal const string AppUserModelId = "UltraExplorer.App";
+
+    /// <summary>
+    /// The taskbar identity of benchmark, snapshot and test copies.  Being a
+    /// different id keeps them out of the user's taskbar group: clicking or
+    /// pinning a test copy's button can never re-point the user's own pin at
+    /// a throwaway build, which is what happened when they shared one.
+    /// </summary>
+    internal const string TestAppUserModelId = "UltraExplorer.Test";
+
     protected override void OnStartup(StartupEventArgs e)
     {
+        // First, before any window exists: the id is read when a window is shown.
+        var isTestCopy = Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1"
+            || e.Args.Any(argument => argument.Equals("--nested-bench", StringComparison.OrdinalIgnoreCase)
+                || argument.Equals("--nested-snapshots", StringComparison.OrdinalIgnoreCase));
+        _ = SetCurrentProcessExplicitAppUserModelID(isTestCopy ? TestAppUserModelId : AppUserModelId);
+
         RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.Default;
         Timeline.DesiredFrameRateProperty.OverrideMetadata(
             typeof(Timeline),
@@ -36,6 +57,10 @@ public partial class App : Application
         // layer already do this job, better and at every zoom.
         NodifyEditor.EnableRenderingContainersOptimizations = false;
         PerfLog.Configure(Environment.GetCommandLineArgs());
+
+        // Before any menu exists: the Shell's context menus, and every other
+        // native menu of the process, come out dark like the window.
+        DarkMenus.UseForProcess();
 
         base.OnStartup(e);
 
@@ -234,4 +259,7 @@ public partial class App : Application
         FileDialogHost.Deliver(invocation, result);
         Shutdown(FileDialogHost.ExitCodeFor(result));
     }
+
+    [System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
 }

@@ -1000,16 +1000,28 @@ internal static partial class Program
             menu = (hit, background);
         }
 
+        var presses = 0;
+        (NestedHit? Hit, bool Background)? pressed = null;
+        void OnPress(NestedHit? hit, bool background, Point point)
+        {
+            presses++;
+            pressed = (hit, background);
+        }
+
         canvas.ContextMenuRequested += OnMenu;
+        canvas.ContextMenuPressed += OnPress;
         try
         {
             var child = sel.Children[3];
             var title = TitlePoint(canvas.ScreenRectOf(child)!.Value);
             pointer.Down(MouseButton.Right, title);
+            Check("the right button going down says what its menu would be for, before any menu is asked for",
+                presses == 1 && menus == 0 && pressed?.Hit is { } early && ReferenceEquals(early.Folder, child) && pressed?.Background == false);
             pointer.Move(title + new Vector(2, 0));
             pointer.Up(MouseButton.Right, title + new Vector(2, 0));
             Check("a right click that moves 2 DIPs opens the menu for what is under it, as before",
                 menus == 1 && menu?.Hit is { } hit && ReferenceEquals(hit.Folder, child) && menu?.Background == false);
+            Check("- the same thing the press said", pressed?.Hit is { } same && menu?.Hit is { } asked && same.Path == asked.Path && pressed?.Background == menu?.Background);
 
             var before = canvas.ScreenRectOf(sel)!.Value;
             pointer.Down(MouseButton.Right, title);
@@ -1058,6 +1070,7 @@ internal static partial class Program
         {
             canvas.LeftDrag = NestedLeftDrag.SelectArea;
             canvas.ContextMenuRequested -= OnMenu;
+            canvas.ContextMenuPressed -= OnPress;
             Clear(canvas);
         }
     }

@@ -87,6 +87,7 @@ public partial class MainWindow
         _nestedTree.FolderLoaded += OnFolderLoadedForIcons;
         Nested.OpenRequested += OnNestedOpenRequested;
         Nested.ContextMenuRequested += OnNestedContextMenuRequested;
+        Nested.ContextMenuPressed += OnNestedContextMenuPressed;
         Nested.DragRequested += OnNestedDragRequested;
         Nested.CameraChanged += OnNestedCameraChanged;
         Nested.FilterChanged += OnNestedFilterChanged;
@@ -840,8 +841,9 @@ public partial class MainWindow
 
     /// <summary>
     /// Right-click on a folder's title is the folder's own Windows menu.
-    /// Right-click in the open space of a big folder is "in" that folder: new
-    /// folder, new file, paste.  Outside every cell is the canvas's own menu.
+    /// Right-click in the open space of a big folder is "in" that folder: the
+    /// Windows menu of its open space - New, Paste - with the folder's own
+    /// settings.  Outside every cell is the canvas's own menu.
     /// </summary>
     private async void OnNestedContextMenuRequested(NestedHit? hit, bool onBackground, Point point)
     {
@@ -850,13 +852,23 @@ public partial class MainWindow
         {
             if (hit is not { } target)
             {
+                DropPreparedMenu();
                 ShowFolderAreaMenu(Nested, null);
                 return;
             }
 
             if (onBackground)
             {
-                var area = await tree.MaterializeAsync(target.Folder.FullPath);
+                // The folder clicked in becomes the selection, as a click on the
+                // empty part of an Explorer window makes it the current folder.
+                var folder = target.Folder.FullPath;
+                tree.Selection.ReplaceSingle(folder, true, 0, SelectionSource.Canvas);
+                if (ShowFolderAreaShellMenu(folder, Nested, point))
+                {
+                    return;
+                }
+
+                var area = await tree.MaterializeAsync(folder);
                 ShowFolderAreaMenu(Nested, area);
                 return;
             }
@@ -869,6 +881,28 @@ public partial class MainWindow
         {
             _viewModel.Toast.ShowError(ex.Message);
         }
+    }
+
+    /// <summary>
+    /// The right button went down on the canvas: the menu its release would
+    /// show - the selection's when the item is part of it, the item's alone
+    /// otherwise, or the open space of the folder - is built while it is held.
+    /// </summary>
+    private void OnNestedContextMenuPressed(NestedHit? hit, bool onBackground, Point point)
+    {
+        if (hit is not { } target)
+        {
+            return;
+        }
+
+        if (onBackground)
+        {
+            PrepareShellMenu(background: true, [target.Folder.FullPath]);
+            return;
+        }
+
+        var selection = _viewModel.Tree.Selection;
+        PrepareShellMenu(background: false, selection.Contains(target.Path) ? selection.Paths : [target.Path]);
     }
 
     // ---- drag and drop ---------------------------------------------------------
