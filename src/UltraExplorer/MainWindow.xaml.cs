@@ -1935,10 +1935,12 @@ public partial class MainWindow : Window
         // The keys that act on the selection only do so from where the
         // selection is shown - either canvas, the folder list, or nowhere in
         // particular.  Anything else holding the keyboard has keys of its own:
-        // Enter and Space press a button, Enter takes a search result, and
-        // Delete over a search result must never reach a selection the user is
-        // not even looking at.  Going places, zooming and refreshing work from
-        // anywhere, as they always have.
+        // a dialog's buttons take Enter and Space, the search box takes Enter
+        // for its results, and Delete typed there must never reach a selection
+        // the user is not even looking at.  (The window's own buttons never
+        // take the keyboard, so a click on one leaves these keys working.)
+        // Going places, zooming and refreshing work from anywhere, as they
+        // always have.
         var onSelection = IsSelectionSurfaceFocused();
 
         switch (modifiers, key)

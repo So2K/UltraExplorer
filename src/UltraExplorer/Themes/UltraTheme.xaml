@@ -430,8 +430,11 @@
         </Setter>
     </Style>
 
-    <!-- Command bar entry: text + optional glyph, 32 high, neutral. -->
+    <!-- Command bar entry: text + optional glyph, 32 high, neutral.  Never
+         takes the keyboard: the command acts on the selection, and the keys
+         for the selection must still work once it has been clicked. -->
     <Style x:Key="CommandBarButton" TargetType="Button" BasedOn="{StaticResource FlatButton}">
+        <Setter Property="Focusable" Value="False" />
         <Setter Property="Height" Value="32" />
         <Setter Property="Padding" Value="10,0" />
         <Setter Property="Margin" Value="1,0" />

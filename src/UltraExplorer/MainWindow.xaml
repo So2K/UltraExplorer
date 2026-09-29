@@ -45,6 +45,16 @@
         <converters:ZeroCountToVisibilityConverter x:Key="ZeroCountToVisibility" />
         <infra:BindingProxy x:Key="Shell" Data="{Binding}" />
 
+        <!-- The window's own buttons - Back, Up, the crumbs, zoom, Fit all,
+             the filter's Previous and Next, Settings and the rest - never take
+             the keyboard.  Clicked, the focus stays where it was: on a canvas,
+             the list or a box being typed in, so Delete, F2, Ctrl+C and Enter
+             keep acting on the selection rather than doing nothing, and Enter
+             never presses the button again.  Each one has its shortcut. -->
+        <Style x:Key="ChromeButton" TargetType="Button" BasedOn="{StaticResource FlatButton}">
+            <Setter Property="Focusable" Value="False" />
+        </Style>
+
         <!-- A column header like the ones over Explorer's details view: flat,
              lit on hover, and never taking the keyboard - focus stays on the
              canvas or the filter box, so Enter, Delete and Space keep meaning
@@ -250,7 +260,7 @@
                                 Width="28"
                                 Height="28"
                                 Padding="0"
-                                Style="{StaticResource FlatButton}"
+                                Style="{StaticResource ChromeButton}"
                                 Click="CloseWindowButton_Click"
                                 ToolTip="Close tab" AutomationProperties.Name="Close tab">
                             <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
@@ -262,7 +272,7 @@
                         Padding="0"
                         Margin="4,0,0,1"
                         VerticalAlignment="Bottom"
-                        Style="{StaticResource FlatButton}"
+                        Style="{StaticResource ChromeButton}"
                         Click="NewTabButton_Click"
                         ToolTip="Reset the canvas view" AutomationProperties.Name="Reset the canvas view"
                         shell:WindowChrome.IsHitTestVisibleInChrome="True">
@@ -271,13 +281,13 @@
             </StackPanel>
 
             <StackPanel x:Name="CaptionButtons" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top" shell:WindowChrome.IsHitTestVisibleInChrome="True">
-                <Button Style="{StaticResource CaptionButton}" Click="MinimizeButton_Click" ToolTip="Minimize" AutomationProperties.Name="Minimize">
+                <Button Focusable="False" Style="{StaticResource CaptionButton}" Click="MinimizeButton_Click" ToolTip="Minimize" AutomationProperties.Name="Minimize">
                     <TextBlock Text="&#xE921;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>
-                <Button x:Name="MaximizeButton" Style="{StaticResource CaptionButton}" Click="MaximizeButton_Click" ToolTip="Maximize" AutomationProperties.Name="Maximize">
+                <Button x:Name="MaximizeButton" Focusable="False" Style="{StaticResource CaptionButton}" Click="MaximizeButton_Click" ToolTip="Maximize" AutomationProperties.Name="Maximize">
                     <TextBlock x:Name="MaximizeGlyph" Text="&#xE922;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>
-                <Button Style="{StaticResource CloseCaptionButton}" Click="CloseWindowButton_Click" ToolTip="Close" AutomationProperties.Name="Close">
+                <Button Focusable="False" Style="{StaticResource CloseCaptionButton}" Click="CloseWindowButton_Click" ToolTip="Close" AutomationProperties.Name="Close">
                     <TextBlock Text="&#xE8BB;" Style="{StaticResource IconText}" FontSize="10" />
                 </Button>
             </StackPanel>
@@ -292,13 +302,13 @@
             </Grid.ColumnDefinitions>
 
             <StackPanel Orientation="Horizontal" Margin="8,0,0,0" VerticalAlignment="Center">
-                <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding BackCommand}" ToolTip="Back (Alt+Left)" AutomationProperties.Name="Back">
+                <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding BackCommand}" ToolTip="Back (Alt+Left)" AutomationProperties.Name="Back">
                     <TextBlock Text="&#xE72B;" Style="{StaticResource IconText}" FontSize="14" />
                 </Button>
-                <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ForwardCommand}" ToolTip="Forward (Alt+Right)" AutomationProperties.Name="Forward">
+                <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding ForwardCommand}" ToolTip="Forward (Alt+Right)" AutomationProperties.Name="Forward">
                     <TextBlock Text="&#xE72A;" Style="{StaticResource IconText}" FontSize="14" />
                 </Button>
-                <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding UpCommand}" ToolTip="Up (Alt+Up)" AutomationProperties.Name="Up">
+                <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding UpCommand}" ToolTip="Up (Alt+Up)" AutomationProperties.Name="Up">
                     <TextBlock Text="&#xE74A;" Style="{StaticResource IconText}" FontSize="14" />
                 </Button>
             </StackPanel>
@@ -345,7 +355,7 @@
                             <ItemsControl.ItemTemplate>
                                 <DataTemplate DataType="{x:Type models:BreadcrumbSegment}">
                                     <StackPanel Orientation="Horizontal">
-                                        <Button Style="{StaticResource FlatButton}"
+                                        <Button Style="{StaticResource ChromeButton}"
                                                 Height="24"
                                                 Padding="6,0"
                                                 Command="{Binding Data.Address.OpenSegmentCommand, Source={StaticResource Shell}}"
@@ -362,7 +372,7 @@
                                              taken from here instead of the one that
                                              was. -->
                                         <Button x:Name="CrumbChevron"
-                                                Style="{StaticResource FlatButton}"
+                                                Style="{StaticResource ChromeButton}"
                                                 Width="16"
                                                 Height="24"
                                                 Padding="0"
@@ -436,7 +446,7 @@
                         <Button Width="28"
                                 Height="26"
                                 Padding="0"
-                                Style="{StaticResource FlatButton}"
+                                Style="{StaticResource ChromeButton}"
                                 Command="{Binding Address.CopyCommand}"
                                 ToolTip="Copy this path"
                                 AutomationProperties.Name="Copy this path">
@@ -445,7 +455,7 @@
                         <Button Width="22"
                                 Height="26"
                                 Padding="0"
-                                Style="{StaticResource FlatButton}"
+                                Style="{StaticResource ChromeButton}"
                                 Command="{Binding Address.ShowRecentCommand}"
                                 ToolTip="Recent locations (F4)"
                                 AutomationProperties.Name="Recent locations">
@@ -454,7 +464,7 @@
                         <Button Width="28"
                                 Height="26"
                                 Padding="0"
-                                Style="{StaticResource FlatButton}"
+                                Style="{StaticResource ChromeButton}"
                                 Command="{Binding RefreshCommand}"
                                 ToolTip="Refresh (F5)" AutomationProperties.Name="Refresh">
                             <TextBlock Text="&#xE72C;" Style="{StaticResource IconText}" FontSize="12" />
@@ -523,7 +533,7 @@
                     <Button Width="28"
                             Height="26"
                             Padding="0"
-                            Style="{StaticResource FlatButton}"
+                            Style="{StaticResource ChromeButton}"
                             Command="{Binding Search.SearchNowCommand}"
                             ToolTip="Search every drive, this folder first (Ctrl+F)" AutomationProperties.Name="Search">
                         <TextBlock Text="&#xE721;" Style="{StaticResource IconText}" FontSize="12" />
@@ -554,7 +564,7 @@
                             Width="26"
                             Height="26"
                             Padding="0"
-                            Style="{StaticResource FlatButton}"
+                            Style="{StaticResource ChromeButton}"
                             Command="{Binding Search.CloseCommand}"
                             Visibility="{Binding Search.Text, Converter={StaticResource StringToVisibility}}"
                             ToolTip="Clear the search (Esc)" AutomationProperties.Name="Clear search">
@@ -596,12 +606,12 @@
 
                     <Border CornerRadius="4" Padding="2" Background="{StaticResource SurfaceRaisedBrush}" BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1">
                         <StackPanel Orientation="Horizontal">
-                            <ToggleButton Style="{StaticResource SegmentButton}"
+                            <ToggleButton Focusable="False" Style="{StaticResource SegmentButton}"
                                           Content="View all"
                                           IsChecked="{Binding IsViewAll, Mode=TwoWay}"
                                           AutomationProperties.Name="View all"
                                           ToolTip="Every drive is a root; folders expand into their direct children" />
-                            <ToggleButton Style="{StaticResource SegmentButton}"
+                            <ToggleButton Focusable="False" Style="{StaticResource SegmentButton}"
                                           Content="View select"
                                           IsEnabled="False"
                                           IsChecked="{Binding IsViewSelect, Mode=TwoWay}"
@@ -612,19 +622,19 @@
                 </StackPanel>
 
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding CollapseAllCommand}" ToolTip="Collapse every branch" AutomationProperties.Name="Collapse every branch">
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding CollapseAllCommand}" ToolTip="Collapse every branch" AutomationProperties.Name="Collapse every branch">
                         <TextBlock Text="&#xE70E;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>
-                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="LayoutButton_Click" ToolTip="Canvas options" AutomationProperties.Name="Canvas options">
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Click="LayoutButton_Click" ToolTip="Canvas options" AutomationProperties.Name="Canvas options">
                         <TextBlock Text="&#xE8A9;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>
-                    <Button x:Name="SettingsButton" Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
+                    <Button x:Name="SettingsButton" Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
                         <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>
-                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="PaneToggleButton_Click" ToolTip="Toggle the navigation pane" AutomationProperties.Name="Toggle the navigation pane">
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Click="PaneToggleButton_Click" ToolTip="Toggle the navigation pane" AutomationProperties.Name="Toggle the navigation pane">
                         <TextBlock Text="&#xE8A4;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>
-                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource FlatButton}" Click="OverflowButton_Click" ToolTip="More" AutomationProperties.Name="More">
+                    <Button Width="32" Height="32" Padding="0" Style="{StaticResource ChromeButton}" Click="OverflowButton_Click" ToolTip="More" AutomationProperties.Name="More">
                         <TextBlock Text="&#xE712;" Style="{StaticResource IconText}" FontSize="13" />
                     </Button>
                 </StackPanel>
@@ -857,17 +867,17 @@
                                            VerticalAlignment="Center"
                                            FontSize="12"
                                            Foreground="{StaticResource TextMutedBrush}" />
-                                <Button x:Name="CanvasFilterPrevious" Grid.Column="2" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                <Button x:Name="CanvasFilterPrevious" Grid.Column="2" Width="28" Height="26" Padding="0" Style="{StaticResource ChromeButton}"
                                         Click="CanvasFilterPrevious_Click" ToolTip="Previous match (Shift+Enter)" AutomationProperties.Name="Previous match"
                                         Visibility="Collapsed">
                                     <TextBlock Text="&#xE70E;" Style="{StaticResource IconText}" FontSize="11" />
                                 </Button>
-                                <Button x:Name="CanvasFilterNext" Grid.Column="3" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                <Button x:Name="CanvasFilterNext" Grid.Column="3" Width="28" Height="26" Padding="0" Style="{StaticResource ChromeButton}"
                                         Click="CanvasFilterNext_Click" ToolTip="Next match (Enter)" AutomationProperties.Name="Next match"
                                         Visibility="Collapsed">
                                     <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="11" />
                                 </Button>
-                                <Button x:Name="CanvasFilterClear" Grid.Column="4" Width="28" Height="26" Padding="0" Style="{StaticResource FlatButton}"
+                                <Button x:Name="CanvasFilterClear" Grid.Column="4" Width="28" Height="26" Padding="0" Style="{StaticResource ChromeButton}"
                                         Click="CanvasFilterClear_Click" ToolTip="Clear the filter (Esc)" AutomationProperties.Name="Clear the filter"
                                         Visibility="Collapsed">
                                     <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="10" />
@@ -972,7 +982,7 @@
                                     Height="22"
                                     Padding="0"
                                     Margin="0,0,4,0"
-                                    Style="{StaticResource FlatButton}"
+                                    Style="{StaticResource ChromeButton}"
                                     Command="{Binding Tree.FolderList.UpCommand}"
                                     ToolTip="Up one folder (Alt+Up)"
                                     AutomationProperties.Name="Up one folder">
@@ -1002,7 +1012,7 @@
                                     Width="22"
                                     Height="22"
                                     Padding="0"
-                                    Style="{StaticResource FlatButton}"
+                                    Style="{StaticResource ChromeButton}"
                                     Command="{Binding Tree.FolderList.HideCommand}"
                                     ToolTip="Hide the folder list"
                                     AutomationProperties.Name="Hide the folder list">
@@ -1199,7 +1209,7 @@
                                              Foreground="{StaticResource AccentBrush}" Background="Transparent" BorderThickness="0"
                                              Visibility="{Binding Search.IsBusy, Converter={StaticResource BoolToVisibility}}" />
                                 <Button Grid.Column="2" Width="28" Height="28" Padding="0" VerticalAlignment="Top"
-                                        Style="{StaticResource FlatButton}"
+                                        Style="{StaticResource ChromeButton}"
                                         Command="{Binding Search.CloseCommand}"
                                         ToolTip="Close the results (Esc in the search box)" AutomationProperties.Name="Close search results">
                                     <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="10" />
@@ -1215,7 +1225,7 @@
                                     </Grid.ColumnDefinitions>
                                     <TextBlock FontSize="10" Foreground="{StaticResource TextDimBrush}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"
                                                Text="↑↓ move · Enter show · Ctrl+Enter open · right-click for more · Esc close" />
-                                    <Button Grid.Column="1" Padding="8,2" Margin="8,0,0,0" Style="{StaticResource FlatButton}"
+                                    <Button Grid.Column="1" Padding="8,2" Margin="8,0,0,0" Style="{StaticResource ChromeButton}"
                                             Command="{Binding Search.GetEverythingCommand}"
                                             Visibility="{Binding Search.OffersEverything, Converter={StaticResource BoolToVisibility}}"
                                             ToolTip="Everything (voidtools.com) indexes every drive; with it running, search answers at once">
@@ -1392,22 +1402,22 @@
                         BorderBrush="{StaticResource BorderStrongBrush}"
                         BorderThickness="1">
                     <StackPanel Orientation="Horizontal">
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomOutCommand}" ToolTip="Zoom out (Ctrl+-, Ctrl+wheel)" AutomationProperties.Name="Zoom out">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding ZoomOutCommand}" ToolTip="Zoom out (Ctrl+-, Ctrl+wheel)" AutomationProperties.Name="Zoom out">
                             <TextBlock Text="&#xE949;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button Width="54" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100% (Shift+0)" AutomationProperties.Name="Reset to 100%">
+                        <Button Width="54" Height="30" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding ResetZoomCommand}" ToolTip="Reset to 100% (Shift+0)" AutomationProperties.Name="Reset to 100%">
                             <TextBlock Text="{Binding ZoomLabel}" FontSize="10.5" />
                         </Button>
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in (Ctrl++, Ctrl+wheel)" AutomationProperties.Name="Zoom in">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding ZoomInCommand}" ToolTip="Zoom in (Ctrl++, Ctrl+wheel)" AutomationProperties.Name="Zoom in">
                             <TextBlock Text="&#xE948;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all (Shift+1) — Shift+2 fits the selection" AutomationProperties.Name="Fit all">
+                        <Button Width="30" Height="30" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all (Shift+1) — Shift+2 fits the selection" AutomationProperties.Name="Fit all">
                             <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button x:Name="CanvasLayersButton" Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Click="LayersButton_Click" ToolTip="Layers: files, icons, details, counts, hidden items, marks" AutomationProperties.Name="Layers">
+                        <Button x:Name="CanvasLayersButton" Width="30" Height="30" Padding="0" Style="{StaticResource ChromeButton}" Click="LayersButton_Click" ToolTip="Layers: files, icons, details, counts, hidden items, marks" AutomationProperties.Name="Layers">
                             <TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
-                        <Button x:Name="CanvasSettingsButton" Width="30" Height="30" Padding="0" Style="{StaticResource FlatButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
+                        <Button x:Name="CanvasSettingsButton" Width="30" Height="30" Padding="0" Style="{StaticResource ChromeButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
                             <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="12" />
                         </Button>
                     </StackPanel>
@@ -1427,7 +1437,7 @@
                         <ProgressBar Width="44" Height="3" IsIndeterminate="True" Margin="0,0,10,0"
                                      Visibility="{Binding Toast.IsBusy, Converter={StaticResource BoolToVisibility}}" />
                         <TextBlock Text="{Binding Toast.Message}" VerticalAlignment="Center" FontSize="11.5" />
-                        <Button Width="24" Height="24" Padding="0" Margin="9,0,0,0" Style="{StaticResource FlatButton}" Command="{Binding Toast.HideCommand}">
+                        <Button Width="24" Height="24" Padding="0" Margin="9,0,0,0" Style="{StaticResource ChromeButton}" Command="{Binding Toast.HideCommand}">
                             <TextBlock Text="&#xE711;" Style="{StaticResource IconText}" FontSize="9" />
                         </Button>
                     </StackPanel>
@@ -1535,13 +1545,13 @@
                            Foreground="{StaticResource TextDimBrush}"
                            TextTrimming="CharacterEllipsis" />
                 <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
-                    <Button Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all" AutomationProperties.Name="Fit all">
+                    <Button Width="24" Height="20" Padding="0" Style="{StaticResource ChromeButton}" Command="{Binding FitAllCommand}" ToolTip="Fit all" AutomationProperties.Name="Fit all">
                         <TextBlock Text="&#xE9A6;" Style="{StaticResource IconText}" FontSize="10" />
                     </Button>
-                    <Button x:Name="StatusLayersButton" Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Click="LayersButton_Click" ToolTip="Layers" AutomationProperties.Name="Layers">
+                    <Button x:Name="StatusLayersButton" Width="24" Height="20" Padding="0" Style="{StaticResource ChromeButton}" Click="LayersButton_Click" ToolTip="Layers" AutomationProperties.Name="Layers">
                         <TextBlock Text="&#xE81E;" Style="{StaticResource IconText}" FontSize="10" />
                     </Button>
-                    <Button x:Name="StatusSettingsButton" Width="24" Height="20" Padding="0" Style="{StaticResource FlatButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
+                    <Button x:Name="StatusSettingsButton" Width="24" Height="20" Padding="0" Style="{StaticResource ChromeButton}" Click="SettingsButton_Click" ToolTip="Settings (Ctrl+,)" AutomationProperties.Name="Settings">
                         <TextBlock Text="&#xE713;" Style="{StaticResource IconText}" FontSize="10" />
                     </Button>
                 </StackPanel>
