@@ -92,9 +92,12 @@ public partial class MainWindow
 
     private void SettingsButton_Click(object sender, RoutedEventArgs e) => OpenSettings();
 
-    /// <summary>What draws the nested canvas now, for the Renderer setting.</summary>
-    private string DescribeRendererNow() =>
-        SettingsViewModel.DescribeRendererNow(IsNested, Nested.IsSceneOnGpu, Nested.RendererAdapter, Nested.RendererReason);
+    /// <summary>What draws the nested canvas now - the pane being worked with - for the Renderer setting.</summary>
+    private string DescribeRendererNow()
+    {
+        var canvas = ActivePane.Canvas;
+        return SettingsViewModel.DescribeRendererNow(IsNested, canvas.IsSceneOnGpu, canvas.RendererAdapter, canvas.RendererReason);
+    }
 
     /// <summary>The app's confirmation, over the Settings window when that is what asked.</summary>
     private bool ConfirmFromSettings(string title, string message, string confirmLabel)

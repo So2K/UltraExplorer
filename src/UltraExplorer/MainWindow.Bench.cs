@@ -75,9 +75,9 @@ public partial class MainWindow
             var watch = Stopwatch.StartNew();
             window._viewModel.Sort = sort;
             watch.Stop();
-            WorstCanvasMilliseconds = Math.Max(WorstCanvasMilliseconds, window._nestedTree.LastOrderChangeMilliseconds);
+            WorstCanvasMilliseconds = Math.Max(WorstCanvasMilliseconds, window.FirstPane.Tree.LastOrderChangeMilliseconds);
             Clicks++;
-            if (window._nestedTree.IsSorting)
+            if (window.FirstPane.Tree.IsSorting)
             {
                 Deferred++;
             }
@@ -147,7 +147,7 @@ public partial class MainWindow
     }
 
     /// <summary>True when this process was started for a benchmark or snapshot run.</summary>
-    private static bool IsDiagnosticsRun =>
+    internal static bool IsDiagnosticsRun =>
         SwitchValue("--nested-bench") is not null || SwitchValue("--nested-snapshots") is not null;
 
     /// <summary>
@@ -404,8 +404,8 @@ public partial class MainWindow
             Nested.Redraw();
             await NextFrameAsync();
             await Task.Delay(30);
-            if (_nestedTree.PendingCount > 0
-                || _nestedTree.IsSorting
+            if (FirstPane.Tree.PendingCount > 0
+                || FirstPane.Tree.IsSorting
                 || Nested.HasPendingWork
                 || Nested.RenderCount != lastRenders && _treeChangedRecently)
             {
@@ -464,7 +464,7 @@ public partial class MainWindow
     private string RendererState() =>
         $"{(Nested.IsSceneOnGpu ? "gpu" : "cpu")}\t{(Nested.AreLabelsOnGpu ? "gpu" : "wpf")}\t{Nested.RendererReason}";
 
-    private void TrackTreeChanges() => _nestedTree.Changed += (_, _) => _treeChangedRecently = true;
+    private void TrackTreeChanges() => FirstPane.Tree.Changed += (_, _) => _treeChangedRecently = true;
 
     private sealed class PhaseStats(string name)
     {
@@ -813,7 +813,7 @@ public partial class MainWindow
         var rested = double.NaN;
         var stats = await PhaseCoreAsync(name, int.MaxValue, _ => { }, force: false, finished: () =>
         {
-            if (Nested.IsFrameHooked || _nestedTree.PendingCount > 0 || Nested.HasPendingWork)
+            if (Nested.IsFrameHooked || FirstPane.Tree.PendingCount > 0 || Nested.HasPendingWork)
             {
                 return false;
             }
@@ -964,8 +964,8 @@ public partial class MainWindow
             await PhaseAsync("fit-static", 60, _ => { })
         };
 
-        var windows = await _nestedTree.RevealAsync(@"C:\Windows");
-        var system32 = await _nestedTree.RevealAsync(@"C:\Windows\System32");
+        var windows = await FirstPane.Tree.RevealAsync(@"C:\Windows");
+        var system32 = await FirstPane.Tree.RevealAsync(@"C:\Windows\System32");
         if (windows is not null)
         {
             Nested.FlyTo(windows, 0.35, animated: false);
@@ -1062,7 +1062,7 @@ public partial class MainWindow
 
         report.AppendLine();
         report.AppendLine($"settle_fit_ms\t{settle.ToString("0", CultureInfo.InvariantCulture)}");
-        report.AppendLine($"loaded_folders\t{_nestedTree.LoadedCount}");
+        report.AppendLine($"loaded_folders\t{FirstPane.Tree.LoadedCount}");
         AppendRendererReport(report, rendererAtStart);
         FinishBenchInstruments(report, output);
     }
@@ -1194,7 +1194,7 @@ public partial class MainWindow
             {
                 Nested.FitAll(animated: false);
             }
-            else if (await _nestedTree.RevealAsync(path) is { } target && ViewAllPath.Equals(target.FullPath, path))
+            else if (await FirstPane.Tree.RevealAsync(path) is { } target && ViewAllPath.Equals(target.FullPath, path))
             {
                 Nested.FlyTo(target, fill, animated: false);
             }
@@ -1243,7 +1243,7 @@ public partial class MainWindow
     {
         // Every folder placed for the order first: a picture must never catch
         // the background pass half way.
-        _nestedTree.FlushSortWork();
+        FirstPane.Tree.FlushSortWork();
         element.UpdateLayout();
         Nested.RenderNow();
 
@@ -1642,9 +1642,9 @@ public partial class MainWindow
         foreach (var field in typeof(NestedTree).GetFields(BindingFlags.Instance | BindingFlags.NonPublic))
         {
             if (field.FieldType == typeof(Func<string, CancellationToken, NestedListing>)
-                && field.GetValue(_nestedTree) is Func<string, CancellationToken, NestedListing> reader)
+                && field.GetValue(FirstPane.Tree) is Func<string, CancellationToken, NestedListing> reader)
             {
-                field.SetValue(_nestedTree, (Func<string, CancellationToken, NestedListing>)((path, token) =>
+                field.SetValue(FirstPane.Tree, (Func<string, CancellationToken, NestedListing>)((path, token) =>
                 {
                     using (var timer = new BenchTimer())
                     {
@@ -1794,7 +1794,7 @@ public partial class MainWindow
     {
         try
         {
-            await _nestedTree.RefreshAsync(folder);
+            await FirstPane.Tree.RefreshAsync(folder);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException)
         {
@@ -1810,7 +1810,7 @@ public partial class MainWindow
     /// </summary>
     private async Task FlyBenchFixtureAsync(BenchFixture fixture, List<PhaseStats> phases)
     {
-        if (await _nestedTree.RevealAsync(fixture.Folders) is { } folders && ViewAllPath.Equals(folders.FullPath, fixture.Folders))
+        if (await FirstPane.Tree.RevealAsync(fixture.Folders) is { } folders && ViewAllPath.Equals(folders.FullPath, fixture.Folders))
         {
             Nested.FlyTo(folders, 0.92, animated: false);
             phases.Add(await RestPhaseAsync("fixture-folders-rest"));
@@ -1833,7 +1833,7 @@ public partial class MainWindow
             }, force: false, finished: () => started >= refreshed.Count && clock.Elapsed.TotalMilliseconds > refreshed.Count * 50 + 300, timeoutMilliseconds: 5_000));
         }
 
-        if (await _nestedTree.RevealAsync(fixture.Files) is { } files && ViewAllPath.Equals(files.FullPath, fixture.Files))
+        if (await FirstPane.Tree.RevealAsync(fixture.Files) is { } files && ViewAllPath.Equals(files.FullPath, fixture.Files))
         {
             Nested.FlyTo(files, 0.92, animated: false);
             await SettleAsync();

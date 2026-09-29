@@ -29,15 +29,11 @@ namespace UltraExplorer;
 /// </summary>
 public partial class MainWindow
 {
-    private bool _applyingCanvasSelection;
     private bool _applyingListSelection;
     private bool _listUserInput;
 
     private void AttachSelection()
     {
-        Nested.SelectionCommitted += OnNestedSelectionCommitted;
-        Nested.MarqueePreview += OnNestedMarqueePreview;
-        Nested.MarqueeStarted += OnNestedMarqueeStarted;
         _viewModel.Tree.Selection.Changed += OnSharedSelectionChanged;
         _viewModel.Tree.FolderList.SelectionRowsChanged += ApplySelectionToList;
         _viewModel.Tree.FolderList.RowsReplaced += ApplySelectionToList;
@@ -48,9 +44,6 @@ public partial class MainWindow
 
     private void DetachSelection()
     {
-        Nested.SelectionCommitted -= OnNestedSelectionCommitted;
-        Nested.MarqueePreview -= OnNestedMarqueePreview;
-        Nested.MarqueeStarted -= OnNestedMarqueeStarted;
         _viewModel.Tree.Selection.Changed -= OnSharedSelectionChanged;
         _viewModel.Tree.FolderList.SelectionRowsChanged -= ApplySelectionToList;
         _viewModel.Tree.FolderList.RowsReplaced -= ApplySelectionToList;
@@ -73,63 +66,25 @@ public partial class MainWindow
     }
 
     // ---- the canvas ------------------------------------------------------------
+    //
+    // A gesture on a canvas is applied to the shared selection by its pane
+    // (NestedPane), in the same call.
 
     /// <summary>
-    /// A gesture on the canvas: applied to the shared selection in the same
-    /// call, so a drag or a menu straight after it already acts on it, and
-    /// the version it made noted as the canvas's own.
+    /// Any change of the shared selection: the pane being worked with, whose
+    /// selection it is, takes it in - its headers, and its canvas unless the
+    /// change is the canvas's own or the canvas is not the picture on show.
     /// </summary>
-    private void OnNestedSelectionCommitted(SelectionEdit edit)
-    {
-        var selection = _viewModel.Tree.Selection;
-        _applyingCanvasSelection = true;
-        try
-        {
-            selection.Apply(edit);
-        }
-        finally
-        {
-            _applyingCanvasSelection = false;
-        }
-
-        Nested.AcknowledgeSelection(selection.Version);
-    }
-
-    /// <summary>Any other change: the canvas takes it in, unless it is not the picture on show.</summary>
-    private void OnSharedSelectionChanged(ItemSelection selection)
-    {
-        // The headers are for the folder selected, or the one the selection is in.
-        UpdateSortHeaders();
-
-        if (!_applyingCanvasSelection && IsNested && _nestedReady)
-        {
-            Nested.LoadSelection(selection);
-        }
-    }
-
-    private void OnNestedMarqueePreview(int count) => _viewModel.Tree.ShowSelectionPreview(count);
-
-    /// <summary>
-    /// The first rectangle ever drawn says, once, that left-drag used to pan
-    /// and where the old behaviour is: the muscle memory is the pan.
-    /// </summary>
-    private void OnNestedMarqueeStarted()
-    {
-        if (_viewModel.LeftDragHintShown || IsDiagnosticsRun)
-        {
-            return;
-        }
-
-        _viewModel.LeftDragHintShown = true;
-        _ = _viewModel.Toast.ShowSuccessAsync(
-            "Left-drag now selects. Pan with the right or middle button, Space+drag or the wheel — Settings (Ctrl+,) ▸ Mouse.");
-    }
+    private void OnSharedSelectionChanged(ItemSelection selection) => ActivePane.OnSharedSelectionChanged(selection);
 
     private void OnShellPropertyChangedForSelection(object? sender, PropertyChangedEventArgs e)
     {
         if (e.PropertyName == nameof(MainViewModel.LeftDrag))
         {
-            Nested.LeftDrag = _viewModel.LeftDrag;
+            foreach (var pane in _panes)
+            {
+                pane.Canvas.LeftDrag = _viewModel.LeftDrag;
+            }
         }
     }
 
@@ -159,51 +114,6 @@ public partial class MainWindow
         }
 
         menu.Items.Add(group);
-    }
-
-    /// <summary>
-    /// A right-click on an item of the canvas: an item outside the selection
-    /// becomes the selection, as in Explorer; one inside it keeps the whole
-    /// set and takes the focus.  The menu then acts on everything selected -
-    /// the Shell's own for items in one folder, built while the button was
-    /// down.  Its entries of our own go by path, so nothing waits for the
-    /// window's tree to know the item.  An item found gone - the Shell cannot
-    /// make its menu and it is not on disk - is let go of instead, and its
-    /// folder read again.
-    /// </summary>
-    private async Task ShowNestedItemMenuAsync(NestedHit target, Point point)
-    {
-        var selection = _viewModel.Tree.Selection;
-        var path = target.Path;
-        if (!selection.Contains(path))
-        {
-            selection.ReplaceSingle(path, !target.IsFile, target.IsFile ? target.File.Length : 0, SelectionSource.Canvas);
-        }
-        else
-        {
-            selection.Apply(new SelectionEdit { Focus = path, Source = SelectionSource.Canvas });
-        }
-
-        if (ShowContextMenu(selection.Paths, Nested, point, includeCanvasCommands: true, fallBack: false))
-        {
-            return;
-        }
-
-        if (!Directory.Exists(path) && !File.Exists(path))
-        {
-            selection.Remove([path], SelectionSource.Command);
-            await RefreshStaleAsync(path);
-            return;
-        }
-
-        ShowSelectionMenu(Nested);
-    }
-
-    /// <summary>What a drag of <paramref name="path"/> carries: the whole selection if it is part of it, else the item alone.</summary>
-    private string[] NestedDragPaths(string path)
-    {
-        var selection = _viewModel.Tree.Selection;
-        return selection.Count > 1 && selection.Contains(path) ? [.. selection.Paths] : [path];
     }
 
     // ---- the folder list ------------------------------------------------------------
@@ -363,7 +273,7 @@ public partial class MainWindow
 
         var path = SwitchValue("--selection-demo-path") ?? Environment.GetFolderPath(Environment.SpecialFolder.System);
         await Task.Delay(1500);
-        if (!IsNested || await _nestedTree.RevealAsync(path) is not { } folder)
+        if (!IsNested || await FirstPane.Tree.RevealAsync(path) is not { } folder)
         {
             return;
         }

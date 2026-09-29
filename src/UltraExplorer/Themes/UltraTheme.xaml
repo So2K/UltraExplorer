@@ -159,6 +159,19 @@
         <Setter Property="Padding" Value="14,8" />
     </Style>
 
+    <!-- The main window's own buttons - Back, Up, the crumbs, zoom, Fit all,
+         the filter's Previous and Next, Settings and the rest - never take
+         the keyboard.  Clicked, the focus stays where it was: on a canvas,
+         the list or a box being typed in, so Delete, F2, Ctrl+C and Enter
+         keep acting on the selection rather than doing nothing, and Enter
+         never presses the button again.  Each one has its shortcut.  Here
+         rather than in the window's resources because the canvas's panes
+         (NestedPaneView) use it too, and a control's static resources are
+         looked up before it is inside the window. -->
+    <Style x:Key="ChromeButton" TargetType="Button" BasedOn="{StaticResource FlatButton}">
+        <Setter Property="Focusable" Value="False" />
+    </Style>
+
     <Style TargetType="TextBox">
         <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
         <Setter Property="CaretBrush" Value="{StaticResource AccentBrightBrush}" />

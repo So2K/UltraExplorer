@@ -1,7 +1,9 @@
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Threading;
+using UltraExplorer;
 using UltraExplorer.Controls;
 using UltraExplorer.Models;
 using UltraExplorer.Rendering.Gpu;
@@ -20,7 +22,9 @@ namespace ViewAllSmoke;
 /// the icons either asked for, a change on disk reaches only the tree whose
 /// folder changed, exactly one pane takes the hub's changes in, a pane left
 /// still keeps reading while the other moves, and closing one pane leaves
-/// the other working - hub, icons and all.
+/// the other working - hub, icons and all.  With them, the window's own
+/// pane before any split (<see cref="SplitPaneWindowChecks"/>, run with the
+/// Settings checks, which have the window).
 /// </summary>
 internal static partial class Program
 {
@@ -487,5 +491,43 @@ internal static partial class Program
             treeB?.Dispose();
             TryDelete(baseDirectory);
         }
+    }
+
+    /// <summary>
+    /// The window as it is before any split: one pane, the one being worked
+    /// with, whose canvas is the one the bench and the checks have always
+    /// called Nested, drawing a tree of its own that hears the changes, with
+    /// the icon service's one inbox; its header kept for a split but
+    /// collapsed, so it looks as the window's one canvas did; the names
+    /// automation finds its parts by unchanged; and the strip over it wired
+    /// to it.  Run from the Settings checks: the window needs the app.
+    /// </summary>
+    private static async Task SplitPaneWindowChecks(MainWindow main, MainViewModel shell)
+    {
+        Section("split panes: the window's one pane");
+        var pane = main.ActivePane;
+        var view = pane.View;
+        Check("the window has one pane, the one being worked with, and Nested is its canvas",
+            main.Panes.Count == 1 && ReferenceEquals(pane, main.FirstPane) && ReferenceEquals(main.Nested, pane.Canvas)
+            && main.NestedHost.Children.Count == 1 && ReferenceEquals(main.NestedHost.Children[0], view));
+        Check("its canvas draws a tree of its own, which hears the changes, and its icons arrive in the icon service's one inbox",
+            ReferenceEquals(pane.Canvas.Tree, pane.Tree) && shell.Tree.NestedChanges.Count == 1 && ReferenceEquals(shell.Tree.NestedChanges[0], pane.Tree)
+            && ReferenceEquals(pane.Canvas.IconArrivals, shell.Icons.CanvasArrivals) && shell.Icons.CanvasInboxCount == 1);
+        Check("the pane's header is kept for a split but collapsed, so one pane looks as the window's canvas always did",
+            view.PaneHeader.Visibility == Visibility.Collapsed);
+        Check("automation finds the canvas, the strip, the filter box and the headers by the names they always had",
+            AutomationProperties.GetAutomationId(pane.Canvas) == "Nested" && AutomationProperties.GetName(pane.Canvas) == "Folders"
+            && view.NestedStrip.Name == "NestedStrip" && view.CanvasFilterBox.Name == "CanvasFilterBox" && view.SortByName.Name == "SortByName");
+
+        view.CanvasFilterBox.Text = "no-such-name-anywhere";
+        var filtered = await SettingsWaitFor(() => pane.Canvas.IsFiltering);
+        Check("typing in the pane's filter box narrows its canvas a moment later, and the strip says so",
+            filtered && view.CanvasFilterHint.Visibility == Visibility.Collapsed && view.CanvasFilterClear.Visibility == Visibility.Visible
+            && view.CanvasFilterCount.Text is { Length: > 0 });
+
+        Click(view.CanvasFilterClear);
+        Check("and its Clear lets the filter go, the strip with it",
+            !pane.Canvas.IsFiltering && view.CanvasFilterBox.Text.Length == 0 && view.CanvasFilterClear.Visibility == Visibility.Collapsed
+            && view.CanvasFilterHint.Visibility == Visibility.Visible && view.CanvasFilterCount.Text.Length == 0);
     }
 }

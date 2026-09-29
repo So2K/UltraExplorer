@@ -67,6 +67,7 @@ internal static partial class Program
             await SettingsResetChecks(shell);
             SettingsWordsChecks();
             ChromeFocusChecks(main);
+            await SplitPaneWindowChecks(main, shell);
             shell.Dispose();
         }
         finally
@@ -368,19 +369,20 @@ internal static partial class Program
             Directory.CreateDirectory(inner);
             File.WriteAllText(file, "x");
             var selection = shell.Tree.Selection;
+            var headers = main.ActivePane.View;
             orders.SetFolder(inner, new ItemSort(SortColumn.Modified, true));
             selection.ReplaceSingle(inner, true, 0, SelectionSource.Navigation);
             Check("on the nested canvas a selected folder is what the headers sort, and they show its own order at once",
-                main.SortFolder() == inner && main.SortByModifiedArrow.Visibility == Visibility.Visible
-                && main.SortByModified.ToolTip is string tip && tip.StartsWith("Sorted by Date modified", StringComparison.Ordinal) && tip.Contains("in Inner", StringComparison.Ordinal));
+                main.SortFolder() == inner && headers.SortByModifiedArrow.Visibility == Visibility.Visible
+                && headers.SortByModified.ToolTip is string tip && tip.StartsWith("Sorted by Date modified", StringComparison.Ordinal) && tip.Contains("in Inner", StringComparison.Ordinal));
 
             selection.ReplaceSingle(file, false, 1, SelectionSource.Navigation);
             Check("a selected file's folder is what they sort",
-                main.SortFolder() == root && main.SortByNameArrow.Visibility == Visibility.Visible
-                && main.SortByName.ToolTip is string nameTip && nameTip.Contains($"in {Path.GetFileName(root)}", StringComparison.Ordinal));
+                main.SortFolder() == root && headers.SortByNameArrow.Visibility == Visibility.Visible
+                && headers.SortByName.ToolTip is string nameTip && nameTip.Contains($"in {Path.GetFileName(root)}", StringComparison.Ordinal));
 
             selection.ReplaceSingle(inner, true, 0, SelectionSource.Navigation);
-            main.SortByName.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent, main.SortByName));
+            headers.SortByName.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent, headers.SortByName));
             Check("and a header click sorts the selected folder, not the one it is in",
                 orders.SortOf(inner).Column == SortColumn.Name && !orders.HasOwnOrder(root));
             selection.Clear(SelectionSource.Navigation);
@@ -570,8 +572,8 @@ internal static partial class Program
             ("the status bar's Settings", main.StatusSettingsButton),
             ("the canvas's Layers", main.CanvasLayersButton),
             ("New folder", main.NewFolderButton),
-            ("the filter's Previous", main.CanvasFilterPrevious),
-            ("the filter's Next", main.CanvasFilterNext),
+            ("the filter's Previous", main.ActivePane.View.CanvasFilterPrevious),
+            ("the filter's Next", main.ActivePane.View.CanvasFilterNext),
             ("Maximize", main.MaximizeButton)
         };
         var taking = chrome.Where(item => item.Button.Focusable).Select(item => item.Name).ToArray();

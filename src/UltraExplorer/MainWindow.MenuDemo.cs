@@ -83,7 +83,7 @@ public partial class MainWindow
             await Task.Delay(wait);
             await ShellMenuWarmUp.Completed;
             lines.Add(string.Create(CultureInfo.InvariantCulture, $"# warm-up: {ShellMenuWarmUp.MenusBuilt} menus built in {ShellMenuWarmUp.Elapsed.TotalMilliseconds:F0} ms; dark menus: {DarkMenus.IsOn}"));
-            if (!IsNested || await _nestedTree.RevealAsync(path) is not { } folder)
+            if (!IsNested || await FirstPane.Tree.RevealAsync(path) is not { } folder)
             {
                 lines.Add("the folder could not be shown on the nested canvas");
                 return;

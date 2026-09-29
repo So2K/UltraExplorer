@@ -1,7 +1,6 @@
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows;
-using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -15,49 +14,59 @@ namespace UltraExplorer;
 /// <summary>
 /// The nested canvas's side of the window.
 ///
-/// The canvas draws folders; everything a folder can be asked to do - select
-/// it, open its menu, copy it, rename it, show its files in the list - still
-/// goes through the tree view model, exactly as a click on a tree node does.
-/// Clicking a cell selects its path there, and whatever the rest of the window
-/// selects (the address bar, the list, back and forward, a search result) is
-/// mirrored back onto the canvas and flown to.  So the two pictures are two
-/// views of one selection, and every command works in both.
+/// The canvas is shown in panes (<see cref="NestedPane"/>), each a canvas with
+/// a tree of its own and the strip over it; everything that is one pane's -
+/// its camera, filter, headers, beacons, menus and drags - is the pane's.
+/// What is left here is the window's: which pane is being worked with
+/// (<see cref="ActivePane"/>), which every window-wide part follows - the
+/// selection's mirror, navigation, the zoom buttons, the keys - and what
+/// every pane shares - the drives, the orders and hidden rules, the layers,
+/// the marks and the background pass.  A window has one pane until its view
+/// is split.
 /// </summary>
-public partial class MainWindow
+public partial class MainWindow : INestedPaneHost
 {
-    private static readonly Color NoteBeaconColour = Color.FromRgb(0xC8, 0xD2, 0xDC);
-    private static readonly Color PinBeaconColour = Color.FromRgb(0xFF, 0xD6, 0x6B);
-    private static readonly Color ActiveBeaconColour = Color.FromRgb(0x60, 0xCD, 0xFF);
-    private static readonly Color SearchBeaconColour = Color.FromRgb(0x4C, 0xC9, 0xD8);
-    private const int SearchBeaconLimit = 100;
-
-    private readonly NestedTree _nestedTree = new();
+    private readonly List<NestedPane> _panes = [];
     private readonly List<NestedRoot> _nestedDrives = [];
-    private DispatcherTimer? _nestedSaveTimer;
-    private DispatcherTimer? _beaconTimer;
     private string[]? _nestedDragPaths;
     private bool _nestedReady;
-    private DispatcherTimer? _filterTimer;
-    private const int FilterBeaconLimit = 150;
-    private bool _nestedCameraRestored;
 
-    /// <summary>Slices of the nested tree's background pass, waiting for frames to run in (see <see cref="PostSortSlice"/>).</summary>
+    /// <summary>Slices of the nested trees' background pass, waiting for frames to run in (see <see cref="PostSortSlice"/>).</summary>
     private readonly Queue<Action> _sortSlices = new();
     private bool _sortSlicesHooked;
     private TimeSpan _lastSortSliceFrame = TimeSpan.MinValue;
 
     private bool IsNested => _viewModel.IsNestedLayout;
 
+    /// <summary>The panes of the nested canvas, in the order they are laid out: one until the view is split.</summary>
+    internal IReadOnlyList<NestedPane> Panes => _panes;
+
     /// <summary>
-    /// The canvas that is showing, for keyboard focus.  A test copy or a
-    /// diagnostics run that is not the active window only has the canvas
-    /// remembered as where the keyboard goes when it is clicked into: moving
-    /// the keyboard there now would activate the window, and take the
-    /// keyboard from whatever the user is typing into on the other screen.
+    /// The pane being worked with: the one the address bar, the status bar,
+    /// the zoom buttons, the keys and every command follow.
     /// </summary>
-    private void FocusCanvas()
+    internal NestedPane ActivePane { get; private set; } = null!;
+
+    /// <summary>The first pane: the one a window that is not split shows, and the one the bench, the snapshots and the demos drive.</summary>
+    internal NestedPane FirstPane => _panes[0];
+
+    /// <summary>The first pane's canvas, as the bench, the snapshots, the demos and the checks have always known it.</summary>
+    internal NestedCanvas Nested => FirstPane.Canvas;
+
+    /// <summary>The canvas that is showing - the active pane's, or the tree - for keyboard focus.</summary>
+    private void FocusCanvas() => FocusCanvas(ActivePane);
+
+    /// <summary>
+    /// The keyboard to <paramref name="pane"/>'s canvas, or to the tree when
+    /// it is the picture on show.  A test copy or a diagnostics run that is
+    /// not the active window only has the canvas remembered as where the
+    /// keyboard goes when it is clicked into: moving the keyboard there now
+    /// would activate the window, and take the keyboard from whatever the
+    /// user is typing into on the other screen.
+    /// </summary>
+    private void FocusCanvas(NestedPane pane)
     {
-        UIElement canvas = IsNested ? Nested : Editor;
+        UIElement canvas = IsNested ? pane.Canvas : Editor;
         if (!IsActive && (IsTestWindow || IsDiagnosticsRun))
         {
             FocusManager.SetFocusedElement(this, canvas);
@@ -69,50 +78,13 @@ public partial class MainWindow
 
     private void AttachNested()
     {
-        _nestedTree.PostBackground = PostSortSlice;
-
-        // Changes on disk: before the drives go in, so every drive takes its
-        // watch from the hub.  The tree registers what it reads; the canvas
-        // takes the hub's changes in at the start of its frames and hands them
-        // to the tree view model, which gives the tree its own.
-        _nestedTree.Changes = _viewModel.Changes;
-        _viewModel.Tree.AddNestedChanges(_nestedTree);
-        Nested.AttachChanges(_viewModel.Changes, _viewModel.Tree);
+        // The first pane takes the icon service's own inbox; a pane made
+        // later has one of its own (ShellIconService.SubscribeCanvas).
+        var first = new NestedPane(this, _viewModel, FirstPaneView, _viewModel.Icons.CanvasArrivals);
+        _panes.Add(first);
+        ActivePane = first;
+        first.Attach();
         AttachDevices();
-
-        Nested.Tree = _nestedTree;
-        Nested.MarkLookup = _viewModel.Marks.Get;
-        Nested.IconLookup = LookUpFileIcon;
-        Nested.IconArrivals = _viewModel.Icons.CanvasArrivals;
-        _nestedTree.FolderLoaded += OnFolderLoadedForIcons;
-        Nested.OpenRequested += OnNestedOpenRequested;
-        Nested.ContextMenuRequested += OnNestedContextMenuRequested;
-        Nested.ContextMenuPressed += OnNestedContextMenuPressed;
-        Nested.DragRequested += OnNestedDragRequested;
-        Nested.CameraChanged += OnNestedCameraChanged;
-        Nested.FilterChanged += OnNestedFilterChanged;
-
-        _filterTimer = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(140) };
-        _filterTimer.Tick += (_, _) =>
-        {
-            _filterTimer.Stop();
-            Nested.SetFilter(CanvasFilterBox.Text);
-        };
-
-        _nestedSaveTimer = new DispatcherTimer(DispatcherPriority.ApplicationIdle) { Interval = TimeSpan.FromMilliseconds(400) };
-        _nestedSaveTimer.Tick += (_, _) =>
-        {
-            _nestedSaveTimer.Stop();
-            _viewModel.Tree.NestedCamera = Nested.CaptureCamera() ?? _viewModel.Tree.NestedCamera;
-            _viewModel.Tree.ScheduleSave();
-        };
-
-        _beaconTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(120) };
-        _beaconTimer.Tick += (_, _) =>
-        {
-            _beaconTimer.Stop();
-            RebuildBeacons();
-        };
 
         _viewModel.PropertyChanged += OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
@@ -120,32 +92,28 @@ public partial class MainWindow
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged += OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
-        UpdateSortHeaders();
     }
 
     private void DetachNested()
     {
-        _nestedSaveTimer?.Stop();
-        _beaconTimer?.Stop();
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
         _viewModel.Tree.DeepRefreshRequested -= OnTreeDeepRefreshRequested;
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged -= OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged -= OnMarkChangedForNested;
-        _nestedTree.FolderLoaded -= OnFolderLoadedForIcons;
-        Nested.IconArrivals = null;
-        Nested.AttachChanges(null, null);
+        foreach (var pane in _panes)
+        {
+            pane.Detach();
+        }
+
         DetachDevices();
-        _viewModel.Tree.RemoveNestedChanges(_nestedTree);
-        _nestedTree.Changes = null;
         _sortSlices.Clear();
         UnhookSortSlices();
-        _nestedTree.Dispose();
     }
 
     /// <summary>
-    /// How the nested tree's background pass after a change of order runs in
+    /// How the nested trees' background pass after a change of order runs in
     /// the window: one slice per frame, straight after the frame is drawn,
     /// rather than in whatever time is left between frames.  A slice queued
     /// below rendering fills every gap there is, so when a frame falls due
@@ -163,8 +131,12 @@ public partial class MainWindow
     /// happened to be hooked, and a slice that came first was a whole slice
     /// on top of the frame's own placing.
     ///
+    /// One queue for every pane's tree: each slice is bound to its own tree,
+    /// and one slice a frame across the panes keeps a split view's frames
+    /// as short as one pane's.
+    ///
     /// While the nested canvas is not on screen the slices wait: nothing is
-    /// drawn from the tree then, and whatever is drawn when it comes back is
+    /// drawn from the trees then, and whatever is drawn when it comes back is
     /// placed as it is drawn.  A pass of a few dozen slices takes that many
     /// frames; nobody waits for it.
     /// </summary>
@@ -231,8 +203,8 @@ public partial class MainWindow
 
     /// <summary>
     /// Runs once the shell has loaded its state: the drives go in as the first
-    /// row of cells, the hidden-folder rules are copied over, and the camera is
-    /// put back where the last session left it.
+    /// row of cells in every pane, the hidden-folder rules are copied over, and
+    /// the camera is put back where the last session left it.
     /// </summary>
     private Task InitializeNestedAsync()
     {
@@ -249,16 +221,15 @@ public partial class MainWindow
             .Where(root => root.IsDrive)
             .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
 
-        // The remembered orders before the first drive goes in, so nothing is
-        // ever placed in name order only to be placed again.  The same orders
-        // as the tree and the list: a folder sorted anywhere is sorted everywhere.
-        _nestedTree.Orders = _viewModel.Orders;
-        SyncNestedRoots();
-        _nestedTree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
-        _nestedTree.SetUserHidden(_viewModel.Tree.HiddenPaths);
+        var roots = NestedRoots();
+        foreach (var pane in _panes)
+        {
+            pane.Initialize(roots);
+        }
+
         SyncNestedSelection();
         _nestedReady = true;
-        _viewModel.NestedZoomLabel = Nested.ZoomText;
+        _viewModel.NestedZoomLabel = ActivePane.Canvas.ZoomText;
         if (IsNested)
         {
             EnterNested(fromStartup: true);
@@ -268,10 +239,9 @@ public partial class MainWindow
     }
 
     /// <summary>
-    /// The nested canvas coming into view, at startup or from the tree.  Its
-    /// marks are gathered only now - while it is hidden it reads nothing - and
-    /// the camera goes back to where it was, or to the selection.  Deferred to
-    /// after layout, so the view is framed for the size it really has.
+    /// The nested canvas coming into view, at startup or from the tree: the
+    /// pane being worked with takes the selection in, gathers its marks and
+    /// goes back to where it was (see <see cref="NestedPane.Enter"/>).
     /// </summary>
     private void EnterNested(bool fromStartup)
     {
@@ -280,25 +250,7 @@ public partial class MainWindow
             return;
         }
 
-        SyncNestedSelection();
-        RebuildBeacons();
-        Dispatcher.InvokeAsync(() =>
-        {
-            Nested.UpdateLayout();
-            if (!_nestedCameraRestored && _viewModel.Tree.RestoredNestedCamera is { } camera)
-            {
-                // Not awaited: the window is usable while the folders on the
-                // way are read, and the view jumps there once they have been.
-                _nestedCameraRestored = true;
-                _ = Nested.RestoreCameraAsync(camera);
-            }
-            else if (!string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
-            {
-                _ = FlyNestedToAsync(_viewModel.Tree.ActivePath, gentle: !fromStartup, animated: false);
-            }
-
-            FocusCanvas();
-        }, DispatcherPriority.Loaded);
+        ActivePane.Enter(fromStartup);
     }
 
     /// <summary>A share or distribution the workspace lists answered after the start: the nested canvas shows it too.</summary>
@@ -310,8 +262,18 @@ public partial class MainWindow
         }
     }
 
-    /// <summary>Drives, plus every share and WSL distribution the tree has as a root of its own.</summary>
+    /// <summary>Drives, plus every share and WSL distribution the tree has as a root of its own, in every pane.</summary>
     private void SyncNestedRoots()
+    {
+        var roots = NestedRoots();
+        foreach (var pane in _panes)
+        {
+            pane.Tree.SetRoots(roots);
+        }
+    }
+
+    /// <summary>The first row of cells: the drives, then every share and WSL distribution the tree has as a root of its own.</summary>
+    private List<NestedRoot> NestedRoots()
     {
         var roots = new List<NestedRoot>(_nestedDrives);
         foreach (var root in _viewModel.Tree.Roots.Where(root => !root.IsDrive))
@@ -322,72 +284,14 @@ public partial class MainWindow
             }
         }
 
-        _nestedTree.SetRoots(roots);
+        return roots;
     }
 
     // ---- selection, both ways ---------------------------------------------
     //
-    // The canvas's gestures reach the shared selection as edits, and every
-    // other change reaches the canvas, in MainWindow.Selection.cs.
-
-    private async Task RefreshStaleAsync(string path)
-    {
-        if (Path.GetDirectoryName(path) is { Length: > 0 } parent && _nestedTree.Find(parent) is { } folder)
-        {
-            try
-            {
-                await _nestedTree.RefreshAsync(folder);
-            }
-            catch (Exception ex) when (ex is OperationCanceledException or ObjectDisposedException or IOException)
-            {
-            }
-        }
-    }
-
-    /// <summary>
-    /// A double-click on a folder has already flown into it.  A file opens -
-    /// through the tree, so a file dialog's own "this is the answer" still
-    /// applies.  A link has nothing inside it to fly into, so it goes where it
-    /// points instead.
-    /// </summary>
-    private async void OnNestedOpenRequested(NestedHit hit)
-    {
-        if (hit.IsFile)
-        {
-            try
-            {
-                if (await _viewModel.Tree.SelectPathAsync(hit.Path) is { } node)
-                {
-                    await _viewModel.Tree.ToggleAsync(node);
-                }
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-            {
-                _viewModel.Toast.ShowError(ex.Message);
-            }
-
-            return;
-        }
-
-        var folder = hit.Folder;
-        if (!folder.IsReparsePoint)
-        {
-            return;
-        }
-
-        try
-        {
-            var target = Directory.ResolveLinkTarget(folder.FullPath, returnFinalTarget: true)?.FullName;
-            if (!string.IsNullOrEmpty(target) && Directory.Exists(target))
-            {
-                await _viewModel.Tree.RevealPathAsync(target);
-            }
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            _viewModel.Toast.ShowError($"Could not follow {folder.Name}: {ex.Message}");
-        }
-    }
+    // The canvas's gestures reach the shared selection as edits (NestedPane),
+    // and every other change reaches the active pane's canvas, in
+    // MainWindow.Selection.cs.
 
     private void OnTreePropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
     {
@@ -395,16 +299,24 @@ public partial class MainWindow
         {
             case nameof(ViewAllViewModel.ActivePath):
                 SyncNestedSelection();
-                ScheduleBeacons();
+                ActivePane.ScheduleBeacons();
 
                 // On the tree the active folder is the current one when nothing is selected.
-                UpdateSortHeaders();
+                ActivePane.UpdateSortHeaders();
                 break;
             case nameof(ViewAllViewModel.HiddenPaths):
-                _nestedTree.SetUserHidden(_viewModel.Tree.HiddenPaths);
+                foreach (var pane in _panes)
+                {
+                    pane.Tree.SetUserHidden(_viewModel.Tree.HiddenPaths);
+                }
+
                 break;
             case nameof(ViewAllViewModel.ShowHiddenItems):
-                _nestedTree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
+                foreach (var pane in _panes)
+                {
+                    pane.Tree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
+                }
+
                 break;
         }
     }
@@ -423,7 +335,7 @@ public partial class MainWindow
                     EnterNested(fromStartup: false);
 
                     // An order chosen while the tree canvas was showing: its
-                    // pass over the nested tree waited, and goes on now.
+                    // pass over the nested trees waited, and goes on now.
                     HookSortSlices();
                 }
                 else
@@ -435,15 +347,19 @@ public partial class MainWindow
                 UpdateSortHeaders();
                 break;
             case nameof(MainViewModel.Sort):
-                // Any order changed.  The tree follows the orders itself: the
-                // canvas keeps what it is looking at where it is, and the tree
-                // places what is on screen at once and the rest behind it.
+                // Any order changed.  The trees follow the orders themselves:
+                // each canvas keeps what it is looking at where it is, and its
+                // tree places what is on screen at once and the rest behind it.
                 UpdateSortHeaders();
                 break;
             case nameof(MainViewModel.Layers):
                 // The files come and go through the tree's pass, like a change
                 // of the way grids fill; the rest is only drawn again.
-                Nested.ShownLayers = _viewModel.Layers;
+                foreach (var pane in _panes)
+                {
+                    pane.Canvas.ShownLayers = _viewModel.Layers;
+                }
+
                 ScheduleBeacons();
                 break;
         }
@@ -452,68 +368,11 @@ public partial class MainWindow
     // ---- the order ---------------------------------------------------------------
 
     /// <summary>
-    /// A header over the canvas: sort the current folder (<see cref="SortFolder"/>)
-    /// by its column, or turn its order round if it already is - or every
-    /// folder, when folders are all sorted the same or there is no folder.
+    /// The folder the headers of the pane being worked with show and change
+    /// the order of, and Canvas options' Sort by with them, and the folder a
+    /// search puts first (see <see cref="NestedPane.SortFolder"/>).
     /// </summary>
-    private void SortHeader_Click(object sender, RoutedEventArgs e)
-    {
-        if (sender is FrameworkElement { Tag: string tag } && Enum.TryParse<SortColumn>(tag, out var column))
-        {
-            var folder = SortFolder();
-            var orders = _viewModel.Orders;
-            orders.Choose(folder, orders.SortOf(folder).Click(column));
-        }
-    }
-
-    /// <summary>
-    /// The folder the headers show and change the order of, and Canvas
-    /// options' Sort by with them.  With several things selected, the one
-    /// with the focus decides.  Null for none - This PC in view with nothing
-    /// selected - where a header orders every folder.
-    ///
-    /// On the nested canvas: the folder being worked with - the folder
-    /// selected, or the one the selected file is in - else the folder in
-    /// view (see <see cref="NestedSortFolder"/>).  A sub-folder picked is
-    /// the one sorted, not the folder around it: whoever selects a folder
-    /// and clicks a header means that folder's contents.
-    ///
-    /// On the tree: the folder selected, whose children open out around it,
-    /// else the folder the selected files are in, else the active one.
-    /// </summary>
-    internal string? SortFolder()
-    {
-        // Worked out once per change of the selection: this is asked after
-        // every move of the camera.
-        var selection = _viewModel.Tree.Selection;
-        if (selection.Version != _sortSelectionVersion)
-        {
-            _sortSelectionVersion = selection.Version;
-            _sortSelectionFolder = null;
-            if (selection.Count > 0)
-            {
-                var primary = selection.Focus is { } focus && selection.Contains(focus) ? focus : selection.Paths[0];
-                if (selection.TryGetItem(primary, out var item))
-                {
-                    _sortSelectionFolder = item.IsDirectory ? primary : Path.GetDirectoryName(primary);
-                }
-            }
-        }
-
-        if (IsNested)
-        {
-            return NestedSortFolder(_sortSelectionFolder, Nested.FolderInView?.FullPath);
-        }
-
-        if (_sortSelectionFolder is { } selected)
-        {
-            return selected;
-        }
-
-        return _viewModel.Tree.ActiveNode is { } node
-            ? node.IsDirectory ? node.FullPath : node.Parent?.FullPath
-            : null;
-    }
+    internal string? SortFolder() => ActivePane.SortFolder();
 
     /// <summary>
     /// The nested canvas's rule for the folder the headers sort, from the
@@ -533,79 +392,17 @@ public partial class MainWindow
         path.StartsWith(folder, StringComparison.OrdinalIgnoreCase)
         && (path.Length == folder.Length || folder.EndsWith(Path.DirectorySeparatorChar) || path[folder.Length] == Path.DirectorySeparatorChar);
 
-    private long _sortSelectionVersion = -1;
-
-    /// <summary>The selected folder, or the folder the selected file is in: what the headers sort, on the nested canvas while it is in view.</summary>
-    private string? _sortSelectionFolder;
-
-    // What the headers last showed: they are brought up to date on every
-    // move of the camera, and nearly always nothing they show has changed.
-    private string? _headerFolder;
-    private ItemSort _headerSort;
-    private SortScope _headerScope;
-    private bool _headersShown;
-
-    /// <summary>
-    /// Lights the header the current folder is ordered by and points its
-    /// arrow the way the order runs - up for A to Z, oldest or smallest
-    /// first; down for the other way - as Explorer's column headers do.
-    /// Called whenever the folder or an order may have changed; does nothing
-    /// when neither did.
-    /// </summary>
+    /// <summary>Every pane's headers brought up to date: an order, or the picture on show, changed.</summary>
     private void UpdateSortHeaders()
     {
-        // The search puts first what is in the folder these headers are for.
-        if (_viewModel.Search.IsOpen)
+        foreach (var pane in _panes)
         {
-            _viewModel.Search.NoteFolder(SortFolder());
-        }
-
-        var orders = _viewModel.Orders;
-        var folder = orders.Scope == SortScope.AllFolders ? null : SortFolder();
-        var sort = orders.SortOf(folder);
-        if (_headersShown && sort == _headerSort && orders.Scope == _headerScope
-            && string.Equals(folder, _headerFolder, StringComparison.OrdinalIgnoreCase))
-        {
-            return;
-        }
-
-        _headersShown = true;
-        _headerFolder = folder;
-        _headerSort = sort;
-        _headerScope = orders.Scope;
-        var where = folder is null
-            ? orders.Scope == SortScope.AllFolders ? string.Empty : " in every folder"
-            : $" in {FolderName(folder)}";
-        (Button Header, TextBlock Arrow, SortColumn Column)[] headers =
-        [
-            (SortByName, SortByNameArrow, SortColumn.Name),
-            (SortByModified, SortByModifiedArrow, SortColumn.Modified),
-            (SortByType, SortByTypeArrow, SortColumn.Type),
-            (SortBySize, SortBySizeArrow, SortColumn.Size)
-        ];
-
-        foreach (var (header, arrow, column) in headers)
-        {
-            var name = ItemSort.Describe(column);
-            if (column == sort.Column)
-            {
-                header.Foreground = (Brush)FindResource("TextBrush");
-                arrow.Text = sort.Descending ? "\uE70D" : "\uE70E";
-                arrow.Visibility = Visibility.Visible;
-                header.ToolTip = $"Sorted by {name}, {ItemSort.DescribeDirection(column, sort.Descending)}{where} (click to reverse)";
-            }
-            else
-            {
-                // Back to the style's muted text, which its hover can light.
-                header.ClearValue(ForegroundProperty);
-                arrow.Visibility = Visibility.Hidden;
-                header.ToolTip = $"Sort by {name}{where} (click again to reverse)";
-            }
+            pane.UpdateSortHeaders();
         }
     }
 
     /// <summary>A folder's name as a menu or a tip says it: its own name, or the whole of a drive's.</summary>
-    private static string FolderName(string path) =>
+    internal static string FolderName(string path) =>
         Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } name ? name : path;
 
     /// <summary>
@@ -632,86 +429,26 @@ public partial class MainWindow
         await Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
     }
 
-    private void SyncNestedSelection() => Nested.LoadSelection(_viewModel.Tree.Selection);
+    private void SyncNestedSelection() => ActivePane.SyncSelection();
 
-    /// <summary>
-    /// The nested version of "bring this node into view".  Navigation - the
-    /// address bar, the sidebar, back and forward - flies to the folder.  A row
-    /// picked in the list only needs to be visible, and usually already is.
-    /// </summary>
-    private async Task FlyNestedToAsync(string path, bool gentle, bool animated = true)
-    {
-        if (string.IsNullOrEmpty(path))
-        {
-            return;
-        }
+    /// <summary>The nested version of "bring this node into view", in the pane being worked with (see <see cref="NestedPane.FlyToAsync"/>).</summary>
+    private Task FlyNestedToAsync(string path, bool gentle, bool animated = true) => ActivePane.FlyToAsync(path, gentle, animated);
 
-        var folderPath = Directory.Exists(path) ? path : Path.GetDirectoryName(path) ?? path;
-        var folder = await _nestedTree.RevealAsync(folderPath);
-        if (folder is null)
-        {
-            // A share or a WSL distribution the tree has only just added.
-            SyncNestedRoots();
-            folder = await _nestedTree.RevealAsync(folderPath);
-            if (folder is null)
-            {
-                return;
-            }
-        }
-
-        var view = new Rect(0, 0, Nested.ActualWidth, Nested.ActualHeight);
-        if (Nested.ScreenRectOf(folder) is { } rect)
-        {
-            if (gentle && rect.Width >= 24 && view.IntersectsWith(rect))
-            {
-                return;
-            }
-
-            if (!gentle && view.Contains(rect) && rect.Width >= view.Width * 0.45)
-            {
-                return;
-            }
-        }
-
-        if (gentle && folder.Parent is { IsComputer: false } parent)
-        {
-            Nested.FlyTo(parent, 0.92, animated);
-        }
-        else
-        {
-            Nested.FlyTo(folder, 0.8, animated);
-        }
-    }
-
-    private void OnNestedCameraChanged()
-    {
-        _viewModel.NestedZoomLabel = Nested.ZoomText;
-
-        // With nothing selected, the headers are for the folder in view.
-        UpdateSortHeaders();
-        _nestedSaveTimer?.Stop();
-        _nestedSaveTimer?.Start();
-    }
-
+    /// <summary>Every pane's camera kept for the next session: the window is closing.</summary>
     private void CaptureNestedCamera()
     {
-        if (Nested.CaptureCamera() is { } camera)
+        foreach (var pane in _panes)
         {
-            _viewModel.Tree.NestedCamera = camera;
+            pane.CaptureCamera();
         }
     }
 
-    /// <summary>
-    /// F5: the folder is read again at once, and whatever the canvas read below
-    /// it is out of date too - read again as it is drawn.  A change on disk, or
-    /// a file operation of the window's own, needs nothing from here: the
-    /// change hub brings it to the tree like any other.
-    /// </summary>
+    /// <summary>F5 on a folder: every pane reads it again, and what it read below it as it is drawn (see <see cref="NestedPane.RefreshDeep"/>).</summary>
     private void OnTreeDeepRefreshRequested(string path)
     {
-        if (_nestedTree.Find(path) is { } folder)
+        foreach (var pane in _panes)
         {
-            _nestedTree.RefreshDeep(folder);
+            pane.RefreshDeep(path);
         }
     }
 
@@ -733,426 +470,120 @@ public partial class MainWindow
         // Raised on whichever thread set the mark.
         Dispatcher.InvokeAsync(() =>
         {
-            Nested.InvalidateMarks();
+            foreach (var pane in _panes)
+            {
+                pane.Canvas.InvalidateMarks();
+            }
+
             ScheduleBeacons();
         });
     }
 
+    /// <summary>Every pane's beacons gathered again a moment from now: marks, pins or the search's results changed.</summary>
     private void ScheduleBeacons()
     {
-        // Hidden, the canvas has no use for marks, and gathering them would
-        // read every folder on the way to each one for nothing.
-        if (!IsNested || !_nestedReady)
+        foreach (var pane in _panes)
         {
-            return;
+            pane.ScheduleBeacons();
         }
-
-        _beaconTimer?.Stop();
-        _beaconTimer?.Start();
-    }
-
-    /// <summary>
-    /// Everything the user has put on a folder, gathered into one list of
-    /// beacons: colours and notes from the mark store, folders pinned to Home,
-    /// the folder that is selected, and while a search is open, what it found.
-    /// A mark on a file shows on the folder it is in.  With the marks layer
-    /// off, the colours, notes and pins are left out.
-    /// </summary>
-    private void RebuildBeacons()
-    {
-        var marks = _viewModel.IsLayerShown(CanvasLayer.Marks);
-        var beacons = new Dictionary<string, (NestedBeaconKind Kind, Color Colour, string Label, string Note)>(StringComparer.OrdinalIgnoreCase);
-
-        void Add(string path, NestedBeaconKind kind, Color? colour, string label, string note = "")
-        {
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                return;
-            }
-
-            if (beacons.TryGetValue(path, out var existing))
-            {
-                beacons[path] = (
-                    existing.Kind | kind,
-                    existing.Kind.HasFlag(NestedBeaconKind.Colour) ? existing.Colour : colour ?? existing.Colour,
-                    existing.Label,
-                    existing.Note.Length > 0 ? existing.Note : note);
-                return;
-            }
-
-            beacons[path] = (kind, colour ?? NoteBeaconColour, label, note);
-        }
-
-        foreach (var (path, mark) in marks ? _viewModel.Marks.Snapshot() : [])
-        {
-            var kind = NestedBeaconKind.None;
-            Color? colour = null;
-            if (!string.IsNullOrEmpty(mark.AccentHex) && TryParse(mark.AccentHex, out var parsed))
-            {
-                kind |= NestedBeaconKind.Colour;
-                colour = parsed;
-            }
-
-            if (!string.IsNullOrWhiteSpace(mark.Note))
-            {
-                kind |= NestedBeaconKind.Note;
-            }
-
-            if (kind != NestedBeaconKind.None)
-            {
-                Add(path, kind, colour, LeafName(path), mark.Note);
-            }
-        }
-
-        foreach (var pinned in _viewModel.QuickAccess.Where(item => marks && item.IsCustom))
-        {
-            Add(pinned.Path, NestedBeaconKind.Pinned, PinBeaconColour, pinned.Name);
-        }
-
-        if (Nested.IsFiltering)
-        {
-            foreach (var match in Nested.FilterMatches.Take(FilterBeaconLimit))
-            {
-                Add(match, NestedBeaconKind.Search, SearchBeaconColour, LeafName(match));
-            }
-        }
-
-        if (_viewModel.Search.IsOpen)
-        {
-            foreach (var result in _viewModel.Search.Results.Take(SearchBeaconLimit))
-            {
-                Add(result.FullPath, NestedBeaconKind.Search, SearchBeaconColour, result.Name);
-            }
-        }
-
-        if (_viewModel.Tree.ActiveNode is { } active)
-        {
-            Add(active.FullPath, NestedBeaconKind.Active, ActiveBeaconColour, active.DisplayName);
-        }
-
-        Nested.SetBeacons([.. beacons.Select(pair => new NestedBeacon(pair.Key, pair.Value.Kind, pair.Value.Colour, pair.Value.Label, pair.Value.Note))]);
-    }
-
-    private static string LeafName(string path)
-    {
-        var name = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
-        return string.IsNullOrEmpty(name) ? path : name;
-    }
-
-    private static bool TryParse(string hex, out Color colour)
-    {
-        colour = default;
-        if (!NestedCanvas.IsHexColour(hex))
-        {
-            return false;
-        }
-
-        try
-        {
-            colour = (Color)ColorConverter.ConvertFromString(hex);
-            return true;
-        }
-        catch (Exception ex) when (ex is FormatException or InvalidOperationException or ArgumentException or NotSupportedException)
-        {
-            return false;
-        }
-    }
-
-    // ---- menus -----------------------------------------------------------------
-
-    /// <summary>
-    /// Right-click on a folder's title is the folder's own Windows menu.
-    /// Right-click in the open space of a big folder is "in" that folder: the
-    /// Windows menu of its open space - New, Paste - with the folder's own
-    /// settings.  Outside every cell is the canvas's own menu.
-    /// </summary>
-    private async void OnNestedContextMenuRequested(NestedHit? hit, bool onBackground, Point point)
-    {
-        var tree = _viewModel.Tree;
-        try
-        {
-            if (hit is not { } target)
-            {
-                DropPreparedMenu();
-                ShowFolderAreaMenu(Nested, null);
-                return;
-            }
-
-            if (onBackground)
-            {
-                // The folder clicked in becomes the selection, as a click on the
-                // empty part of an Explorer window makes it the current folder.
-                var folder = target.Folder.FullPath;
-                tree.Selection.ReplaceSingle(folder, true, 0, SelectionSource.Canvas);
-                if (ShowFolderAreaShellMenu(folder, Nested, point))
-                {
-                    return;
-                }
-
-                var area = await tree.MaterializeAsync(folder);
-                ShowFolderAreaMenu(Nested, area);
-                return;
-            }
-
-            // The whole selection when the item is part of it (see
-            // MainWindow.Selection.cs).
-            await ShowNestedItemMenuAsync(target, point);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        {
-            _viewModel.Toast.ShowError(ex.Message);
-        }
-    }
-
-    /// <summary>
-    /// The right button went down on the canvas: the menu its release would
-    /// show - the selection's when the item is part of it, the item's alone
-    /// otherwise, or the open space of the folder - is built while it is held.
-    /// </summary>
-    private void OnNestedContextMenuPressed(NestedHit? hit, bool onBackground, Point point)
-    {
-        if (hit is not { } target)
-        {
-            return;
-        }
-
-        if (onBackground)
-        {
-            PrepareShellMenu(background: true, [target.Folder.FullPath]);
-            return;
-        }
-
-        var selection = _viewModel.Tree.Selection;
-        PrepareShellMenu(background: false, selection.Contains(target.Path) ? selection.Paths : [target.Path]);
-    }
-
-    // ---- drag and drop ---------------------------------------------------------
-
-    /// <summary>A folder or file picked up: the selection if it is part of one, otherwise just it.</summary>
-    private void OnNestedDragRequested(string path)
-    {
-        if (IsPickerMode)
-        {
-            return;
-        }
-
-        var paths = NestedDragPaths(path);
-        _nestedDragPaths = paths;
-        try
-        {
-            var data = new DataObject(DataFormats.FileDrop, paths);
-            DragDrop.DoDragDrop(Nested, data, DragDropEffects.Copy | DragDropEffects.Move);
-        }
-        finally
-        {
-            _nestedDragPaths = null;
-            Nested.DropTarget = null;
-        }
-
-        // Moved somewhere else - into Explorer, onto the desktop - the items
-        // are gone from where they were, and nothing else will say so.
-        // Explorer often finishes a move after the drop has returned, so the
-        // folders are looked at again now and once more a little later.
-        _ = RefreshSourcesAsync(paths);
-    }
-
-    private async Task RefreshSourcesAsync(IReadOnlyList<string> paths)
-    {
-        var parents = paths
-            .Select(Path.GetDirectoryName)
-            .Where(parent => !string.IsNullOrEmpty(parent))
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        foreach (var delay in new[] { 300, 1500 })
-        {
-            await Task.Delay(delay);
-            foreach (var parent in parents)
-            {
-                await _viewModel.Tree.RefreshPathAsync(parent!);
-            }
-        }
-    }
-
-    private void Nested_DragOver(object sender, DragEventArgs e)
-    {
-        e.Handled = true;
-        if (!TryGetDropPaths(e.Data, out var paths) || ResolveNestedDropTarget(e, paths) is not { } target)
-        {
-            Nested.DropTarget = null;
-            e.Effects = DragDropEffects.None;
-            return;
-        }
-
-        // The keys and what the source allows, as the tree canvas has them (see DropEffectFor).
-        var effect = DropEffectFor(e, paths, target.FullPath);
-        Nested.DropTarget = effect == DragDropEffects.None ? null : target;
-        e.Effects = effect;
-    }
-
-    private void Nested_DragLeave(object sender, DragEventArgs e)
-    {
-        ForgetDropPaths();
-        if (!Nested.IsMouseOver)
-        {
-            Nested.DropTarget = null;
-        }
-    }
-
-    private async void Nested_Drop(object sender, DragEventArgs e)
-    {
-        e.Handled = true;
-        Nested.DropTarget = null;
-        var carriesPaths = TryGetDropPaths(e.Data, out var paths);
-        ForgetDropPaths();
-        if (!carriesPaths || ResolveNestedDropTarget(e, paths) is not { } target)
-        {
-            e.Effects = DragDropEffects.None;
-            return;
-        }
-
-        var effect = DropEffectFor(e, paths, target.FullPath);
-        e.Effects = ReportedDropEffect(effect);
-        if (effect == DragDropEffects.None)
-        {
-            return;
-        }
-
-        await _viewModel.DropIntoPathAsync(paths, target.FullPath, move: effect == DragDropEffects.Move);
-    }
-
-    /// <summary>The innermost folder under the pointer, unless it is one of the things being dropped or inside one.</summary>
-    private NestedFolder? ResolveNestedDropTarget(DragEventArgs e, IReadOnlyList<string> paths)
-    {
-        if (Nested.HitTest(e.GetPosition(Nested)) is not { } hit || hit.Folder.IsComputer)
-        {
-            return null;
-        }
-
-        var target = hit.Folder;
-        return IsDropRefused(target.FullPath, () => paths.Any(path =>
-            ViewAllPath.Equals(path, target.FullPath)
-            || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)
-            || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _nestedDragPaths is not null))
-            ? null
-            : target;
-    }
-
-    /// <summary>
-    /// A file's icon for the canvas, the file named by its folder and its
-    /// index among the folder's shown files: whatever the icon service already
-    /// has, and a question for the rest, whose answer arrives in the canvas's
-    /// icon inbox (<see cref="ShellIconService.GetForCanvas"/>).  Icons are
-    /// per type, looked up by the file's shared extension, so a folder of a
-    /// thousand photos asks once and a frame of their names builds nothing;
-    /// only programs, shortcuts and icon files are asked about one by one.
-    /// </summary>
-    private ImageSource? LookUpFileIcon(NestedFolder folder, int index) => _viewModel.Icons.GetForCanvas(folder, index);
-
-    /// <summary>
-    /// A folder was read: the types among its files are asked for behind
-    /// everything on screen, so their icons are usually there before any of
-    /// its names is big enough to carry one.
-    /// </summary>
-    private void OnFolderLoadedForIcons(NestedFolder folder) => _viewModel.Icons.Prefetch(folder);
-
-    // ---- the name filter ---------------------------------------------------------
-
-    /// <summary>Typing narrows the canvas a moment after the last key, not on every one.</summary>
-    private void CanvasFilterBox_TextChanged(object sender, TextChangedEventArgs e)
-    {
-        CanvasFilterHint.Visibility = CanvasFilterBox.Text.Length == 0 ? Visibility.Visible : Visibility.Collapsed;
-        _filterTimer?.Stop();
-        _filterTimer?.Start();
-    }
-
-    /// <summary>Enter goes to the next match, Shift+Enter the previous, Escape clears and goes back to the canvas.</summary>
-    private void CanvasFilterBox_PreviewKeyDown(object sender, KeyEventArgs e)
-    {
-        switch (e.Key)
-        {
-            case Key.Enter:
-                ApplyFilterNow();
-                Nested.GoToMatch((Keyboard.Modifiers & ModifierKeys.Shift) != 0 ? -1 : 1);
-                e.Handled = true;
-                break;
-            case Key.Down:
-                ApplyFilterNow();
-                Nested.GoToMatch(1);
-                e.Handled = true;
-                break;
-            case Key.Up:
-                ApplyFilterNow();
-                Nested.GoToMatch(-1);
-                e.Handled = true;
-                break;
-            case Key.Escape:
-                ClearCanvasFilter();
-                e.Handled = true;
-                break;
-        }
-    }
-
-    private void ApplyFilterNow()
-    {
-        if (_filterTimer is { IsEnabled: true })
-        {
-            _filterTimer.Stop();
-            Nested.SetFilter(CanvasFilterBox.Text);
-        }
-    }
-
-    private void ClearCanvasFilter()
-    {
-        CanvasFilterBox.Text = string.Empty;
-        _filterTimer?.Stop();
-        Nested.SetFilter(null);
-        FocusCanvas();
-    }
-
-    private void CanvasFilterPrevious_Click(object sender, RoutedEventArgs e) => Nested.GoToMatch(-1);
-
-    private void CanvasFilterNext_Click(object sender, RoutedEventArgs e) => Nested.GoToMatch(1);
-
-    private void CanvasFilterClear_Click(object sender, RoutedEventArgs e) => ClearCanvasFilter();
-
-    private void FocusCanvasFilter()
-    {
-        CanvasFilterBox.Focus();
-        CanvasFilterBox.SelectAll();
-    }
-
-    /// <summary>
-    /// The count beside the strip, and the matches as beacons: a match deep
-    /// in the tree is a speck, and a speck has to be findable like any mark.
-    /// </summary>
-    private void OnNestedFilterChanged()
-    {
-        var matches = Nested.FilterMatches;
-        var active = Nested.IsFiltering;
-        CanvasFilterCount.Text = !active
-            ? string.Empty
-            : matches.Count == 0
-                ? "No matches among the folders read so far"
-                : Nested.FilterCursor >= 0
-                    ? $"{Nested.FilterCursor + 1:N0} of {matches.Count:N0}"
-                    : matches.Count == 1 ? "1 match" : $"{matches.Count:N0} matches";
-        var navigation = active && matches.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
-        CanvasFilterPrevious.Visibility = navigation;
-        CanvasFilterNext.Visibility = navigation;
-        CanvasFilterClear.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
-        ScheduleBeacons();
     }
 
     // ---- keyboard --------------------------------------------------------------
 
-    /// <summary>The keys the nested canvas answers itself: the arrows, Enter and Backspace.</summary>
+    /// <summary>The keys a nested canvas answers itself - the arrows, Enter and Backspace - on whichever pane has the keyboard.</summary>
     private bool TryHandleNestedKey(Key key, ModifierKeys modifiers)
     {
-        if (!IsNested || !Nested.IsKeyboardFocusWithin)
+        if (!IsNested)
         {
             return false;
         }
 
-        return Nested.HandleKey(key, modifiers);
+        foreach (var pane in _panes)
+        {
+            if (pane.Canvas.IsKeyboardFocusWithin)
+            {
+                return pane.Canvas.HandleKey(key, modifiers);
+            }
+        }
+
+        return false;
     }
+
+    /// <summary>Whether the keyboard is on one of the panes' canvases.</summary>
+    private bool IsNestedCanvasFocused()
+    {
+        foreach (var pane in _panes)
+        {
+            if (pane.Canvas.IsKeyboardFocusWithin)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>The pane whose canvas <paramref name="element"/> is, or is inside.</summary>
+    private NestedPane? PaneAt(DependencyObject? element)
+    {
+        if (FindAncestor<NestedCanvas>(element) is { } canvas)
+        {
+            foreach (var pane in _panes)
+            {
+                if (ReferenceEquals(pane.Canvas, canvas))
+                {
+                    return pane;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private void FocusCanvasFilter() => ActivePane.FocusFilter();
+
+    // ---- what a pane asks of the window ------------------------------------------
+
+    bool INestedPaneHost.IsPickerMode => IsPickerMode;
+
+    string[]? INestedPaneHost.NestedDragPaths
+    {
+        get => _nestedDragPaths;
+        set => _nestedDragPaths = value;
+    }
+
+    bool INestedPaneHost.IsActivePane(NestedPane pane) => ReferenceEquals(pane, ActivePane);
+
+    void INestedPaneHost.PostSortSlice(Action slice) => PostSortSlice(slice);
+
+    void INestedPaneHost.SyncNestedRoots() => SyncNestedRoots();
+
+    void INestedPaneHost.FocusCanvas(NestedPane pane) => FocusCanvas(pane);
+
+    void INestedPaneHost.ClearDropTargets()
+    {
+        foreach (var pane in _panes)
+        {
+            pane.Canvas.DropTarget = null;
+        }
+    }
+
+    void INestedPaneHost.DropPreparedMenu() => DropPreparedMenu();
+
+    void INestedPaneHost.PrepareShellMenu(bool background, IReadOnlyList<string> paths) => PrepareShellMenu(background, paths);
+
+    bool INestedPaneHost.ShowFolderAreaShellMenu(string folder, FrameworkElement origin, Point point) => ShowFolderAreaShellMenu(folder, origin, point);
+
+    void INestedPaneHost.ShowFolderAreaMenu(FrameworkElement placementTarget, ViewAllNodeViewModel? area) => ShowFolderAreaMenu(placementTarget, area);
+
+    bool INestedPaneHost.ShowContextMenu(IReadOnlyList<string> paths, FrameworkElement origin, Point point, bool includeCanvasCommands, bool fallBack) =>
+        ShowContextMenu(paths, origin, point, includeCanvasCommands, fallBack);
+
+    void INestedPaneHost.ShowSelectionMenu(FrameworkElement placementTarget) => ShowSelectionMenu(placementTarget);
+
+    bool INestedPaneHost.TryGetDropPaths(IDataObject data, out string[] paths) => TryGetDropPaths(data, out paths);
+
+    bool INestedPaneHost.IsDropRefused(string folder, Func<bool> refuses) => IsDropRefused(folder, refuses);
+
+    void INestedPaneHost.ForgetDropPaths() => ForgetDropPaths();
 }

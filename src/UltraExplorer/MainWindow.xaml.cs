@@ -166,11 +166,15 @@ public partial class MainWindow : Window
         // the caller asked for is already filtered when it appears.
         await ApplyPickerRulesAsync();
         await _viewModel.InitializeAsync(_pickerStartFolder);
-        Nested.LeftDrag = _viewModel.LeftDrag;
+        foreach (var pane in _panes)
+        {
+            pane.Canvas.LeftDrag = _viewModel.LeftDrag;
 
-        // Before the drives go in, so a canvas without its files is never
-        // placed with them first.
-        Nested.ShownLayers = _viewModel.Layers;
+            // Before the drives go in, so a canvas without its files is never
+            // placed with them first.
+            pane.Canvas.ShownLayers = _viewModel.Layers;
+        }
+
         await InitializeNestedAsync();
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
@@ -414,8 +418,11 @@ public partial class MainWindow : Window
 
         _isSpaceHeld = armed;
         Editor.Cursor = armed ? Cursors.Hand : null;
-        Nested.IsSpacePanArmed = armed;
-        Nested.Cursor = armed ? Cursors.Hand : null;
+        foreach (var pane in _panes)
+        {
+            pane.Canvas.IsSpacePanArmed = armed;
+            pane.Canvas.Cursor = armed ? Cursors.Hand : null;
+        }
     }
 
     /// <summary>
@@ -670,18 +677,19 @@ public partial class MainWindow : Window
         // What is under the pointer can be a run of text inside a node rather
         // than an element, so the canvas is looked for among its ancestors.
         var over = InputHitTest(local) as DependencyObject;
+        var pane = IsNested ? PaneAt(over) : null;
         var overCanvas = IsNested
-            ? ReferenceEquals(FindAncestor<NestedCanvas>(over), Nested)
+            ? pane is not null
             : ReferenceEquals(FindAncestor<NodifyEditor>(over), Editor);
         if (!overCanvas)
         {
             return;
         }
 
-        if (IsNested)
+        if (pane is not null)
         {
-            // The canvas's own Shift+wheel, turned round.
-            Nested.PointerWheel(Nested.PointFromScreen(screenPoint), -delta, ModifierKeys.Shift);
+            // The canvas's own Shift+wheel, turned round, on the pane under the pointer.
+            pane.Canvas.PointerWheel(pane.Canvas.PointFromScreen(screenPoint), -delta, ModifierKeys.Shift);
         }
         else
         {
@@ -952,7 +960,7 @@ public partial class MainWindow : Window
     {
         if (IsNested)
         {
-            Nested.FitAll();
+            ActivePane.Canvas.FitAll();
             return;
         }
 
@@ -968,11 +976,11 @@ public partial class MainWindow : Window
             // reset is the whole of This PC on screen.
             if (factor <= 0)
             {
-                Nested.FitAll();
+                ActivePane.Canvas.FitAll();
             }
             else
             {
-                Nested.ZoomBy(factor > 1 ? 1.5 : 1 / 1.5);
+                ActivePane.Canvas.ZoomBy(factor > 1 ? 1.5 : 1 / 1.5);
             }
 
             return;
@@ -1159,7 +1167,7 @@ public partial class MainWindow : Window
     /// had it - so Ctrl held over a drag from Explorer went unseen, and a copy
     /// on the same drive was made a move.
     /// </summary>
-    private static DragDropEffects DropEffectFor(DragEventArgs e, IReadOnlyList<string> paths, string targetDirectory)
+    internal static DragDropEffects DropEffectFor(DragEventArgs e, IReadOnlyList<string> paths, string targetDirectory)
     {
         var modifiers = ModifierKeys.None;
         if ((e.KeyStates & DragDropKeyStates.ShiftKey) != 0)
@@ -1199,7 +1207,7 @@ public partial class MainWindow : Window
     /// "moved" may delete what it takes to be its leftover originals - before
     /// this move has even picked them up.
     /// </summary>
-    private static DragDropEffects ReportedDropEffect(DragDropEffects effect)
+    internal static DragDropEffects ReportedDropEffect(DragDropEffects effect)
         => effect == DragDropEffects.Copy ? DragDropEffects.Copy : DragDropEffects.None;
 
     /// <summary>
@@ -1329,9 +1337,10 @@ public partial class MainWindow : Window
     private void AddRendererItems(ItemsControl menu)
     {
         var group = new MenuItem { Header = "Renderer" };
-        var now = Nested.IsSceneOnGpu
-            ? $"Drawn by {Nested.RendererAdapter}"
-            : $"Drawn by the processor: {Nested.RendererReason}";
+        var canvas = ActivePane.Canvas;
+        var now = canvas.IsSceneOnGpu
+            ? $"Drawn by {canvas.RendererAdapter}"
+            : $"Drawn by the processor: {canvas.RendererReason}";
         group.Items.Add(new MenuItem { Header = now, IsEnabled = false });
         group.Items.Add(new Separator());
 
@@ -2077,7 +2086,7 @@ public partial class MainWindow : Window
         return focused is null
             || ReferenceEquals(focused, this)
             || Editor.IsKeyboardFocusWithin
-            || Nested.IsKeyboardFocusWithin
+            || IsNestedCanvasFocused()
             || FolderListItems.IsKeyboardFocusWithin;
     }
 
@@ -2135,17 +2144,19 @@ public partial class MainWindow : Window
 
         if (IsNested)
         {
-            var at = new Point(Nested.ActualWidth / 2, Nested.ActualHeight / 2);
-            if (_nestedTree.Find(_viewModel.Tree.ActivePath) is { } folder && Nested.ScreenRectOf(folder) is { } rect)
+            var pane = ActivePane;
+            var canvas = pane.Canvas;
+            var at = new Point(canvas.ActualWidth / 2, canvas.ActualHeight / 2);
+            if (pane.Tree.Find(_viewModel.Tree.ActivePath) is { } folder && canvas.ScreenRectOf(folder) is { } rect)
             {
-                var visible = Rect.Intersect(rect, new Rect(0, 0, Nested.ActualWidth, Nested.ActualHeight));
+                var visible = Rect.Intersect(rect, new Rect(0, 0, canvas.ActualWidth, canvas.ActualHeight));
                 if (!visible.IsEmpty)
                 {
                     at = new Point(visible.X + visible.Width / 2, visible.Y + Math.Min(visible.Height / 2, 24));
                 }
             }
 
-            ShowContextMenu(paths, Nested, at);
+            ShowContextMenu(paths, canvas, at);
             return;
         }
 

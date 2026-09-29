@@ -32,7 +32,10 @@
 Файлы: `Services/NestedLayout.cs` (геометрия), `Services/NestedTree.cs`
 (дерево и чтение), `Models/NestedFolder.cs`, `Controls/NestedCanvas.cs`
 (камера, кадр, ввод, маяки, фильтр), `Controls/NestedRaster.cs` (заливки),
-`MainWindow.Nested.cs` (связь с окном), `MainWindow.Bench.cs` (замеры).
+`NestedPane.cs` и `NestedPaneView.xaml` (панель холста: холст, его дерево,
+строка фильтра и заголовков сортировки, меню и перетаскивание),
+`MainWindow.Nested.cs` (связь панелей с окном, активная панель),
+`MainWindow.Bench.cs` (замеры).
 
 ### Геометрия
 
