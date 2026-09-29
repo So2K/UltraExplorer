@@ -14,11 +14,14 @@ namespace UltraExplorer.Infrastructure;
 /// Every one is written to <c>crash.log</c> in the state folder.  One on the
 /// UI thread while a window is on screen is then survived: the user is told
 /// once, and the window carries on, which for a file manager beats losing the
-/// window and whatever it was about to save.  Two cases still end the process
-/// as before, because carrying on would be worse: nothing is on screen (a
-/// failure during start-up would otherwise leave an invisible process
-/// behind), or the same thing keeps failing (an exception on every frame or
-/// every event is not something to click through).
+/// window and whatever it was about to save.  Some cases still end the process
+/// as before, because carrying on would be worse: the window has not finished
+/// starting (see <see cref="MarkStarted"/> - a half-built window would carry
+/// on, and closing it would save its defaults over the user's settings),
+/// nothing is on screen (a failure would otherwise leave an invisible process
+/// behind), the same thing keeps failing (an exception on every frame or
+/// every event is not something to click through), or this is a benchmark,
+/// snapshot or test copy, whose runs must fail where they fail.
 /// </summary>
 internal static class CrashReporter
 {
@@ -32,11 +35,19 @@ internal static class CrashReporter
     private static readonly object Gate = new();
     private static readonly Queue<DateTime> Recent = new();
     private static bool _showing;
+    private static bool _survive;
+    private static bool _started;
 
     public static string LogPath => AppPaths.State("crash.log");
 
-    public static void Install(Application application)
+    /// <param name="survive">
+    /// Whether a UI-thread exception may be survived at all.  False for
+    /// benchmark, snapshot and test copies: each is only logged, and ends the
+    /// process as it did before there was a reporter.
+    /// </param>
+    public static void Install(Application application, bool survive)
     {
+        _survive = survive;
         application.DispatcherUnhandledException += OnDispatcherUnhandledException;
 
         // A background thread's exception cannot be survived, only recorded.
@@ -85,11 +96,21 @@ internal static class CrashReporter
         }
     }
 
+    /// <summary>
+    /// The window has finished starting: its state is read, its canvas is up
+    /// and its layout restored.  Until then an exception ends the process, as
+    /// a failure before the window was shown always did - the start-up work
+    /// runs while the window is already visible, and surviving a failure in it
+    /// would leave a half-built window whose close saves defaults over the
+    /// user's settings.  UI thread.
+    /// </summary>
+    public static void MarkStarted() => _started = true;
+
     private static void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         Log("on the UI thread", e.Exception);
 
-        if (!IsAnyWindowShown() || IsStorm())
+        if (!_survive || !_started || !IsAnyWindowShown() || IsStorm())
         {
             return;
         }

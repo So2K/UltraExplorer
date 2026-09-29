@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Threading;
+using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
 
@@ -130,6 +131,16 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // Frames that keep failing are not tried again for every post, read
+        // or icon that asks for one: what went out of date waits in _dirty
+        // for the next try, which input or the back-off timer makes
+        // (see ContainFailedFrame).
+        if (FramesFailing)
+        {
+            ScheduleFrameRetry();
+            return;
+        }
+
         _frameHooked = true;
         if (!FramesByHandForTests)
         {
@@ -172,6 +183,7 @@ public sealed partial class NestedCanvas
     {
         UnhookFrame();
         _loadRedrawTimer?.Stop();
+        _frameRetry?.Stop();
         if (Interlocked.Exchange(ref _wakePosted, 0) != 0)
         {
             HandOffWake();
@@ -257,11 +269,13 @@ public sealed partial class NestedCanvas
     /// A wake on the UI thread: the loop is hooked, nothing marked out of
     /// date, and the frame's first phases take in what was posted.  A canvas
     /// that cannot draw - collapsed, or in no window - would never run that
-    /// frame, so the work goes to the fallback drivers instead.
+    /// frame, so the work goes to the fallback drivers instead; and so does
+    /// one whose frames keep failing, or every read and icon arriving would
+    /// run another frame that fails.
     /// </summary>
     private void OnWake()
     {
-        if (IsVisible)
+        if (IsVisible && !FramesFailing)
         {
             RequestFrame(Layers.None);
             return;
@@ -284,8 +298,45 @@ public sealed partial class NestedCanvas
     /// <summary>Frames of the loop in a row that ended in an exception; nought after any that did not.</summary>
     private int _failedFrames;
 
-    /// <summary>After this many frames in a row fail, the loop stops trying until something asks for a frame again.</summary>
+    /// <summary>After this many frames in a row fail, the loop stops trying until input or the back-off timer tries again.</summary>
     private const int MaximumFailedFrames = 3;
+
+    /// <summary>The first wait before frames that kept failing are tried again; it doubles with every try that fails too.</summary>
+    private static readonly TimeSpan FirstFrameRetry = TimeSpan.FromSeconds(1);
+
+    /// <summary>The longest wait between tries.</summary>
+    private static readonly TimeSpan LastFrameRetry = TimeSpan.FromSeconds(30);
+
+    /// <summary>What tries a frame again while frames keep failing; null until one has.</summary>
+    private DispatcherTimer? _frameRetry;
+
+    /// <summary>How long the next wait for a try is.</summary>
+    private TimeSpan _frameRetryDelay = FirstFrameRetry;
+
+    /// <summary>Whether the loop has let go since the last frame that worked, which is logged once.</summary>
+    private bool _framesLetGo;
+
+    /// <summary>
+    /// Whether frames have failed so often in a row that the loop has let go:
+    /// wakes go to the fallback drivers, and a frame is only tried again for
+    /// input on the canvas or when the back-off timer says.
+    /// </summary>
+    private bool FramesFailing => _failedFrames >= MaximumFailedFrames;
+
+    /// <summary>For tests: frames of the loop that still fail on purpose, from the start, as a bug would.</summary>
+    internal int FailFramesForTests { get; set; }
+
+    /// <summary>For tests: where a failed frame is written instead of the crash log.</summary>
+    internal Action<string, Exception>? FrameFailureLogForTests { get; set; }
+
+    /// <summary>For tests: whether the loop has let go after frames that kept failing.</summary>
+    internal bool FramesFailingForTests => FramesFailing;
+
+    /// <summary>For tests: one frame of the loop the way WPF's Rendering runs it, failures contained.</summary>
+    internal void RunContainedFrameForTests(TimeSpan renderingTime) => RunContainedFrame(renderingTime);
+
+    /// <summary>For tests: the back-off timer's tick, now.</summary>
+    internal void RetryFramesForTests() => OnFrameRetryDue(null, EventArgs.Empty);
 
     /// <summary>
     /// WPF's Rendering: one frame of the loop.  Nothing above this catches
@@ -295,11 +346,17 @@ public sealed partial class NestedCanvas
     /// and see every exception.
     /// </summary>
     private void OnFrame(object? sender, EventArgs e)
+        => RunContainedFrame(e is RenderingEventArgs rendering ? rendering.RenderingTime : _clock.Now);
+
+    private void RunContainedFrame(TimeSpan renderingTime)
     {
         try
         {
-            RunFrame(e is RenderingEventArgs rendering ? rendering.RenderingTime : _clock.Now);
-            _failedFrames = 0;
+            RunFrame(renderingTime);
+            if (_failedFrames != 0)
+            {
+                FramesRecovered();
+            }
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -309,19 +366,29 @@ public sealed partial class NestedCanvas
 
     /// <summary>
     /// A frame of the loop threw part way through.  It is written to the
-    /// trace and dropped, and what it left half done is put straight: the
-    /// flags only a frame being drawn holds are cleared, and since the layers
-    /// it had taken to draw were taken off <see cref="_dirty"/> before it
-    /// failed, everything is marked to be drawn again on the next frame.  A
-    /// failure that comes back every frame would spin the loop at the
-    /// display's rate, throwing each time: after a few in a row the loop
-    /// lets go instead, and the inboxes' fallback drivers take in what the
-    /// frames would have, until something asks for a frame and it is tried
-    /// once more.
+    /// crash log - the first of a run of them, and the one that makes the
+    /// loop let go - and dropped, and what it left half done is put straight:
+    /// the flags only a frame being drawn holds are cleared, and since the
+    /// layers it had taken to draw were taken off <see cref="_dirty"/> before
+    /// it failed, everything is marked to be drawn again on the next frame.
+    ///
+    /// A failure that comes back every frame would spin the loop at the
+    /// display's rate, throwing each time: after a few in a row the loop lets
+    /// go instead.  The inboxes' fallback drivers then take in what the frames
+    /// would have - a wake no longer asks for a frame (<see cref="OnWake"/>),
+    /// nor does anything else that asks for one (<see cref="RequestFrame"/>) -
+    /// and a frame is tried again only for input on the canvas
+    /// (<see cref="RetryFailedFrames"/>) or when a back-off timer says, one
+    /// second at first and twice as long after every try that fails too, up
+    /// to half a minute.  The first frame that works puts all of it back.
     /// </summary>
     private void ContainFailedFrame(Exception ex)
     {
-        System.Diagnostics.Trace.WriteLine($"UltraExplorer: a frame of the nested canvas failed and was dropped ({_failedFrames + 1} in a row): {ex}");
+        if (_failedFrames == 0)
+        {
+            LogFrameFailure("in a frame of the nested canvas; the frame was dropped", ex);
+        }
+
         _inFrameLoop = false;
         _sceneChangedArea = Rect.Empty;
         _dirty |= Layers.All;
@@ -331,9 +398,77 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        if (!_framesLetGo)
+        {
+            _framesLetGo = true;
+            LogFrameFailure($"in a frame of the nested canvas, {MaximumFailedFrames} in a row; frames are tried again for input or after a pause", ex);
+        }
+
+        _failedFrames = MaximumFailedFrames;
         UnhookFrame();
         _loadRedrawTimer?.Stop();
         HandOffWake();
+        ScheduleFrameRetry();
+    }
+
+    private void LogFrameFailure(string where, Exception ex)
+    {
+        if (FrameFailureLogForTests is { } log)
+        {
+            log(where, ex);
+            return;
+        }
+
+        CrashReporter.Log(where, ex);
+    }
+
+    /// <summary>Makes sure the back-off timer will try a frame again, while frames keep failing.</summary>
+    private void ScheduleFrameRetry()
+    {
+        if (_frameRetry is null)
+        {
+            _frameRetry = new DispatcherTimer(DispatcherPriority.Background, Dispatcher);
+            _frameRetry.Tick += OnFrameRetryDue;
+        }
+
+        if (!_frameRetry.IsEnabled)
+        {
+            _frameRetry.Interval = _frameRetryDelay;
+            _frameRetry.Start();
+        }
+    }
+
+    private void OnFrameRetryDue(object? sender, EventArgs e)
+    {
+        _frameRetry?.Stop();
+        var doubled = _frameRetryDelay + _frameRetryDelay;
+        _frameRetryDelay = doubled < LastFrameRetry ? doubled : LastFrameRetry;
+        RetryFailedFrames();
+    }
+
+    /// <summary>
+    /// Input on the canvas, a new size, or the back-off timer: while frames
+    /// keep failing, one more frame is tried, drawing everything.  One that
+    /// fails again lets go at once and waits for the next try.
+    /// </summary>
+    private void RetryFailedFrames()
+    {
+        if (!FramesFailing)
+        {
+            return;
+        }
+
+        _failedFrames = MaximumFailedFrames - 1;
+        RequestFrame(Layers.All);
+    }
+
+    /// <summary>A frame worked after some that failed: the loop, its wakes and the back-off are as they always were.</summary>
+    private void FramesRecovered()
+    {
+        _failedFrames = 0;
+        _framesLetGo = false;
+        _frameRetryDelay = FirstFrameRetry;
+        _frameRetry?.Stop();
     }
 
     /// <summary>For tests: one frame of the loop at <paramref name="renderingTime"/>, as WPF's Rendering would run it.</summary>
@@ -376,6 +511,12 @@ public sealed partial class NestedCanvas
         var stats = new FrameStats { Fresh = fresh };
         try
         {
+            if (FailFramesForTests > 0)
+            {
+                FailFramesForTests--;
+                throw new InvalidOperationException("A frame failed on purpose, for a test.");
+            }
+
             // 2. The camera.
             var phase = System.Diagnostics.Stopwatch.GetTimestamp();
             if (fresh)

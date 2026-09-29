@@ -27,12 +27,15 @@ internal static class ShaderCache
 {
     private const string ResourceSuffix = "Rendering.Gpu.Shaders.Nested.hlsl";
     private const uint Magic = 0x48535855; // "UXSH"
-    // Version 2: the bytecode is compiled at Flags.  Version 1's went through
-    // an overload that takes no flags and compiles at optimisation level 1
-    // whatever Flags said; the new version gives the file a new name, so that
-    // bytecode is compiled again rather than read.
+    // Version 2: the bytecode is compiled at Flags, through the overload
+    // that takes them.  Version 1's went through one that takes no flags and
+    // always compiles at optimisation level 1; the new version gives the file
+    // a new name, so that bytecode is compiled again rather than read.
+    // Level 1 is kept on purpose: it is what every pixel the GPU draws was
+    // checked against, and another level is other bytecode, which may round
+    // differently.
     private const int FormatVersion = 2;
-    private const ShaderFlags Flags = ShaderFlags.OptimizationLevel3;
+    private const ShaderFlags Flags = ShaderFlags.OptimizationLevel1;
 
     /// <summary>Every entry point compiled from the source, with its profile.</summary>
     public static readonly IReadOnlyList<ShaderEntry> Entries =
@@ -105,8 +108,8 @@ internal static class ShaderCache
         var compiled = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         foreach (var entry in Entries)
         {
-            // The overload that takes flags: the shorter one compiles at
-            // optimisation level 1 whatever Flags asks for.  No macros and
+            // The overload that takes flags, so Flags is what is compiled
+            // at rather than whatever the shorter one fixes.  No macros and
             // no include handler - the source is one file; the parameter is
             // not marked nullable, but D3DCompile takes null for none.
             var result = Compiler.Compile(source, [], null!, entry.Name, "Nested.hlsl", entry.Profile, Flags, out var blob, out var errors);

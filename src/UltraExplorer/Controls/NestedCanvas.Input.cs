@@ -306,6 +306,8 @@ public sealed partial class NestedCanvas
     /// </summary>
     internal void PointerDown(MouseButton button, Point point, ModifierKeys modifiers, int clickCount, bool synthetic = false)
     {
+        // Somebody is using the canvas: frames that kept failing get one more try.
+        RetryFailedFrames();
         if (_press != PressKind.None)
         {
             return;
@@ -638,6 +640,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     internal void PointerWheel(Point point, int delta, ModifierKeys modifiers)
     {
+        RetryFailedFrames();
         if ((modifiers & ModifierKeys.Control) != 0)
         {
             ZoomAt(point, Math.Pow(1.2, delta / 120.0));

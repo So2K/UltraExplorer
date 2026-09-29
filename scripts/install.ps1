@@ -47,7 +47,12 @@ foreach ($process in $running) {
 }
 
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
-Get-ChildItem -LiteralPath $destination -Force | Remove-Item -Recurse -Force
+# The Setup installer (installer/UltraExplorer.iss) uses the same folder and
+# keeps its uninstaller there (unins000.exe and .dat); removing those would
+# leave an entry in Apps & features whose Uninstall fails.
+Get-ChildItem -LiteralPath $destination -Force |
+    Where-Object { $_.Name -notlike 'unins*' } |
+    Remove-Item -Recurse -Force
 Copy-Item -Path (Join-Path $staging '*') -Destination $destination -Recurse -Force
 Remove-Item -Recurse -Force -LiteralPath $staging
 

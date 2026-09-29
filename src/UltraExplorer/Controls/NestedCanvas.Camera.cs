@@ -820,6 +820,7 @@ public sealed partial class NestedCanvas
     protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
     {
         base.OnRenderSizeChanged(sizeInfo);
+        RetryFailedFrames();
 
         // Collapsed (the tree canvas is showing): nothing to frame, and the
         // camera stays as it was for when the canvas comes back.

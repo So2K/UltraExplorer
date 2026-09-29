@@ -194,6 +194,11 @@ public partial class MainWindow : Window
             PushViewport();
         }, DispatcherPriority.Loaded);
 
+        // The window is whole from here: its state read, its canvas up, its
+        // layout restored.  A failure before this ends the process instead of
+        // leaving a half-built window that would save its defaults on close.
+        CrashReporter.MarkStarted();
+
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
         if (_picker is null && TryStartNestedDiagnostics())

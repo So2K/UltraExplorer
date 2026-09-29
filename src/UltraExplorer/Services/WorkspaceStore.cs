@@ -112,12 +112,15 @@ public sealed class WorkspaceStore
 
             // On disk before the move, not only in the cache: a power cut
             // after a rename of unwritten data leaves an empty workspace,
-            // which loads as none at all.
+            // which loads as none at all.  The flush waits for the disk, which
+            // can take tens of milliseconds, so it is waited for off the
+            // interface thread: saves start from a toggle or a pin, and the
+            // frame right after one must not stall on it.
             await using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.Asynchronous))
             {
                 await JsonSerializer.SerializeAsync(stream, state, JsonOptions, cancellationToken);
                 await stream.FlushAsync(cancellationToken);
-                stream.Flush(flushToDisk: true);
+                await Task.Run(() => stream.Flush(flushToDisk: true), cancellationToken);
             }
 
             File.Move(tempPath, _statePath, true);
