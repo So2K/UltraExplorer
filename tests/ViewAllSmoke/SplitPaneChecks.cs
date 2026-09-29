@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -869,6 +870,254 @@ internal static partial class Program
             shell.SplitRatio = SplitLayout.DefaultRatio;
             TryDelete(baseDirectory);
         }
+    }
+
+    /// <summary>
+    /// Working between the panes, on real files in a folder of the temp
+    /// folder, the window laid out but never shown: a folder's menu opening
+    /// it in the other pane - splitting the view the first time, flying the
+    /// other pane there after - while the pane being worked with stays; the
+    /// other pane's folder found by its sort headers' rule; Copy and Move to
+    /// other pane in the item menu, named after that folder and not offered
+    /// for what cannot go there, copying and moving for real from the menu
+    /// and from Shift+F5 and Shift+F6, a move let go of in both panes'
+    /// selections; a drag found in the coordinates of the canvas it is over,
+    /// lit there and not in the pane it left, Explorer's move and copy as
+    /// ever, refused on its own folder, and dropped for real; neither pane
+    /// lit once a drag ends; and nothing of it on the tree canvas.
+    /// </summary>
+    private static async Task SplitBetweenPanesWindowChecks(MainWindow main, MainViewModel shell)
+    {
+        Section("split panes: between the panes");
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitBetween", Guid.NewGuid().ToString("N"));
+        var left = Path.Combine(baseDirectory, "left");
+        var right = Path.Combine(baseDirectory, "right");
+        var sub = Path.Combine(left, "sub");
+        var inner = Path.Combine(right, "inner");
+        var copyMe = Path.Combine(left, "copy-me.txt");
+        var moveMe = Path.Combine(left, "move-me.txt");
+        var dragMe = Path.Combine(left, "drag-me.txt");
+        var fileB = Path.Combine(right, "b.txt");
+        var deep = Path.Combine(inner, "deep.txt");
+        Directory.CreateDirectory(sub);
+        Directory.CreateDirectory(inner);
+        for (var index = 0; index < 12; index++)
+        {
+            Directory.CreateDirectory(Path.Combine(baseDirectory, $"m{index:D2}"));
+        }
+
+        foreach (var file in new[] { copyMe, moveMe, dragMe, fileB, deep })
+        {
+            File.WriteAllText(file, Path.GetFileName(file));
+        }
+
+        var first = main.FirstPane;
+        var selection = shell.Tree.Selection;
+        var host = (INestedPaneHost)main;
+        var drive = new NestedRoot(baseDirectory, "S", NestedFolderKind.Drive);
+        string[] Labels(IEnumerable<ShellMenuEntry> entries) => [.. entries.Where(entry => !entry.IsSeparator).Select(entry => entry.Label)];
+        ShellMenuEntry? Entry(IEnumerable<ShellMenuEntry> entries, string label) => entries.FirstOrDefault(entry => entry.Label == label);
+        IReadOnlyList<NestedRoot>? machineDrives = null;
+        try
+        {
+            // The checks before went to the tree canvas and back, which
+            // reveals what was selected there: that stands down now, rather
+            // than selecting it over the selections made here.
+            shell.Tree.BeginNavigation();
+            shell.IsSplit = false;
+            shell.Tree.PreferLightReveal = true;
+            shell.Layout = CanvasLayout.Nested;
+            LayOutWindow(main, 1400, 900);
+
+            // The fixture is the one drive of every pane, the second too once it is made.
+            machineDrives = main.UseNestedDrivesForChecks([drive]);
+            await first.FlyToAsync(left, gentle: false, animated: false);
+            selection.ReplaceSingle(sub, true, 0, SelectionSource.Navigation);
+
+            // ---- one pane ----
+            var alone = main.ItemMenuEntries([sub]);
+            Check("unsplit, a folder's menu offers first to open it in the other pane, and nothing is copied or moved to a pane that is not there",
+                Labels(alone).FirstOrDefault() == "Open in other pane" && Entry(alone, "Open in other pane") is { Glyph: "" }
+                && !Labels(alone).Any(label => label.Contains("to other pane", StringComparison.Ordinal)));
+            Check("the open space of a folder offers it too, after the folder's own settings; a file does not",
+                Labels(main.FolderAreaEntries(left, forShell: true)) is var area && area.Contains("Open in other pane")
+                && Array.IndexOf(area, "Open in other pane") == Array.IndexOf(area, "Show in File Explorer") + 1
+                && !Labels(main.ItemMenuEntries([copyMe])).Contains("Open in other pane"));
+            Check("Shift+F5 with no other pane is taken, copies nothing, and says why",
+                main.TryHandlePaneTransferKey(Key.F5, ModifierKeys.Shift) && shell.Toast.Message.Contains("split the view", StringComparison.Ordinal)
+                && Directory.EnumerateFileSystemEntries(sub).Any() is false);
+            Check("F5 and F6 alone are not the other pane's: they read again and go between the panes",
+                !main.TryHandlePaneTransferKey(Key.F5, ModifierKeys.None) && !main.TryHandlePaneTransferKey(Key.F6, ModifierKeys.None)
+                && !main.TryHandlePaneTransferKey(Key.F7, ModifierKeys.Shift));
+
+            // ---- Open in other pane splits the view ----
+            await main.OpenInOtherPaneAsync(right, animated: false);
+            var second = main.SecondPane;
+            Check("Open in other pane splits the view, the pane being worked with still the first, with its selection as it was",
+                shell.IsSplit && second is not null && ReferenceEquals(main.ActivePane, first) && selection.Paths.SequenceEqual([sub]));
+            if (second is null)
+            {
+                return;
+            }
+
+            Check("and the new pane has the folder selected, as a step of its own history",
+                second.KeptSelection.Count == 1 && second.KeptSelection.Contains(right) && ViewAllPath.Equals(second.KeptSelection.Focus ?? string.Empty, right)
+                && ViewAllPath.Equals(second.History.Current ?? string.Empty, right) && ViewAllPath.Equals(second.FocusPath ?? string.Empty, right));
+
+            // Laid out with the split, the new pane has its room.
+            LayOutWindow(main, 1400, 900);
+            await main.OpenInOtherPaneAsync(right, animated: false);
+            second.UpdateHeader();
+            Check("split, Open in other pane flies the other pane there and its header names it, while the first stays where it was",
+                second.Canvas.CaptureCamera()?.AnchorPath == right && second.Canvas.FolderInView?.FullPath == right
+                && second.View.PaneLocation.Text.EndsWith("right", StringComparison.Ordinal)
+                && first.Canvas.CaptureCamera()?.AnchorPath == left && ReferenceEquals(main.ActivePane, first) && selection.Paths.SequenceEqual([sub]));
+
+            // ---- the other pane's folder: its sort headers' rule ----
+            Check("the folder things go to is the one the other pane has selected", ViewAllPath.Equals(main.OtherPaneFolder() ?? string.Empty, right));
+            second.KeptSelection.ReplaceSingle(inner, true, 0, SelectionSource.Navigation);
+            Check("a folder selected there inside the one in view is that folder", ViewAllPath.Equals(main.OtherPaneFolder() ?? string.Empty, inner));
+            second.KeptSelection.ReplaceSingle(fileB, false, 1, SelectionSource.Navigation);
+            Check("a file selected there, the folder it is in", ViewAllPath.Equals(main.OtherPaneFolder() ?? string.Empty, right));
+            second.KeptSelection.ReplaceSingle(moveMe, false, 1, SelectionSource.Navigation);
+            Check("and a file selected somewhere the pane is not looking, the folder it has in view",
+                ViewAllPath.Equals(main.OtherPaneFolder() ?? string.Empty, right));
+
+            // ---- the item menu's entries ----
+            selection.ReplaceSingle(copyMe, false, 1, SelectionSource.Navigation);
+            var entries = main.ItemMenuEntries([copyMe]);
+            var copy = Entry(entries, "Copy to other pane (right)");
+            Check("a file's menu offers first to copy it and to move it to the other pane, named after its folder, with their keys",
+                copy is { IsEnabled: true, Shortcut: "Shift+F5", Glyph: "" }
+                && Entry(entries, "Move to other pane (right)") is { IsEnabled: true, Shortcut: "Shift+F6", Glyph: "" }
+                && Labels(entries).Take(3).SequenceEqual(["Copy to other pane (right)", "Move to other pane (right)", "Colour"]));
+            var already = main.ItemMenuEntries([fileB]);
+            Check("not to be chosen for what is in that folder already",
+                Entry(already, "Copy to other pane (right)") is { IsEnabled: false } && Entry(already, "Move to other pane (right)") is { IsEnabled: false });
+            Check("nor for the folder itself, or one it is inside",
+                Entry(main.ItemMenuEntries([right]), "Copy to other pane (right)") is { IsEnabled: false }
+                && Entry(main.ItemMenuEntries([baseDirectory]), "Move to other pane (right)") is { IsEnabled: false });
+            Check("a folder's menu has Open in other pane above them",
+                Labels(main.ItemMenuEntries([sub])).Take(3).SequenceEqual(["Open in other pane", "Copy to other pane (right)", "Move to other pane (right)"]));
+
+            // ---- copied and moved, for real ----
+            copy!.Execute();
+            Check("Copy to other pane copies the file into the other pane's folder and leaves it where it was",
+                await LiveWait(() => File.Exists(Path.Combine(right, "copy-me.txt")), 10_000) >= 0 && File.Exists(copyMe));
+            Check("and the toast says where it went", await LiveWait(() => shell.Toast.Message == "Copied 1 item(s) to right", 5_000) >= 0);
+
+            selection.ReplaceSingle(moveMe, false, 1, SelectionSource.Navigation);
+            Check("Shift+F6 is taken where the selection is", main.TryHandlePaneTransferKey(Key.F6, ModifierKeys.Shift));
+            Check("and moves what is selected into the other pane's folder",
+                await LiveWait(() => File.Exists(Path.Combine(right, "move-me.txt")) && !File.Exists(moveMe), 10_000) >= 0);
+            Check("letting go of it in both panes' selections: the one being worked with, and the other's, which had it too",
+                await LiveWait(() => !selection.Contains(moveMe) && !second.KeptSelection.Contains(moveMe), 5_000) >= 0);
+            await LiveWait(() => shell.Toast.Message == "Moved 1 item(s) to right", 5_000);
+
+            second.KeptSelection.ReplaceSingle(right, true, 0, SelectionSource.Navigation);
+            await main.SendToOtherPaneAsync([Path.Combine(right, "copy-me.txt")], move: true);
+            Check("what is in the other pane's folder already goes nowhere, and the toast says why",
+                File.Exists(Path.Combine(right, "copy-me.txt")) && shell.Toast.Message.StartsWith("Nothing to move", StringComparison.Ordinal));
+
+            // ---- dragged from one pane onto a folder of the other ----
+            await first.Tree.LoadAsync(first.Tree.Find(left)!);
+            await second.Tree.LoadAsync(second.Tree.Find(right)!);
+            LayOutWindow(main, 1400, 900);
+            var root = SettingsHosts[main];
+            Point? Centre(NestedPane pane, string path) =>
+                pane.Tree.Find(path) is { } folder && pane.Canvas.ScreenRectOf(folder) is { } cell
+                    ? pane.Canvas.TranslatePoint(new Point(cell.X + cell.Width / 2, cell.Y + cell.Height / 2), root)
+                    : null;
+            if (Centre(first, sub) is not { } overSub || Centre(second, inner) is not { } overInner)
+            {
+                Check("each pane's folder is on its canvas", false);
+                return;
+            }
+
+            DragEventArgs Drag(NestedPane pane, RoutedEvent routed, IDataObject data, Point at, DragDropKeyStates keys = DragDropKeyStates.None)
+            {
+                var args = SplitDragArgs(routed, data, keys, root, at);
+                pane.Canvas.RaiseEvent(args);
+                return args;
+            }
+
+            var carried = new DataObject(DataFormats.FileDrop, new[] { dragMe });
+            var overFirst = Drag(first, DragDrop.DragOverEvent, carried, overSub);
+            Check("a drag over the first pane lights the folder under the pointer there",
+                first.Canvas.DropTarget?.FullPath == sub && second.Canvas.DropTarget is null && overFirst is { Handled: true, Effects: DragDropEffects.Move });
+            Drag(first, DragDrop.DragLeaveEvent, carried, overInner);
+            var overSecond = Drag(second, DragDrop.DragOverEvent, carried, overInner);
+            Check("on over the other pane: the folder under the pointer there is lit, found in that pane's own coordinates, and the pane it left is not",
+                second.Canvas.DropTarget?.FullPath == inner && first.Canvas.DropTarget is null && overSecond.Effects == DragDropEffects.Move);
+            Check("Explorer's rules as ever: on the same drive a move, with Ctrl a copy, with Shift a move",
+                Drag(second, DragDrop.DragOverEvent, carried, overInner, DragDropKeyStates.ControlKey).Effects == DragDropEffects.Copy
+                && Drag(second, DragDrop.DragOverEvent, carried, overInner, DragDropKeyStates.ShiftKey).Effects == DragDropEffects.Move
+                && second.Canvas.DropTarget?.FullPath == inner);
+
+            host.NestedDragPaths = [deep];
+            var ownFolder = Drag(second, DragDrop.DragOverEvent, new DataObject(DataFormats.FileDrop, new[] { deep }), overInner);
+            var intoItself = Drag(second, DragDrop.DragOverEvent, new DataObject(DataFormats.FileDrop, new[] { right }), overInner);
+            host.NestedDragPaths = null;
+            Check("refused on the folder a drag from the window carries its item out of, and on a folder inside what it carries",
+                ownFolder.Effects == DragDropEffects.None && intoItself.Effects == DragDropEffects.None && second.Canvas.DropTarget is null);
+
+            selection.ReplaceSingle(dragMe, false, 1, SelectionSource.Navigation);
+            host.NestedDragPaths = [dragMe];
+            Drag(second, DragDrop.DragOverEvent, carried, overInner);
+            var dropped = Drag(second, DragDrop.DropEvent, carried, overInner);
+            host.NestedDragPaths = null;
+            host.ClearDropTargets();
+            Check("dropped there it is moved into that folder, the drag's source told nothing is left for it to do, and the folder is lit no more",
+                dropped.Effects == DragDropEffects.None && second.Canvas.DropTarget is null
+                && await LiveWait(() => File.Exists(Path.Combine(inner, "drag-me.txt")) && !File.Exists(dragMe), 10_000) >= 0);
+            Check("and it is let go of in the pane it came from", await LiveWait(() => !selection.Contains(dragMe), 5_000) >= 0);
+            await LiveWait(() => shell.Toast.Message == "Moved 1 item(s) to inner", 5_000);
+
+            first.Canvas.DropTarget = first.Tree.Find(sub);
+            second.Canvas.DropTarget = second.Tree.Find(inner);
+            host.ClearDropTargets();
+            Check("when a drag ends, neither pane's folder is lit any more", first.Canvas.DropTarget is null && second.Canvas.DropTarget is null);
+
+            // ---- the tree canvas has no other pane ----
+            shell.Layout = CanvasLayout.Tree;
+            Check("on the tree canvas there is no other pane's folder, and the menus offer nothing of the split",
+                main.OtherPaneFolder() is null && !Labels(main.ItemMenuEntries([sub])).Any(label => label.Contains("other pane", StringComparison.Ordinal))
+                && !Labels(main.FolderAreaEntries(left, forShell: false)).Any(label => label.Contains("other pane", StringComparison.Ordinal)));
+            await main.SendToOtherPaneAsync([copyMe], move: false);
+            Check("and Copy to other pane there says so", shell.Toast.Message.Contains("nested canvas", StringComparison.Ordinal));
+        }
+        finally
+        {
+            host.NestedDragPaths = null;
+            host.ClearDropTargets();
+            shell.IsSplit = false;
+            shell.Layout = CanvasLayout.Nested;
+            if (machineDrives is not null)
+            {
+                main.UseNestedDrivesForChecks(machineDrives);
+            }
+
+            selection.Clear(SelectionSource.Navigation);
+            await LiveWait(() => !shell.Toast.IsBusy, 5_000);
+            TryDelete(baseDirectory);
+        }
+    }
+
+    /// <summary>
+    /// A drag event as the window's drop target raises it, at a point of
+    /// <paramref name="relativeTo"/>: WPF makes them only for a real drag,
+    /// so the checks make their own with the constructor it uses.
+    /// </summary>
+    private static DragEventArgs SplitDragArgs(RoutedEvent routed, IDataObject data, DragDropKeyStates keys, DependencyObject relativeTo, Point point)
+    {
+        var constructor = typeof(DragEventArgs).GetConstructor(
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            null,
+            [typeof(IDataObject), typeof(DragDropKeyStates), typeof(DragDropEffects), typeof(DependencyObject), typeof(Point)],
+            null) ?? throw new MissingMethodException(nameof(DragEventArgs), ".ctor");
+        var args = (DragEventArgs)constructor.Invoke([data, keys, DragDropEffects.Copy | DragDropEffects.Move, relativeTo, point]);
+        args.RoutedEvent = routed;
+        return args;
     }
 
     /// <summary>A key pressed in the window, as the keyboard sends it: down from the window first.</summary>

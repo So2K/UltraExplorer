@@ -68,9 +68,13 @@ lazily read tree over a fake disk, the camera, hit testing, sorting by name,
 date, type and size, and the cost of a frame, all without a window - plus the GPU
 renderer offscreen on each graphics card and on WARP: device and surface
 lifetime, the rectangle shader against the CPU raster, the icon and glyph
-atlases and text shaping against WPF's own. It
+atlases and text shaping against WPF's own - and the split view: two canvases
+sharing one change hub, icon service and graphics card, each pane's own
+camera, selection and history in a window that is never shown, and copying,
+moving and dropping real files between the panes in a folder under `%TEMP%`
+(`SplitPaneChecks`). It
 builds a throwaway fixture under `%TEMP%`, prints one line per check and exits
-non-zero on the first failure. If `%TEMP%` is not writable (a sandboxed shell),
+non-zero if any check failed. If `%TEMP%` is not writable (a sandboxed shell),
 point `TMP` and `TEMP` at a folder that is.
 
 Its `performance` section asserts wall-clock budgets rather than describing them
@@ -172,7 +176,8 @@ Two switches judge a change to the nested canvas by numbers and by pixels
 instead of by feel. Both open the window at 1600×1000 on the first monitor
 that is not the primary one (or the one `ULTRAEXPLORER_DIAGNOSTICS_MONITOR`
 names by index), never activate it, switch to the nested canvas, do their
-run and exit. Compare only runs made on the same monitor: another scale is
+run on its first pane and exit - with a fresh state folder the view is not
+split, and the pictures are those of the one pane a window always had. Compare only runs made on the same monitor: another scale is
 another picture.
 
 ```powershell
@@ -210,8 +215,8 @@ everyday one. `ViewAllSmoke --only <Group,...>` runs only the named check groups
 
 | File | Contents |
 |---|---|
-| `%LOCALAPPDATA%\UltraExplorer\view-all.workspace.json` | expanded branches, node positions, viewport, active path, extra roots (and how many starts in a row each has been out of reach - ten, and it is forgotten), nested canvas camera |
-| `%LOCALAPPDATA%\UltraExplorer\workspace.json` | pinned folders, navigation pane width, minimap toggle, nested or tree canvas, sort order |
+| `%LOCALAPPDATA%\UltraExplorer\view-all.workspace.json` | expanded branches, node positions, viewport, active path, extra roots (and how many starts in a row each has been out of reach - ten, and it is forgotten), nested canvas camera, and the split view's second pane: its path and camera (`secondPane`) |
+| `%LOCALAPPDATA%\UltraExplorer\workspace.json` | pinned folders, navigation pane width, minimap toggle, nested or tree canvas, sort order, split view (on or off, side by side or stacked, the divider's ratio, the pane worked with) |
 | `%LOCALAPPDATA%\UltraExplorer\folder-marks.json` | colour labels and notes, keyed by path |
 | `%LOCALAPPDATA%\UltraExplorer\picker.workspace.json` | canvas layout of file-dialog sessions, kept apart from the user's own |
 | `%LOCALAPPDATA%\UltraExplorer\picker-clients.json` | per caller GUID: last folder, file type, recent names |

@@ -1273,6 +1273,17 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Copy", "\uE8C8", _viewModel.CopyCommand, "Ctrl+C");
         AddCommandItem(menu, "Copy as path", "\uE71B", _viewModel.CopyPathCommand, "Ctrl+Shift+C");
         AddCommandItem(menu, "Paste", "\uE77F", _viewModel.PasteCommand, "Ctrl+V");
+
+        // The split view's, as the Shell's menu has them below its own.
+        var selection = _viewModel.Tree.Selection;
+        var focus = selection.Focus is { } focused && selection.TryGetItem(focused, out var item) && item.IsDirectory ? focused : null;
+        var panes = OtherPaneEntries(selection.Paths, focus);
+        if (panes.Count > 0)
+        {
+            menu.Items.Add(new Separator());
+            AddEntries(menu, panes);
+        }
+
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Duplicate", "\uE8C8", _viewModel.DuplicateCommand, "Ctrl+Shift+D");
         AddCommandItem(menu, "Delete", "\uE74D", _viewModel.DeleteCommand, "Del");
@@ -1968,6 +1979,13 @@ public partial class MainWindow : Window
         // Going places, zooming and refreshing work from anywhere, as they
         // always have.
         var onSelection = IsSelectionSurfaceFocused();
+
+        // Shift+F5 and Shift+F6: what is selected, to the other pane.
+        if (onSelection && TryHandlePaneTransferKey(key, modifiers))
+        {
+            e.Handled = true;
+            return;
+        }
 
         switch (modifiers, key)
         {

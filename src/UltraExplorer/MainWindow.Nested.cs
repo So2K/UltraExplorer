@@ -288,6 +288,21 @@ public partial class MainWindow : INestedPaneHost
         }
     }
 
+    /// <summary>
+    /// For the checks: <paramref name="drives"/> in place of the machine's,
+    /// in every pane now and in any pane made later - a pane that looks for
+    /// a new share gives every pane the window's drives again - and the ones
+    /// they replace, to be put back after.
+    /// </summary>
+    internal IReadOnlyList<NestedRoot> UseNestedDrivesForChecks(IReadOnlyList<NestedRoot> drives)
+    {
+        NestedRoot[] before = [.. _nestedDrives];
+        _nestedDrives.Clear();
+        _nestedDrives.AddRange(drives);
+        SyncNestedRoots();
+        return before;
+    }
+
     /// <summary>The first row of cells: the drives, then every share and WSL distribution the tree has as a root of its own.</summary>
     private List<NestedRoot> NestedRoots()
     {

@@ -457,9 +457,9 @@ public partial class MainWindow
     /// <summary>
     /// A folder's own settings, in the menu of its open space: how its
     /// contents are sorted, its colour, its note, its pin on Home, and the
-    /// folder in File Explorer and - in the app's menu - in Windows'
-    /// properties sheet.  Each acts on this folder by its path, whatever else
-    /// is selected.
+    /// folder shown in File Explorer, in Windows' properties sheet (in the
+    /// app's menu) and, on the nested canvas, in the other pane.  Each acts
+    /// on this folder by its path, whatever else is selected.
     /// </summary>
     private List<ShellMenuEntry> FolderSettingsEntries(string folder, string name, bool forShell)
     {
@@ -480,21 +480,37 @@ public partial class MainWindow
             entries.Add(new ShellMenuEntry("Properties", () => _viewModel.ShowPropertiesOf(folder)) { Glyph = "\uE946", Shortcut = gesture });
         }
 
+        // The folder in the other pane of a split view, which this splits if need be.
+        if (OpenInOtherPaneEntryFor(folder) is { } other)
+        {
+            entries.Add(other);
+        }
+
         return entries;
     }
 
     /// <summary>
-    /// What the app adds to the Shell's menu for items on a canvas: their
-    /// colour, the note and the pin of the one in focus, and hiding the
-    /// folders among them or putting them back into the layout.  All of it by
-    /// path, so the menu never waits for the canvas's tree to know the items.
+    /// What the app adds to the Shell's menu for items on a canvas: on the
+    /// nested canvas, the split view's - the folder in focus opened in the
+    /// other pane, the items copied or moved to it - then their colour, the
+    /// note and the pin of the one in focus, and hiding the folders among
+    /// them or putting them back into the layout.  All of it by path, so the
+    /// menu never waits for the canvas's tree to know the items.
     /// </summary>
-    private IReadOnlyList<ShellMenuEntry> ItemMenuEntries(IReadOnlyList<string> paths)
+    internal IReadOnlyList<ShellMenuEntry> ItemMenuEntries(IReadOnlyList<string> paths)
     {
         var selection = _viewModel.Tree.Selection;
         var focus = selection.Focus is { } focused && paths.Contains(focused, StringComparer.OrdinalIgnoreCase) ? focused : paths[0];
-        var entries = new List<ShellMenuEntry> { ColourEntry(paths), NoteEntry(focus, FolderDisplayName(focus)) };
-        if (!IsPickerMode && (selection.TryGetItem(focus, out var item) ? item.IsDirectory : Directory.Exists(focus)))
+        var isFolder = selection.TryGetItem(focus, out var item) ? item.IsDirectory : Directory.Exists(focus);
+        var entries = OtherPaneEntries(paths, isFolder ? focus : null);
+        if (entries.Count > 0)
+        {
+            entries.Add(ShellMenuEntry.Separator);
+        }
+
+        entries.Add(ColourEntry(paths));
+        entries.Add(NoteEntry(focus, FolderDisplayName(focus)));
+        if (!IsPickerMode && isFolder)
         {
             // Pinning takes every folder selected, as the command does; unpinning the one in focus.
             entries.Add(_viewModel.IsPinned(focus)

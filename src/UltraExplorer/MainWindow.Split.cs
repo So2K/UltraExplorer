@@ -6,6 +6,7 @@ using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using UltraExplorer.Models;
+using UltraExplorer.Services;
 using UltraExplorer.ViewModels;
 
 namespace UltraExplorer;
@@ -28,6 +29,11 @@ namespace UltraExplorer;
 /// along the top of its header, and the window's selection, Back and
 /// Forward, the address bar, the status bar, the list, the zoom buttons and
 /// every command are its (see <see cref="ActivatePane"/>).</para>
+///
+/// <para>Things go from one pane to the other by a drag onto a folder of
+/// the other, by Copy and Move to other pane (Shift+F5, Shift+F6) into the
+/// other pane's folder, and a folder goes to the other pane by Open in other
+/// pane.</para>
 ///
 /// <para>The tree canvas and a file dialog are never split: the tree has no
 /// panes, and a file dialog never makes a second.</para>
@@ -417,6 +423,209 @@ public partial class MainWindow
             pane.UpdateHeader();
             pane.ScheduleHeader();
         }
+    }
+
+    // ---- between the panes ---------------------------------------------------------
+    //
+    // Dragging from one pane onto a folder of the other is a drop like any
+    // other (NestedPane): Explorer's rules, the folder lit while the drag is
+    // over it.  Without the mouse, what is selected in the pane being worked
+    // with goes to the other with Shift+F5 and Shift+F6 or its menu, and a
+    // folder's menu opens it in the other pane.
+
+    /// <summary>
+    /// The folder of the pane not being worked with that Copy and Move to
+    /// other pane put things into: the folder selected there, or the one the
+    /// file selected there is in, or else the folder it has in view - the
+    /// rule its sort headers go by (see <see cref="NestedPane.SortFolder"/>).
+    /// Null with one pane, on the tree canvas, and with the other pane at
+    /// This PC with nothing selected there.
+    /// </summary>
+    internal string? OtherPaneFolder() => IsNested && !IsPickerMode && InactivePane is { } other ? other.SortFolder() : null;
+
+    /// <summary>
+    /// What of <paramref name="paths"/> can go into <paramref name="folder"/>:
+    /// not the folder itself, not a folder it is inside, and not what is in
+    /// it already - a copy or a move there would do nothing, or ask the Shell
+    /// something that makes no sense.  Only the names are compared.
+    /// </summary>
+    internal static string[] PathsGoingTo(IReadOnlyList<string> paths, string folder) =>
+    [
+        .. paths.Where(path =>
+            !ViewAllPath.Equals(path, folder)
+            && !(Path.GetDirectoryName(path) is { Length: > 0 } parent && ViewAllPath.Equals(parent, folder))
+            && !NativeShellService.IsInvalidMoveTarget(path, folder))
+    ];
+
+    /// <summary>
+    /// Copy or Move to other pane - Shift+F5 and Shift+F6, or the item menu -
+    /// for <paramref name="paths"/>, what the pane being worked with has
+    /// selected: into the other pane's folder (<see cref="OtherPaneFolder"/>)
+    /// through the Shell, as a paste or a drop goes, with its progress, its
+    /// questions and its Undo.  A move lets go of what moved in both panes'
+    /// selections.  Where nothing can go, the toast says why.
+    /// </summary>
+    internal async Task SendToOtherPaneAsync(IReadOnlyList<string> paths, bool move)
+    {
+        if (paths.Count == 0)
+        {
+            return;
+        }
+
+        if (OtherPaneFolder() is not { } folder)
+        {
+            _viewModel.Toast.ShowError(SecondPane is null
+                ? "There is no other pane: split the view first (Ctrl+\\)."
+                : IsNested
+                    ? "The other pane has no folder in view: go into one there first."
+                    : "The other pane is on the nested canvas: go back to it first.");
+            return;
+        }
+
+        var name = FolderName(folder);
+        string[] going;
+        try
+        {
+            if (!Directory.Exists(folder))
+            {
+                _viewModel.Toast.ShowError($"{name} is no longer there.");
+                return;
+            }
+
+            going = PathsGoingTo(paths, folder);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            _viewModel.Toast.ShowError(ex.Message);
+            return;
+        }
+
+        if (going.Length == 0)
+        {
+            _viewModel.Toast.ShowError($"Nothing to {(move ? "move" : "copy")}: what is selected is {name} or already in it.");
+            return;
+        }
+
+        await _viewModel.DropIntoPathAsync(going, folder, move);
+    }
+
+    /// <summary>
+    /// Open in other pane: the other pane goes to <paramref name="folder"/>
+    /// and has it selected (see <see cref="NestedPane.OpenAsync"/>); the pane
+    /// being worked with stays the one it was.  A window that is not split is
+    /// split for it - from the tree canvas, onto the nested one.
+    /// </summary>
+    /// <param name="animated">Whether a pane that was already on screen flies there; a pane the split has only just made is simply there.</param>
+    internal async Task OpenInOtherPaneAsync(string folder, bool animated = true)
+    {
+        if (IsPickerMode || string.IsNullOrEmpty(folder))
+        {
+            return;
+        }
+
+        var shown = SecondPane is not null && IsNested;
+        if (!_viewModel.IsSplit)
+        {
+            _viewModel.IsSplit = true;
+        }
+        else if (!IsNested)
+        {
+            _viewModel.Layout = CanvasLayout.Nested;
+        }
+
+        if (InactivePane is { } other)
+        {
+            await other.OpenAsync(folder, animated && shown);
+        }
+    }
+
+    /// <summary>
+    /// The split view's entries on the menu of items on the nested canvas:
+    /// Open in other pane for a <paramref name="folder"/> - which splits the
+    /// view if it is not split - and, while it is, Copy and Move to other
+    /// pane for <paramref name="paths"/>, named after the folder they would
+    /// go to, and not to be chosen where nothing can go there.  Nothing on
+    /// the tree canvas or in a file dialog, which are never split.
+    /// </summary>
+    internal List<ShellMenuEntry> OtherPaneEntries(IReadOnlyList<string> paths, string? folder)
+    {
+        var entries = new List<ShellMenuEntry>();
+        if (IsPickerMode || !IsNested)
+        {
+            return entries;
+        }
+
+        if (folder is not null)
+        {
+            entries.Add(OpenInOtherPaneEntry(folder));
+        }
+
+        if (SecondPane is null || paths.Count == 0)
+        {
+            return entries;
+        }
+
+        var target = OtherPaneFolder();
+        string[] going;
+        try
+        {
+            going = target is null ? [] : PathsGoingTo(paths, target);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            going = [];
+        }
+
+        var name = target is null ? null : FolderName(target);
+        var why = name is null
+            ? "The other pane has no folder in view: go into one there first"
+            : going.Length == 0 ? $"What is selected is {name} or already in it" : null;
+        string[] sent = [.. paths];
+        entries.Add(new ShellMenuEntry(name is null ? "Copy to other pane" : $"Copy to other pane ({name})", () => _ = SendToOtherPaneAsync(sent, move: false))
+        {
+            Glyph = "",
+            Shortcut = "Shift+F5",
+            IsEnabled = going.Length > 0,
+            ToolTip = why ?? $"Copies what is selected into {name}, the folder of the other pane"
+        });
+        entries.Add(new ShellMenuEntry(name is null ? "Move to other pane" : $"Move to other pane ({name})", () => _ = SendToOtherPaneAsync(sent, move: true))
+        {
+            Glyph = "",
+            Shortcut = "Shift+F6",
+            IsEnabled = going.Length > 0,
+            ToolTip = why ?? $"Moves what is selected into {name}, the folder of the other pane"
+        });
+        return entries;
+    }
+
+    /// <summary>A folder's Open in other pane, on the nested canvas only; null elsewhere.</summary>
+    private ShellMenuEntry? OpenInOtherPaneEntryFor(string folder) =>
+        IsPickerMode || !IsNested ? null : OpenInOtherPaneEntry(folder);
+
+    private ShellMenuEntry OpenInOtherPaneEntry(string folder) =>
+        new("Open in other pane", () => _ = OpenInOtherPaneAsync(folder))
+        {
+            Glyph = "",
+            ToolTip = SecondPane is null
+                ? $"Splits the view, with {FolderName(folder)} in the second pane (F6 goes to it)"
+                : $"Shows {FolderName(folder)} in the other pane (F6 goes to it)"
+        };
+
+    /// <summary>
+    /// Shift+F5 copies what is selected into the other pane's folder and
+    /// Shift+F6 moves it there - Total Commander's F5 and F6, with Shift, as
+    /// F5 alone reads the folder again and F6 goes to the other pane.  Only
+    /// from where the selection is shown, as the other keys that act on it.
+    /// </summary>
+    internal bool TryHandlePaneTransferKey(Key key, ModifierKeys modifiers)
+    {
+        if (IsPickerMode || modifiers != ModifierKeys.Shift || key is not (Key.F5 or Key.F6))
+        {
+            return false;
+        }
+
+        _ = SendToOtherPaneAsync([.. _viewModel.Tree.SelectedPaths], move: key == Key.F6);
+        return true;
     }
 
     // ---- the ways to it ------------------------------------------------------------

@@ -849,10 +849,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// Copies or moves dropped items into a folder.  Whether it is a move is
+    /// Copies or moves dropped items into a folder - or items sent to the
+    /// other pane of a split view, into its folder.  Whether it is a move is
     /// the window's decision - the one its drag cursor showed, from the keys
-    /// the drag reported and what its source allows - so it is taken as given
-    /// rather than worked out again here from whatever keys seem to be down.
+    /// the drag reported and what its source allows, or the command chosen -
+    /// so it is taken as given rather than worked out again here from
+    /// whatever keys seem to be down.
     /// </summary>
     public async Task DropIntoPathAsync(
         IReadOnlyList<string> paths,

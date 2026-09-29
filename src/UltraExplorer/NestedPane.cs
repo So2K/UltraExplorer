@@ -590,6 +590,42 @@ internal sealed class NestedPane
         }
     }
 
+    /// <summary>
+    /// Open in other pane: this pane goes to <paramref name="folder"/> as the
+    /// pane being worked with goes to a place typed in the address bar - the
+    /// folder becomes what it has selected and a step of its Back and
+    /// Forward, and the camera flies to it - while the pane being worked with
+    /// stays the one it was.  The place asked for wins over a camera still to
+    /// be put back: a pane only just made by the split goes there, not to
+    /// where the last split left it.
+    /// </summary>
+    /// <param name="animated">Whether the camera flies there or is simply there: a pane only just made has nothing to fly from.</param>
+    public async Task OpenAsync(string folder, bool animated)
+    {
+        if (IsActive)
+        {
+            await _viewModel.Tree.RevealPathAsync(folder);
+            return;
+        }
+
+        _cameraRestored = true;
+        KeptSelection.Apply(new SelectionEdit
+        {
+            Clear = true,
+            Added = [new SelectionItem(folder, true, 0)],
+            Anchor = folder,
+            Focus = folder,
+            Source = SelectionSource.Navigation
+        });
+        History.Record(folder);
+        _viewModel.Tree.ScheduleSave();
+
+        // After the pane's own entering, which a pane only just made has
+        // waiting at this priority, and once it has its size.
+        await Dispatcher.InvokeAsync(Canvas.UpdateLayout, DispatcherPriority.Loaded);
+        await FlyToAsync(folder, gentle: false, animated);
+    }
+
     // ---- the selection, both ways ----------------------------------------------------
     //
     // The canvas's gestures reach the shared selection as edits, and every
@@ -1265,38 +1301,50 @@ internal sealed class NestedPane
         }
     }
 
+    // A drag crosses both panes of a split view - from one to the other is
+    // the point of it - so each handler works with the canvas that raised
+    // it: the folder under the pointer is found in that canvas's own
+    // coordinates and camera, and lit there, never in the other pane.
+
     private void OnCanvasDragOver(object sender, DragEventArgs e)
     {
         e.Handled = true;
-        if (!_host.TryGetDropPaths(e.Data, out var paths) || ResolveDropTarget(e, paths) is not { } target)
+        var canvas = (NestedCanvas)sender;
+        if (!_host.TryGetDropPaths(e.Data, out var paths) || ResolveDropTarget(canvas, e, paths) is not { } target)
         {
-            Canvas.DropTarget = null;
+            canvas.DropTarget = null;
             e.Effects = DragDropEffects.None;
             return;
         }
 
         // The keys and what the source allows, as the tree canvas has them (see DropEffectFor).
         var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
-        Canvas.DropTarget = effect == DragDropEffects.None ? null : target;
+        canvas.DropTarget = effect == DragDropEffects.None ? null : target;
         e.Effects = effect;
     }
 
+    /// <summary>
+    /// The drag left the canvas - for the other pane, or out of the window -
+    /// and its folder is not lit any more.  Whatever the mouse is said to be
+    /// over: during a drag nothing tells WPF where the mouse is, so the pane
+    /// the drag started on would still count as under it, and stay lit while
+    /// the drag hovers over the other.  Nothing inside the canvas raises a
+    /// leave of its own: what it draws is visuals, not elements.
+    /// </summary>
     private void OnCanvasDragLeave(object sender, DragEventArgs e)
     {
         _host.ForgetDropPaths();
-        if (!Canvas.IsMouseOver)
-        {
-            Canvas.DropTarget = null;
-        }
+        ((NestedCanvas)sender).DropTarget = null;
     }
 
     private async void OnCanvasDrop(object sender, DragEventArgs e)
     {
         e.Handled = true;
-        Canvas.DropTarget = null;
+        var canvas = (NestedCanvas)sender;
+        canvas.DropTarget = null;
         var carriesPaths = _host.TryGetDropPaths(e.Data, out var paths);
         _host.ForgetDropPaths();
-        if (!carriesPaths || ResolveDropTarget(e, paths) is not { } target)
+        if (!carriesPaths || ResolveDropTarget(canvas, e, paths) is not { } target)
         {
             e.Effects = DragDropEffects.None;
             return;
@@ -1312,10 +1360,15 @@ internal sealed class NestedPane
         await _viewModel.DropIntoPathAsync(paths, target.FullPath, move: effect == DragDropEffects.Move);
     }
 
-    /// <summary>The innermost folder under the pointer, unless it is one of the things being dropped or inside one.</summary>
-    private NestedFolder? ResolveDropTarget(DragEventArgs e, IReadOnlyList<string> paths)
+    /// <summary>
+    /// The innermost folder of <paramref name="canvas"/> under the pointer -
+    /// a folder's open space is the folder - unless it is one of the things
+    /// being dropped or inside one, or the folder a drag from this window
+    /// carries them out of.
+    /// </summary>
+    private NestedFolder? ResolveDropTarget(NestedCanvas canvas, DragEventArgs e, IReadOnlyList<string> paths)
     {
-        if (Canvas.HitTest(e.GetPosition(Canvas)) is not { } hit || hit.Folder.IsComputer)
+        if (canvas.HitTest(e.GetPosition(canvas)) is not { } hit || hit.Folder.IsComputer)
         {
             return null;
         }

@@ -69,6 +69,7 @@ internal static partial class Program
             ChromeFocusChecks(main);
             await SplitPaneWindowChecks(main, shell);
             await SplitViewWindowChecks(main, shell);
+            await SplitBetweenPanesWindowChecks(main, shell);
             shell.Dispose();
         }
         finally

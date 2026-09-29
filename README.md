@@ -27,6 +27,12 @@ works like the Explorer you know, with a map of everything underneath.
   to toggle, Shift+arrows, Ctrl+A. The canvas and the folder list share one
   selection, and copy, cut, delete, drag-and-drop and the context menu act on
   all of it.
+- **Split view.** Two panes side by side or stacked (Ctrl + \\), like the split
+  network editor in Houdini. Each is a whole canvas at its own place on the
+  disk, with its own camera, selection, filter, sort headers and Back/Forward,
+  and a path bar naming its folder. Drag files from one onto a folder of the
+  other, copy or move the selection to the other pane with Shift + F5 /
+  Shift + F6, or open a folder there from its menu; F6 switches panes.
 - **Live.** Every change on disk shows up on the canvas and in the list within a
   moment — one watcher per volume, not per folder.
 - **Find things on a huge map.** Colour marks, notes and pins stay visible as
@@ -83,15 +89,19 @@ find it. Run it again to update. Settings live in `%LOCALAPPDATA%\UltraExplorer`
 | Everything / the selection | Shift + 1 / Shift + 2 |
 | Search every drive | Ctrl + F, then ↑↓, Enter to show, Ctrl + Enter to open, Esc |
 | Filter by name | Ctrl + Shift + F |
+| Split view / stacked | Ctrl + \\ / Ctrl + Shift + \\, or the split button; drag the divider to resize |
+| Switch panes | F6, or click in a pane |
+| Copy / move to the other pane | Shift + F5 / Shift + F6, or drag onto a folder there |
 | Settings | the gear, or Ctrl + , |
 
 Right-click a folder's open space for its own menu: sort this folder, colour,
-note, pin, properties.
+note, pin, properties, open in the other pane. Items get Copy and Move to
+other pane below the Windows menu while the view is split.
 
 ## Build and test
 
 See [BUILD.md](BUILD.md): building, the headless test harness (`ViewAllSmoke`,
-about 1,800 checks), the benchmark and snapshot switches, and a self-contained
+about 2,100 checks), the benchmark and snapshot switches, and a self-contained
 publish. [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md) describes how it works inside
 (in Russian).
 
