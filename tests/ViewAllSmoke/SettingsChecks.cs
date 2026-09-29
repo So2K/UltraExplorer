@@ -66,6 +66,7 @@ internal static partial class Program
 
             await SettingsResetChecks(shell);
             SettingsWordsChecks();
+            ChromeFocusChecks(main);
             shell.Dispose();
         }
         finally
@@ -552,6 +553,34 @@ internal static partial class Program
         orders.Flow = LayoutOrder.AcrossThenDown;
         orders.Flow = LayoutOrder.DownThenAcross;
         Check("a closed window's settings stop listening", raised == 0);
+    }
+
+    /// <summary>
+    /// The window's own buttons never take the keyboard, so the selection's
+    /// keys still work once one has been clicked; the dialogs' buttons still
+    /// do, so a dialog can be answered from the keyboard.
+    /// </summary>
+    private static void ChromeFocusChecks(MainWindow main)
+    {
+        Section("the window's buttons and the keyboard");
+        var chrome = new (string Name, UIElement Button)[]
+        {
+            ("Settings", main.SettingsButton),
+            ("the canvas's Settings", main.CanvasSettingsButton),
+            ("the status bar's Settings", main.StatusSettingsButton),
+            ("the canvas's Layers", main.CanvasLayersButton),
+            ("New folder", main.NewFolderButton),
+            ("the filter's Previous", main.CanvasFilterPrevious),
+            ("the filter's Next", main.CanvasFilterNext),
+            ("Maximize", main.MaximizeButton)
+        };
+        var taking = chrome.Where(item => item.Button.Focusable).Select(item => item.Name).ToArray();
+        Check($"no button of the window takes the keyboard when clicked ({(taking.Length == 0 ? "none does" : string.Join(", ", taking))})",
+            taking.Length == 0);
+
+        var dialogButton = new System.Windows.Controls.Button { Style = (Style)Application.Current.FindResource("FlatButton") };
+        var accent = new System.Windows.Controls.Button { Style = (Style)Application.Current.FindResource("AccentButton") };
+        Check("a dialog's buttons still do", dialogButton.Focusable && accent.Focusable);
     }
 
     private static void SettingsWordsChecks()

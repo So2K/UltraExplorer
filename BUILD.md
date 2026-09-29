@@ -210,13 +210,13 @@ everyday one. `ViewAllSmoke --only <Group,...>` runs only the named check groups
 
 | File | Contents |
 |---|---|
-| `%LOCALAPPDATA%\UltraExplorer\view-all.workspace.json` | expanded branches, node positions, viewport, active path, extra roots, nested canvas camera |
+| `%LOCALAPPDATA%\UltraExplorer\view-all.workspace.json` | expanded branches, node positions, viewport, active path, extra roots (and how many starts in a row each has been out of reach - ten, and it is forgotten), nested canvas camera |
 | `%LOCALAPPDATA%\UltraExplorer\workspace.json` | pinned folders, navigation pane width, minimap toggle, nested or tree canvas, sort order |
 | `%LOCALAPPDATA%\UltraExplorer\folder-marks.json` | colour labels and notes, keyed by path |
 | `%LOCALAPPDATA%\UltraExplorer\picker.workspace.json` | canvas layout of file-dialog sessions, kept apart from the user's own |
 | `%LOCALAPPDATA%\UltraExplorer\picker-clients.json` | per caller GUID: last folder, file type, recent names |
 | `%LOCALAPPDATA%\UltraExplorer\gpu\`, `cache\`, `jit\` | compiled shaders, the icon and glyph atlases, the startup JIT profile - all rebuilt when missing |
-| `%LOCALAPPDATA%\UltraExplorer\crash.log` | every exception nothing else caught, with its stack; `crash.old.log` holds the previous megabyte |
+| `%LOCALAPPDATA%\UltraExplorer\crash.log` | every exception nothing else caught, and every nested-canvas frame that failed, with its stack; `crash.old.log` holds the previous megabyte |
 | `%LOCALAPPDATA%\UltraExplorer\*.json.corrupt-<time>` | a state file that could not be read, set aside rather than overwritten by the next save, to be mended by hand |
 
 Deleting them resets the app to its first-run state. The environment variable
