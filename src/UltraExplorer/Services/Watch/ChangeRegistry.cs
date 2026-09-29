@@ -105,14 +105,23 @@ internal sealed class ChangeRegistry
         _paths.TryGetValue(key, out interest);
 
     /// <summary>
+    /// A path's registrations went from one root to another - a volume taken
+    /// out and put back at its letter - and how many of them, nested and
+    /// other, so the roots' counts can go with them: none when nothing moved.
+    /// </summary>
+    internal readonly record struct RootMove(WatchRoot? From, WatchRoot? To, int Nested, int Other);
+
+    /// <summary>
     /// Registers <paramref name="target"/> for <paramref name="key"/>, which is
     /// under <paramref name="root"/> (null for a path no volume holds); false
     /// when it already was.  A path first registered under a root since
     /// dropped moves to the new one - even when this target already was
-    /// registered for it.
+    /// registered for it - and <paramref name="moved"/> says how many
+    /// registrations it took along, not counting this one.
     /// </summary>
-    public bool Add(ChangeConsumer consumer, string key, object target, WatchRoot? root)
+    public bool Add(ChangeConsumer consumer, string key, object target, WatchRoot? root, out RootMove moved)
     {
+        moved = default;
         lock (_gate)
         {
             if (!_paths.TryGetValue(key, out var interest))
@@ -138,6 +147,11 @@ internal sealed class ChangeRegistry
                 // under is the one it stays under while this target is known.
                 if (!ReferenceEquals(interest.Root, root) && (!known || interest.Root is { IsDropped: true }))
                 {
+                    moved = new RootMove(
+                        interest.Root,
+                        root,
+                        Items(interest.Nested).Count,
+                        Items(interest.List).Count + Items(interest.Graph).Count);
                     interest.Root?.RemoveInterest(key);
                     interest.Root = root;
                     root?.AddInterest(key);

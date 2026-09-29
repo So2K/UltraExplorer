@@ -869,8 +869,11 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>
     /// A watch that is polled is due its look: when the list's folder is under
     /// it, its last-write time is compared, off this thread, with the one the
-    /// last look found, and a folder that moved on is read again.  The first
-    /// look at a folder only notes its time.
+    /// last look found, and a folder that moved on is read again.  With no
+    /// time kept yet - the first look since the list came to the folder, or
+    /// since its watch went down - there is nothing to compare, and a change
+    /// made between the list's read and this look would never be shown: the
+    /// folder is read again once, as the tree does.
     /// </summary>
     internal void OnPollDue(WatchRoot root)
     {
@@ -901,7 +904,7 @@ public sealed class FolderListViewModel : ObservableObject
             }
 
             _listedWriteTicks = now;
-            if (ticks != 0 && now != ticks)
+            if (now != ticks)
             {
                 RefreshForChange();
             }

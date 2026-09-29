@@ -238,6 +238,14 @@ public sealed class NativeShellService
             // would only say that the source and the destination are the same.
             .Where(source => !PathsEqual(source, Path.Combine(targetDirectory, Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar)))))
             .ToArray();
+
+        // Moved, an item inside another one moved with it is gone by the time
+        // the Shell comes to it (see WithoutNested).
+        if (move)
+        {
+            sourceArray = WithoutNested(sourceArray);
+        }
+
         if (sourceArray.Length == 0)
         {
             return Task.CompletedTask;
@@ -263,7 +271,7 @@ public sealed class NativeShellService
     /// </summary>
     public Task DeleteAsync(IEnumerable<string> paths, bool permanently)
     {
-        var pathArray = paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var pathArray = WithoutNested(paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
         if (pathArray.Length == 0)
         {
             return Task.CompletedTask;
@@ -395,6 +403,47 @@ public sealed class NativeShellService
     public sealed record ClipboardPayload(string[] Paths, bool Cut);
 
     private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
+
+    /// <summary>
+    /// <paramref name="paths"/> without any that lie inside another of them.
+    /// The nested canvas can select a folder and something in it, and a
+    /// clipboard can carry both: deleted or moved as one operation, the
+    /// folder goes first and takes the other with it, and the Shell then asks
+    /// about an item it cannot find and reports the whole operation as failed.
+    /// The names alone decide - no disk is asked - and the order is kept.
+    /// </summary>
+    internal static string[] WithoutNested(IReadOnlyList<string> paths)
+    {
+        if (paths.Count < 2)
+        {
+            return [.. paths];
+        }
+
+        var all = new HashSet<string>(paths.Select(NestingKey), StringComparer.OrdinalIgnoreCase);
+        var kept = new List<string>(paths.Count);
+        foreach (var path in paths)
+        {
+            var inside = false;
+            for (var parent = Path.GetDirectoryName(NestingKey(path)); !string.IsNullOrEmpty(parent); parent = Path.GetDirectoryName(parent))
+            {
+                if (all.Contains(NestingKey(parent)))
+                {
+                    inside = true;
+                    break;
+                }
+            }
+
+            if (!inside)
+            {
+                kept.Add(path);
+            }
+        }
+
+        return [.. kept];
+    }
+
+    /// <summary>A path as <see cref="WithoutNested"/> compares it: full, without a trailing separator.</summary>
+    private static string NestingKey(string path) => Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
 
     private static bool PathsEqual(string left, string right)
         => string.Equals(Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar), Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar), StringComparison.OrdinalIgnoreCase);

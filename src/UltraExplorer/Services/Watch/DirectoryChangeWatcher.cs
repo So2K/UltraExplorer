@@ -104,6 +104,9 @@ internal sealed unsafe class DirectoryChangeWatcher
     /// <summary>While they stream, how long Windows gathers them before the next read takes them.</summary>
     internal const double GatherMilliseconds = 10;
 
+    /// <summary>The longest wait before asking again after overflows in a row with nothing else between them.</summary>
+    internal const double LongestOverflowWaitMilliseconds = 1_000;
+
     private static readonly IOCompletionCallback Completion = OnCompletion;
     private static readonly long StreamingGapTicks = (long)(StreamingGapMilliseconds * Stopwatch.Frequency / 1000);
 
@@ -118,6 +121,7 @@ internal sealed unsafe class DirectoryChangeWatcher
     private NativeOverlapped* _outstanding;
     private Timer? _gather;
     private long _lastCompletion;
+    private int _overflowsInRow;
     private bool _gathering;
     private bool _details;
     private bool _stopping;
@@ -385,6 +389,7 @@ internal sealed unsafe class DirectoryChangeWatcher
             _lastCompletion = start;
             if (error == 0 && byteCount > 0)
             {
+                _overflowsInRow = 0;
                 var length = (int)Math.Min(byteCount, (uint)_size);
                 new ReadOnlySpan<byte>(_buffer, length).CopyTo(_copy);
                 if (streaming)
@@ -408,12 +413,17 @@ internal sealed unsafe class DirectoryChangeWatcher
                 // One overflow on the heels of another - a stream past the
                 // buffer, or a share that answers every read so - is asked
                 // again as a stream is, a moment later, rather than at once
-                // round and round.
+                // round and round; and with every further one in a row, and
+                // no records between them, twice as late, up to a second.
+                // Nothing more is lost by waiting: Windows keeps what changes
+                // meanwhile for the next read, and what it cannot keep is one
+                // more overflow, which the epoch already stands for.
                 overflowed = true;
                 Overflows++;
-                if (streaming)
+                _overflowsInRow++;
+                if (streaming || _overflowsInRow > 1)
                 {
-                    Gather();
+                    Gather(OverflowWaitMilliseconds(_overflowsInRow));
                 }
                 else
                 {
@@ -456,14 +466,23 @@ internal sealed unsafe class DirectoryChangeWatcher
         }
     }
 
-    /// <summary>Asks for the next changes <see cref="GatherMilliseconds"/> from now, letting Windows gather them meanwhile.  Under the gate.</summary>
-    private void Gather()
+    /// <summary>Asks for the next changes <paramref name="milliseconds"/> from now, letting Windows gather them meanwhile.  Under the gate.</summary>
+    private void Gather(double milliseconds = GatherMilliseconds)
     {
         Gathered++;
         _gathering = true;
         _gather ??= new Timer(static state => ((DirectoryChangeWatcher)state!).IssueGathered(), this, Timeout.Infinite, Timeout.Infinite);
-        _gather.Change(TimeSpan.FromMilliseconds(GatherMilliseconds), Timeout.InfiniteTimeSpan);
+        _gather.Change(TimeSpan.FromMilliseconds(milliseconds), Timeout.InfiniteTimeSpan);
     }
+
+    /// <summary>
+    /// How long to let Windows gather before asking again after the
+    /// <paramref name="inRow"/>th overflow in a row: <see cref="GatherMilliseconds"/>,
+    /// doubling with each one after the first, up to
+    /// <see cref="LongestOverflowWaitMilliseconds"/>.
+    /// </summary>
+    internal static double OverflowWaitMilliseconds(int inRow) =>
+        Math.Min(GatherMilliseconds * Math.Pow(2, Math.Clamp(inRow - 1, 0, 16)), LongestOverflowWaitMilliseconds);
 
     /// <summary>The gathering wait is over: asks for what Windows gathered.</summary>
     private void IssueGathered()

@@ -17,6 +17,13 @@ public sealed partial class ChangeHub
     internal Func<WatchRoot, int>? ArmFailureForTests { get; set; }
 
     /// <summary>
+    /// For tests: given each watch as soon as it is opened, before the arm
+    /// takes it in - where a test can end it, as a first read that fails at
+    /// once would.
+    /// </summary>
+    internal Action<DirectoryChangeWatcher>? OpenedForTests { get; set; }
+
+    /// <summary>
     /// Adds a root watching <paramref name="directory"/> rather than a whole
     /// volume, for tests: paths inside it resolve to it before anything else,
     /// so a test hears only its own folder's changes.  Armed unless
@@ -119,6 +126,10 @@ public sealed partial class ChangeHub
         if (error == 0)
         {
             error = DirectoryChangeWatcher.Open(root.WatchedPath, BufferFor(root), allowDetails: !root.IsNetwork, root.Records!, out watcher);
+            if (error == 0)
+            {
+                OpenedForTests?.Invoke(watcher!);
+            }
         }
 
         var armed = false;
@@ -132,7 +143,7 @@ public sealed partial class ChangeHub
             // rather than counted armed with nothing listening.
             if (error == 0 && watcher!.HasEnded)
             {
-                error = watcher.EndedWith is not 0 and var ended ? ended : WatchNative.ErrorInvalidFunction;
+                error = EndedError(watcher.EndedWith);
                 watcher = null;
             }
 
@@ -182,6 +193,14 @@ public sealed partial class ChangeHub
 
         ScheduleRoot(root);
     }
+
+    /// <summary>
+    /// The error an arm whose watch had already ended fails with: the one the
+    /// watch ended with, or - ended with none, which only a stop leaves -
+    /// one that is retried.  Never a refusal: that would poll the volume for
+    /// good for what was only a watch that went away.
+    /// </summary>
+    internal static int EndedError(int endedWith) => endedWith != 0 ? endedWith : WatchNative.ErrorNotReady;
 
     /// <summary>
     /// What a failure to arm or keep a watch leaves: a volume that refuses
@@ -269,13 +288,17 @@ public sealed partial class ChangeHub
 
             if (Volatile.Read(ref root.OverflowBumpOwed) != 0)
             {
-                var bumpAt = Volatile.Read(ref root.LastOverflowBump) + _overflowGapTicks;
+                var gap = OverflowGapOf(root);
+                var bumpAt = Volatile.Read(ref root.LastOverflowBump) + gap;
                 if (bumpAt > now)
                 {
                     next = Math.Min(next, bumpAt);
                 }
                 else if (Interlocked.Exchange(ref root.OverflowBumpOwed, 0) != 0)
                 {
+                    // Overflows kept coming inside the gap: the next one is
+                    // put off twice as long, up to a poll's interval.
+                    Volatile.Write(ref root.OverflowGap, Math.Min(gap * 2, _pollTicks));
                     BumpForOverflow(root, now);
                 }
             }
@@ -345,7 +368,7 @@ public sealed partial class ChangeHub
         var due = Unset;
         if (Volatile.Read(ref root.OverflowBumpOwed) != 0)
         {
-            due = Volatile.Read(ref root.LastOverflowBump) + _overflowGapTicks;
+            due = Volatile.Read(ref root.LastOverflowBump) + OverflowGapOf(root);
         }
 
         var retryAt = Volatile.Read(ref root.RetryAt);

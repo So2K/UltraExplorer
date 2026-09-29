@@ -307,13 +307,20 @@ public sealed partial class ChangeHub
 
     /// <summary>
     /// Changes under <paramref name="root"/> outgrew its buffer and were lost:
-    /// the epoch moves on, once - at once, or, within
-    /// <see cref="OverflowGapMilliseconds"/> of the last overflow that moved
-    /// it, when that gap is up.  Put off, never dropped: a change lost after
-    /// the last move may have been missed by a read begun since, and only
-    /// another move has that folder read again.
+    /// the epoch moves on, once - at once, or, within the root's gap of the
+    /// last overflow that moved it, when that gap is up.  Put off, never
+    /// dropped: a change lost after the last move may have been missed by a
+    /// read begun since, and only another move has that folder read again.
+    ///
+    /// The gap starts at <see cref="OverflowGapMilliseconds"/> and doubles
+    /// every time overflows keep coming inside it, up to
+    /// <see cref="PollMilliseconds"/>: a share that answers every read with
+    /// an overflow would otherwise have every folder of it on screen read
+    /// again over the network twice a second for as long as it is shown.
+    /// An overflow that comes after the gap is up - the storm is over - moves
+    /// the epoch at once and puts the gap back to its least.
     /// </summary>
-    internal void OnOverflow(WatchRoot root, DirectoryChangeWatcher watcher)
+    internal void OnOverflow(WatchRoot root, DirectoryChangeWatcher? watcher)
     {
         if (!ReferenceEquals(root.Watcher, watcher))
         {
@@ -323,19 +330,27 @@ public sealed partial class ChangeHub
         Interlocked.Increment(ref _overflows);
         var now = _time.GetTimestamp();
         var last = Volatile.Read(ref root.LastOverflowBump);
-        if (last != 0 && now - last < _overflowGapTicks)
+        var gap = OverflowGapOf(root);
+        if (last != 0 && now - last < gap)
         {
             Volatile.Write(ref root.OverflowBumpOwed, 1);
             lock (_gate)
             {
-                ScheduleLocked(last + _overflowGapTicks);
+                ScheduleLocked(last + gap);
             }
 
             return;
         }
 
+        Volatile.Write(ref root.OverflowGap, 0);
         BumpForOverflow(root, now);
     }
+
+    /// <summary>The least time, in hub ticks, between two epochs an overflow of <paramref name="root"/> moves on now.</summary>
+    private long OverflowGapOf(WatchRoot root) => Volatile.Read(ref root.OverflowGap) is > 0 and var gap ? gap : _overflowGapTicks;
+
+    /// <summary>For tests: the root's overflow gap now, in milliseconds.</summary>
+    internal double OverflowGapMillisecondsOf(WatchRoot root) => OverflowGapOf(root) * 1000.0 / _time.TimestampFrequency;
 
     /// <summary>Moves the epoch on for an overflow - and for any put off before it - and hands the bump on when anything registered could be out of date.</summary>
     private void BumpForOverflow(WatchRoot root, long now)

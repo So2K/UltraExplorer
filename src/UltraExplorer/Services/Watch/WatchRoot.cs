@@ -204,9 +204,16 @@ public sealed class WatchRoot
     /// <summary>
     /// Set when an overflow came too soon after the last one to move the
     /// epoch on at once: the timer moves it on once the least gap has passed
-    /// (<see cref="ChangeHub.OverflowGapMilliseconds"/>).
+    /// (<see cref="OverflowGap"/>).
     /// </summary>
     internal int OverflowBumpOwed;
+
+    /// <summary>
+    /// The least time, in hub ticks, between two epochs an overflow moves on:
+    /// zero for <see cref="ChangeHub.OverflowGapMilliseconds"/>, longer while
+    /// overflows keep coming (see <see cref="ChangeHub.OnOverflow"/>).
+    /// </summary>
+    internal long OverflowGap;
 
     /// <summary>Set while an <see cref="IChangeSink.PollDue"/> for the root waits to be handed on.</summary>
     internal int PollQueued;

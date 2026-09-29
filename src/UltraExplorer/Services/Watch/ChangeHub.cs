@@ -210,7 +210,32 @@ public sealed partial class ChangeHub : IDisposable
         }
 
         var root = FindRoot(key, create: true, depth: 0);
-        if (!Registry.Add(consumer, key, target, root))
+        var added = Registry.Add(consumer, key, target, root, out var moved);
+
+        // The path's registrations moved roots with it: their counts go
+        // along, or the new root would count no interest in the path - no
+        // bump after it arms, no polls, a share let go while the list shows
+        // it - and a later Unregister would take one away from another's.
+        if (moved.Nested != 0 || moved.Other != 0)
+        {
+            if (moved.From is { } from)
+            {
+                Release(ref from.NestedInterest, moved.Nested);
+                Release(ref from.OtherInterest, moved.Other);
+            }
+
+            if (moved.To is { } to)
+            {
+                Interlocked.Add(ref to.NestedInterest, moved.Nested);
+                Interlocked.Add(ref to.OtherInterest, moved.Other);
+                if (moved.Other != 0)
+                {
+                    ArmWhenIdle(to);
+                }
+            }
+        }
+
+        if (!added)
         {
             return;
         }
