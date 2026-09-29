@@ -75,6 +75,8 @@ internal static partial class Program
         }
         finally
         {
+            DeleteSplitWindowFixtures();
+
             // The renderer is the process's; the checks after these must find it as it was.
             if (GpuBootstrap.ExplicitPreference is null)
             {

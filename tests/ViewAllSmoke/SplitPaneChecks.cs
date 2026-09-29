@@ -694,7 +694,7 @@ internal static partial class Program
     private static async Task SplitViewWindowChecks(MainWindow main, MainViewModel shell)
     {
         Section("split panes: the split view");
-        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitView", Guid.NewGuid().ToString("N"));
+        var baseDirectory = SplitWindowFixture("UltraExplorerSplitView");
         var left = Path.Combine(baseDirectory, "left");
         var right = Path.Combine(baseDirectory, "right");
         var fileA = Path.Combine(left, "a.txt");
@@ -717,6 +717,7 @@ internal static partial class Program
             LayOutWindow(main, 1400, 900);
             shell.Tree.PreferLightReveal = true;
             shell.Layout = CanvasLayout.Nested;
+            await SplitSettleAsync(main);
             Check("unsplit, the window has one pane, no divider, no second canvas, and its button is not lit",
                 main.Panes.Count == 1 && main.SecondPane is null && main.PaneSplitter is null
                 && host.ColumnDefinitions.Count == 0 && host.RowDefinitions.Count == 0
@@ -870,7 +871,6 @@ internal static partial class Program
             shell.IsSplit = false;
             shell.SplitOrientation = SplitOrientation.SideBySide;
             shell.SplitRatio = SplitLayout.DefaultRatio;
-            TryDelete(baseDirectory);
         }
     }
 
@@ -891,7 +891,7 @@ internal static partial class Program
     private static async Task SplitBetweenPanesWindowChecks(MainWindow main, MainViewModel shell)
     {
         Section("split panes: between the panes");
-        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitBetween", Guid.NewGuid().ToString("N"));
+        var baseDirectory = SplitWindowFixture("UltraExplorerSplitBetween");
         var left = Path.Combine(baseDirectory, "left");
         var right = Path.Combine(baseDirectory, "right");
         var sub = Path.Combine(left, "sub");
@@ -930,6 +930,7 @@ internal static partial class Program
             shell.Tree.PreferLightReveal = true;
             shell.Layout = CanvasLayout.Nested;
             LayOutWindow(main, 1400, 900);
+            await SplitSettleAsync(main);
 
             // The fixture is the one drive of every pane, the second too once it is made.
             machineDrives = main.UseNestedDrivesForChecks([drive]);
@@ -1101,7 +1102,6 @@ internal static partial class Program
 
             selection.Clear(SelectionSource.Navigation);
             await LiveWait(() => !shell.Toast.IsBusy, 5_000);
-            TryDelete(baseDirectory);
         }
     }
 
@@ -1110,20 +1110,23 @@ internal static partial class Program
     /// folder, the window laid out but never shown: a press on a part of the
     /// other pane that cannot take the keyboard - a sort header, its header
     /// - brings the keyboard to that pane's canvas, while its filter box and
-    /// canvas take it themselves; a navigation still reading its way down
-    /// when the other pane is clicked ends in the pane it was asked in, its
-    /// selection, history and camera, and leaves the other alone; a pane
-    /// activated hands its place to the commands at once, before the graph
-    /// has found it; what the closed second pane had selected is followed
-    /// until the next split, and what went meanwhile is not selected in it;
-    /// on the tree canvas a split left on is not shown as one, and the
-    /// button, the keys and the menu bring it back; and the search panel
-    /// keeps clear of the second pane's header and strip.
+    /// canvas take it themselves; a flight asked for while an earlier one
+    /// still reads its way down is where the camera goes, whichever gets
+    /// there first; a navigation still reading its way down when the other
+    /// pane is clicked ends in the pane it was asked in, its selection,
+    /// history and camera, and leaves the other alone; a pane activated
+    /// hands its place to the commands at once, before the graph has found
+    /// it; what the closed second pane had selected is followed until the
+    /// next split, and what went meanwhile is not selected in it; on the
+    /// tree canvas a split left on is not shown as one, and the button, the
+    /// keys and the menu bring it back - the tree only passed through, not
+    /// taken for the picture on show once its reveal ends; and the search
+    /// panel keeps clear of the second pane's header and strip.
     /// </summary>
     private static async Task SplitFollowWindowChecks(MainWindow main, MainViewModel shell)
     {
         Section("split panes: the keyboard, navigations and the tree canvas");
-        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitFollow", Guid.NewGuid().ToString("N"));
+        var baseDirectory = SplitWindowFixture("UltraExplorerSplitFollow");
         var left = Path.Combine(baseDirectory, "left");
         var right = Path.Combine(baseDirectory, "right");
         var fileA = Path.Combine(left, "a.txt");
@@ -1165,7 +1168,7 @@ internal static partial class Program
             shell.Layout = CanvasLayout.Nested;
             shell.SplitOrientation = SplitOrientation.SideBySide;
             LayOutWindow(main, 1400, 900);
-            await SettingsSettle();
+            await SplitSettleAsync(main);
             var margin = main.SearchPanel.Margin;
             machineDrives = main.UseNestedDrivesForChecks([drive]);
             shell.IsSplit = true;
@@ -1180,6 +1183,16 @@ internal static partial class Program
 
             await first.FlyToAsync(left, gentle: false, animated: false);
             await second.FlyToAsync(right, gentle: false, animated: false);
+
+            // ---- the last flight asked for is where the camera goes ----
+            // The deep folder is four reads away; the first pane's own folder
+            // has been read.  The flight asked for second finishes first.
+            var earlier = first.FlyToAsync(deep, gentle: false, animated: false);
+            await first.FlyToAsync(left, gentle: false, animated: false);
+            var stillReading = !earlier.IsCompleted;
+            await earlier;
+            Check($"a flight asked for while an earlier one still reads its way down ({stillReading}) is where the camera goes, though the earlier one gets there after it",
+                stillReading && first.Canvas.CaptureCamera()?.AnchorPath == left && first.FlightsUnderWay == 0);
 
             // ---- the keyboard comes with a press on the pane ----
             // As a test copy, the window notes where it would put the
@@ -1285,12 +1298,17 @@ internal static partial class Program
             // ---- the tree canvas with the split left on ----
             shell.IsSplit = true;
             shell.Layout = CanvasLayout.Tree;
+            var treeEntry = main.TreeEntryForChecks;
             Check("on the tree canvas a split left on is not shown as one: the button is not lit and the menu does not check it",
                 shell.IsSplit && !Lit() && Item(main.BuildSplitMenu(main.SplitButton), "Split view") is { IsChecked: false }
                 && Item(main.BuildSplitMenu(main.SplitButton), "Side by side") is { IsChecked: false });
             Click(main.SplitButton);
             Check("the button brings back the nested canvas and its panes, split as they were, rather than closing them",
                 shell.Layout == CanvasLayout.Nested && shell.IsSplit && main.Panes.Count == 2 && Lit());
+            var passedThrough = !treeEntry.IsCompleted;
+            await treeEntry;
+            Check($"the tree only passed through, its reveal still reading ({passedThrough}): once that ends the tree is not taken for the picture on show",
+                passedThrough && !shell.Tree.IsCanvasShown && shell.Layout == CanvasLayout.Nested);
             shell.Layout = CanvasLayout.Tree;
             Check("so does Ctrl+\\", main.TryHandleSplitKey(Key.Oem5, ModifierKeys.Control) && shell.Layout == CanvasLayout.Nested && shell.IsSplit);
             shell.Layout = CanvasLayout.Tree;
@@ -1318,8 +1336,52 @@ internal static partial class Program
             }
 
             selection.Clear(SelectionSource.Navigation);
-            TryDelete(baseDirectory);
         }
+    }
+
+    /// <summary>
+    /// The folders the split view's checks in the window work in, deleted
+    /// once the window is done with (<see cref="DeleteSplitWindowFixtures"/>)
+    /// rather than as each section ends.  Deleted there and then, the folder
+    /// the folder list was showing went from disk while the next section ran,
+    /// and the window - as it should - took its selection and the camera of
+    /// the pane being worked with to the nearest folder still there, over
+    /// whatever that section had just selected and flown to.
+    /// </summary>
+    private static readonly List<string> SplitWindowFixtures = [];
+
+    /// <summary>A new folder in the temp folder's <paramref name="name"/> for a section of the split view's checks in the window.</summary>
+    private static string SplitWindowFixture(string name)
+    {
+        var path = Path.Combine(Path.GetTempPath(), name, Guid.NewGuid().ToString("N"));
+        SplitWindowFixtures.Add(path);
+        return path;
+    }
+
+    /// <summary>The split view's checks' folders deleted: the window is done with.</summary>
+    private static void DeleteSplitWindowFixtures()
+    {
+        foreach (var path in SplitWindowFixtures)
+        {
+            TryDelete(path);
+        }
+
+        SplitWindowFixtures.Clear();
+    }
+
+    /// <summary>
+    /// What the checks before left under way, finished before a section of
+    /// the split view starts: a pane entered when the nested canvas came back
+    /// from the tree goes to its place behind layout, and its flight reads
+    /// the folders on the way - through a temp folder of thousands - for a
+    /// while.  Left to run, it ended in the middle of the section, after the
+    /// section's own flights had been asked for.
+    /// </summary>
+    private static async Task SplitSettleAsync(MainWindow main)
+    {
+        await SettingsSettle();
+        await LiveWait(() => main.Panes.All(pane => pane.FlightsUnderWay == 0), 10_000);
+        await SettingsSettle();
     }
 
     /// <summary>The mouse's left button pressed on <paramref name="element"/>: only the press's way down, which is where a pane takes it.</summary>

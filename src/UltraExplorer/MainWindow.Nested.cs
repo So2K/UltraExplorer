@@ -31,6 +31,16 @@ public partial class MainWindow : INestedPaneHost
     private string[]? _nestedDragPaths;
     private bool _nestedReady;
 
+    /// <summary>
+    /// The switches between the nested canvas and the tree so far, so the way
+    /// into the tree - which reads before it shows anything - can tell that
+    /// the nested canvas came back meanwhile (see <see cref="EnterTreeAsync"/>).
+    /// </summary>
+    private int _pictureSwitches;
+
+    /// <summary>For the checks: the last way into the tree (<see cref="EnterTreeAsync"/>), done once its reveal has ended.</summary>
+    internal Task TreeEntryForChecks { get; private set; } = Task.CompletedTask;
+
     /// <summary>Slices of the nested trees' background pass, waiting for frames to run in (see <see cref="PostSortSlice"/>).</summary>
     private readonly Queue<Action> _sortSlices = new();
     private bool _sortSlicesHooked;
@@ -360,6 +370,7 @@ public partial class MainWindow : INestedPaneHost
             case nameof(MainViewModel.IsNestedLayout):
                 // Switching pictures keeps the place: the other canvas opens on
                 // whatever is selected.
+                _pictureSwitches++;
                 if (IsNested)
                 {
                     _viewModel.Tree.PreferLightReveal = true;
@@ -372,7 +383,7 @@ public partial class MainWindow : INestedPaneHost
                 }
                 else
                 {
-                    _ = EnterTreeAsync();
+                    TreeEntryForChecks = EnterTreeAsync();
                 }
 
                 // The other picture decides the current folder its own way.
@@ -441,9 +452,20 @@ public partial class MainWindow : INestedPaneHost
     /// Back to the tree: what is selected was only brought in by name, so it
     /// is revealed properly - its folders opened - before the tree is shown,
     /// and the reveal itself brings it into view.
+    ///
+    /// <para>With a folder of thousands on the way the reveal takes a while,
+    /// and the nested canvas may be back before it is done: the tree was only
+    /// passed through, and is neither marked as shown nor given the keyboard
+    /// once the reveal ends.  Marked shown behind the nested canvas, every
+    /// change on disk in a folder the tree had read was read again at once
+    /// for a picture nobody could see - and reading a folder again lets go of
+    /// the nodes brought in by name below it, the selection's among them,
+    /// which took the selection to that folder: the nested canvas's pick
+    /// jumped to a folder far above it.</para>
     /// </summary>
     private async Task EnterTreeAsync()
     {
+        var entry = _pictureSwitches;
         var tree = _viewModel.Tree;
         tree.PreferLightReveal = false;
         try
@@ -455,10 +477,21 @@ public partial class MainWindow : INestedPaneHost
         }
         finally
         {
-            tree.IsCanvasShown = true;
+            if (entry == _pictureSwitches)
+            {
+                tree.IsCanvasShown = true;
+            }
         }
 
-        await Dispatcher.InvokeAsync(FocusCanvas, DispatcherPriority.Input);
+        await Dispatcher.InvokeAsync(
+            () =>
+            {
+                if (entry == _pictureSwitches)
+                {
+                    FocusCanvas();
+                }
+            },
+            DispatcherPriority.Input);
     }
 
     private void SyncNestedSelection() => ActivePane.SyncSelection();

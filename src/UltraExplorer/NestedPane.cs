@@ -142,6 +142,9 @@ internal sealed class NestedPane
     /// <summary>Set while the shared selection takes what this pane kept (<see cref="Activate"/>), which the canvas already shows.</summary>
     private bool _activating;
 
+    /// <summary>The flight asked for last, which a flight asked for before it and still reading its way there stands down for (see <see cref="FlyToAsync"/>).</summary>
+    private int _flightTicket;
+
     /// <summary>The second pane's camera to start from: where it was last time, or where the first pane is (see <see cref="StartAt"/>).</summary>
     private NestedCameraState? _startCamera;
 
@@ -216,6 +219,12 @@ internal sealed class NestedPane
     public string? FocusPath => IsActive
         ? _viewModel.Tree.ActivePath is { Length: > 0 } active ? active : null
         : KeptSelection.Focus ?? (KeptSelection.Count > 0 ? KeptSelection.Paths[0] : null) ?? Canvas.FolderInView?.FullPath;
+
+    /// <summary>
+    /// For the checks: flights (<see cref="FlyToAsync"/>) still reading the
+    /// folders on their way, the camera not yet told where to go.
+    /// </summary>
+    internal int FlightsUnderWay { get; private set; }
 
     /// <summary>Set once the pane has its drives, orders and hidden rules: until then it has nothing to show and gathers nothing.</summary>
     public bool IsReady { get; private set; }
@@ -546,6 +555,17 @@ internal sealed class NestedPane
     /// The nested version of "bring this node into view".  Navigation - the
     /// address bar, the sidebar, back and forward - flies to the folder.  A row
     /// picked in the list only needs to be visible, and usually already is.
+    ///
+    /// <para>The folders on the way are read first, which for a folder of
+    /// thousands or a share that takes its time is a while, and another
+    /// flight may be asked for meanwhile: a favourite clicked, the canvas
+    /// coming back from the tree, a navigation of this pane landing here
+    /// after the other pane was clicked (<see cref="Land"/>).  The camera
+    /// goes where the last one asked, whichever finishes reading first - as
+    /// a navigation ends where the last one asked (see
+    /// <see cref="ViewAllViewModel.RevealAsync"/>).  An earlier flight that
+    /// finished later took the camera back to where nobody wanted it any
+    /// more, and one that jumped there stopped the flight under way.</para>
     /// </summary>
     public async Task FlyToAsync(string path, bool gentle, bool animated = true)
     {
@@ -554,40 +574,51 @@ internal sealed class NestedPane
             return;
         }
 
-        var folderPath = Directory.Exists(path) ? path : Path.GetDirectoryName(path) ?? path;
-        var folder = await Tree.RevealAsync(folderPath);
-        if (folder is null)
+        var ticket = ++_flightTicket;
+        FlightsUnderWay++;
+        try
         {
-            // A share or a WSL distribution the tree has only just added.
-            _host.SyncNestedRoots();
-            folder = await Tree.RevealAsync(folderPath);
-            if (folder is null)
+            var folderPath = Directory.Exists(path) ? path : Path.GetDirectoryName(path) ?? path;
+            var folder = await Tree.RevealAsync(folderPath);
+            if (folder is null && ticket == _flightTicket)
             {
-                return;
+                // A share or a WSL distribution the tree has only just added.
+                _host.SyncNestedRoots();
+                folder = await Tree.RevealAsync(folderPath);
             }
-        }
 
-        var view = new Rect(0, 0, Canvas.ActualWidth, Canvas.ActualHeight);
-        if (Canvas.ScreenRectOf(folder) is { } rect)
-        {
-            if (gentle && rect.Width >= 24 && view.IntersectsWith(rect))
+            // Nowhere to go, or superseded: a flight asked for since is the one that counts.
+            if (folder is null || ticket != _flightTicket)
             {
                 return;
             }
 
-            if (!gentle && view.Contains(rect) && rect.Width >= view.Width * 0.45)
+            var view = new Rect(0, 0, Canvas.ActualWidth, Canvas.ActualHeight);
+            if (Canvas.ScreenRectOf(folder) is { } rect)
             {
-                return;
+                if (gentle && rect.Width >= 24 && view.IntersectsWith(rect))
+                {
+                    return;
+                }
+
+                if (!gentle && view.Contains(rect) && rect.Width >= view.Width * 0.45)
+                {
+                    return;
+                }
+            }
+
+            if (gentle && folder.Parent is { IsComputer: false } parent)
+            {
+                Canvas.FlyTo(parent, 0.92, animated);
+            }
+            else
+            {
+                Canvas.FlyTo(folder, 0.8, animated);
             }
         }
-
-        if (gentle && folder.Parent is { IsComputer: false } parent)
+        finally
         {
-            Canvas.FlyTo(parent, 0.92, animated);
-        }
-        else
-        {
-            Canvas.FlyTo(folder, 0.8, animated);
+            FlightsUnderWay--;
         }
     }
 
