@@ -1263,7 +1263,8 @@
                 </Border>
 
                 <!-- Canvas controls -->
-                <Border HorizontalAlignment="Right"
+                <Border x:Name="CanvasControls"
+                        HorizontalAlignment="Right"
                         VerticalAlignment="Bottom"
                         Margin="14"
                         Padding="3"

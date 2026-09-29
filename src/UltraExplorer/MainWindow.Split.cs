@@ -79,6 +79,7 @@ public partial class MainWindow
         _viewModel.PropertyChanged += OnShellPropertyChangedForSplit;
         _viewModel.Tree.NavigationLandedAway += OnNavigationLandedAway;
         NestedHost.SizeChanged += OnNestedHostSizeChanged;
+        FirstPaneView.SizeChanged += OnPaneViewSizeChanged;
     }
 
     private void DetachSplit()
@@ -86,7 +87,15 @@ public partial class MainWindow
         _viewModel.PropertyChanged -= OnShellPropertyChangedForSplit;
         _viewModel.Tree.NavigationLandedAway -= OnNavigationLandedAway;
         NestedHost.SizeChanged -= OnNestedHostSizeChanged;
+        FirstPaneView.SizeChanged -= OnPaneViewSizeChanged;
     }
+
+    /// <summary>
+    /// The first pane changes size whenever the second does - the divider
+    /// dragged, the orientation switched, the window resized - so the
+    /// overlays that sit over the pane being worked with follow from here.
+    /// </summary>
+    private void OnPaneViewSizeChanged(object sender, SizeChangedEventArgs e) => PlacePaneOverlays();
 
     /// <summary>
     /// The split the last session left, once every pane has its drives: the
@@ -138,6 +147,7 @@ public partial class MainWindow
                 // The tree canvas shows no split, whatever is left on.
                 UpdateSplitControls();
                 PlaceSearchPanel();
+                PlacePaneOverlays();
                 break;
             case nameof(MainViewModel.SplitRatio):
                 LayOutPanes();
@@ -398,7 +408,11 @@ public partial class MainWindow
         }
     }
 
-    private void OnNestedHostSizeChanged(object sender, SizeChangedEventArgs e) => UpdatePaneMinimums();
+    private void OnNestedHostSizeChanged(object sender, SizeChangedEventArgs e)
+    {
+        UpdatePaneMinimums();
+        PlacePaneOverlays();
+    }
 
     /// <summary>The divider was let go: the panes' shares, as it left them, are the split's ratio from now on.</summary>
     private void OnPaneSplitterDragCompleted(object sender, DragCompletedEventArgs e)
@@ -528,6 +542,60 @@ public partial class MainWindow
 
         // Once the headers shown or hidden have been laid out.
         Dispatcher.InvokeAsync(PlaceSearchPanel, DispatcherPriority.Loaded);
+        Dispatcher.InvokeAsync(PlacePaneOverlays, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>The margins the pane overlays have in the window's XAML, for one pane.</summary>
+    private Thickness? _folderListMargin;
+
+    private Thickness? _canvasControlsMargin;
+
+    private Thickness? _minimapMargin;
+
+    /// <summary>
+    /// The overlays that belong to the pane being worked with - the folder
+    /// list, which lists its folder, and the zoom buttons and the minimap,
+    /// which act on its camera - kept over that pane while the view is
+    /// split, in the corners they take over the whole canvas area with one
+    /// pane.  Otherwise the list of the pane on the right sat over the pane
+    /// on the left.  With one pane, the margins the XAML gives.
+    /// </summary>
+    private void PlacePaneOverlays()
+    {
+        var inset = default(Thickness);
+        if (IsSplitShown && FolderListPanel.Parent is FrameworkElement area && area.ActualWidth > 0
+            && ActivePane.View is { ActualWidth: > 0 } view && view.IsVisible)
+        {
+            var origin = view.TranslatePoint(new Point(0, 0), area);
+            inset = new Thickness(
+                Math.Max(0, origin.X),
+                Math.Max(0, origin.Y),
+                Math.Max(0, area.ActualWidth - origin.X - view.ActualWidth),
+                Math.Max(0, area.ActualHeight - origin.Y - view.ActualHeight));
+        }
+
+        Place(CanvasControls, ref _canvasControlsMargin, inset);
+        Place(MinimapPanel, ref _minimapMargin, inset);
+
+        // A pane too narrow for the list and the zoom buttons side by side
+        // keeps the list above the buttons rather than under them.
+        if (IsSplitShown && ActivePane.View.ActualWidth
+            < FolderListPanel.Width + CanvasControls.ActualWidth + (_folderListMargin ??= FolderListPanel.Margin).Left + (_canvasControlsMargin ?? CanvasControls.Margin).Right + 8)
+        {
+            inset.Bottom += CanvasControls.ActualHeight + 8;
+        }
+
+        Place(FolderListPanel, ref _folderListMargin, inset);
+
+        static void Place(FrameworkElement element, ref Thickness? original, Thickness inset)
+        {
+            var margin = original ??= element.Margin;
+            var placed = new Thickness(margin.Left + inset.Left, margin.Top + inset.Top, margin.Right + inset.Right, margin.Bottom + inset.Bottom);
+            if (element.Margin != placed)
+            {
+                element.Margin = placed;
+            }
+        }
     }
 
     /// <summary>The search panel's margin as the window's XAML gives it, for one pane.</summary>
