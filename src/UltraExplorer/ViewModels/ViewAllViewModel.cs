@@ -77,6 +77,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Which navigation through <see cref="RevealPathAsync"/> is the latest; an older one still reading does not select.</summary>
     private int _revealTicket;
 
+    /// <summary>
+    /// Whose <see cref="Selection"/> the latest ticket from <see cref="BeginNavigation"/>
+    /// was taken for: a navigation that waits before it reveals - a path
+    /// typed into the address bar, checked first - goes where it was asked
+    /// for, whichever pane is being worked with by the time it reveals.
+    /// </summary>
+    private object? _navigationHolder;
+
+    /// <summary>
+    /// The selection's focus while the graph is still finding its node
+    /// (<see cref="FocusAsync"/>): what a command acts on meanwhile, not the
+    /// node before it (see <see cref="FocusedPath"/>).  Null once the focus
+    /// has its node, or there is none.
+    /// </summary>
+    private string? _pendingFocus;
+
     private int _marqueePreview = -1;
     private bool _focusRecordsNavigation = true;
     private ViewAllNodeViewModel? _activeNode;
@@ -205,6 +221,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
     /// <summary>Raised when the canvas should fly to a node.</summary>
     public event Action<ViewAllNodeViewModel, bool>? FocusNodeRequested;
+
+    /// <summary>
+    /// Raised in place of selecting and flying there when a navigation ends
+    /// after <see cref="Selection"/> has changed hands: it was started in a
+    /// pane of a split view - a favourite, Back, a path typed in - and the
+    /// other pane was clicked while it read its way down a slow share.  The
+    /// place is that pane's, which goes there itself; the pane being worked
+    /// with keeps its selection, its history and its view.
+    /// </summary>
+    public event Action<NavigationLanding>? NavigationLandedAway;
 
     /// <summary>Raised when a message belongs on the shell toast.</summary>
     public event Action<string, bool>? MessageRequested;
@@ -493,6 +519,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         get => _activeNode;
         private set
         {
+            // A node given to the focus is newer than one still being looked for.
+            _pendingFocus = null;
             if (SetProperty(ref _activeNode, value))
             {
                 OnPropertyChanged(nameof(ActivePath));
@@ -607,6 +635,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// selected, asked as the workspace is written.  Null while there is one pane.
     /// </summary>
     public Func<string?>? OtherPanePath { get; set; }
+
+    /// <summary>
+    /// Whose <see cref="Selection"/> is now: in a split view, the pane being
+    /// worked with, set by the window each time the panes change places;
+    /// never changed while the window has one pane.  A navigation notes it
+    /// as it starts, and one that ends after it has changed lands with the
+    /// pane it was started for (<see cref="NavigationLandedAway"/>), not in
+    /// the selection that is by then another pane's.
+    /// </summary>
+    public object? SelectionHolder { get; set; }
 
     /// <summary>
     /// The selections the panes of a split view keep while another pane's is
@@ -1441,9 +1479,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// first: a path typed into the address bar is checked off the interface
     /// thread before it is revealed, and anything asked for meanwhile - a
     /// favourite, Back - is newer and must win.  Hand it to
-    /// <see cref="RevealAsync"/>.
+    /// <see cref="RevealAsync"/>.  The navigation is for the selection as it
+    /// is now (<see cref="SelectionHolder"/>): the pane it is asked in.
     /// </summary>
-    public int BeginNavigation() => ++_revealTicket;
+    public int BeginNavigation()
+    {
+        _navigationHolder = SelectionHolder;
+        return ++_revealTicket;
+    }
 
     /// <summary>Whether no navigation has started since <paramref name="ticket"/> was taken.</summary>
     public bool IsLatestNavigation(int ticket) => ticket == _revealTicket;
@@ -1485,6 +1528,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         // new ticket; one that flies there without selecting stands down for
         // any that starts after it.
         var taken = ticket ?? (select ? ++_revealTicket : _revealTicket);
+
+        // The pane of a split view this is for: the one being worked with
+        // when it was asked for, which it goes on being for however long the
+        // way down takes.
+        var holder = ticket is { } begun && begun == _revealTicket ? _navigationHolder : SelectionHolder;
 
         IReadOnlyList<string> chain;
         string normalized;
@@ -1565,6 +1613,20 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         var superseded = taken != _revealTicket;
         var isExact = ViewAllPath.Equals(node.FullPath, normalized);
         var acts = !superseded && (isExact || !exact);
+
+        // Asked for in a pane of a split view that has stopped being the one
+        // worked with meanwhile: the selection is another pane's by now, and
+        // so are the history and the camera a navigation moves.  The pane it
+        // was asked in goes there itself, and to its caller it is as good as
+        // superseded - nothing here was selected or flown to.
+        if (acts && (select || focus) && !ReferenceEquals(holder, SelectionHolder))
+        {
+            RebuildRenderSet();
+            NavigationLandedAway?.Invoke(new NavigationLanding(holder, node, select, focus, records));
+            ScheduleSave();
+            return new RevealOutcome(node, isExact, Superseded: true);
+        }
+
         if (select && acts)
         {
             SelectOnly(node, records);
@@ -1697,11 +1759,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// </summary>
     public IReadOnlyList<string> SelectedPaths => Selection.Paths;
 
-    /// <summary>Selection, falling back to the focused node for read-only commands.</summary>
+    /// <summary>Selection, falling back to the focus for read-only commands (see <see cref="FocusedPath"/>).</summary>
     public IReadOnlyList<string> SelectedOrActivePaths
         => Selection.Count > 0
             ? Selection.Paths
-            : ActiveNode is null ? [] : [ActiveNode.FullPath];
+            : _pendingFocus is { } pending ? [pending] : ActiveNode is null ? [] : [ActiveNode.FullPath];
+
+    /// <summary>
+    /// Where the focus is, for a command: <see cref="ActivePath"/>, or while
+    /// the graph is still finding the node of a focus it has only just been
+    /// given, that focus.  A pane of a split view just clicked hands the
+    /// window a selection the graph may not have read its way down to yet,
+    /// and Up, New folder or Paste in the moment before it has must act on
+    /// that pane's place, not on the other pane's.
+    /// </summary>
+    public string FocusedPath => _pendingFocus ?? ActivePath;
 
     /// <summary>
     /// The folder that a new item or a paste should land in: with several
@@ -1715,6 +1787,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             if (Selection.Count > 1 && Selection.Container is { } container)
             {
                 return container;
+            }
+
+            if (_pendingFocus is { } pending)
+            {
+                // Not given its node yet: what the selection says it is, or
+                // else what the disk does.
+                var isDirectory = Selection.TryGetItem(pending, out var item) ? item.IsDirectory : Directory.Exists(pending);
+                return isDirectory ? pending : Path.GetDirectoryName(pending);
             }
 
             var node = ActiveNode;
@@ -2637,6 +2717,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     {
         var ticket = ++_selectTicket;
         var records = selection.LastRecordsNavigation;
+        _pendingFocus = null;
         if (selection.Focus is { } focus && !(_activeNode is { } current && string.Equals(current.FullPath, focus, StringComparison.OrdinalIgnoreCase)))
         {
             if (TryGetNode(focus, out var node))
@@ -2645,6 +2726,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             }
             else
             {
+                // Before the look, which may find the node at once.
+                _pendingFocus = focus;
                 _ = FocusAsync(focus, ticket, records, holdList: selection.LastSource == SelectionSource.List);
             }
         }
@@ -2997,7 +3080,18 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 /// <summary>
 /// How a <see cref="ViewAllViewModel.RevealAsync"/> ended: the node it got
 /// to (the deepest folder still there when the path is gone), whether that is
-/// the path itself, and whether a newer navigation took over meanwhile - in
-/// which case nothing was selected or flown to.
+/// the path itself, and whether a newer navigation took over meanwhile, or
+/// the pane it was for stopped being the one worked with (see
+/// <see cref="ViewAllViewModel.NavigationLandedAway"/>) - in which case
+/// nothing was selected or flown to here.
 /// </summary>
 public readonly record struct RevealOutcome(ViewAllNodeViewModel? Node, bool IsExact, bool Superseded);
+
+/// <summary>
+/// Where a navigation ended that was started for a selection no longer the
+/// window's (see <see cref="ViewAllViewModel.NavigationLandedAway"/>): the
+/// pane it was started in - the <see cref="ViewAllViewModel.SelectionHolder"/>
+/// of the time - the node it got to, whether it was to select it and fly
+/// there, and whether going there is a step for Back and Forward.
+/// </summary>
+public readonly record struct NavigationLanding(object? Holder, ViewAllNodeViewModel Node, bool Select, bool Focus, bool Records);

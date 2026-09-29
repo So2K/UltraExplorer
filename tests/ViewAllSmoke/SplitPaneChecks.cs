@@ -817,8 +817,9 @@ internal static partial class Program
                 && ReferenceEquals(shell.History, first.History) && shell.ActivePaneIndex == 0 && !shell.Tree.IsSecondPaneActive);
             Check("the second pane is let go of whole: its canvas off its tree and out of the window, its tree off the hub and its inbox gone",
                 closedSecond.Canvas.Tree is null && host.Children.Count == 1 && host.ColumnDefinitions.Count == 0 && main.PaneSplitter is null
-                && shell.Tree.NestedChanges.Count == 1 && shell.Icons.CanvasInboxCount == 1 && shell.Tree.KeptSelectionCount == 0
+                && shell.Tree.NestedChanges.Count == 1 && shell.Icons.CanvasInboxCount == 1
                 && shell.Tree.OtherPanePath is null && first.Canvas.DrainsChanges);
+            Check("only what it had selected is still followed, for the next split", shell.Tree.KeptSelectionCount == 1);
             Check("the first pane's header is gone with it, so one pane looks as it always did",
                 first.View.PaneHeader.Visibility == Visibility.Collapsed && main.SplitButton.ReadLocalValue(Control.ForegroundProperty) == DependencyProperty.UnsetValue);
             Check("and where the second pane was is kept for the next split",
@@ -831,6 +832,7 @@ internal static partial class Program
             Check("a new second pane, where the last one was, and the first still worked with",
                 again is not null && !ReferenceEquals(again, closedSecond) && ViewAllPath.Equals(again.FocusPath ?? string.Empty, right)
                 && ReferenceEquals(main.ActivePane, first) && Lit(first));
+            Check("the selection kept for it is its own now, followed once", shell.Tree.KeptSelectionCount == 1);
             Check("one above the other: rows, no columns, a divider across",
                 host.RowDefinitions.Count == 3 && host.ColumnDefinitions.Count == 0 && Grid.GetRow(again!.View) == 2
                 && main.PaneSplitter is { ResizeDirection: GridResizeDirection.Rows });
@@ -1102,6 +1104,227 @@ internal static partial class Program
             TryDelete(baseDirectory);
         }
     }
+
+    /// <summary>
+    /// What the review of the split view found, on real folders in the temp
+    /// folder, the window laid out but never shown: a press on a part of the
+    /// other pane that cannot take the keyboard - a sort header, its header
+    /// - brings the keyboard to that pane's canvas, while its filter box and
+    /// canvas take it themselves; a navigation still reading its way down
+    /// when the other pane is clicked ends in the pane it was asked in, its
+    /// selection, history and camera, and leaves the other alone; a pane
+    /// activated hands its place to the commands at once, before the graph
+    /// has found it; what the closed second pane had selected is followed
+    /// until the next split, and what went meanwhile is not selected in it;
+    /// on the tree canvas a split left on is not shown as one, and the
+    /// button, the keys and the menu bring it back; and the search panel
+    /// keeps clear of the second pane's header and strip.
+    /// </summary>
+    private static async Task SplitFollowWindowChecks(MainWindow main, MainViewModel shell)
+    {
+        Section("split panes: the keyboard, navigations and the tree canvas");
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitFollow", Guid.NewGuid().ToString("N"));
+        var left = Path.Combine(baseDirectory, "left");
+        var right = Path.Combine(baseDirectory, "right");
+        var fileA = Path.Combine(left, "a.txt");
+        var hidden = Path.Combine(right, "deep", "deeper");
+        var fileB = Path.Combine(hidden, "b.txt");
+        var fileC = Path.Combine(right, "c.txt");
+        var fileD = Path.Combine(right, "d.txt");
+        var far = Path.Combine(baseDirectory, "far");
+        var deep = Path.Combine(far, "a", "b", "c", "d");
+        Directory.CreateDirectory(left);
+        Directory.CreateDirectory(hidden);
+        Directory.CreateDirectory(deep);
+        for (var index = 0; index < 400; index++)
+        {
+            Directory.CreateDirectory(Path.Combine(far, $"n{index:D3}"));
+        }
+
+        foreach (var file in new[] { fileA, fileB, fileC, fileD })
+        {
+            File.WriteAllText(file, Path.GetFileName(file));
+        }
+
+        var first = main.FirstPane;
+        var selection = shell.Tree.Selection;
+        var drive = new NestedRoot(baseDirectory, "S", NestedFolderKind.Drive);
+        var accent = ((SolidColorBrush)Application.Current.FindResource("AccentBrush")).Color;
+        bool Lit() => main.SplitButton.Foreground is SolidColorBrush { Color: var colour } && colour == accent
+            && main.SplitButton.ReadLocalValue(Control.ForegroundProperty) != DependencyProperty.UnsetValue;
+        MenuItem? Item(ItemsControl menu, string header) => menu.Items.OfType<MenuItem>().FirstOrDefault(item => item.Header as string == header);
+        IReadOnlyList<NestedRoot>? machineDrives = null;
+        var testWindow = Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW");
+        try
+        {
+            // What the checks before revealed stands down, rather than
+            // selecting over the selections made here.
+            shell.Tree.BeginNavigation();
+            shell.IsSplit = false;
+            shell.Tree.PreferLightReveal = true;
+            shell.Layout = CanvasLayout.Nested;
+            shell.SplitOrientation = SplitOrientation.SideBySide;
+            LayOutWindow(main, 1400, 900);
+            await SettingsSettle();
+            var margin = main.SearchPanel.Margin;
+            machineDrives = main.UseNestedDrivesForChecks([drive]);
+            shell.IsSplit = true;
+            LayOutWindow(main, 1400, 900);
+            await SettingsSettle();
+            var second = main.SecondPane;
+            if (second is null)
+            {
+                Check("the view splits", false);
+                return;
+            }
+
+            await first.FlyToAsync(left, gentle: false, animated: false);
+            await second.FlyToAsync(right, gentle: false, animated: false);
+
+            // ---- the keyboard comes with a press on the pane ----
+            // As a test copy, the window notes where it would put the
+            // keyboard rather than taking it, which a window never shown
+            // could not: the checks read that.
+            Environment.SetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW", "1");
+            main.ActivatePane(second);
+            FocusManager.SetFocusedElement(main, second.Canvas);
+            Press(first.View.SortByName);
+            Check("a press on a sort header of the other pane, which never takes the keyboard, makes that pane the one worked with and sends the keyboard to its canvas",
+                ReferenceEquals(main.ActivePane, first) && ReferenceEquals(FocusManager.GetFocusedElement(main), first.Canvas));
+            Press(second.View.PaneLocation);
+            Check("and so does a press on the other pane's header",
+                ReferenceEquals(main.ActivePane, second) && ReferenceEquals(FocusManager.GetFocusedElement(main), second.Canvas));
+            Press(first.View.CanvasFilterBox);
+            Check("a press in its filter box makes it the one worked with and leaves the keyboard to the box, which takes it itself",
+                ReferenceEquals(main.ActivePane, first) && ReferenceEquals(FocusManager.GetFocusedElement(main), second.Canvas));
+            FocusManager.SetFocusedElement(main, first.Canvas);
+            Press(second.Canvas);
+            Check("and a press on its canvas leaves it to the canvas",
+                ReferenceEquals(main.ActivePane, second) && ReferenceEquals(FocusManager.GetFocusedElement(main), first.Canvas));
+            Press(second.View.SortBySize);
+            Check("a press on the pane already worked with moves nothing",
+                ReferenceEquals(main.ActivePane, second) && ReferenceEquals(FocusManager.GetFocusedElement(main), first.Canvas));
+            FocusManager.SetFocusedElement(main, null);
+            Environment.SetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW", testWindow);
+
+            // ---- a navigation ends in the pane it was asked in ----
+            main.ActivatePane(first);
+            selection.ReplaceSingle(fileA, false, 1, SelectionSource.Navigation);
+            await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileA));
+            main.ActivatePane(second);
+            selection.ReplaceSingle(fileC, false, 1, SelectionSource.Navigation);
+            await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileC));
+            main.ActivatePane(first);
+            await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileA));
+            var firstSteps = first.History.Count;
+            var secondSteps = second.History.Count;
+            var secondCamera = second.Canvas.CaptureCamera();
+            var reveal = shell.Tree.RevealPathAsync(deep);
+            var reading = !reveal.IsCompleted;
+            main.ActivatePane(second);
+            await reveal;
+            await SettingsSettle();
+            Check($"a navigation asked for in the first pane, still reading its way down ({reading}) when the second is clicked, leaves the second as it was: its selection, its history and its camera",
+                reading && ReferenceEquals(main.ActivePane, second) && selection.Paths.SequenceEqual([fileC])
+                && ViewAllPath.Equals(shell.Tree.ActivePath, fileC) && second.History.Count == secondSteps
+                && second.Canvas.CaptureCamera() == secondCamera);
+            Check("it ends in the first pane: what it has selected, and a step of its history",
+                first.KeptSelection.Paths.SequenceEqual([deep]) && ViewAllPath.Equals(first.History.Current ?? string.Empty, deep)
+                && first.History.Count == firstSteps + 1);
+            Check("and the first pane's camera goes there",
+                await LiveWait(() => first.Canvas.CaptureCamera()?.AnchorPath is { } anchor && ViewAllPath.Equals(anchor, deep), 5_000) >= 0);
+
+            // ---- the place handed over at once ----
+            main.ActivatePane(first);
+            second.KeptSelection.ReplaceSingle(fileB, false, 1, SelectionSource.Navigation);
+            main.ActivatePane(second);
+            var stale = !ViewAllPath.Equals(shell.Tree.ActivePath, fileB);
+            Check($"a pane activated with a file the graph has not found yet ({stale}): Paste, New folder and Up act on its place at once, not on the other pane's",
+                stale && ViewAllPath.Equals(shell.Tree.TargetDirectory ?? string.Empty, hidden)
+                && ViewAllPath.Equals(shell.Tree.FocusedPath, fileB) && shell.Tree.SelectedOrActivePaths.SequenceEqual([fileB]));
+            Check("and once the graph has found it, the address bar names it too",
+                await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileB))
+                && ViewAllPath.Equals(shell.Tree.TargetDirectory ?? string.Empty, hidden));
+
+            // ---- the closed pane's selection ----
+            main.ActivatePane(first);
+            second.KeptSelection.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Added = [new SelectionItem(fileB, false, 1), new SelectionItem(fileC, false, 1), new SelectionItem(fileD, false, 1)],
+                Anchor = fileD,
+                Focus = fileD,
+                Source = SelectionSource.Navigation
+            });
+            shell.IsSplit = false;
+            shell.Tree.ForgetSelected([fileB]);
+            File.Delete(fileB);
+            File.WriteAllText(fileB, "made again");
+            File.Delete(fileC);
+            shell.IsSplit = true;
+            var again = main.SecondPane;
+            Check("split again, the second pane has what was selected in it before, less what the window deleted or moved meanwhile, though a file of that name is there again",
+                again is not null && !again.KeptSelection.Contains(fileB) && again.KeptSelection.Contains(fileD)
+                && ViewAllPath.Equals(again.KeptSelection.Focus ?? string.Empty, fileD));
+            Check("and what went from the disk some other way is let go of a moment later",
+                again is not null && await LiveWait(() => !again.KeptSelection.Contains(fileC), 5_000) >= 0 && again.KeptSelection.Contains(fileD));
+
+            // ---- the search panel ----
+            LayOutWindow(main, 1400, 900);
+            shell.Search.Text = "split-follow-no-such-name";
+            var below = again is null ? 0 : again.View.PaneHeader.ActualHeight + again.View.NestedStrip.ActualHeight;
+            Check($"side by side, the search panel opens below the second pane's header and strip ({main.SearchPanel.Margin.Top:0} of {margin.Top:0} + {below:0})",
+                below > 40 && Math.Abs(main.SearchPanel.Margin.Top - (margin.Top + below)) < 0.5 && main.SearchPanel.Margin.Right == margin.Right);
+            shell.Search.Close();
+            shell.IsSplit = false;
+            await SettingsSettle();
+            shell.Search.Text = "split-follow-no-such-name";
+            Check("and with one pane where it always was", main.SearchPanel.Margin == margin);
+            shell.Search.Close();
+
+            // ---- the tree canvas with the split left on ----
+            shell.IsSplit = true;
+            shell.Layout = CanvasLayout.Tree;
+            Check("on the tree canvas a split left on is not shown as one: the button is not lit and the menu does not check it",
+                shell.IsSplit && !Lit() && Item(main.BuildSplitMenu(main.SplitButton), "Split view") is { IsChecked: false }
+                && Item(main.BuildSplitMenu(main.SplitButton), "Side by side") is { IsChecked: false });
+            Click(main.SplitButton);
+            Check("the button brings back the nested canvas and its panes, split as they were, rather than closing them",
+                shell.Layout == CanvasLayout.Nested && shell.IsSplit && main.Panes.Count == 2 && Lit());
+            shell.Layout = CanvasLayout.Tree;
+            Check("so does Ctrl+\\", main.TryHandleSplitKey(Key.Oem5, ModifierKeys.Control) && shell.Layout == CanvasLayout.Nested && shell.IsSplit);
+            shell.Layout = CanvasLayout.Tree;
+            Check("and Ctrl+Shift+\\ turns the layout and shows it",
+                main.TryHandleSplitKey(Key.OemBackslash, ModifierKeys.Control | ModifierKeys.Shift)
+                && shell.Layout == CanvasLayout.Nested && shell.IsSplit && shell.SplitOrientation == SplitOrientation.Stacked);
+            shell.Layout = CanvasLayout.Tree;
+            var sideBySide = Item(main.BuildSplitMenu(main.SplitButton), "Side by side")!;
+            sideBySide.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent, sideBySide));
+            Check("as does a layout chosen from the menu", shell.Layout == CanvasLayout.Nested && shell.IsSplit && shell.SplitOrientation == SplitOrientation.SideBySide);
+            Click(main.SplitButton);
+            Check("and on show, the button closes it", !shell.IsSplit && main.Panes.Count == 1 && !Lit());
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW", testWindow);
+            FocusManager.SetFocusedElement(main, null);
+            shell.Search.Close();
+            shell.IsSplit = false;
+            shell.Layout = CanvasLayout.Nested;
+            shell.SplitOrientation = SplitOrientation.SideBySide;
+            if (machineDrives is not null)
+            {
+                main.UseNestedDrivesForChecks(machineDrives);
+            }
+
+            selection.Clear(SelectionSource.Navigation);
+            TryDelete(baseDirectory);
+        }
+    }
+
+    /// <summary>The mouse's left button pressed on <paramref name="element"/>: only the press's way down, which is where a pane takes it.</summary>
+    private static void Press(UIElement element) =>
+        element.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left) { RoutedEvent = UIElement.PreviewMouseDownEvent });
 
     /// <summary>
     /// A drag event as the window's drop target raises it, at a point of

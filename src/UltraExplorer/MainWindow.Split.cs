@@ -5,6 +5,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Threading;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
 using UltraExplorer.ViewModels;
@@ -48,8 +49,14 @@ public partial class MainWindow
 
     private GridSplitter? _paneSplitter;
 
-    /// <summary>What the second pane had selected when the split was last closed, for the next split of this session.</summary>
-    private (SelectionItem[] Items, string? Focus)? _closedSecondSelection;
+    /// <summary>
+    /// What the second pane had selected when the split was last closed, for
+    /// the next split of this session: followed meanwhile as a kept selection
+    /// is (see <see cref="ViewAllViewModel.AddKeptSelection"/>), so what is
+    /// deleted, moved away or renamed while the view has one pane leaves it
+    /// or takes its new name.
+    /// </summary>
+    private ItemSelection? _closedSecondSelection;
 
     /// <summary>The second pane of a split view, or null while the view has one pane.</summary>
     internal NestedPane? SecondPane => _panes.Count > 1 ? _panes[1] : null;
@@ -70,12 +77,14 @@ public partial class MainWindow
     private void AttachSplit()
     {
         _viewModel.PropertyChanged += OnShellPropertyChangedForSplit;
+        _viewModel.Tree.NavigationLandedAway += OnNavigationLandedAway;
         NestedHost.SizeChanged += OnNestedHostSizeChanged;
     }
 
     private void DetachSplit()
     {
         _viewModel.PropertyChanged -= OnShellPropertyChangedForSplit;
+        _viewModel.Tree.NavigationLandedAway -= OnNavigationLandedAway;
         NestedHost.SizeChanged -= OnNestedHostSizeChanged;
     }
 
@@ -123,6 +132,12 @@ public partial class MainWindow
             case nameof(MainViewModel.SplitOrientation):
                 LayOutPanes();
                 UpdateSplitControls();
+                PlaceSearchPanel();
+                break;
+            case nameof(MainViewModel.IsNestedLayout):
+                // The tree canvas shows no split, whatever is left on.
+                UpdateSplitControls();
+                PlaceSearchPanel();
                 break;
             case nameof(MainViewModel.SplitRatio):
                 LayOutPanes();
@@ -160,6 +175,7 @@ public partial class MainWindow
         var saved = tree.SecondPane;
         SelectionItem[] items;
         string? focus;
+        var kept = false;
         if (restoring)
         {
             items = tree.RestoredSecondPaneItem is { } item ? [item] : [];
@@ -167,8 +183,11 @@ public partial class MainWindow
         }
         else if (_closedSecondSelection is { } closed)
         {
-            items = closed.Items;
+            tree.RemoveKeptSelection(closed);
+            _closedSecondSelection = null;
+            items = [.. closed.Items];
             focus = closed.Focus ?? saved?.ActivePath;
+            kept = items.Length > 0;
         }
         else
         {
@@ -197,7 +216,39 @@ public partial class MainWindow
             pane.Enter(fromStartup: false, focus: false, fly: false);
         }
 
+        if (kept)
+        {
+            _ = ForgetVanishedAsync(items);
+        }
+
         return pane;
+    }
+
+    /// <summary>
+    /// What the second pane had selected when the split was last closed was
+    /// followed through the window's own deletes, moves and renames while
+    /// the view had one pane, but only the folders the window was watching
+    /// could say what went from outside it.  Whatever of it is no longer
+    /// there is looked for now, off the interface thread - a share that
+    /// does not answer holds nothing up - and let go of wherever it is
+    /// selected by then.
+    /// </summary>
+    private async Task ForgetVanishedAsync(SelectionItem[] items)
+    {
+        string[] gone;
+        try
+        {
+            gone = await Task.Run(() => items.Where(item => !Path.Exists(item.Path)).Select(item => item.Path).ToArray());
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return;
+        }
+
+        if (gone.Length > 0)
+        {
+            _viewModel.Tree.ForgetSelected(gone);
+        }
     }
 
     /// <summary>
@@ -216,7 +267,6 @@ public partial class MainWindow
         var tree = _viewModel.Tree;
         second.CaptureCamera();
         tree.SecondPane = (tree.SecondPane ?? new NestedPaneState(null, null)) with { ActivePath = second.FocusPath };
-        _closedSecondSelection = ([.. second.KeptSelection.Items], second.KeptSelection.Focus);
         tree.OtherPanePath = null;
         tree.IsSecondPaneActive = false;
 
@@ -224,6 +274,10 @@ public partial class MainWindow
         second.Canvas.Tree = null;
         second.Detach();
         _panes.Remove(second);
+
+        // Its selection, let go of by the pane, is followed for the next split.
+        _closedSecondSelection = second.KeptSelection;
+        tree.AddKeptSelection(second.KeptSelection);
         LayOutPanes();
         UpdatePaneChrome();
         if (hadKeyboard)
@@ -376,7 +430,9 @@ public partial class MainWindow
     /// selected, its folder in view is where the address bar and the list
     /// go.  Back and Forward step through this pane's history from now on,
     /// the zoom buttons and the keys act on its canvas, and its header takes
-    /// the accent.  Nothing flies anywhere: each pane stays where it is.
+    /// the accent.  Nothing flies anywhere: each pane stays where it is.  A
+    /// navigation the other pane started and has not finished still ends
+    /// there, not here (see <see cref="OnNavigationLandedAway"/>).
     /// </summary>
     internal void ActivatePane(NestedPane pane)
     {
@@ -388,6 +444,7 @@ public partial class MainWindow
         var outgoing = ActivePane;
         outgoing.Deactivate();
         ActivePane = pane;
+        _viewModel.Tree.SelectionHolder = pane;
         _viewModel.History = pane.History;
         _viewModel.ActivePaneIndex = pane.Index;
         _viewModel.Tree.IsSecondPaneActive = pane.Index == 1;
@@ -402,6 +459,51 @@ public partial class MainWindow
     }
 
     void INestedPaneHost.ActivatePane(NestedPane pane) => ActivatePane(pane);
+
+    /// <summary>
+    /// Before any key acts: the pane the keyboard is in is the one being
+    /// worked with.  A canvas answers the arrows, Enter and Esc itself, on
+    /// its own pane's selection, while Delete, F2 and Ctrl+X act on the
+    /// window's; were the keyboard left in one pane with the other active,
+    /// the arrows would move the selection in one and Delete would recycle
+    /// what is selected in the other.  A click on a pane brings the keyboard
+    /// with it (see <see cref="NestedPane"/>), so this only ever catches a
+    /// keyboard put back somewhere the window did not choose.
+    /// </summary>
+    private void FollowKeyboardToPane()
+    {
+        if (_panes.Count < 2)
+        {
+            return;
+        }
+
+        foreach (var pane in _panes)
+        {
+            if (pane.View.IsKeyboardFocusWithin)
+            {
+                ActivatePane(pane);
+                return;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A navigation - a favourite, Back, a path typed in, a search result -
+    /// started in a pane that stopped being the one worked with before it
+    /// got there: a share that took its time, the other pane clicked
+    /// meanwhile.  It ends in the pane it was asked in, as it would have
+    /// had nobody clicked (see <see cref="NestedPane.Land"/>), and the pane
+    /// being worked with keeps its selection, its history and its view.  A
+    /// pane closed meanwhile has nowhere to go.
+    /// </summary>
+    private void OnNavigationLandedAway(NavigationLanding landing)
+    {
+        if (landing.Holder is NestedPane pane && _panes.Contains(pane) && !ReferenceEquals(pane, ActivePane))
+        {
+            var node = landing.Node;
+            pane.Land(node.FullPath, node.IsDirectory, node.Entry.SizeBytes ?? 0, landing.Select, landing.Focus, landing.Records);
+        }
+    }
 
     /// <summary>F6: the other pane is the one being worked with, and has the keyboard.</summary>
     private void ActivateOtherPane()
@@ -422,6 +524,35 @@ public partial class MainWindow
             pane.View.ShowAsPane(split, ReferenceEquals(pane, ActivePane));
             pane.UpdateHeader();
             pane.ScheduleHeader();
+        }
+
+        // Once the headers shown or hidden have been laid out.
+        Dispatcher.InvokeAsync(PlaceSearchPanel, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>The search panel's margin as the window's XAML gives it, for one pane.</summary>
+    private Thickness? _searchPanelMargin;
+
+    /// <summary>
+    /// The search panel, over the top right of the canvas area, kept clear
+    /// of the panes' chrome while the view is shown split: below the header
+    /// and the strip of the pane it sits over - the second side by side, the
+    /// first stacked - so that pane's place, filter box and sort headers
+    /// stay usable while a search is open.  With one pane, where it always
+    /// was, which leaves the strip's filter box clear.
+    /// </summary>
+    private void PlaceSearchPanel()
+    {
+        var margin = _searchPanelMargin ??= SearchPanel.Margin;
+        if (IsSplitShown && SecondPane is { } second)
+        {
+            var under = _viewModel.SplitOrientation == SplitOrientation.Stacked ? FirstPaneView : second.View;
+            margin.Top += under.PaneHeader.ActualHeight + under.NestedStrip.ActualHeight;
+        }
+
+        if (SearchPanel.Margin != margin)
+        {
+            SearchPanel.Margin = margin;
         }
     }
 
@@ -648,7 +779,7 @@ public partial class MainWindow
             switch (modifiers)
             {
                 case ModifierKeys.Control:
-                    _viewModel.IsSplit = !_viewModel.IsSplit;
+                    ToggleSplit();
                     return true;
                 case ModifierKeys.Control | ModifierKeys.Shift:
                     SwitchSplitOrientation();
@@ -665,16 +796,55 @@ public partial class MainWindow
         return false;
     }
 
-    /// <summary>Side by side becomes stacked and stacked side by side, and the view is split if it was not.</summary>
+    /// <summary>
+    /// Whether the window shows its view split: split, and on the nested
+    /// canvas.  The tree canvas never splits, and a split left on while it
+    /// shows is not one anybody can see - the button is not lit for it, and
+    /// asking for a split there brings the panes back rather than closing
+    /// them.
+    /// </summary>
+    private bool IsSplitShown => _viewModel.IsSplit && IsNested;
+
+    /// <summary>The split button, Ctrl+\ and Split view in the menus: a split on show closes; otherwise one is shown.</summary>
+    private void ToggleSplit()
+    {
+        if (IsSplitShown)
+        {
+            _viewModel.IsSplit = false;
+        }
+        else
+        {
+            ShowSplit();
+        }
+    }
+
+    /// <summary>
+    /// The view split, on show: split if it was not - which goes to the
+    /// nested canvas by itself - or, split already behind the tree canvas,
+    /// back to the nested canvas where its panes are.
+    /// </summary>
+    private void ShowSplit()
+    {
+        if (_viewModel.IsSplit)
+        {
+            _viewModel.Layout = CanvasLayout.Nested;
+        }
+        else
+        {
+            _viewModel.IsSplit = true;
+        }
+    }
+
+    /// <summary>Side by side becomes stacked and stacked side by side, and the split is shown if it was not.</summary>
     private void SwitchSplitOrientation()
     {
         _viewModel.SplitOrientation = _viewModel.SplitOrientation == SplitOrientation.Stacked
             ? SplitOrientation.SideBySide
             : SplitOrientation.Stacked;
-        _viewModel.IsSplit = true;
+        ShowSplit();
     }
 
-    private void SplitButton_Click(object sender, RoutedEventArgs e) => _viewModel.IsSplit = !_viewModel.IsSplit;
+    private void SplitButton_Click(object sender, RoutedEventArgs e) => ToggleSplit();
 
     private void SplitMenuButton_Click(object sender, RoutedEventArgs e) => BuildSplitMenu(SplitButton).IsOpen = true;
 
@@ -688,20 +858,21 @@ public partial class MainWindow
 
     /// <summary>
     /// Split view and its two layouts, as the split button's drop-down and
-    /// Canvas options have them.  Choosing a layout splits the view if it is
-    /// not split yet.
+    /// Canvas options have them.  Choosing a layout shows the split if it is
+    /// not shown yet.  Checked only for a split on show (see <see cref="IsSplitShown"/>).
     /// </summary>
     private void AddSplitItems(ItemsControl menu)
     {
+        var shown = IsSplitShown;
         var split = new MenuItem
         {
             Header = "Split view",
             IsCheckable = true,
-            IsChecked = _viewModel.IsSplit,
+            IsChecked = shown,
             InputGestureText = "Ctrl+\\",
             ToolTip = "Two panes, each at its own place on the disk; F6 goes from one to the other"
         };
-        split.Click += (_, _) => _viewModel.IsSplit = !_viewModel.IsSplit;
+        split.Click += (_, _) => ToggleSplit();
         menu.Items.Add(split);
         menu.Items.Add(new Separator());
         foreach (var (choice, name, tip) in new[]
@@ -714,14 +885,14 @@ public partial class MainWindow
             {
                 Header = name,
                 IsCheckable = true,
-                IsChecked = _viewModel.IsSplit && _viewModel.SplitOrientation == choice,
+                IsChecked = shown && _viewModel.SplitOrientation == choice,
                 ToolTip = tip
             };
             var chosen = choice;
             item.Click += (_, _) =>
             {
                 _viewModel.SplitOrientation = chosen;
-                _viewModel.IsSplit = true;
+                ShowSplit();
             };
             menu.Items.Add(item);
         }
@@ -729,14 +900,15 @@ public partial class MainWindow
 
     /// <summary>
     /// The split button as the split is: its glyph the layout it makes, lit
-    /// while the view is split; not there at all in a file dialog, which
-    /// never splits.
+    /// while the view is shown split - not on the tree canvas, which shows
+    /// one view whatever is left on; not there at all in a file dialog,
+    /// which never splits.
     /// </summary>
     private void UpdateSplitControls()
     {
         SplitControls.Visibility = IsPickerMode ? Visibility.Collapsed : Visibility.Visible;
         SplitGlyph.Data = _viewModel.SplitOrientation == SplitOrientation.Stacked ? StackedGlyph : SideBySideGlyph;
-        if (_viewModel.IsSplit)
+        if (IsSplitShown)
         {
             SplitButton.Foreground = (Brush)FindResource("AccentBrush");
         }

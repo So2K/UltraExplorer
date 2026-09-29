@@ -1091,7 +1091,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task GoUpAsync()
     {
-        var current = Tree.ActivePath;
+        var current = Tree.FocusedPath;
         if (string.IsNullOrWhiteSpace(current))
         {
             return;

@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
@@ -626,6 +627,41 @@ internal sealed class NestedPane
         await FlyToAsync(folder, gentle: false, animated);
     }
 
+    /// <summary>
+    /// A navigation asked for while this pane was the one worked with - a
+    /// favourite, Back, a path typed in - got there after another pane had
+    /// become it: this pane goes there as it would have.  What was to be
+    /// selected becomes what it has selected and, unless it was a step back
+    /// or forward - whose place in the history is taken already - a step of
+    /// its history; the camera flies there.  The pane being worked with is
+    /// left as it is.
+    /// </summary>
+    /// <param name="select">Whether the navigation selects what it got to, or only flies there.</param>
+    /// <param name="fly">Whether the camera goes there.</param>
+    /// <param name="records">Whether going there is a step for Back and Forward.</param>
+    public void Land(string path, bool isDirectory, long size, bool select, bool fly, bool records)
+    {
+        if (IsActive)
+        {
+            return;
+        }
+
+        if (select)
+        {
+            KeptSelection.ReplaceSingle(path, isDirectory, size, SelectionSource.Navigation);
+            if (records)
+            {
+                History.Record(path);
+            }
+        }
+
+        if (fly && IsNested && IsReady)
+        {
+            _cameraRestored = true;
+            _ = FlyToAsync(path, gentle: false);
+        }
+    }
+
     // ---- the selection, both ways ----------------------------------------------------
     //
     // The canvas's gestures reach the shared selection as edits, and every
@@ -762,7 +798,39 @@ internal sealed class NestedPane
         Canvas.AcknowledgeSelection(shared.Version);
     }
 
-    private void OnViewPreviewMouseDown(object sender, MouseButtonEventArgs e) => _host.ActivatePane(this);
+    /// <summary>
+    /// A press anywhere on the pane makes it the one being worked with, on
+    /// the way down, before the canvas's own press acts on its selection -
+    /// and brings the keyboard with it.  The canvas and the filter box take
+    /// the keyboard themselves; the rest of the pane cannot - its header,
+    /// the strip, the sort headers, the filter's arrows - and a press there
+    /// would leave the keyboard on the other pane's canvas: the arrows and
+    /// Enter would go on moving that pane's selection while Delete, F2 and
+    /// Ctrl+X acted on this one's.
+    /// </summary>
+    private void OnViewPreviewMouseDown(object sender, MouseButtonEventArgs e)
+    {
+        var wasActive = IsActive;
+        _host.ActivatePane(this);
+        if (!wasActive && IsActive && !View.IsKeyboardFocusWithin && !TakesKeyboardItself(e.OriginalSource as DependencyObject))
+        {
+            _host.FocusCanvas(this);
+        }
+    }
+
+    /// <summary>Whether a press on <paramref name="source"/> moves the keyboard there itself: it is on the canvas, or in a text box.</summary>
+    private bool TakesKeyboardItself(DependencyObject? source)
+    {
+        for (var current = source; current is not null && !ReferenceEquals(current, View); current = MainWindow.ParentOf(current))
+        {
+            if (ReferenceEquals(current, Canvas) || current is TextBoxBase)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private void OnViewKeyboardFocusWithinChanged(object sender, DependencyPropertyChangedEventArgs e)
     {

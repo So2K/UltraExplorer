@@ -576,9 +576,9 @@ public partial class MainWindow : Window
     {
         if (IsNested)
         {
-            if (!string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
+            if (_viewModel.Tree.FocusedPath is { Length: > 0 } focused)
             {
-                _ = FlyNestedToAsync(_viewModel.Tree.ActivePath, gentle: false);
+                _ = FlyNestedToAsync(focused, gentle: false);
             }
 
             return;
@@ -1907,6 +1907,9 @@ public partial class MainWindow : Window
         // Alt+Up, Alt+Enter and Shift+F10.
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
 
+        // Whatever the key, it is for the pane the keyboard is in.
+        FollowKeyboardToPane();
+
         // Ctrl+L and Alt+D are both "put the path in a line I can type in";
         // Windows has answered to either for twenty years.
         if ((modifiers == ModifierKeys.Control && key == Key.L)
@@ -2415,13 +2418,17 @@ public partial class MainWindow : Window
                 return match;
             }
 
-            current = current is Visual or System.Windows.Media.Media3D.Visual3D
-                ? VisualTreeHelper.GetParent(current)
-                : LogicalTreeHelper.GetParent(current);
+            current = ParentOf(current);
         }
 
         return null;
     }
+
+    /// <summary>What <paramref name="element"/> is in: its visual parent, or for text and other content, its logical one.</summary>
+    internal static DependencyObject? ParentOf(DependencyObject element) =>
+        element is Visual or System.Windows.Media.Media3D.Visual3D
+            ? VisualTreeHelper.GetParent(element)
+            : LogicalTreeHelper.GetParent(element);
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr windowHandle, int attribute, ref int value, int valueSize);

@@ -83,6 +83,7 @@ public partial class MainWindow : INestedPaneHost
         var first = new NestedPane(this, _viewModel, FirstPaneView, _viewModel.Icons.CanvasArrivals, index: 0, history: _viewModel.History);
         _panes.Add(first);
         ActivePane = first;
+        _viewModel.Tree.SelectionHolder = first;
         first.Attach();
         AttachDevices();
         AttachSplit();
@@ -494,6 +495,11 @@ public partial class MainWindow : INestedPaneHost
         {
             ScheduleBeacons();
         }
+
+        if (e.PropertyName == nameof(SearchViewModel.IsOpen) && _viewModel.Search.IsOpen)
+        {
+            PlaceSearchPanel();
+        }
     }
 
     private void OnMarkChangedForNested(string path, FolderMark mark)
@@ -521,38 +527,18 @@ public partial class MainWindow : INestedPaneHost
 
     // ---- keyboard --------------------------------------------------------------
 
-    /// <summary>The keys a nested canvas answers itself - the arrows, Enter and Backspace - on whichever pane has the keyboard.</summary>
-    private bool TryHandleNestedKey(Key key, ModifierKeys modifiers)
-    {
-        if (!IsNested)
-        {
-            return false;
-        }
+    /// <summary>
+    /// The keys a nested canvas answers itself - the arrows, Enter and
+    /// Backspace - while the pane being worked with has the keyboard: the
+    /// pane the keyboard is in always is by now (see <see cref="FollowKeyboardToPane"/>),
+    /// and a canvas of any other pane would edit a selection the window's
+    /// commands do not act on.
+    /// </summary>
+    private bool TryHandleNestedKey(Key key, ModifierKeys modifiers) =>
+        IsNested && ActivePane.Canvas.IsKeyboardFocusWithin && ActivePane.Canvas.HandleKey(key, modifiers);
 
-        foreach (var pane in _panes)
-        {
-            if (pane.Canvas.IsKeyboardFocusWithin)
-            {
-                return pane.Canvas.HandleKey(key, modifiers);
-            }
-        }
-
-        return false;
-    }
-
-    /// <summary>Whether the keyboard is on one of the panes' canvases.</summary>
-    private bool IsNestedCanvasFocused()
-    {
-        foreach (var pane in _panes)
-        {
-            if (pane.Canvas.IsKeyboardFocusWithin)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    /// <summary>Whether the keyboard is on the canvas of the pane being worked with, whose selection the window's commands act on.</summary>
+    private bool IsNestedCanvasFocused() => ActivePane.Canvas.IsKeyboardFocusWithin;
 
     /// <summary>The pane whose canvas <paramref name="element"/> is, or is inside.</summary>
     private NestedPane? PaneAt(DependencyObject? element)

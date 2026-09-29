@@ -70,6 +70,7 @@ internal static partial class Program
             await SplitPaneWindowChecks(main, shell);
             await SplitViewWindowChecks(main, shell);
             await SplitBetweenPanesWindowChecks(main, shell);
+            await SplitFollowWindowChecks(main, shell);
             shell.Dispose();
         }
         finally
