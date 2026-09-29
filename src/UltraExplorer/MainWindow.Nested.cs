@@ -301,6 +301,15 @@ public partial class MainWindow
         }, DispatcherPriority.Loaded);
     }
 
+    /// <summary>A share or distribution the workspace lists answered after the start: the nested canvas shows it too.</summary>
+    private void OnExtraRootAdded(ViewAllNodeViewModel root)
+    {
+        if (_nestedReady)
+        {
+            SyncNestedRoots();
+        }
+    }
+
     /// <summary>Drives, plus every share and WSL distribution the tree has as a root of its own.</summary>
     private void SyncNestedRoots()
     {

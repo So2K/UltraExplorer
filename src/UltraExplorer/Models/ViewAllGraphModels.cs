@@ -86,6 +86,14 @@ public sealed class ViewAllWorkspaceState
     public List<string> ExtraRoots { get; set; } = [];
 
     /// <summary>
+    /// How many starts in a row each extra root that is not here has been out
+    /// of reach at.  One out of reach at
+    /// <see cref="Services.ViewAllGraphService.MaximumRootMisses"/> in a row is
+    /// taken for gone and forgotten; one that answers is taken off.
+    /// </summary>
+    public Dictionary<string, int> ExtraRootMisses { get; set; } = [];
+
+    /// <summary>
     /// Folders the user hid from the canvas, with everything under them.  Kept
     /// by path rather than per node, because a hidden folder inside a branch
     /// that is refreshed loses its node and would lose the flag with it.

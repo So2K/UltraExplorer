@@ -33,11 +33,32 @@ public sealed class ViewAllGraphService : IDisposable
     private readonly HashSet<string> _hiddenPaths = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Extra roots the saved workspace listed that could not be reached when it
-    /// was restored, as they were saved.  Kept only to be saved again, so a
-    /// share that is offline for one session is still there for the next.
+    /// Extra roots the saved workspace listed that could not be reached when
+    /// they were asked for, as they were saved.  Kept only to be saved again,
+    /// so a share that is offline for one session is still there for the next
+    /// - until it has been out of reach <see cref="MaximumRootMisses"/> starts
+    /// in a row, and is taken for gone.
     /// </summary>
     private readonly List<string> _unavailableRoots = [];
+
+    /// <summary>
+    /// Extra roots the saved workspace listed that have not been asked for
+    /// yet (see <see cref="ProbeExtraRootsAsync"/>): saved again as they were,
+    /// with what was open and placed under them, until they have been.
+    /// </summary>
+    private readonly List<string> _pendingRoots = [];
+
+    /// <summary>How many starts in a row each extra root has been out of reach at, as saved and as this session found.</summary>
+    private readonly Dictionary<string, int> _rootMisses = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>The folders the saved workspace had, for what lies under a root not here yet: opened when it comes, saved again while it does not.</summary>
+    private ViewAllNodeState[] _savedNodes = [];
+
+    /// <summary>An extra root out of reach at this many starts in a row is forgotten: a share or a distribution that is gone for good.</summary>
+    internal const int MaximumRootMisses = 10;
+
+    /// <summary>How long an extra root is waited for at start-up before it counts as out of reach this time.</summary>
+    internal static readonly TimeSpan ExtraRootTimeout = TimeSpan.FromSeconds(20);
 
     /// <summary>
     /// What refreshes of a folder still under way owe it: the sub-folders that
@@ -149,9 +170,17 @@ public sealed class ViewAllGraphService : IDisposable
         Options = options;
     }
 
+    /// <param name="deferExtraRoots">
+    /// Leaves the shares and WSL distributions the workspace lists to
+    /// <see cref="ProbeExtraRootsAsync"/>, for the window to ask for once it
+    /// is up: one whose server is off takes as long as the network allows to
+    /// say so, and start-up must not wait on it.  Otherwise they are asked
+    /// for here, all at once, each for at most <see cref="ExtraRootTimeout"/>.
+    /// </param>
     public async Task InitializeAsync(
         ViewAllWorkspaceState? restoredState = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool deferExtraRoots = false)
     {
         ThrowIfDisposed();
         ClearGraph();
@@ -159,11 +188,14 @@ public sealed class ViewAllGraphService : IDisposable
         _restoredStates.Clear();
         _hiddenPaths.Clear();
         _unavailableRoots.Clear();
+        _pendingRoots.Clear();
+        _rootMisses.Clear();
 
         // A workspace file edited by hand, or written by something else, can
         // hold nulls where lists and paths belong; they are passed over like
         // any other path that no longer means anything.
         var savedNodes = (restoredState?.Nodes ?? []).Where(state => state?.Path is not null).ToArray();
+        _savedNodes = savedNodes;
 
         // Seeded before the first node is created, so a hidden folder is never
         // briefly visible and never briefly indexed.
@@ -210,28 +242,30 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         // WSL distributions and UNC shares are not drives, so nothing would
-        // rediscover them; the workspace lists them explicitly.
+        // rediscover them; the workspace lists them explicitly.  They are
+        // asked for later, all at once (see ProbeExtraRootsAsync).
+        foreach (var (path, misses) in restoredState.ExtraRootMisses ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(path) && misses > 0)
+            {
+                _rootMisses[path] = misses;
+            }
+        }
+
         foreach (var extraRoot in restoredState.ExtraRoots ?? [])
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            if (string.IsNullOrWhiteSpace(extraRoot))
+            if (string.IsNullOrWhiteSpace(extraRoot)
+                || _pendingRoots.Contains(extraRoot, StringComparer.OrdinalIgnoreCase))
             {
                 continue;
             }
 
             try
             {
-                // A share whose server is off, a VPN not yet connected, a WSL
-                // distribution not started: out of reach this time, and not
-                // gone.  It is written back with the rest (see CaptureState)
-                // and tried again at the next start, rather than forgotten
-                // by the first save of a session that could not see it.
-                if (await AddRootAsync(extraRoot, cancellationToken) is null)
-                {
-                    _unavailableRoots.Add(extraRoot);
-                }
+                _ = ViewAllPath.Normalize(extraRoot);
+                _pendingRoots.Add(extraRoot);
             }
-            catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
             {
                 // Not a path at all; nothing to retry.
             }
@@ -258,6 +292,194 @@ public sealed class ViewAllGraphService : IDisposable
                 }
             }
         }
+
+        if (!deferExtraRoots)
+        {
+            await ProbeExtraRootsAsync(ExtraRootTimeout, cancellationToken);
+        }
+    }
+
+    /// <summary>The saved extra roots not asked for yet.</summary>
+    public IReadOnlyList<string> PendingExtraRoots => _pendingRoots;
+
+    /// <summary>Whether <paramref name="path"/> lies in a saved extra root not asked for yet.</summary>
+    public bool IsInPendingRoot(string path) => _pendingRoots.Any(root => IsAtOrUnder(path, root));
+
+    /// <summary>
+    /// Asks for every saved extra root not asked for yet, all at once, each
+    /// for at most <paramref name="timeout"/>.  Each one that answers becomes
+    /// a root as it does - <paramref name="added"/> is told - with what was
+    /// open under it last time opened again, and its count of starts out of
+    /// reach cleared.  Each one that does not - a server that is off, a VPN
+    /// not yet connected, a distribution not installed any more - is out of
+    /// reach this time, not gone: it is written back with the rest (see
+    /// <see cref="CaptureState"/>) and tried again at the next start, unless
+    /// that makes <see cref="MaximumRootMisses"/> starts in a row, when it is
+    /// forgotten.  Returns how many were added.
+    /// </summary>
+    public async Task<int> ProbeExtraRootsAsync(
+        TimeSpan timeout,
+        CancellationToken cancellationToken = default,
+        Action<ViewAllNodeViewModel>? added = null)
+    {
+        if (_pendingRoots.Count == 0 || _disposed)
+        {
+            return 0;
+        }
+
+        var probes = _pendingRoots
+            .Select(path => (Path: path, Answer: ProbeAsync(path, timeout, cancellationToken)))
+            .ToList();
+        var count = 0;
+        while (probes.Count > 0)
+        {
+            await Task.WhenAny(probes.Select(probe => probe.Answer));
+            if (_disposed)
+            {
+                return count;
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            for (var index = probes.Count - 1; index >= 0; index--)
+            {
+                var (path, answer) = probes[index];
+                if (!answer.IsCompleted)
+                {
+                    continue;
+                }
+
+                probes.RemoveAt(index);
+                if (!_pendingRoots.Remove(path))
+                {
+                    continue;
+                }
+
+                if (answer.Result is not { } descriptor)
+                {
+                    // Out of reach once more.
+                    var misses = _rootMisses.GetValueOrDefault(path) + 1;
+                    _rootMisses[path] = misses;
+                    if (misses < MaximumRootMisses)
+                    {
+                        _unavailableRoots.Add(path);
+                    }
+
+                    continue;
+                }
+
+                _rootMisses.Remove(path);
+                if (await AddProbedRootAsync(descriptor, cancellationToken) is { } root)
+                {
+                    count++;
+                    added?.Invoke(root);
+                }
+            }
+        }
+
+        return count;
+    }
+
+    /// <summary>What an extra root answers, or null when it does not within <paramref name="timeout"/>.  Never throws but for cancellation.</summary>
+    private async Task<ViewAllEntryDescriptor?> ProbeAsync(string path, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _fileSystem.DescribeDirectoryAsync(path, cancellationToken).WaitAsync(timeout, cancellationToken);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or TimeoutException
+            or ArgumentException or NotSupportedException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>An extra root that answered: made a root - unless it already is one, added meanwhile - with its saved folders opened again.</summary>
+    private async Task<ViewAllNodeViewModel?> AddProbedRootAsync(ViewAllEntryDescriptor descriptor, CancellationToken cancellationToken)
+    {
+        if (_nodesByPath.ContainsKey(descriptor.FullPath))
+        {
+            return null;
+        }
+
+        var root = CreateNode(descriptor, depth: 0, parent: null);
+        RestorePosition(root);
+        Reflow();
+        GraphChanged?.Invoke(this, EventArgs.Empty);
+
+        var expandedPaths = _savedNodes
+            .Where(state => state.IsExpanded && IsAtOrUnderNormalized(state.Path, root.FullPath))
+            .OrderBy(state => PathDepth(state.Path))
+            .ThenBy(state => state.Path, StringComparer.OrdinalIgnoreCase)
+            .Select(state => state.Path)
+            .ToArray();
+        using (SuspendLayout())
+        {
+            foreach (var path in expandedPaths)
+            {
+                if (_disposed)
+                {
+                    break;
+                }
+
+                cancellationToken.ThrowIfCancellationRequested();
+                if (TryGetNode(path, out var node))
+                {
+                    try
+                    {
+                        await ExpandAsync(node, cancellationToken);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                    {
+                        // What cannot be read now stays closed; the root is here.
+                    }
+                }
+            }
+        }
+
+        return root;
+    }
+
+    /// <summary>Whether <paramref name="path"/> is <paramref name="root"/> or inside it, by name alone.</summary>
+    private static bool IsAtOrUnder(string path, string root)
+    {
+        try
+        {
+            return IsAtOrUnderNormalized(ViewAllPath.Normalize(path), ViewAllPath.Normalize(root));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IsAtOrUnder"/> for two paths already spelled the one way
+    /// (<see cref="ViewAllPath.Normalize"/>) - saved folders are, being
+    /// written from their nodes - so thousands can be looked through with no
+    /// path built.
+    /// </summary>
+    private static bool IsAtOrUnderNormalized(string path, string root) =>
+        path.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+        && (path.Length == root.Length
+            || root.EndsWith(Path.DirectorySeparatorChar)
+            || path[root.Length] == Path.DirectorySeparatorChar);
+
+    /// <summary><paramref name="paths"/> spelled the one way, leaving out any that are not paths at all.</summary>
+    private static List<string> Normalized(IEnumerable<string> paths)
+    {
+        var normalized = new List<string>();
+        foreach (var path in paths)
+        {
+            try
+            {
+                normalized.Add(ViewAllPath.Normalize(path));
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+            }
+        }
+
+        return normalized;
     }
 
     /// <summary>
@@ -1453,28 +1675,45 @@ public sealed class ViewAllGraphService : IDisposable
         => Index.HitTest(graphPoint, node => node.IsTreeVisible && !exclude(node));
 
     public ViewAllWorkspaceState CaptureState(ViewAllViewportState viewport)
-        => new()
+    {
+        // The roots not here - not asked for yet, or out of reach this
+        // session - go back in too, unless one has been added again since:
+        // an offline share is not a share the user removed.  So do the
+        // folders saved under them, open and placed as they were.
+        var absent = _pendingRoots.Concat(_unavailableRoots)
+            .Where(path => !TryGetNode(path, out _))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var nodes = _nodes.Select(node => new ViewAllNodeState(
+                node.FullPath,
+                node.Location.X,
+                node.Location.Y,
+                node.HasManualPosition,
+                node.IsExpanded))
+            .ToList();
+        if (absent.Count > 0)
+        {
+            var absentRoots = Normalized(absent);
+            nodes.AddRange(_savedNodes.Where(state =>
+                absentRoots.Any(root => IsAtOrUnderNormalized(state.Path, root)) && !_nodesByPath.ContainsKey(state.Path)));
+        }
+
+        return new()
         {
             ViewportX = viewport.Location.X,
             ViewportY = viewport.Location.Y,
             ViewportZoom = viewport.Zoom,
-
-            // The roots that could not be reached this session go back in too,
-            // unless one has been added again since: an offline share is not a
-            // share the user removed.
             ExtraRoots = _roots.Where(node => !node.IsDrive).Select(node => node.FullPath)
-                .Concat(_unavailableRoots.Where(path => !TryGetNode(path, out _)))
+                .Concat(absent)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList(),
+            ExtraRootMisses = absent
+                .Where(path => _rootMisses.GetValueOrDefault(path) > 0)
+                .ToDictionary(path => path, path => _rootMisses[path], StringComparer.OrdinalIgnoreCase),
             HiddenPaths = [.. _hiddenPaths],
-            Nodes = _nodes.Select(node => new ViewAllNodeState(
-                    node.FullPath,
-                    node.Location.X,
-                    node.Location.Y,
-                    node.HasManualPosition,
-                    node.IsExpanded))
-                .ToList()
+            Nodes = nodes
         };
+    }
 
     private ViewAllNodeViewModel CreateNode(
         ViewAllEntryDescriptor entry,

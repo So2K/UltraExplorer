@@ -48,6 +48,26 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     private (string Key, long First, ChangeKinds Kinds) _lastChange;
 
     private bool _isInitialized;
+
+    /// <summary>
+    /// Set once the saved workspace has been read and put back.  Until then
+    /// nothing is written over it: a save of a half-restored graph - the
+    /// window closed, or a save come due, while folders were still being
+    /// opened again - would keep only what was back so far.
+    /// </summary>
+    private bool _isStateRestored;
+
+    /// <summary>A save was asked for before the workspace was back; one is made once it is.</summary>
+    private bool _saveHeldForRestore;
+
+    /// <summary>
+    /// The folder selected last time, when it lies in a share or distribution
+    /// not asked for yet: selected when that root answers, unless something
+    /// else has been selected meanwhile (<see cref="_heldActiveVersion"/>).
+    /// </summary>
+    private string? _heldActivePath;
+    private long _heldActiveVersion;
+
     private bool _isDisposed;
     private bool _isBusy;
     private bool _isSyncingSelection;
@@ -542,7 +562,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             var state = await _store.LoadAsync();
             RestoredNestedCamera = state?.NestedCamera;
             NestedCamera = RestoredNestedCamera;
-            await _graph.InitializeAsync(state);
+
+            // Shares and distributions are asked for once the window is up
+            // (ProbeExtraRootsAsync): one whose server is off would hold the
+            // whole window up for as long as the network takes to say so.
+            await _graph.InitializeAsync(state, deferExtraRoots: true);
 
             if (state is { Nodes.Count: > 0 })
             {
@@ -553,6 +577,18 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 if (!string.IsNullOrWhiteSpace(state.ActivePath) && _graph.TryGetNode(state.ActivePath, out var active))
                 {
                     SelectOnly(active);
+                }
+                else if (!string.IsNullOrWhiteSpace(state.ActivePath) && _graph.IsInPendingRoot(state.ActivePath))
+                {
+                    // In a share not asked for yet: the first drive stands in,
+                    // and the share's folder is selected when it answers.
+                    if (_graph.Roots.FirstOrDefault() is { } standIn)
+                    {
+                        SelectOnly(standIn);
+                    }
+
+                    _heldActivePath = state.ActivePath;
+                    _heldActiveVersion = Selection.Version;
                 }
                 else if (PreferLightReveal
                     && !string.IsNullOrWhiteSpace(state.ActivePath)
@@ -578,6 +614,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             }
 
             RebuildRenderSet();
+
+            // Put back: saves may write it from now on.  One asked for while
+            // it was being put back is made now.  A restore that failed never
+            // gets here, and leaves the file as it was for the next start.
+            _isStateRestored = true;
+            if (_saveHeldForRestore)
+            {
+                _saveHeldForRestore = false;
+                ScheduleSave();
+            }
         }
         catch (Exception ex)
         {
@@ -586,6 +632,98 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         finally
         {
             IsBusy = false;
+        }
+    }
+
+    /// <summary>Raised when a saved share or distribution answered and became a root, after the start.</summary>
+    public event Action<ViewAllNodeViewModel>? ExtraRootAdded;
+
+    /// <summary>
+    /// Asks for the shares and WSL distributions the workspace lists, all at
+    /// once, once the window is up: each that answers becomes a root as it
+    /// does, with what was open in it opened again - and the folder selected
+    /// last time selected, if it is in one and nothing else has been selected
+    /// since.  Each that does not is kept for the next start (see
+    /// <see cref="ViewAllGraphService.ProbeExtraRootsAsync"/>).
+    /// </summary>
+    public async Task ProbeExtraRootsAsync()
+    {
+        if (!_isStateRestored || _isDisposed || _graph.PendingExtraRoots.Count == 0)
+        {
+            return;
+        }
+
+        try
+        {
+            await _graph.ProbeExtraRootsAsync(ViewAllGraphService.ExtraRootTimeout, added: OnExtraRootAdded);
+        }
+        catch (ObjectDisposedException)
+        {
+            return;
+        }
+
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        // A folder selected last time in a root that did not answer stays
+        // what is saved as selected - to be tried again at the next start -
+        // until something else is selected.
+        RebuildRenderSet();
+
+        // What was found out - which roots answered, which missed once more -
+        // is written down now rather than at the next change.
+        ScheduleSave();
+    }
+
+    private void OnExtraRootAdded(ViewAllNodeViewModel root)
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        RebuildRenderSet();
+        ExtraRootAdded?.Invoke(root);
+        if (_heldActivePath is { } held && IsInRoot(held, root))
+        {
+            _heldActivePath = null;
+            _ = SelectHeldActiveAsync(held, _heldActiveVersion);
+        }
+    }
+
+    /// <summary>The folder selected last time, now that its root is here - unless the user has selected something since.</summary>
+    private async Task SelectHeldActiveAsync(string path, long version)
+    {
+        ViewAllNodeViewModel? node;
+        try
+        {
+            node = TryGetNode(path, out var known)
+                ? known
+                : PreferLightReveal && await _graph.MaterializeChainAsync(path) is { IsComplete: true, Node: { } named } ? named : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return;
+        }
+
+        if (node is not null && !_isDisposed && Selection.Version == version)
+        {
+            SelectOnly(node);
+        }
+    }
+
+    private static bool IsInRoot(string path, ViewAllNodeViewModel root)
+    {
+        try
+        {
+            var chain = ViewAllPath.AncestorChain(path);
+            return chain.Any(step => ViewAllPath.Equals(step, root.FullPath));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return false;
         }
     }
 
@@ -1546,10 +1684,24 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
         try
         {
-            var state = _graph.CaptureState(new ViewAllViewportState(_viewportLocation, _viewportZoom));
-            state.ActivePath = ActiveNode?.FullPath ?? string.Empty;
-            state.NestedCamera = NestedCamera;
-            await _store.SaveAsync(state);
+            // Not over a workspace still being put back (see _isStateRestored);
+            // the marks are a file of their own, and go as always.
+            if (_isStateRestored)
+            {
+                var state = _graph.CaptureState(new ViewAllViewportState(_viewportLocation, _viewportZoom));
+
+                // Selected last time in a share not here yet: still that.
+                state.ActivePath = _heldActivePath is { } held && Selection.Version == _heldActiveVersion
+                    ? held
+                    : ActiveNode?.FullPath ?? string.Empty;
+                state.NestedCamera = NestedCamera;
+                await _store.SaveAsync(state);
+            }
+            else
+            {
+                _saveHeldForRestore = true;
+            }
+
             await _marks.SaveAsync();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

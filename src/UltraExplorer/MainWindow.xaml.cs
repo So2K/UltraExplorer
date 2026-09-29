@@ -199,6 +199,13 @@ public partial class MainWindow : Window
         // leaving a half-built window that would save its defaults on close.
         CrashReporter.MarkStarted();
 
+        // The shares and WSL distributions the workspace lists are asked for
+        // only now, all at once: one whose server is off takes as long as the
+        // network allows to say so, and the window does not wait on it.  Each
+        // that answers joins the canvases as it does.
+        _viewModel.Tree.ExtraRootAdded += OnExtraRootAdded;
+        _ = _viewModel.Tree.ProbeExtraRootsAsync();
+
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
         _capture?.Start();
         if (_picker is null && TryStartNestedDiagnostics())
@@ -266,6 +273,7 @@ public partial class MainWindow : Window
             DependencyPropertyDescriptor
                 .FromProperty(NodifyEditor.ViewportLocationProperty, typeof(NodifyEditor))
                 .RemoveValueChanged(Editor, OnViewportLocationChanged);
+            _viewModel.Tree.ExtraRootAdded -= OnExtraRootAdded;
             DetachNodeDrag();
             DetachSelection();
             DetachNested();
