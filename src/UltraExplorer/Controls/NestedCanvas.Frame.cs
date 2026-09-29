@@ -198,6 +198,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
     {
+        ShareDrivenSlots(IsVisible);
         if (IsVisible)
         {
             RequestFrame(Layers.All);
@@ -225,14 +226,19 @@ public sealed partial class NestedCanvas
             _drivenSlots.Add(slot);
         }
 
-        slot.Active = this;
+        slot.Claim(this);
         if (_tree is { } tree && ReferenceEquals(slot, tree.Driver))
         {
             FollowBatches(tree);
         }
     }
 
-    /// <summary>Gives <paramref name="slot"/> back to its fallback driver, with anything it was woken for.</summary>
+    /// <summary>
+    /// Gives <paramref name="slot"/> back, with anything it was woken for: to
+    /// the other canvas that drives it too, if one does - the other pane of a
+    /// split view, which takes over the work from its next frame - and
+    /// otherwise to the slot's fallback driver.
+    /// </summary>
     internal void StopDriving(FrameDriverSlot slot)
     {
         if (_batchTree is { } followed && ReferenceEquals(slot, followed.Driver))
@@ -241,12 +247,33 @@ public sealed partial class NestedCanvas
         }
 
         _drivenSlots.Remove(slot);
-        if (ReferenceEquals(slot.Active, this))
-        {
-            slot.Active = null;
-        }
+        slot.Release(this);
+        slot.Wake();
+    }
 
-        slot.Fallback.Wake();
+    /// <summary>
+    /// Hidden, the canvas lets any other canvas driving the same slots be the
+    /// one woken - the other pane, which can draw - and wakes it for whatever
+    /// is waiting; shown again, it takes them back.  Alone in a slot, as a
+    /// single pane always is, nothing changes: its wakes go to the fallback
+    /// while it is hidden (<see cref="OnWake"/>), as they always did.
+    /// </summary>
+    private void ShareDrivenSlots(bool shown)
+    {
+        foreach (var slot in _drivenSlots)
+        {
+            if (shown)
+            {
+                slot.Claim(this);
+                continue;
+            }
+
+            slot.Yield(this);
+            if (slot.Active is { } other && !ReferenceEquals(other, this))
+            {
+                other.Wake();
+            }
+        }
     }
 
     void IFrameDriver.Wake() => Wake();

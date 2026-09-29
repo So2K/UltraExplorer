@@ -423,6 +423,7 @@ public sealed partial class NestedCanvas
         try
         {
             _renderer = NestedGpuRenderer.For(devices);
+            _instances = new NestedGpuRenderer.Instances(devices);
             _surface = new NestedSurface(devices, _scaleX, _scaleY);
         }
         catch (Exception ex) when (ex is SharpGen.Runtime.SharpGenException or GpuUnavailableException or ObjectDisposedException or ArgumentException)
@@ -432,6 +433,8 @@ public sealed partial class NestedCanvas
             // again later, and after three failures a minute leaves the
             // canvas on the CPU for the session.
             _renderer = null;
+            _instances?.Dispose();
+            _instances = null;
             RendererReason = GpuBootstrap.ReasonUnavailable;
             if (!devices.IsDisposed)
             {
@@ -476,8 +479,13 @@ public sealed partial class NestedCanvas
         dc.DrawImage(surface, surface.DrawRect);
     }
 
-    /// <summary>The renderer's part of a present: GPU commands only, the instances filled before the lock.</summary>
-    private void DrawSurface(in SurfaceFrame frame) => _renderer!.Draw(frame.Target, frame.Width, frame.Height, _gpuFrame!);
+    /// <summary>
+    /// The renderer's part of a present: GPU commands only, the instances
+    /// filled before the lock, copied into this canvas's own buffers - so a
+    /// list the last present already copied is not copied again, whatever the
+    /// other pane of a split view drew with the same renderer since.
+    /// </summary>
+    private void DrawSurface(in SurfaceFrame frame) => _renderer!.Draw(frame.Target, frame.Width, frame.Height, _gpuFrame!, _instances!);
 
     /// <summary>
     /// Gives up the surface: back to the bitmap, which the next CPU frame
@@ -489,6 +497,8 @@ public sealed partial class NestedCanvas
         var surface = _surface;
         _surface = null;
         _renderer = null;
+        _instances?.Dispose();
+        _instances = null;
         _surfaceLost = false;
         if (surface is null)
         {

@@ -261,9 +261,35 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
     /// <summary>
     /// Where the hub's changes to the nested canvas's folders go: the nested
-    /// tree, set by the window that draws it.  Null while there is none.
+    /// tree of every pane the window draws, added and taken away by the
+    /// window (<see cref="AddNestedChanges"/>).  Every change goes to every
+    /// one of them, and a tree takes only its own folders' (see
+    /// <see cref="NestedTree.Owns"/>); a missed change or a poll is every
+    /// tree's.  Empty while there is none; one with a single pane.
     /// </summary>
-    public IChangeSink? NestedChanges { get; set; }
+    public IReadOnlyList<IChangeSink> NestedChanges => _nestedChanges;
+
+    /// <summary>The sinks of <see cref="NestedChanges"/>, replaced whole on a change so a delivery in progress walks the list it began with.</summary>
+    private IChangeSink[] _nestedChanges = [];
+
+    /// <summary>A pane's tree is to hear of changes to its folders from now on; nothing if it already does.</summary>
+    public void AddNestedChanges(IChangeSink sink)
+    {
+        ArgumentNullException.ThrowIfNull(sink);
+        if (Array.IndexOf(_nestedChanges, sink) < 0)
+        {
+            _nestedChanges = [.. _nestedChanges, sink];
+        }
+    }
+
+    /// <summary>A pane's tree hears of no more changes: its pane closed, or the window is going.</summary>
+    public void RemoveNestedChanges(IChangeSink sink)
+    {
+        if (Array.IndexOf(_nestedChanges, sink) >= 0)
+        {
+            _nestedChanges = [.. _nestedChanges.Where(kept => !ReferenceEquals(kept, sink))];
+        }
+    }
 
     /// <summary>
     /// How far the layout carried the folder the user just opened or closed.
@@ -1791,7 +1817,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         switch (consumer)
         {
             case ChangeConsumer.Nested:
-                NestedChanges?.FolderChanged(consumer, target, change);
+                foreach (var sink in _nestedChanges)
+                {
+                    sink.FolderChanged(consumer, target, change);
+                }
+
                 break;
             case ChangeConsumer.List when ReferenceEquals(target, FolderList):
                 FolderList.OnFolderChanged(change);
@@ -1817,7 +1847,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
-        NestedChanges?.EpochBumped(root);
+        foreach (var sink in _nestedChanges)
+        {
+            sink.EpochBumped(root);
+        }
+
         FolderList.OnEpochBumped(root);
         foreach (var (path, node) in _graphInterest)
         {
@@ -1828,7 +1862,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
     }
 
-    /// <summary>A watch that is polled is due its look: the nested canvas's tree looks at what it has on screen, the list at its folder.</summary>
+    /// <summary>A watch that is polled is due its look: each nested canvas's tree looks at what it has on screen, the list at its folder.</summary>
     void IChangeSink.PollDue(WatchRoot root)
     {
         if (_isDisposed)
@@ -1836,7 +1870,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
-        NestedChanges?.PollDue(root);
+        foreach (var sink in _nestedChanges)
+        {
+            sink.PollDue(root);
+        }
+
         FolderList.OnPollDue(root);
     }
 

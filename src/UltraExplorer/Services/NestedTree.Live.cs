@@ -126,13 +126,34 @@ public sealed partial class NestedTree : IChangeSink
     /// Something changed in a folder the tree has read, on the tree's thread
     /// within a frame's allowance for changes: the hub has already waited for
     /// a burst of changes to go quiet, so this is once per folder per burst.
+    /// A folder of another tree is none of this one's: the two panes of a
+    /// split view each have a tree, both registered with the one hub, and the
+    /// window hands every change to both (see <see cref="Owns"/>).
     /// </summary>
     void IChangeSink.FolderChanged(ChangeConsumer consumer, object target, in FolderChange change)
     {
-        if (consumer == ChangeConsumer.Nested && target is NestedFolder folder)
+        if (consumer == ChangeConsumer.Nested && target is NestedFolder folder && Owns(folder))
         {
             OnFolderChanged(folder, change);
         }
+    }
+
+    /// <summary>
+    /// Whether <paramref name="folder"/> is one of this tree's: its parents
+    /// lead up to this tree's This PC.  A folder dropped since is still
+    /// counted - its parents are kept - and <see cref="OnFolderChanged"/>
+    /// leaves it alone for that.  A walk up as many levels as the folder is
+    /// deep, once per folder per burst of changes.
+    /// </summary>
+    internal bool Owns(NestedFolder folder)
+    {
+        var top = folder;
+        while (top.Parent is { } parent)
+        {
+            top = parent;
+        }
+
+        return ReferenceEquals(top, Root);
     }
 
     /// <summary>

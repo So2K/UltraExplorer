@@ -76,7 +76,7 @@ public partial class MainWindow
         // takes the hub's changes in at the start of its frames and hands them
         // to the tree view model, which gives the tree its own.
         _nestedTree.Changes = _viewModel.Changes;
-        _viewModel.Tree.NestedChanges = _nestedTree;
+        _viewModel.Tree.AddNestedChanges(_nestedTree);
         Nested.AttachChanges(_viewModel.Changes, _viewModel.Tree);
         AttachDevices();
 
@@ -137,7 +137,7 @@ public partial class MainWindow
         Nested.IconArrivals = null;
         Nested.AttachChanges(null, null);
         DetachDevices();
-        _viewModel.Tree.NestedChanges = null;
+        _viewModel.Tree.RemoveNestedChanges(_nestedTree);
         _nestedTree.Changes = null;
         _sortSlices.Clear();
         UnhookSortSlices();

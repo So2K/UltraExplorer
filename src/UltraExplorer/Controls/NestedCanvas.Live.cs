@@ -30,10 +30,23 @@ public sealed partial class NestedCanvas
     internal ChangeHub? Changes => _changes;
 
     /// <summary>
+    /// Whether this canvas is the one that drains the hub: the last canvas
+    /// to take its wakes that still has them, and is not hidden while another
+    /// is shown (see <see cref="FrameDriverSlot"/>).  One pane of a split view
+    /// takes every change in for both - the sink hands each folder to the
+    /// tree it belongs to - and the other only tells its own tree where its
+    /// view is and which shares it shows.
+    /// </summary>
+    internal bool DrainsChanges => _changes is { } hub && ReferenceEquals(hub.Driver.Active, this);
+
+    /// <summary>
     /// Takes over the change hub's wakes: what it has for <paramref name="sink"/>
     /// - the tree's folders, the folder list's, the tree canvas's - is taken in
     /// at the start of this canvas's frames while it can draw, and by the hub's
-    /// fallback driver while it cannot.  Null for either lets go.
+    /// fallback driver while it cannot.  Null for either lets go, and hands
+    /// the wakes to the canvas that took them before, if another still has
+    /// them.  A second canvas given the same hub - the other pane - takes the
+    /// wakes over from the first, which keeps them should the second let go.
     /// </summary>
     internal void AttachChanges(ChangeHub? hub, IChangeSink? sink)
     {
@@ -60,7 +73,10 @@ public sealed partial class NestedCanvas
     /// The tree is told first where the view is, so a folder that went with
     /// the view inside it counts as on screen.  Then the shares on screen are
     /// noted, at most once a second: a share's watch is kept armed only while
-    /// something of it is drawn.
+    /// something of it is drawn.  Only the canvas that drains the hub takes
+    /// the changes (<see cref="DrainsChanges"/>); every canvas tells its own
+    /// tree where its view is and notes its own shares, since the other pane's
+    /// view and shares are not this one's.
     /// </summary>
     partial void DrainChangeHub(ref FrameBudget budget)
     {
@@ -75,16 +91,21 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        hub.Drain(ref budget, sink);
+        if (ReferenceEquals(hub.Driver.Active, this))
+        {
+            hub.Drain(ref budget, sink);
+        }
+
         if (Stopwatch.GetElapsedTime(_sharesNotedAt).TotalMilliseconds >= ShareNoteMinMilliseconds)
         {
             NoteSharesOnScreen(hub, tree);
         }
     }
 
+    /// <summary>Changes wait in the hub for this canvas to take them in: only for the canvas that drains it, so the other pane does not keep its loop going for work that is not its to do.</summary>
     partial void PendingHubWork(ref bool pending)
     {
-        if (_changes is { HasWork: true })
+        if (_changes is { HasWork: true } hub && ReferenceEquals(hub.Driver.Active, this))
         {
             pending = true;
         }

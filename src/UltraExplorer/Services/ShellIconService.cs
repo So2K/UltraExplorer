@@ -33,7 +33,8 @@ internal readonly record struct IconArrival(string Key, ImageSource? Icon);
 ///
 /// <para><b>Two ways of being told.</b>  The nested canvas asks through
 /// <see cref="GetForCanvas"/>, and what the Shell answers goes into one queue,
-/// <see cref="CanvasArrivals"/>, that the canvas takes in at the start of its
+/// <see cref="CanvasArrivals"/> - one per canvas when the view is split
+/// (<see cref="SubscribeCanvas"/>) - that the canvas takes in at the start of its
 /// next frame: two hundred programs in System32 are one wake of the frame loop
 /// and one redraw of the names, not two hundred dispatcher operations each
 /// redrawing every name on screen - which at 4K was thirteen seconds of
@@ -125,20 +126,8 @@ public sealed class ShellIconService : IDisposable
         _flush = FlushAnswers;
         _flushTimer = new Timer(_ => PostFlush(), null, Timeout.Infinite, Timeout.Infinite);
 
-        // With no canvas taking them in - none attached, or the canvas off
-        // screen - arrivals are only let go of: the icons are in the cache,
-        // and a canvas that comes back draws every name again anyway.
-        FrameInbox<IconArrival>? arrivals = null;
-        arrivals = new FrameInbox<IconArrival>(new FrameDriverSlot(new ImmediateFrameDriver(
-            (ref FrameBudget budget) =>
-            {
-                arrivals!.Rearm();
-                while (arrivals.TryTake(out _))
-                {
-                }
-            },
-            () => !arrivals!.IsEmpty)));
-        CanvasArrivals = arrivals;
+        CanvasArrivals = NewCanvasInbox();
+        _canvasInboxes = [CanvasArrivals];
 
         _worker = new Thread(Work)
         {
@@ -153,9 +142,83 @@ public sealed class ShellIconService : IDisposable
     /// <summary>
     /// Where the icons the canvas asked for arrive, one item per icon, for the
     /// canvas to take in at the start of a frame (NestedCanvas.IconArrivals).
-    /// Its driver slot's fallback lets them go while no canvas drives it.
+    /// Its driver slot's fallback lets them go while no canvas drives it.  The
+    /// first canvas's - the only one, unless the view is split: every other
+    /// canvas has an inbox of its own (<see cref="SubscribeCanvas"/>).
     /// </summary>
     internal FrameInbox<IconArrival> CanvasArrivals { get; }
+
+    /// <summary>
+    /// Every canvas's inbox, <see cref="CanvasArrivals"/> first: an icon one
+    /// canvas asked for arrives in all of them, since the Shell is asked once
+    /// for everybody (<see cref="_canvasAsked"/>) and the other pane may be
+    /// drawing a file of the same type without an icon, waiting for it.
+    /// Replaced whole when a canvas comes or goes, so the worker posting an
+    /// answer walks the list as it was.
+    /// </summary>
+    private FrameInbox<IconArrival>[] _canvasInboxes;
+
+    /// <summary>
+    /// An inbox of its own for another canvas drawing file names - the second
+    /// pane of a split view - which the Shell's answers arrive in from now on,
+    /// as they do in <see cref="CanvasArrivals"/>.  Given back with
+    /// <see cref="UnsubscribeCanvas"/> when the canvas goes.  On the UI thread.
+    /// </summary>
+    internal FrameInbox<IconArrival> SubscribeCanvas()
+    {
+        var inbox = NewCanvasInbox();
+        lock (_gate)
+        {
+            Volatile.Write(ref _canvasInboxes, [.. _canvasInboxes, inbox]);
+        }
+
+        return inbox;
+    }
+
+    /// <summary>
+    /// An inbox from <see cref="SubscribeCanvas"/> is no longer taken in:
+    /// nothing is posted to it any more.  <see cref="CanvasArrivals"/> is the
+    /// service's own and stays.
+    /// </summary>
+    internal void UnsubscribeCanvas(FrameInbox<IconArrival> inbox)
+    {
+        if (ReferenceEquals(inbox, CanvasArrivals))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (Array.IndexOf(_canvasInboxes, inbox) >= 0)
+            {
+                Volatile.Write(ref _canvasInboxes, [.. _canvasInboxes.Where(kept => !ReferenceEquals(kept, inbox))]);
+            }
+        }
+    }
+
+    /// <summary>Canvases whose inboxes the answers arrive in, for the checks.</summary>
+    internal int CanvasInboxCount => Volatile.Read(ref _canvasInboxes).Length;
+
+    /// <summary>
+    /// An inbox for one canvas.  With no canvas taking it in - none attached,
+    /// or the canvas off screen - what arrives is only let go of: the icons
+    /// are in the cache, and a canvas that comes back draws every name again
+    /// anyway.
+    /// </summary>
+    private static FrameInbox<IconArrival> NewCanvasInbox()
+    {
+        FrameInbox<IconArrival>? arrivals = null;
+        arrivals = new FrameInbox<IconArrival>(new FrameDriverSlot(new ImmediateFrameDriver(
+            (ref FrameBudget budget) =>
+            {
+                arrivals!.Rearm();
+                while (arrivals.TryTake(out _))
+                {
+                }
+            },
+            () => !arrivals!.IsEmpty)));
+        return arrivals;
+    }
 
     /// <summary>Icons asked for and not answered yet, both lanes; for the checks and the bench.</summary>
     internal int PendingCount
@@ -583,7 +646,11 @@ public sealed class ShellIconService : IDisposable
         if (tellCanvas)
         {
             Interlocked.Increment(ref _canvasArrivalsPosted);
-            CanvasArrivals.Post(new IconArrival(entry.Key, icon));
+            var arrival = new IconArrival(entry.Key, icon);
+            foreach (var inbox in Volatile.Read(ref _canvasInboxes))
+            {
+                inbox.Post(arrival);
+            }
         }
 
         if (callbacks is not null)

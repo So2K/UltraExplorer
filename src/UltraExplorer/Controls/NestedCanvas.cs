@@ -261,10 +261,12 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     private WriteableBitmap? _bitmap;
 
     // The scene on the GPU (see "the GPU" below): the surface WPF shows in
-    // place of the bitmap, the renderer and instance lists that fill it, and
-    // which surface and texture the scene layer was last recorded with.
+    // place of the bitmap, the renderer and instance lists that fill it, the
+    // buffers on the card this canvas's instances are copied into, and which
+    // surface and texture the scene layer was last recorded with.
     private NestedSurface? _surface;
     private NestedGpuRenderer? _renderer;
+    private NestedGpuRenderer.Instances? _instances;
     private NestedGpuFrame? _gpuFrame;
     private GpuSink? _gpuSink;
     private SurfaceDrawer? _drawSurface;

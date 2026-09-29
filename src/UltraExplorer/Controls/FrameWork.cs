@@ -106,23 +106,104 @@ internal interface IFrameDriver
 /// posted while no canvas is showing is still taken in (a folder revealed
 /// while the tree canvas is up, a change on disk while the folder list is
 /// the only view).  Shared by every inbox that feeds the same consumer.
+///
+/// <para>More than one canvas can take a slot: the two panes of a split view
+/// share the change hub's.  Every driver that took it (<see cref="Claim"/>)
+/// and has not given it back is kept, in the order they took it, and the
+/// last is the active one; a driver that gives it back
+/// (<see cref="Release"/>) hands it to the one before it rather than to the
+/// fallback, so a pane closing never leaves the other pane's work waiting
+/// for the fallback.  With one driver this is the single field it always
+/// was.  Changed on the UI thread; read, by <see cref="Wake"/>, on any.</para>
 /// </summary>
 internal sealed class FrameDriverSlot(IFrameDriver fallback)
 {
-    private IFrameDriver? _active;
+    /// <summary>The drivers that took the slot, oldest first; replaced whole, never written in place, so a wake on another thread reads a list that stays as it was.</summary>
+    private IFrameDriver[] _drivers = [];
 
-    /// <summary>The driver that takes the work in while there is one; null leaves it to <see cref="Fallback"/>.</summary>
+    /// <summary>
+    /// The driver that takes the work in while there is one; null leaves it
+    /// to <see cref="Fallback"/>.  Setting it makes that driver the only one
+    /// (null, none), whoever else had taken the slot: for a test that stands
+    /// in for the canvas.
+    /// </summary>
     public IFrameDriver? Active
     {
-        get => Volatile.Read(ref _active);
-        set => Volatile.Write(ref _active, value);
+        get
+        {
+            var drivers = Volatile.Read(ref _drivers);
+            return drivers.Length == 0 ? null : drivers[^1];
+        }
+
+        set => Volatile.Write(ref _drivers, value is null ? [] : [value]);
     }
 
     /// <summary>The driver that takes the work in when no other does.</summary>
     public IFrameDriver Fallback { get; set; } = fallback;
 
+    /// <summary>How many drivers have the slot right now, for tests.</summary>
+    internal int DriverCount => Volatile.Read(ref _drivers).Length;
+
+    /// <summary>Whether <paramref name="driver"/> has taken the slot and not given it back.</summary>
+    public bool IsClaimedBy(IFrameDriver driver) => Array.IndexOf(Volatile.Read(ref _drivers), driver) >= 0;
+
+    /// <summary><paramref name="driver"/> takes the slot, and is the active driver from now on - the last to take it, if it had already.</summary>
+    public void Claim(IFrameDriver driver)
+    {
+        var drivers = Volatile.Read(ref _drivers);
+        if (drivers.Length > 0 && ReferenceEquals(drivers[^1], driver))
+        {
+            return;
+        }
+
+        Volatile.Write(ref _drivers, [.. Without(drivers, driver), driver]);
+    }
+
+    /// <summary>
+    /// <paramref name="driver"/> gives the slot back: the driver that took it
+    /// before, if one still has it, is the active one again, and otherwise
+    /// the fallback is.  Nothing when it did not have it.
+    /// </summary>
+    public void Release(IFrameDriver driver)
+    {
+        var drivers = Volatile.Read(ref _drivers);
+        if (Array.IndexOf(drivers, driver) >= 0)
+        {
+            Volatile.Write(ref _drivers, Without(drivers, driver));
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="driver"/> keeps the slot but lets any other driver
+    /// that has it be the active one: a pane that was hidden, whose wakes
+    /// would only be passed on to the fallback while another pane is there to
+    /// draw.  A driver alone in the slot stays its active driver.
+    /// </summary>
+    public void Yield(IFrameDriver driver)
+    {
+        var drivers = Volatile.Read(ref _drivers);
+        if (drivers.Length > 1 && Array.IndexOf(drivers, driver) > 0)
+        {
+            Volatile.Write(ref _drivers, [driver, .. Without(drivers, driver)]);
+        }
+    }
+
     /// <summary>Wakes whichever driver is in charge.  Any thread.</summary>
     public void Wake() => (Active ?? Fallback).Wake();
+
+    private static IFrameDriver[] Without(IFrameDriver[] drivers, IFrameDriver driver)
+    {
+        var index = Array.IndexOf(drivers, driver);
+        if (index < 0)
+        {
+            return drivers;
+        }
+
+        var rest = new IFrameDriver[drivers.Length - 1];
+        Array.Copy(drivers, 0, rest, 0, index);
+        Array.Copy(drivers, index + 1, rest, index, drivers.Length - index - 1);
+        return rest;
+    }
 }
 
 /// <summary>Takes in waiting work within a budget: what a driver runs.</summary>

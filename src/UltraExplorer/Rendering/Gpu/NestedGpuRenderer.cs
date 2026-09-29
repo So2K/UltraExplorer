@@ -30,6 +30,15 @@ namespace UltraExplorer.Rendering.Gpu;
 /// set: the shared surface WPF shows (<see cref="NestedSurface.Present"/>)
 /// or an offscreen texture, which is what the tests and the warm-up draw
 /// into.  UI thread once the set is handed out; the warm-up thread before.
+///
+/// <para>The pipelines are the set's, shared by every canvas on the card; the
+/// buffers the instances are copied into are not.  A list is copied only
+/// when it changed since the frame the buffer last held, and two canvases on
+/// one card - the panes of a split view - taking turns with one set of
+/// buffers would copy everything, every present, a scene of 400,000 cells
+/// being 25 MB.  So each canvas keeps its own (<see cref="Instances"/>) and
+/// draws with them; the renderer's own set is for whatever draws without one,
+/// the tests' offscreen frames.</para>
 /// </summary>
 internal sealed unsafe class NestedGpuRenderer : IDisposable
 {
@@ -53,10 +62,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
     private readonly ID3D11BlendState _premultiplied;
     private readonly ID3D11RasterizerState _rasterizer;
     private readonly ID3D11Buffer _frameConstants;
-    private readonly InstanceBuffer _sceneBuffer;
-    private readonly InstanceBuffer _labelBuffer;
-    private readonly InstanceBuffer _iconBuffer;
-    private readonly InstanceBuffer _glyphBuffer;
+    private Instances? _ownInstances;
     private int _constantsWidth = -1;
     private int _constantsHeight = -1;
     private bool _disposed;
@@ -96,10 +102,6 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
                 CpuAccessFlags.Write,
                 ResourceOptionFlags.None,
                 0));
-            _sceneBuffer = new InstanceBuffer(device, InitialSceneInstances * RectInstance.Size);
-            _labelBuffer = new InstanceBuffer(device, InitialLabelInstances * RectInstance.Size);
-            _iconBuffer = new InstanceBuffer(device, InitialIconInstances * IconInstance.Size);
-            _glyphBuffer = new InstanceBuffer(device, InitialGlyphInstances * GlyphQuadSize);
         }
         catch
         {
@@ -187,26 +189,44 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
     public static void RegisterWarmUp() => GpuBootstrap.RegisterWarmUp(set => For(set).WarmUp());
 
     /// <summary>
+    /// Draws <paramref name="frame"/> into <paramref name="target"/> with the
+    /// renderer's own buffers (see <see cref="Draw(ID3D11RenderTargetView, int, int, NestedGpuFrame, Instances)"/>):
+    /// for a frame drawn by something that keeps none of its own.  They are
+    /// made the first time this is called.
+    /// </summary>
+    public void Draw(ID3D11RenderTargetView target, int width, int height, NestedGpuFrame frame)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        Draw(target, width, height, frame, _ownInstances ??= new Instances(_devices));
+    }
+
+    /// <summary>
     /// Draws <paramref name="frame"/> into <paramref name="target"/>: clears
     /// all of it to the frame's colour, then draws the instances into the
     /// top-left <paramref name="width"/> x <paramref name="height"/> pixels.
-    /// Copies a list to the GPU only when it changed since the last frame
-    /// drawn from it.  Icons and glyphs are drawn only when the frame names
-    /// the atlas views to sample, and names them on this renderer's set
+    /// Copies a list into <paramref name="instances"/> - which must be on this
+    /// renderer's set - only when it changed since the last frame drawn with
+    /// them.  Icons and glyphs are drawn only when the frame names the atlas
+    /// views to sample, and names them on this renderer's set
     /// (<see cref="NestedGpuFrame.LabelDevices"/>).  GPU commands only;
     /// nothing waits for the GPU here, and nothing is allocated.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public void Draw(ID3D11RenderTargetView target, int width, int height, NestedGpuFrame frame)
+    public void Draw(ID3D11RenderTargetView target, int width, int height, NestedGpuFrame frame, Instances instances)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!ReferenceEquals(instances.Devices, _devices))
+        {
+            throw new ArgumentException("The instance buffers belong to another graphics card's set.", nameof(instances));
+        }
+
         var context = _devices.Context;
         var uploadStarted = Stopwatch.GetTimestamp();
         UpdateConstants(context, width, height);
-        LastUploadBytes = _sceneBuffer.Upload(context, frame, frame.SceneRects, frame.SceneVersion)
-            + _labelBuffer.Upload(context, frame, frame.LabelRects, frame.LabelVersion)
-            + _iconBuffer.Upload(context, frame, frame.Icons, frame.LabelVersion)
-            + _glyphBuffer.Upload(context, frame, frame.Glyphs, frame.LabelVersion);
+        LastUploadBytes = instances.Scene.Upload(context, frame, frame.SceneRects, frame.SceneVersion)
+            + instances.Labels.Upload(context, frame, frame.LabelRects, frame.LabelVersion)
+            + instances.Icons.Upload(context, frame, frame.Icons, frame.LabelVersion)
+            + instances.Glyphs.Upload(context, frame, frame.Glyphs, frame.LabelVersion);
         LastUploadMilliseconds = Stopwatch.GetElapsedTime(uploadStarted).TotalMilliseconds;
 
         context.ClearRenderTargetView(target, ToColor4(frame.ClearColour));
@@ -229,13 +249,13 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
 
         if (scene > 0)
         {
-            context.IASetVertexBuffer(0, _sceneBuffer.Buffer, RectInstance.Size);
+            context.IASetVertexBuffer(0, instances.Scene.Buffer, RectInstance.Size);
             context.DrawInstanced(4, (uint)scene, 0, 0);
         }
 
         if (labels > 0)
         {
-            context.IASetVertexBuffer(0, _labelBuffer.Buffer, RectInstance.Size);
+            context.IASetVertexBuffer(0, instances.Labels.Buffer, RectInstance.Size);
             context.DrawInstanced(4, (uint)labels, 0, 0);
         }
 
@@ -252,7 +272,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
             context.PSSetShader(_iconPixelShader);
             context.PSSetShaderResource(0, frame.IconView!);
             context.PSSetSampler(0, _iconSampler);
-            context.IASetVertexBuffer(0, _iconBuffer.Buffer, IconInstance.Size);
+            context.IASetVertexBuffer(0, instances.Icons.Buffer, IconInstance.Size);
             context.DrawInstanced(4, (uint)icons, 0, 0);
         }
 
@@ -264,7 +284,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
             context.PSSetShader(_glyphPixelShader);
             context.PSSetShaderResource(1, frame.GlyphView!);
             context.PSSetSampler(1, _glyphSampler);
-            context.IASetVertexBuffer(0, _glyphBuffer.Buffer, GlyphQuadSize);
+            context.IASetVertexBuffer(0, instances.Glyphs.Buffer, GlyphQuadSize);
             context.DrawInstanced(4, (uint)glyphs, 0, 0);
         }
 
@@ -282,13 +302,15 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
     /// offscreen texture: every kind of rectangle, and an icon and a glyph
     /// from the atlas textures attached to the set when they are - makes the
     /// driver compile the pipelines now, on the warm-up thread, instead of
-    /// inside the first frame of a zoom.  The caller waits for the GPU (the
-    /// bootstrap does after every warm-up).
+    /// inside the first frame of a zoom.  Its instances go into small buffers
+    /// of its own, thrown away with it: no canvas draws with them.  The
+    /// caller waits for the GPU (the bootstrap does after every warm-up).
     /// </summary>
     public void WarmUp()
     {
         using var target = _devices.CreateOffscreenTarget(256, 256);
         using var frame = new NestedGpuFrame(64, 16, 16);
+        using var instances = new Instances(_devices, WarmUpInstances);
         var sink = new GpuSink();
         sink.Begin(frame.SceneRects, 256, 256, 0xFF111315);
         sink.Clear(0xFF111315);
@@ -327,9 +349,12 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
         }
 
         frame.LabelsChanged();
-        Draw(target.RenderTargetView, 256, 256, frame);
+        Draw(target.RenderTargetView, 256, 256, frame, instances);
         _devices.Context.Flush();
     }
+
+    /// <summary>Instances of each kind the warm-up's buffers hold: its frame has a handful.</summary>
+    private const int WarmUpInstances = 64;
 
     public void Dispose()
     {
@@ -344,10 +369,7 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
 
     private void DisposeParts()
     {
-        _glyphBuffer?.Dispose();
-        _iconBuffer?.Dispose();
-        _labelBuffer?.Dispose();
-        _sceneBuffer?.Dispose();
+        _ownInstances?.Dispose();
         _frameConstants?.Dispose();
         _rasterizer?.Dispose();
         _premultiplied?.Dispose();
@@ -414,12 +436,66 @@ internal sealed unsafe class NestedGpuRenderer : IDisposable
     }
 
     /// <summary>
+    /// The buffers one canvas's instances are copied into, on one card's set,
+    /// one per list: each keeps what it last held, so a present copies only
+    /// the lists that changed since this canvas's last present, whatever
+    /// another canvas on the card drew in between.  Grown by doubling as the
+    /// canvas's frames need, and made anew with the canvas's surface when the
+    /// card or the DPI changes.  Disposed by whoever made them.
+    /// </summary>
+    internal sealed class Instances : IDisposable
+    {
+        public Instances(GpuDeviceSet devices)
+            : this(devices, 0)
+        {
+        }
+
+        /// <summary>Buffers for <paramref name="initialInstances"/> instances of each kind to begin with; zero for the sizes a canvas starts at.</summary>
+        internal Instances(GpuDeviceSet devices, int initialInstances)
+        {
+            Devices = devices;
+            var device = devices.Device;
+            try
+            {
+                Scene = new InstanceBuffer(device, (initialInstances > 0 ? initialInstances : InitialSceneInstances) * RectInstance.Size);
+                Labels = new InstanceBuffer(device, (initialInstances > 0 ? initialInstances : InitialLabelInstances) * RectInstance.Size);
+                Icons = new InstanceBuffer(device, (initialInstances > 0 ? initialInstances : InitialIconInstances) * IconInstance.Size);
+                Glyphs = new InstanceBuffer(device, (initialInstances > 0 ? initialInstances : InitialGlyphInstances) * GlyphQuadSize);
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
+        }
+
+        /// <summary>The set the buffers were made on, and the only one they can be drawn with.</summary>
+        public GpuDeviceSet Devices { get; }
+
+        internal InstanceBuffer Scene { get; } = null!;
+
+        internal InstanceBuffer Labels { get; } = null!;
+
+        internal InstanceBuffer Icons { get; } = null!;
+
+        internal InstanceBuffer Glyphs { get; } = null!;
+
+        public void Dispose()
+        {
+            Glyphs?.Dispose();
+            Icons?.Dispose();
+            Labels?.Dispose();
+            Scene?.Dispose();
+        }
+    }
+
+    /// <summary>
     /// A dynamic vertex buffer holding one list's instances.  Rewritten whole
     /// (Map with WriteDiscard, so the GPU keeps reading the old copy while the
     /// new one is written) and only when the list was filled afresh; grown by
     /// doubling when a frame needs more, which is the only time it allocates.
     /// </summary>
-    private sealed class InstanceBuffer(ID3D11Device device, int initialBytes) : IDisposable
+    internal sealed class InstanceBuffer(ID3D11Device device, int initialBytes) : IDisposable
     {
         private object? _frame;
         private int _version = int.MinValue;

@@ -76,7 +76,7 @@ internal static partial class Program
 
             using var nested = new NestedTree();
             nested.Changes = hub;
-            tree.NestedChanges = nested;
+            tree.AddNestedChanges(nested);
             nested.SetRoots([new NestedRoot(root, "J", NestedFolderKind.Drive)]);
             var reads = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             nested.FolderLoaded += folder => reads[folder.FullPath] = reads.GetValueOrDefault(folder.FullPath) + 1;
