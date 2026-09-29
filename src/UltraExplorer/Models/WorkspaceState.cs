@@ -77,6 +77,29 @@ public sealed class WorkspaceState
     /// </summary>
     public List<string>? CanvasLayersOff { get; set; }
 
+    /// <summary>
+    /// Whether the nested canvas is split into two panes (see
+    /// <see cref="SplitLayout"/>).  Missing - a workspace written before
+    /// there was a split - it is not.
+    /// </summary>
+    public bool IsSplit { get; set; }
+
+    /// <summary>
+    /// "SideBySide" or "Stacked": how the two panes of a split view are laid
+    /// out.  Missing or not understood, side by side.
+    /// </summary>
+    public string? SplitOrientation { get; set; }
+
+    /// <summary>
+    /// The first pane's share of the room a split view has, from
+    /// <see cref="SplitLayout.MinimumRatio"/> to <see cref="SplitLayout.MaximumRatio"/>.
+    /// Missing, half; outside that, brought back inside it.
+    /// </summary>
+    public double SplitRatio { get; set; } = SplitLayout.DefaultRatio;
+
+    /// <summary>Which pane of a split view was being worked with: 0 the first, 1 the second.</summary>
+    public int ActivePane { get; set; }
+
     public static Controls.NestedLeftDrag ParseLeftDrag(string? setting) =>
         string.Equals(setting?.Trim(), "pan", StringComparison.OrdinalIgnoreCase)
             ? Controls.NestedLeftDrag.Pan

@@ -23,6 +23,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private static readonly string[] LayoutProperties =
         [nameof(IsNestedLayout), nameof(IsTreeLayout), nameof(CanShowMinimap), nameof(MinimapDescription)];
 
+    private static readonly string[] SplitProperties =
+        [nameof(IsSplit), nameof(IsSplitSideBySide), nameof(IsSplitStacked)];
+
     private static readonly string[] RendererProperties =
         [nameof(IsRendererAuto), nameof(IsRendererGpu), nameof(IsRendererCpu), nameof(CanChooseRenderer), nameof(RendererDescription)];
 
@@ -116,6 +119,40 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             {
                 _main.Layout = CanvasLayout.Tree;
             }
+        }
+    }
+
+    /// <summary>
+    /// The split view: two panes of the nested canvas, each at its own place
+    /// on the disk - the very switch Ctrl+\, the command bar's split button
+    /// and Canvas options turn.  Not in a file dialog, which never splits.
+    /// </summary>
+    public bool IsSplit
+    {
+        get => _main.IsSplit;
+        set => _main.IsSplit = value;
+    }
+
+    /// <summary>The panes side by side; choosing it splits the view if it is not.</summary>
+    public bool IsSplitSideBySide
+    {
+        get => _main.SplitOrientation == SplitOrientation.SideBySide;
+        set => ChooseSplit(value, SplitOrientation.SideBySide);
+    }
+
+    /// <summary>The panes one above the other; choosing it splits the view if it is not.</summary>
+    public bool IsSplitStacked
+    {
+        get => _main.SplitOrientation == SplitOrientation.Stacked;
+        set => ChooseSplit(value, SplitOrientation.Stacked);
+    }
+
+    private void ChooseSplit(bool chosen, SplitOrientation orientation)
+    {
+        if (chosen && CanChooseLayout)
+        {
+            _main.SplitOrientation = orientation;
+            _main.IsSplit = true;
         }
     }
 
@@ -546,6 +583,10 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             case nameof(MainViewModel.IsTreeLayout):
                 Raise(LayoutProperties);
                 RefreshRendererStatus();
+                break;
+            case nameof(MainViewModel.IsSplit):
+            case nameof(MainViewModel.SplitOrientation):
+                Raise(SplitProperties);
                 break;
             case nameof(MainViewModel.Renderer):
                 Raise(RendererProperties);

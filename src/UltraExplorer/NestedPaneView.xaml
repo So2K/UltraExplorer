@@ -57,7 +57,7 @@
     </UserControl.Resources>
 
     <!-- One pane of the nested canvas: a header saying where the pane is
-         (reserved for a split view, and collapsed while the window has one
+         (shown in a split view, and collapsed while the window has one
          pane), the strip that narrows it to names and orders it like
          Explorer's column headers, and the canvas itself.  Only the parts:
          what they do is NestedPane's. -->
@@ -68,9 +68,44 @@
             <RowDefinition Height="*" />
         </Grid.RowDefinitions>
 
+        <!-- Where the pane is, like the path bar over each pane of Houdini's
+             network editor: the folder in view as a short trail.  The pane
+             being worked with has a line of the accent along its top edge -
+             above the canvas, never on it, so nothing the canvas draws
+             changes. -->
         <Border x:Name="PaneHeader"
                 Grid.Row="0"
-                Visibility="Collapsed" />
+                Visibility="Collapsed"
+                Background="{StaticResource WindowBrush}"
+                BorderBrush="{StaticResource BorderBrush}"
+                BorderThickness="0,0,0,1">
+            <DockPanel>
+                <Border x:Name="PaneAccent"
+                        DockPanel.Dock="Top"
+                        Height="2"
+                        Background="Transparent" />
+                <Grid Height="24" Margin="10,0">
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="*" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock x:Name="PaneGlyph"
+                               Text="&#xE8B7;"
+                               Style="{StaticResource IconText}"
+                               FontSize="12"
+                               Foreground="{StaticResource FolderBrush}"
+                               Margin="0,0,8,0" />
+                    <TextBlock x:Name="PaneLocation"
+                               Grid.Column="1"
+                               Text="This PC"
+                               FontSize="12"
+                               Foreground="{StaticResource TextDimBrush}"
+                               TextTrimming="CharacterEllipsis"
+                               VerticalAlignment="Center"
+                               AutomationProperties.Name="Where the pane is" />
+                </Grid>
+            </DockPanel>
+        </Border>
 
         <Border x:Name="NestedStrip"
                 Grid.Row="1"

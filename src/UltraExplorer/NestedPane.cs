@@ -31,6 +31,13 @@ internal interface INestedPaneHost
     /// <summary>Whether <paramref name="pane"/> is the pane being worked with, which the window-wide chrome follows.</summary>
     bool IsActivePane(NestedPane pane);
 
+    /// <summary>
+    /// <paramref name="pane"/> becomes the pane being worked with - it was
+    /// clicked, or took the keyboard - and the window's selection, history
+    /// and chrome follow it.  Nothing if it already is.
+    /// </summary>
+    void ActivatePane(NestedPane pane);
+
     /// <summary>A slice of a tree's background pass, run a frame at a time behind the frames of every pane.</summary>
     void PostSortSlice(Action slice);
 
@@ -91,6 +98,14 @@ internal interface INestedPaneHost
 /// result) is mirrored back onto the canvas and flown to.  So the pictures
 /// are views of one selection, and every command works in each.</para>
 ///
+/// <para>In a split view that one selection is the pane being worked with's.
+/// The other pane keeps its own (<see cref="KeptSelection"/>), shown on its
+/// canvas, and the two change places when the other pane is clicked
+/// (<see cref="Activate"/>, <see cref="Deactivate"/>): every command, the
+/// address bar, the list and the status bar then follow that pane without
+/// knowing there are two.  So does Back and Forward, each pane having its
+/// own <see cref="History"/>.</para>
+///
 /// <para>What is the window's and not one pane's it asks the window for
 /// (<see cref="INestedPaneHost"/>).  A window has one pane until its view
 /// is split, and only then makes a second: one pane costs exactly what the
@@ -114,10 +129,26 @@ internal sealed class NestedPane
     private DispatcherTimer? _saveTimer;
     private DispatcherTimer? _beaconTimer;
     private DispatcherTimer? _filterTimer;
+    private DispatcherTimer? _headerTimer;
     private bool _cameraRestored;
 
     /// <summary>Set while a gesture on this pane's canvas is being applied to the shared selection, so its echo is not loaded back.</summary>
     private bool _applyingCanvasSelection;
+
+    /// <summary>Set while the shared selection is copied into <see cref="KeptSelection"/>, which the canvas already shows.</summary>
+    private bool _keepingSelection;
+
+    /// <summary>Set while the shared selection takes what this pane kept (<see cref="Activate"/>), which the canvas already shows.</summary>
+    private bool _activating;
+
+    /// <summary>The second pane's camera to start from: where it was last time, or where the first pane is (see <see cref="StartAt"/>).</summary>
+    private NestedCameraState? _startCamera;
+
+    /// <summary>The folder the header last named, so a camera that moves within it changes nothing.</summary>
+    private string? _headerPath = string.Empty;
+
+    /// <summary>The selection the sort folder was last worked out from: the shared one or the kept one, whose versions are counted apart.</summary>
+    private ItemSelection? _sortSelection;
 
     private long _sortSelectionVersion = -1;
 
@@ -135,12 +166,16 @@ internal sealed class NestedPane
     /// The inbox the Shell's icons for this pane arrive in: the icon
     /// service's own for the first pane, one of its own for any other.
     /// </param>
-    public NestedPane(INestedPaneHost host, MainViewModel viewModel, NestedPaneView view, FrameInbox<IconArrival> iconInbox)
+    /// <param name="index">0 for the first pane, 1 for the second of a split view: which of the workspace's cameras is the pane's.</param>
+    /// <param name="history">Where the pane has been: the window's own for the first pane, a new one for the second.</param>
+    public NestedPane(INestedPaneHost host, MainViewModel viewModel, NestedPaneView view, FrameInbox<IconArrival> iconInbox, int index = 0, NavigationHistory? history = null)
     {
         _host = host;
         _viewModel = viewModel;
         _iconInbox = iconInbox;
         View = view;
+        Index = index;
+        History = history ?? new NavigationHistory();
     }
 
     /// <summary>The pane's parts: the header, the strip and the canvas.</summary>
@@ -151,6 +186,35 @@ internal sealed class NestedPane
 
     /// <summary>The folders this pane's canvas draws, read for it alone.</summary>
     public NestedTree Tree { get; } = new();
+
+    /// <summary>0 for the first pane, 1 for the second of a split view.</summary>
+    public int Index { get; }
+
+    /// <summary>Where this pane has been, for Back and Forward while it is the pane being worked with.</summary>
+    public NavigationHistory History { get; }
+
+    /// <summary>
+    /// What this pane has selected while another pane is being worked with:
+    /// its canvas shows it, and the window's selection takes it back when
+    /// the pane is activated.  Stale - not looked at - while the pane is the
+    /// one being worked with, whose selection is the window's.
+    /// </summary>
+    public ItemSelection KeptSelection { get; } = new();
+
+    /// <summary>This pane's selection: the window's while it is the pane being worked with, its kept one otherwise.</summary>
+    public ItemSelection Selection => IsActive ? _viewModel.Tree.Selection : KeptSelection;
+
+    /// <summary>Whether this is the pane being worked with.</summary>
+    public bool IsActive => _host.IsActivePane(this);
+
+    /// <summary>
+    /// The path this pane is at: the window's active path while it is the
+    /// pane being worked with; otherwise what it keeps in focus, or the one
+    /// thing it has selected, or the folder in view.
+    /// </summary>
+    public string? FocusPath => IsActive
+        ? _viewModel.Tree.ActivePath is { Length: > 0 } active ? active : null
+        : KeptSelection.Focus ?? (KeptSelection.Count > 0 ? KeptSelection.Paths[0] : null) ?? Canvas.FolderInView?.FullPath;
 
     /// <summary>Set once the pane has its drives, orders and hidden rules: until then it has nothing to show and gathers nothing.</summary>
     public bool IsReady { get; private set; }
@@ -200,6 +264,13 @@ internal sealed class NestedPane
             header.Click += OnSortHeaderClick;
         }
 
+        // Clicked anywhere - the canvas, its strip, its header - or given the
+        // keyboard, the pane is the one being worked with.  On the way down,
+        // so the canvas's own press already acts on the pane's selection.
+        View.PreviewMouseDown += OnViewPreviewMouseDown;
+        View.IsKeyboardFocusWithinChanged += OnViewKeyboardFocusWithinChanged;
+        KeptSelection.Changed += OnKeptSelectionChanged;
+
         _filterTimer = new DispatcherTimer(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(140) };
         _filterTimer.Tick += (_, _) =>
         {
@@ -213,6 +284,16 @@ internal sealed class NestedPane
             _saveTimer.Stop();
             KeptCamera = Canvas.CaptureCamera() ?? KeptCamera;
             _viewModel.Tree.ScheduleSave();
+        };
+
+        // The header names the folder in view as the last picture has it, so
+        // it is brought up to date once the camera has come to rest and the
+        // picture has been drawn, not on the move.
+        _headerTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(120) };
+        _headerTimer.Tick += (_, _) =>
+        {
+            _headerTimer.Stop();
+            UpdateHeader();
         };
 
         _beaconTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(120) };
@@ -231,6 +312,11 @@ internal sealed class NestedPane
         _saveTimer?.Stop();
         _beaconTimer?.Stop();
         _filterTimer?.Stop();
+        _headerTimer?.Stop();
+        View.PreviewMouseDown -= OnViewPreviewMouseDown;
+        View.IsKeyboardFocusWithinChanged -= OnViewKeyboardFocusWithinChanged;
+        KeptSelection.Changed -= OnKeptSelectionChanged;
+        _viewModel.Tree.RemoveKeptSelection(KeptSelection);
         Tree.FolderLoaded -= OnFolderLoadedForIcons;
         Canvas.IconArrivals = null;
         _viewModel.Icons.UnsubscribeCanvas(_iconInbox);
@@ -262,10 +348,17 @@ internal sealed class NestedPane
     /// camera goes back to where it was, or to the selection.  Deferred to
     /// after layout, so the view is framed for the size it really has.
     /// </summary>
-    public void Enter(bool fromStartup)
+    /// <param name="focus">Whether the keyboard goes to the pane: to the one being worked with, not to the other of a split.</param>
+    /// <param name="fly">
+    /// Whether a pane whose camera is back already goes to its selection: the
+    /// one being worked with does, as it always has, while the other of a
+    /// split view stays where it was left.
+    /// </param>
+    public void Enter(bool fromStartup, bool focus = true, bool fly = true)
     {
         SyncSelection();
         RebuildBeacons();
+        UpdateHeader();
         Dispatcher.InvokeAsync(() =>
         {
             Canvas.UpdateLayout();
@@ -276,25 +369,85 @@ internal sealed class NestedPane
                 _cameraRestored = true;
                 _ = Canvas.RestoreCameraAsync(camera);
             }
-            else if (!string.IsNullOrEmpty(_viewModel.Tree.ActivePath))
+            else if (fly && FocusPath is { Length: > 0 } path)
             {
-                _ = FlyToAsync(_viewModel.Tree.ActivePath, gentle: !fromStartup, animated: false);
+                _ = FlyToAsync(path, gentle: !fromStartup, animated: false);
+            }
+            else if (!_cameraRestored && FocusPath is { Length: > 0 } place)
+            {
+                // A pane that stays where it is left still has to be somewhere
+                // the first time: at its selection.
+                _cameraRestored = true;
+                _ = FlyToAsync(place, gentle: false, animated: false);
             }
 
-            _host.FocusCanvas(this);
+            if (focus)
+            {
+                _host.FocusCanvas(this);
+            }
         }, DispatcherPriority.Loaded);
+    }
+
+    /// <summary>
+    /// Where the second pane of a split view starts, before it is first
+    /// entered: the camera it goes to - where it was last time, or where the
+    /// first pane is - and what it has selected: what it had selected last
+    /// time, or only a place, <paramref name="focus"/>.  The pane is not the
+    /// one being worked with; its selection is kept (see <see cref="Deactivate"/>).
+    /// </summary>
+    public void StartAt(NestedCameraState? camera, IReadOnlyList<SelectionItem> selected, string? focus)
+    {
+        _startCamera = camera;
+        _cameraRestored = false;
+        _keepingSelection = true;
+        try
+        {
+            KeptSelection.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Added = selected,
+                Anchor = focus,
+                Focus = focus,
+                Source = SelectionSource.Navigation
+            });
+        }
+        finally
+        {
+            _keepingSelection = false;
+        }
+
+        _viewModel.Tree.AddKeptSelection(KeptSelection);
+        if (focus is { Length: > 0 })
+        {
+            History.Record(focus);
+        }
     }
 
     // ---- the camera -------------------------------------------------------------
 
-    /// <summary>Where the last session left this pane's camera, if anywhere.</summary>
-    private NestedCameraState? RestoredCamera => _viewModel.Tree.RestoredNestedCamera;
+    /// <summary>
+    /// Where the last session left this pane's camera, if anywhere: the
+    /// workspace's for the first pane; for the second, where it was told to
+    /// start (<see cref="StartAt"/>).
+    /// </summary>
+    private NestedCameraState? RestoredCamera => Index == 0 ? _viewModel.Tree.RestoredNestedCamera : _startCamera;
 
     /// <summary>This pane's camera as the canvas workspace keeps it, for the next session.</summary>
     private NestedCameraState? KeptCamera
     {
-        get => _viewModel.Tree.NestedCamera;
-        set => _viewModel.Tree.NestedCamera = value;
+        get => Index == 0 ? _viewModel.Tree.NestedCamera : _viewModel.Tree.SecondPane?.NestedCamera;
+        set
+        {
+            var tree = _viewModel.Tree;
+            if (Index == 0)
+            {
+                tree.NestedCamera = value;
+            }
+            else
+            {
+                tree.SecondPane = (tree.SecondPane ?? new NestedPaneState(null, null)) with { NestedCamera = value };
+            }
+        }
     }
 
     /// <summary>The camera as it is now, kept for the next session: the window is being closed.</summary>
@@ -315,8 +468,77 @@ internal sealed class NestedPane
 
         // With nothing selected, the headers are for the folder in view.
         UpdateSortHeaders();
+        ScheduleHeader();
         _saveTimer?.Stop();
         _saveTimer?.Start();
+    }
+
+    // ---- the header ---------------------------------------------------------------
+
+    /// <summary>
+    /// The pane's header names the folder in view, as a short trail, while
+    /// the view is split; nothing is worked out while the header is hidden.
+    /// Asked after every move of the camera, it changes the words only when
+    /// the folder does.
+    /// </summary>
+    public void UpdateHeader()
+    {
+        if (View.PaneHeader.Visibility != Visibility.Visible)
+        {
+            _headerPath = string.Empty;
+            return;
+        }
+
+        var path = Canvas.FolderInView?.FullPath;
+        if (string.Equals(path, _headerPath, StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        _headerPath = path;
+        View.ShowLocation(ShortLocation(path), path ?? "This PC");
+    }
+
+    /// <summary>The header brought up to date a moment from now, once the picture it names has been drawn; nothing while it is hidden.</summary>
+    public void ScheduleHeader()
+    {
+        if (View.PaneHeader.Visibility == Visibility.Visible)
+        {
+            _headerTimer?.Stop();
+            _headerTimer?.Start();
+        }
+    }
+
+    /// <summary>
+    /// A folder as the pane's header names it: each step of its path, the
+    /// drive first - "C: › Users › Me" - and for a deep one the drive and
+    /// the last three, the rest an ellipsis, so the folder itself is never
+    /// what is cut off.  This PC for none.
+    /// </summary>
+    internal static string ShortLocation(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return "This PC";
+        }
+
+        IReadOnlyList<string> chain;
+        try
+        {
+            chain = ViewAllPath.AncestorChain(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return path;
+        }
+
+        var names = chain.Select(step => MainWindow.FolderName(step).TrimEnd(Path.DirectorySeparatorChar)).ToList();
+        if (names.Count > 4)
+        {
+            names = [names[0], "…", .. names[^3..]];
+        }
+
+        return string.Join("  ›  ", names);
     }
 
     /// <summary>
@@ -373,17 +595,24 @@ internal sealed class NestedPane
     // The canvas's gestures reach the shared selection as edits, and every
     // other change reaches the canvas: see MainWindow.Selection.cs.
 
-    /// <summary>The shared selection, shown on the canvas as it is now.</summary>
-    public void SyncSelection() => Canvas.LoadSelection(_viewModel.Tree.Selection);
+    /// <summary>The pane's selection, shown on the canvas as it is now - unless it is the one the canvas already shows being handed over.</summary>
+    public void SyncSelection()
+    {
+        if (!_activating)
+        {
+            Canvas.LoadSelection(Selection);
+        }
+    }
 
     /// <summary>
-    /// A gesture on the canvas: applied to the shared selection in the same
-    /// call, so a drag or a menu straight after it already acts on it, and
-    /// the version it made noted as the canvas's own.
+    /// A gesture on the canvas: applied to the pane's selection - the shared
+    /// one, the pane being the one worked with - in the same call, so a drag
+    /// or a menu straight after it already acts on it, and the version it
+    /// made noted as the canvas's own.
     /// </summary>
     private void OnSelectionCommitted(SelectionEdit edit)
     {
-        var selection = _viewModel.Tree.Selection;
+        var selection = Selection;
         _applyingCanvasSelection = true;
         try
         {
@@ -406,6 +635,104 @@ internal sealed class NestedPane
         if (!_applyingCanvasSelection && IsNested && IsReady)
         {
             Canvas.LoadSelection(selection);
+        }
+    }
+
+    /// <summary>
+    /// The selection this pane keeps while another is being worked with
+    /// changed - something in it was deleted, moved away or renamed: its
+    /// canvas and headers follow, as the pane being worked with's follow the
+    /// shared one.
+    /// </summary>
+    private void OnKeptSelectionChanged(ItemSelection kept)
+    {
+        if (_keepingSelection || IsActive)
+        {
+            return;
+        }
+
+        UpdateSortHeaders();
+        if (!_applyingCanvasSelection && IsNested && IsReady)
+        {
+            Canvas.LoadSelection(kept);
+        }
+
+        ScheduleBeacons();
+    }
+
+    /// <summary>
+    /// Another pane is to be worked with: what the window's selection holds
+    /// is this pane's, and is kept (<see cref="KeptSelection"/>) - the canvas
+    /// already shows it, and is told it holds the kept copy - and followed
+    /// through deletes and renames while it waits.
+    /// </summary>
+    public void Deactivate()
+    {
+        var shared = _viewModel.Tree.Selection;
+        _keepingSelection = true;
+        try
+        {
+            KeptSelection.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Added = [.. shared.Items],
+                Anchor = shared.Anchor,
+                Focus = shared.Focus ?? FocusPath,
+                Source = SelectionSource.Navigation
+            });
+        }
+        finally
+        {
+            _keepingSelection = false;
+        }
+
+        Canvas.AcknowledgeSelection(KeptSelection.Version);
+        _viewModel.Tree.AddKeptSelection(KeptSelection);
+    }
+
+    /// <summary>
+    /// This pane is to be worked with: the window's selection takes what the
+    /// pane kept, which its canvas already shows, not as a step for Back and
+    /// Forward.  With nothing selected, the pane's place is the folder it has
+    /// in view, which the address bar and the list go to - without selecting
+    /// it.  Called with the window's active pane already this one.
+    /// </summary>
+    public void Activate()
+    {
+        _viewModel.Tree.RemoveKeptSelection(KeptSelection);
+        var kept = KeptSelection;
+        var focus = kept.Count > 0 ? kept.Focus : Canvas.FolderInView?.FullPath ?? kept.Focus;
+        var shared = _viewModel.Tree.Selection;
+        _activating = true;
+        _applyingCanvasSelection = true;
+        try
+        {
+            shared.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Added = [.. kept.Items],
+                Anchor = kept.Anchor ?? focus,
+                Focus = focus,
+                RecordsNavigation = false,
+                Source = SelectionSource.Navigation
+            });
+        }
+        finally
+        {
+            _applyingCanvasSelection = false;
+            _activating = false;
+        }
+
+        Canvas.AcknowledgeSelection(shared.Version);
+    }
+
+    private void OnViewPreviewMouseDown(object sender, MouseButtonEventArgs e) => _host.ActivatePane(this);
+
+    private void OnViewKeyboardFocusWithinChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        if (e.NewValue is true)
+        {
+            _host.ActivatePane(this);
         }
     }
 
@@ -556,10 +883,12 @@ internal sealed class NestedPane
     public string? SortFolder()
     {
         // Worked out once per change of the selection: this is asked after
-        // every move of the camera.
-        var selection = _viewModel.Tree.Selection;
-        if (selection.Version != _sortSelectionVersion)
+        // every move of the camera.  The pane's own - the shared one or the
+        // one it keeps, whose versions are counted apart.
+        var selection = Selection;
+        if (selection.Version != _sortSelectionVersion || !ReferenceEquals(selection, _sortSelection))
         {
+            _sortSelection = selection;
             _sortSelectionVersion = selection.Version;
             _sortSelectionFolder = null;
             if (selection.Count > 0)
@@ -736,9 +1065,17 @@ internal sealed class NestedPane
             }
         }
 
-        if (_viewModel.Tree.ActiveNode is { } active)
+        // The pane's own focus: the window's while it is being worked with.
+        if (IsActive)
         {
-            Add(active.FullPath, NestedBeaconKind.Active, ActiveBeaconColour, active.DisplayName);
+            if (_viewModel.Tree.ActiveNode is { } active)
+            {
+                Add(active.FullPath, NestedBeaconKind.Active, ActiveBeaconColour, active.DisplayName);
+            }
+        }
+        else if (KeptSelection.Focus is { } focus)
+        {
+            Add(focus, NestedBeaconKind.Active, ActiveBeaconColour, LeafName(focus));
         }
 
         Canvas.SetBeacons([.. beacons.Select(pair => new NestedBeacon(pair.Key, pair.Value.Kind, pair.Value.Colour, pair.Value.Label, pair.Value.Note))]);
@@ -907,7 +1244,7 @@ internal sealed class NestedPane
     /// <summary>What a drag of <paramref name="path"/> carries: the whole selection if it is part of it, else the item alone.</summary>
     private string[] DragPaths(string path)
     {
-        var selection = _viewModel.Tree.Selection;
+        var selection = Selection;
         return selection.Count > 1 && selection.Contains(path) ? [.. selection.Paths] : [path];
     }
 

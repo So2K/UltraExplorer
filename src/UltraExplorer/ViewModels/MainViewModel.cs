@@ -39,7 +39,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly WorkspaceStore _workspaceStore = new();
     private readonly FolderMarkService _marks = new();
     private readonly FileSystemService _fileSystemService;
-    private readonly List<string> _navigationHistory = [];
+
+    /// <summary>Where the pane being worked with has been (see <see cref="History"/>).</summary>
+    private NavigationHistory _history = new();
 
     /// <summary>
     /// How the window hears of changes on disk: one hub for every view, with
@@ -48,7 +50,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// </summary>
     private readonly ChangeHub _changes = new(TimeProvider.System);
 
-    private int _navigationIndex = -1;
     private bool _isInitialized;
 
     /// <summary>
@@ -73,6 +74,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private Controls.NestedLeftDrag _leftDrag = Controls.NestedLeftDrag.SelectArea;
     private bool _leftDragHintShown;
     private CanvasLayer _layers = CanvasLayer.All;
+    private bool _isSplit;
+    private SplitOrientation _splitOrientation = SplitOrientation.SideBySide;
+    private double _splitRatio = SplitLayout.DefaultRatio;
+    private int _activePaneIndex;
     private readonly bool _isPickerSession;
     private string? _dialogTitle;
 
@@ -431,6 +436,90 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether the nested canvas is split into two panes, each a whole canvas
+    /// at its own place on the disk, with its own camera, selection, filter
+    /// and history.  Off until the user splits it; a file dialog never does.
+    /// Splitting from the tree canvas goes to the nested one first: the tree
+    /// is never split.  Remembered with the workspace.
+    /// </summary>
+    public bool IsSplit
+    {
+        get => _isSplit;
+        set
+        {
+            if (_isPickerSession || _isSplit == value)
+            {
+                return;
+            }
+
+            // The picture first, so the panes open onto a canvas on screen.
+            if (value && IsTreeLayout)
+            {
+                Layout = CanvasLayout.Nested;
+            }
+
+            _isSplit = value;
+            OnPropertyChanged();
+            _ = SaveNowAsync();
+        }
+    }
+
+    /// <summary>How the two panes of a split view are laid out: side by side (the default) or one above the other.</summary>
+    public SplitOrientation SplitOrientation
+    {
+        get => _splitOrientation;
+        set
+        {
+            if (!_isPickerSession && SetProperty(ref _splitOrientation, value))
+            {
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// The first pane's share of the room, as the divider between the panes
+    /// was left - kept between <see cref="SplitLayout.MinimumRatio"/> and
+    /// <see cref="SplitLayout.MaximumRatio"/>.
+    /// </summary>
+    public double SplitRatio
+    {
+        get => _splitRatio;
+        set
+        {
+            var ratio = SplitLayout.ClampRatio(value);
+            if (!_isPickerSession && Math.Abs(ratio - _splitRatio) > 0.0005)
+            {
+                _splitRatio = ratio;
+                OnPropertyChanged();
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Which pane of a split view is being worked with - 0 the first, 1 the
+    /// second - as the window says.  Written with the rest of the workspace,
+    /// not on every click between the panes.
+    /// </summary>
+    public int ActivePaneIndex
+    {
+        get => _activePaneIndex;
+        set => SetProperty(ref _activePaneIndex, value is 1 ? 1 : 0);
+    }
+
+    /// <summary>
+    /// Where the pane being worked with has been, which Back and Forward step
+    /// through and the address bar offers.  Each pane of a split view has its
+    /// own, and the window hands over the one of the pane it activates.
+    /// </summary>
+    internal NavigationHistory History
+    {
+        get => _history;
+        set => _history = value ?? new NavigationHistory();
+    }
+
     /// <summary>The zoom shown on the canvas controls, from whichever canvas is showing.</summary>
     public string ZoomLabel => IsNestedLayout ? _nestedZoomLabel : Tree.ZoomLabel;
 
@@ -613,6 +702,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _leftDragHintShown = state.NestedLeftDragHintShown;
             _layers = CanvasLayers.Parse(state.CanvasLayersOff);
 
+            // A file dialog shows the tree and never splits, and writes back
+            // whatever the file says (see SaveNowAsync).
+            if (!_isPickerSession)
+            {
+                _isSplit = state.IsSplit;
+                _splitOrientation = SplitLayout.ParseOrientation(state.SplitOrientation);
+                _splitRatio = SplitLayout.ClampRatio(state.SplitRatio);
+                _activePaneIndex = state.IsSplit && state.ActivePane == 1 ? 1 : 0;
+            }
+
             // Handed to the tree before it builds its first layout, so the
             // drives open already in the remembered orders.  A file dialog
             // starts from names from A in every folder, but reads its grids
@@ -712,6 +811,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         // way; and what only feeds its hidden editor waits until it is shown.
         Tree.PreferLightReveal = IsNestedLayout;
         Tree.IsCanvasShown = IsTreeLayout;
+        Tree.RestoresSecondPane = _isSplit;
         await Tree.InitializeAsync(initialPath);
         Address.SetPath(Tree.ActivePath);
         UpdateSidebarSelection();
@@ -806,6 +906,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var leftDrag = WorkspaceState.LeftDragSetting(_leftDrag);
         var hintShown = _leftDragHintShown;
         var layersOff = CanvasLayers.OffSetting(_layers);
+        var isSplit = _isSplit;
+        string? orientation = SplitLayout.OrientationSetting(_splitOrientation);
+        var ratio = _splitRatio;
+        var activePane = _isSplit ? _activePaneIndex : 0;
 
         // A file dialog's hidden items are its caller's rules, not a choice.
         var showHidden = !_isPickerSession && Tree.ShowHiddenItems;
@@ -821,6 +925,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             hintShown = current.NestedLeftDragHintShown;
             layersOff = current.CanvasLayersOff;
             showHidden = current.ShowHiddenItems;
+            isSplit = current.IsSplit;
+            orientation = current.SplitOrientation;
+            ratio = current.SplitRatio;
+            activePane = current.ActivePane;
         }
 
         var state = new WorkspaceState
@@ -838,6 +946,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             NestedLeftDrag = leftDrag,
             NestedLeftDragHintShown = hintShown,
             CanvasLayersOff = layersOff,
+            IsSplit = isSplit,
+            SplitOrientation = orientation,
+            SplitRatio = ratio,
+            ActivePane = activePane,
             Favorites = QuickAccess
                 .Where(favorite => favorite.IsCustom)
                 .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))
@@ -936,21 +1048,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// Where this window has already been, newest first and each place once.
     /// The address bar offers these when there is nothing typed to work from.
     /// </summary>
-    private IReadOnlyList<string> RecentLocations()
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var recent = new List<string>();
-        for (var index = _navigationHistory.Count - 1; index >= 0; index--)
-        {
-            var path = _navigationHistory[index];
-            if (!string.IsNullOrWhiteSpace(path) && seen.Add(path))
-            {
-                recent.Add(path);
-            }
-        }
-
-        return recent;
-    }
+    private IReadOnlyList<string> RecentLocations() => _history.Recent();
 
     private void UpdateSidebarSelection()
     {
@@ -963,54 +1061,22 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void RecordNavigation(string path)
-    {
-        if (string.IsNullOrWhiteSpace(path))
-        {
-            return;
-        }
-
-        if (_navigationIndex >= 0
-            && _navigationIndex < _navigationHistory.Count
-            && ViewAllPath.Equals(_navigationHistory[_navigationIndex], path))
-        {
-            return;
-        }
-
-        if (_navigationIndex < _navigationHistory.Count - 1)
-        {
-            _navigationHistory.RemoveRange(_navigationIndex + 1, _navigationHistory.Count - _navigationIndex - 1);
-        }
-
-        _navigationHistory.Add(path);
-        if (_navigationHistory.Count > 100)
-        {
-            _navigationHistory.RemoveAt(0);
-        }
-
-        _navigationIndex = _navigationHistory.Count - 1;
-    }
+    private void RecordNavigation(string path) => _history.Record(path);
 
     private void GoBack()
     {
-        if (_navigationIndex <= 0)
+        if (_history.Back() is { } path)
         {
-            return;
+            _ = NavigateHistoryAsync(path);
         }
-
-        _navigationIndex--;
-        _ = NavigateHistoryAsync(_navigationHistory[_navigationIndex]);
     }
 
     private void GoForward()
     {
-        if (_navigationIndex >= _navigationHistory.Count - 1)
+        if (_history.Forward() is { } path)
         {
-            return;
+            _ = NavigateHistoryAsync(path);
         }
-
-        _navigationIndex++;
-        _ = NavigateHistoryAsync(_navigationHistory[_navigationIndex]);
     }
 
     /// <summary>
@@ -1207,8 +1273,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             await _shellService.CopyOrMoveAsync(safePaths, targetDirectory, move);
             if (move)
             {
-                // Moved away: nothing that was selected there is any more.
-                Tree.Selection.Remove(safePaths, SelectionSource.Command);
+                // Moved away: nothing that was selected there is any more, in
+                // whichever pane it was selected.
+                Tree.ForgetSelected(safePaths);
             }
 
             await Tree.RefreshPathAsync(targetDirectory);
@@ -1352,9 +1419,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Toast.ShowBusy(permanently ? "Deleting permanently…" : "Moving to Recycle Bin…");
             await _shellService.DeleteAsync(paths, permanently);
 
-            // Let go of explicitly: a folder the nested canvas selected in
-            // need not have a node for its refresh to prune.
-            Tree.Selection.Remove(paths, SelectionSource.Command);
+            // Let go of explicitly, in every pane: a folder the nested canvas
+            // selected in need not have a node for its refresh to prune.
+            Tree.ForgetSelected(paths);
             foreach (var parent in parents)
             {
                 await Tree.RefreshPathAsync(parent!);

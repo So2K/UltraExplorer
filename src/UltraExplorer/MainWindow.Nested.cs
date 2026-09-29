@@ -80,11 +80,12 @@ public partial class MainWindow : INestedPaneHost
     {
         // The first pane takes the icon service's own inbox; a pane made
         // later has one of its own (ShellIconService.SubscribeCanvas).
-        var first = new NestedPane(this, _viewModel, FirstPaneView, _viewModel.Icons.CanvasArrivals);
+        var first = new NestedPane(this, _viewModel, FirstPaneView, _viewModel.Icons.CanvasArrivals, index: 0, history: _viewModel.History);
         _panes.Add(first);
         ActivePane = first;
         first.Attach();
         AttachDevices();
+        AttachSplit();
 
         _viewModel.PropertyChanged += OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
@@ -102,6 +103,7 @@ public partial class MainWindow : INestedPaneHost
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged -= OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged -= OnMarkChangedForNested;
+        DetachSplit();
         foreach (var pane in _panes)
         {
             pane.Detach();
@@ -229,6 +231,9 @@ public partial class MainWindow : INestedPaneHost
 
         SyncNestedSelection();
         _nestedReady = true;
+
+        // The split the last session left, before any pane is entered.
+        RestoreSplit();
         _viewModel.NestedZoomLabel = ActivePane.Canvas.ZoomText;
         if (IsNested)
         {
@@ -241,13 +246,24 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>
     /// The nested canvas coming into view, at startup or from the tree: the
     /// pane being worked with takes the selection in, gathers its marks and
-    /// goes back to where it was (see <see cref="NestedPane.Enter"/>).
+    /// goes back to where it was (see <see cref="NestedPane.Enter"/>), with
+    /// the keyboard.  The other pane of a split view shows what it keeps and
+    /// goes back to its camera the first time, and otherwise stays where it
+    /// was left.
     /// </summary>
     private void EnterNested(bool fromStartup)
     {
         if (!_nestedReady)
         {
             return;
+        }
+
+        foreach (var pane in _panes)
+        {
+            if (!ReferenceEquals(pane, ActivePane))
+            {
+                pane.Enter(fromStartup, focus: false, fly: false);
+            }
         }
 
         ActivePane.Enter(fromStartup);

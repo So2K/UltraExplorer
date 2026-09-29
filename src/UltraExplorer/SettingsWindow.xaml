@@ -306,6 +306,32 @@
                     </Border>
                 </controls:SettingCard>
 
+                <controls:SettingCard Glyph="&#xF57C;"
+                                      Header="Split view"
+                                      Description="Two panes of the nested canvas, each at its own place on the disk. Ctrl+\ splits and unsplits, F6 goes to the other pane.">
+                    <StackPanel Orientation="Horizontal">
+                        <Border Style="{StaticResource SegmentGroup}" Margin="0,0,14,0" IsEnabled="{Binding CanChooseLayout}">
+                            <StackPanel Orientation="Horizontal">
+                                <RadioButton x:Name="SplitSideBySideChoice"
+                                             Style="{StaticResource SegmentRadio}"
+                                             GroupName="SplitOrientation"
+                                             Content="Side by side"
+                                             IsChecked="{Binding IsSplitSideBySide}" />
+                                <RadioButton x:Name="SplitStackedChoice"
+                                             Style="{StaticResource SegmentRadio}"
+                                             GroupName="SplitOrientation"
+                                             Content="Stacked"
+                                             IsChecked="{Binding IsSplitStacked}" />
+                            </StackPanel>
+                        </Border>
+                        <CheckBox x:Name="SplitSwitch"
+                                  Style="{StaticResource ToggleSwitch}"
+                                  IsChecked="{Binding IsSplit}"
+                                  IsEnabled="{Binding CanChooseLayout}"
+                                  AutomationProperties.Name="Split view" />
+                    </StackPanel>
+                </controls:SettingCard>
+
                 <controls:SettingCard Glyph="&#xE7F4;"
                                       Header="Renderer"
                                       Description="{Binding RendererDescription}"

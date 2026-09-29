@@ -100,9 +100,24 @@ public sealed class ViewAllWorkspaceState
     /// </summary>
     public List<string> HiddenPaths { get; set; } = [];
 
-    /// <summary>Where the nested canvas was looking, if it was the one in use.</summary>
+    /// <summary>
+    /// Where the nested canvas was looking, if it was the one in use: its
+    /// first pane's, when the view is split, as <see cref="ActivePath"/> is
+    /// the first pane's selection.
+    /// </summary>
     public NestedCameraState? NestedCamera { get; set; }
+
+    /// <summary>
+    /// The second pane of a split view: where it was looking and what it had
+    /// selected.  Kept while the view is not split, so splitting it again
+    /// goes back there; missing from a workspace that was never split, which
+    /// an older build reads as it always did.
+    /// </summary>
+    public NestedPaneState? SecondPane { get; set; }
 }
+
+/// <summary>One pane of a split view as the workspace keeps it: what it had selected, and where its camera was.</summary>
+public sealed record NestedPaneState(string? ActivePath, NestedCameraState? NestedCamera);
 
 public sealed record ViewAllNodeState(
     string Path,

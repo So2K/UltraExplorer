@@ -2,6 +2,9 @@ using System.Diagnostics;
 using System.IO;
 using System.Windows;
 using System.Windows.Automation;
+using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 using UltraExplorer;
 using UltraExplorer.Controls;
@@ -36,7 +39,151 @@ internal static partial class Program
         RunOnSta("split panes: slots on canvases", SplitCanvasSlotChecksAsync);
         RunOnSta("split panes: one pane idle", SplitIdleReadChecksAsync);
         RunOnSta("split panes: hub, icons and closing", SplitLiveChecksAsync);
+        SplitModelChecks();
+        RunOnSta("split panes: what the workspace keeps", SplitStateChecksAsync);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Each pane's own Back and Forward, and the words its header names its
+    /// folder in: the drive first and the last three steps of a deep one.
+    /// </summary>
+    private static void SplitModelChecks()
+    {
+        Section("split panes: history and the header");
+        var history = new NavigationHistory();
+        history.Record(@"C:\a");
+        history.Record(@"C:\a");
+        history.Record(@"C:\b");
+        history.Record(@"C:\c");
+        Check("a pane's history records each place once in a row, and steps back and forward through them",
+            history.Count == 3 && history.Back() == @"C:\b" && history.Back() == @"C:\a" && history.Back() is null
+            && history.Forward() == @"C:\b" && history.Current == @"C:\b");
+        history.Record(@"C:\d");
+        Check("going somewhere after a step back lets go of what was ahead, as a browser does",
+            history.Count == 3 && !history.CanGoForward && history.Recent().SequenceEqual([@"C:\d", @"C:\b", @"C:\a"]));
+
+        Check("the header names a folder by its steps, the drive first",
+            NestedPane.ShortLocation(@"C:\Users\Me") == "C:  ›  Users  ›  Me");
+        Check("a deep one by the drive and its last three, so the folder itself is never what is cut",
+            NestedPane.ShortLocation(@"C:\Users\Me\Documents\Deep\Deeper") == "C:  ›  …  ›  Documents  ›  Deep  ›  Deeper");
+        Check("and no folder at all is This PC", NestedPane.ShortLocation(null) == "This PC" && NestedPane.ShortLocation(@"D:\") == "D:");
+    }
+
+    /// <summary>
+    /// What the workspace keeps of a split view, and that a workspace from
+    /// before there was one still loads: the split itself with the window's
+    /// settings, the second pane's place and selection with the canvas's -
+    /// each pane's own, whichever was being worked with - and a pane not
+    /// being worked with losing what is deleted or found gone, as the one
+    /// being worked with does.  A file dialog never splits.
+    /// </summary>
+    private static async Task SplitStateChecksAsync()
+    {
+        Section("split panes: what the workspace keeps");
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitState", Guid.NewGuid().ToString("N"));
+        var left = Path.Combine(baseDirectory, "left");
+        var right = Path.Combine(baseDirectory, "right");
+        var gone = Path.Combine(left, "gone.txt");
+        Directory.CreateDirectory(left);
+        Directory.CreateDirectory(Path.Combine(right, "inner"));
+        File.WriteAllText(gone, "g");
+        try
+        {
+            var store = new WorkspaceStore(Path.Combine(baseDirectory, "workspace.json"));
+            await store.SaveAsync(new WorkspaceState { IsSplit = true, SplitOrientation = "Stacked", SplitRatio = 0.3, ActivePane = 1 });
+            var loaded = await store.LoadAsync();
+            Check("the workspace keeps the split: on, stacked, the divider where it was and the pane being worked with",
+                loaded is { IsSplit: true, SplitOrientation: "Stacked", ActivePane: 1 } && Math.Abs(loaded.SplitRatio - 0.3) < 1e-9);
+
+            var oldPath = Path.Combine(baseDirectory, "old-workspace.json");
+            File.WriteAllText(oldPath, "{ \"SchemaVersion\": 2, \"SidebarWidth\": 260, \"CanvasLayout\": \"Nested\" }");
+            var old = await new WorkspaceStore(oldPath).LoadAsync();
+            Check("a workspace from before the split loads unsplit: side by side, half each, the first pane worked with",
+                old is { IsSplit: false, ActivePane: 0, SidebarWidth: 260 }
+                && SplitLayout.ParseOrientation(old.SplitOrientation) == SplitOrientation.SideBySide
+                && SplitLayout.ClampRatio(old.SplitRatio) == SplitLayout.DefaultRatio);
+            Check("the divider is kept between 0.15 and 0.85 of the room, and a ratio that is no number is half",
+                SplitLayout.ClampRatio(0.05) == 0.15 && SplitLayout.ClampRatio(0.95) == 0.85
+                && SplitLayout.ClampRatio(double.NaN) == 0.5 && SplitLayout.ClampRatio(0.4) == 0.4);
+            Check("stacked however it is spelled, and side by side for anything else",
+                SplitLayout.ParseOrientation(" stacked ") == SplitOrientation.Stacked
+                && SplitLayout.ParseOrientation("diagonal") == SplitOrientation.SideBySide
+                && SplitLayout.ParseOrientation(null) == SplitOrientation.SideBySide);
+
+            var shell = new FakeShell();
+            using var icons = new ShellIconService(shell.Extract, Dispatcher.CurrentDispatcher);
+            var marks = new FolderMarkService(Path.Combine(baseDirectory, "marks.json"));
+            var treePath = Path.Combine(baseDirectory, "view-all.workspace.json");
+            var camera = new NestedCameraState(right, 0.1, -0.2, 0.9);
+            using (var tree = new ViewAllViewModel(marks, icons, treePath) { PreferLightReveal = true })
+            {
+                await tree.InitializeAsync(left);
+
+                // The second pane is being worked with: the selection is its,
+                // and the first pane says what it has.
+                tree.SecondPane = new NestedPaneState(null, camera);
+                tree.OtherPanePath = () => left;
+                tree.IsSecondPaneActive = true;
+                tree.Selection.ReplaceSingle(right, true, 0, SelectionSource.Navigation);
+                await LiveWait(() => ViewAllPath.Equals(tree.ActivePath, right), 5_000);
+
+                // A pane not being worked with keeps its selection, which a
+                // delete and a folder found without the item leave.
+                var kept = new ItemSelection();
+                kept.ReplaceSingle(gone, false, 1, SelectionSource.Navigation);
+                tree.AddKeptSelection(kept);
+                tree.AddKeptSelection(kept);
+                Check("a pane's kept selection is followed once", tree.KeptSelectionCount == 1);
+                File.Delete(gone);
+                await tree.RefreshPathAsync(left);
+                Check("an item found gone leaves the selection of the pane not being worked with", kept.Count == 0);
+                kept.ReplaceSingle(Path.Combine(right, "inner"), true, 0, SelectionSource.Navigation);
+                tree.ForgetSelected([Path.Combine(right, "inner")]);
+                Check("and so does one deleted or moved away from the pane being worked with", kept.Count == 0);
+                tree.RemoveKeptSelection(kept);
+                Check("a pane activated or closed is followed no more", tree.KeptSelectionCount == 0);
+
+                await tree.SaveAsync();
+            }
+
+            var written = await new ViewAllWorkspaceStore(treePath).LoadAsync();
+            Check("the canvas workspace keeps each pane's own selection whichever was worked with: the first's as it always has, the second's with its camera",
+                written is { SecondPane: { } saved }
+                && ViewAllPath.Equals(written.ActivePath, left) && ViewAllPath.Equals(saved.ActivePath ?? string.Empty, right) && saved.NestedCamera == camera);
+
+            using (var again = new ViewAllViewModel(marks, icons, treePath) { PreferLightReveal = true, RestoresSecondPane = true })
+            {
+                await again.InitializeAsync();
+                Check("read back, the second pane's place and camera return, and what it had selected is found - a folder",
+                    again.RestoredSecondPane?.NestedCamera == camera
+                    && again.RestoredSecondPaneItem is { IsDirectory: true } item && ViewAllPath.Equals(item.Path, right)
+                    && again.SecondPane == again.RestoredSecondPane);
+                Check("and the first pane's selection is the first pane's", ViewAllPath.Equals(again.ActivePath, left));
+            }
+
+            using (var unsplit = new ViewAllViewModel(marks, icons, treePath) { PreferLightReveal = true })
+            {
+                await unsplit.InitializeAsync();
+                Check("a window that opens unsplit keeps the second pane's place for its next split, without looking for its selection",
+                    unsplit.RestoredSecondPane?.NestedCamera == camera && unsplit.RestoredSecondPaneItem is null);
+            }
+
+            var oldTree = Path.Combine(baseDirectory, "old-view-all.workspace.json");
+            File.WriteAllText(oldTree, "{ \"schemaVersion\": 1, \"nodes\": [], \"activePath\": \"\", \"nestedCamera\": { \"anchorPath\": \"\", \"x\": 0, \"y\": 0, \"width\": 1 } }");
+            var oldState = await new ViewAllWorkspaceStore(oldTree).LoadAsync();
+            Check("a canvas workspace from before the split loads, its camera the first pane's and no second pane",
+                oldState is { SecondPane: null, NestedCamera: { Width: 1 } });
+
+            using var picker = new MainViewModel(Path.Combine(baseDirectory, "picker.workspace.json"));
+            picker.IsSplit = true;
+            picker.SplitOrientation = SplitOrientation.Stacked;
+            Check("a file dialog never splits", !picker.IsSplit && picker.SplitOrientation == SplitOrientation.SideBySide);
+        }
+        finally
+        {
+            TryDelete(baseDirectory);
+        }
     }
 
     /// <summary>
@@ -529,5 +676,205 @@ internal static partial class Program
         Check("and its Clear lets the filter go, the strip with it",
             !pane.Canvas.IsFiltering && view.CanvasFilterBox.Text.Length == 0 && view.CanvasFilterClear.Visibility == Visibility.Collapsed
             && view.CanvasFilterHint.Visibility == Visibility.Visible && view.CanvasFilterCount.Text.Length == 0);
+    }
+
+    /// <summary>
+    /// The split view in the window, laid out but never shown: the split the
+    /// workspace left put back once the panes have their drives, the second
+    /// pane made with a canvas, tree and inbox of its own and let go of whole
+    /// when the split closes; each pane's camera its own; clicking between
+    /// them - F6 - swapping the window's selection, address and history
+    /// without a step for Back; the commands, the zoom buttons and the search
+    /// acting on the pane being worked with; a delete leaving the other
+    /// pane's selection too; side by side and stacked, the divider kept
+    /// within its limits; the tree canvas never split; and the button, the
+    /// keys and the menus that do it all.
+    /// </summary>
+    private static async Task SplitViewWindowChecks(MainWindow main, MainViewModel shell)
+    {
+        Section("split panes: the split view");
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerSplitView", Guid.NewGuid().ToString("N"));
+        var left = Path.Combine(baseDirectory, "left");
+        var right = Path.Combine(baseDirectory, "right");
+        var fileA = Path.Combine(left, "a.txt");
+        var fileB = Path.Combine(right, "b.txt");
+        Directory.CreateDirectory(left);
+        Directory.CreateDirectory(right);
+        for (var index = 0; index < 12; index++)
+        {
+            Directory.CreateDirectory(Path.Combine(baseDirectory, $"m{index:D2}"));
+        }
+
+        File.WriteAllText(fileA, "a");
+        File.WriteAllText(fileB, "b");
+        var first = main.FirstPane;
+        var host = main.NestedHost;
+        var accent = ((SolidColorBrush)Application.Current.FindResource("AccentBrush")).Color;
+        bool Lit(NestedPane pane) => pane.View.PaneAccent.Background is SolidColorBrush { Color: var colour } && colour == accent;
+        try
+        {
+            LayOutWindow(main, 1400, 900);
+            shell.Tree.PreferLightReveal = true;
+            shell.Layout = CanvasLayout.Nested;
+            Check("unsplit, the window has one pane, no divider, no second canvas, and its button is not lit",
+                main.Panes.Count == 1 && main.SecondPane is null && main.PaneSplitter is null
+                && host.ColumnDefinitions.Count == 0 && host.RowDefinitions.Count == 0
+                && main.SplitButton.ReadLocalValue(Control.ForegroundProperty) == DependencyProperty.UnsetValue);
+
+            // The workspace left the view split, with the second pane worked with.
+            shell.IsSplit = true;
+            shell.ActivePaneIndex = 1;
+            Check("split before the panes have their drives, nothing is made yet", main.Panes.Count == 1);
+            await main.StartNestedForChecksAsync();
+            await SettingsSettle();
+            var second = main.SecondPane;
+            Check("once they have, the split is put back: a second pane, the one being worked with",
+                second is not null && main.Panes.Count == 2 && ReferenceEquals(main.ActivePane, second) && ReferenceEquals(shell.History, second.History));
+            if (second is null)
+            {
+                return;
+            }
+
+            Check("it has a canvas, a tree and an icon inbox of its own, and its tree hears the changes too",
+                !ReferenceEquals(second.Canvas, first.Canvas) && !ReferenceEquals(second.Tree, first.Tree) && ReferenceEquals(second.Canvas.Tree, second.Tree)
+                && shell.Tree.NestedChanges.Count == 2 && shell.Icons.CanvasInboxCount == 2
+                && !ReferenceEquals(second.Canvas.IconArrivals, shell.Icons.CanvasArrivals) && shell.Tree.KeptSelectionCount == 1);
+            Check("the two lie side by side, half each, with the divider between them",
+                host.ColumnDefinitions.Count == 3 && host.Children.Count == 3
+                && ReferenceEquals(host.Children[0], main.FirstPaneView) && ReferenceEquals(host.Children[2], second.View)
+                && host.ColumnDefinitions[0].Width == new GridLength(0.5, GridUnitType.Star) && host.ColumnDefinitions[1].Width.Value == 5
+                && Grid.GetColumn(second.View) == 2 && main.PaneSplitter is { Focusable: false, ResizeDirection: GridResizeDirection.Columns });
+            Check("both headers show, the accent on the pane being worked with, and the button is lit",
+                first.View.PaneHeader.Visibility == Visibility.Visible && second.View.PaneHeader.Visibility == Visibility.Visible
+                && Lit(second) && !Lit(first) && main.SplitButton.Foreground is SolidColorBrush { Color: var lit } && lit == accent);
+            Check("automation tells the canvases apart", AutomationProperties.GetAutomationId(first.Canvas) == "Nested"
+                && AutomationProperties.GetAutomationId(second.Canvas) == "NestedSecond");
+            LayOutWindow(main, 1400, 900);
+            Check($"each canvas has half the room ({first.Canvas.ActualWidth:0} and {second.Canvas.ActualWidth:0})",
+                first.Canvas.ActualWidth > 500 && Math.Abs(first.Canvas.ActualWidth - second.Canvas.ActualWidth) < 2);
+
+            // ---- each pane at its own place ----
+            main.ActivatePane(first);
+            var drive = new NestedRoot(baseDirectory, "S", NestedFolderKind.Drive);
+            first.Tree.SetRoots([drive]);
+            second.Tree.SetRoots([drive]);
+            await first.FlyToAsync(left, gentle: false, animated: false);
+            await second.FlyToAsync(right, gentle: false, animated: false);
+            var cameraFirst = first.Canvas.CaptureCamera();
+            var cameraSecond = second.Canvas.CaptureCamera();
+            Check("each pane's camera is its own: the first on its folder, the second on another",
+                cameraFirst?.AnchorPath == left && cameraSecond?.AnchorPath == right);
+            first.UpdateHeader();
+            second.UpdateHeader();
+            Check($"each header names the folder its pane has in view ({first.View.PaneLocation.Text} | {second.View.PaneLocation.Text})",
+                first.View.PaneLocation.Text.EndsWith("left", StringComparison.Ordinal) && second.View.PaneLocation.Text.EndsWith("right", StringComparison.Ordinal));
+            shell.ZoomInCommand.Execute(null);
+            Check("the zoom buttons zoom the pane being worked with alone",
+                first.Canvas.CaptureCamera() is { } zoomed && zoomed.Width > cameraFirst!.Width && second.Canvas.CaptureCamera() == cameraSecond);
+
+            // ---- the selection, the address and the history swap ----
+            var selection = shell.Tree.Selection;
+            selection.ReplaceSingle(fileA, false, 1, SelectionSource.Navigation);
+            await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileA));
+            var firstSteps = first.History.Count;
+            var secondSteps = second.History.Count;
+            main.ActivatePane(second);
+            Check("activating the other pane: the window's selection is its - nothing yet - and the first keeps its own",
+                ReferenceEquals(main.ActivePane, second) && selection.Count == 0 && first.KeptSelection.Contains(fileA)
+                && Lit(second) && !Lit(first) && shell.ActivePaneIndex == 1 && shell.Tree.IsSecondPaneActive);
+            Check("with nothing selected there, the address bar goes to the folder it has in view",
+                await SettingsWaitFor(() => ViewAllPath.Equals(shell.Address.CurrentPath, right)));
+            selection.ReplaceSingle(fileB, false, 1, SelectionSource.Navigation);
+            await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileB));
+            Check("a pick there is the window's selection, its address and where a new item goes",
+                ViewAllPath.Equals(shell.Address.CurrentPath, fileB) && shell.Tree.SelectedPaths.SequenceEqual([fileB])
+                && ViewAllPath.Equals(shell.Tree.TargetDirectory ?? string.Empty, right));
+            Check("the headers and the search sort and look in that pane's folder", ViewAllPath.Equals(main.SortFolder() ?? string.Empty, right));
+            Check("Back and Forward are that pane's: the pick is in its history, and the other's is as it was",
+                ReferenceEquals(shell.History, second.History) && ViewAllPath.Equals(second.History.Current ?? string.Empty, fileB) && first.History.Count == firstSteps
+                && second.History.Count == secondSteps + 1);
+            main.ActivatePane(first);
+            await SettingsWaitFor(() => ViewAllPath.Equals(shell.Tree.ActivePath, fileA));
+            Check("back in the first pane its selection and address come back, and the other keeps its pick",
+                selection.Count == 1 && selection.Contains(fileA) && ViewAllPath.Equals(shell.Address.CurrentPath, fileA)
+                && second.KeptSelection.Contains(fileB) && ReferenceEquals(shell.History, first.History));
+            Check("going between the panes is no step for Back and Forward",
+                first.History.Count == firstSteps && second.History.Count == secondSteps + 1);
+            shell.Tree.ForgetSelected([fileB]);
+            Check("an item deleted or moved away leaves the other pane's selection too", second.KeptSelection.Count == 0);
+
+            // ---- F6, and closing with the second pane worked with ----
+            PressKey(main, Key.F6);
+            Check("F6 goes to the other pane", ReferenceEquals(main.ActivePane, second) && Lit(second));
+            PressKey(main, Key.F6);
+            Check("and back", ReferenceEquals(main.ActivePane, first) && Lit(first));
+            PressKey(main, Key.F6);
+            var closedSecond = second;
+            Check("Ctrl+\\ closes the split", main.TryHandleSplitKey(Key.Oem5, ModifierKeys.Control) && !shell.IsSplit);
+            Check("the first pane is the one left, worked with again, with its selection back",
+                main.Panes.Count == 1 && ReferenceEquals(main.ActivePane, first) && selection.Contains(fileA)
+                && ReferenceEquals(shell.History, first.History) && shell.ActivePaneIndex == 0 && !shell.Tree.IsSecondPaneActive);
+            Check("the second pane is let go of whole: its canvas off its tree and out of the window, its tree off the hub and its inbox gone",
+                closedSecond.Canvas.Tree is null && host.Children.Count == 1 && host.ColumnDefinitions.Count == 0 && main.PaneSplitter is null
+                && shell.Tree.NestedChanges.Count == 1 && shell.Icons.CanvasInboxCount == 1 && shell.Tree.KeptSelectionCount == 0
+                && shell.Tree.OtherPanePath is null && first.Canvas.DrainsChanges);
+            Check("the first pane's header is gone with it, so one pane looks as it always did",
+                first.View.PaneHeader.Visibility == Visibility.Collapsed && main.SplitButton.ReadLocalValue(Control.ForegroundProperty) == DependencyProperty.UnsetValue);
+            Check("and where the second pane was is kept for the next split",
+                shell.Tree.SecondPane is { } place && ViewAllPath.Equals(place.ActivePath ?? string.Empty, right) && place.NestedCamera?.AnchorPath == right);
+
+            // ---- split again, stacked ----
+            Check("Ctrl+Shift+\\ splits it again, stacked", main.TryHandleSplitKey(Key.OemBackslash, ModifierKeys.Control | ModifierKeys.Shift)
+                && shell.IsSplit && shell.SplitOrientation == SplitOrientation.Stacked);
+            var again = main.SecondPane;
+            Check("a new second pane, where the last one was, and the first still worked with",
+                again is not null && !ReferenceEquals(again, closedSecond) && ViewAllPath.Equals(again.FocusPath ?? string.Empty, right)
+                && ReferenceEquals(main.ActivePane, first) && Lit(first));
+            Check("one above the other: rows, no columns, a divider across",
+                host.RowDefinitions.Count == 3 && host.ColumnDefinitions.Count == 0 && Grid.GetRow(again!.View) == 2
+                && main.PaneSplitter is { ResizeDirection: GridResizeDirection.Rows });
+            LayOutWindow(main, 1400, 900);
+            shell.SplitRatio = 0.3;
+            Check("the divider set to 0.3 gives the first pane that share", host.RowDefinitions[0].Height == new GridLength(0.3, GridUnitType.Star)
+                && Math.Abs(host.RowDefinitions[2].Height.Value - 0.7) < 1e-9);
+            shell.SplitRatio = 0.99;
+            Check("and no pane is given less than 0.15: the divider stops there, dragged or set",
+                shell.SplitRatio == 0.85 && host.RowDefinitions[0].MinHeight > 0 && host.RowDefinitions[2].MinHeight == host.RowDefinitions[0].MinHeight);
+
+            // ---- the menus ----
+            MenuItem? Item(ItemsControl menu, string header) => menu.Items.OfType<MenuItem>().FirstOrDefault(item => item.Header as string == header);
+            var splitMenu = main.BuildSplitMenu(main.SplitButton);
+            Check("the button's drop-down: the split with its key, and the two layouts, stacked chosen",
+                Item(splitMenu, "Split view") is { IsChecked: true, InputGestureText: "Ctrl+\\" }
+                && Item(splitMenu, "Stacked") is { IsChecked: true } && Item(splitMenu, "Side by side") is { IsChecked: false });
+            var sideBySide = Item(splitMenu, "Side by side")!;
+            sideBySide.RaiseEvent(new RoutedEventArgs(MenuItem.ClickEvent, sideBySide));
+            Check("choosing Side by side lays them out side by side", shell.SplitOrientation == SplitOrientation.SideBySide && host.ColumnDefinitions.Count == 3);
+            var options = main.BuildCanvasOptionsMenu(main.SplitButton);
+            Check("Canvas options has the split too", Item(options, "Split view") is { } splitOptions && Item(splitOptions, "Split view") is { IsChecked: true });
+
+            // ---- the tree canvas is never split ----
+            shell.Layout = CanvasLayout.Tree;
+            shell.IsSplit = false;
+            Check("closed from the tree canvas, the split goes", main.Panes.Count == 1);
+            Click(main.SplitButton);
+            Check("and splitting from the tree canvas goes to the nested canvas first", shell.IsSplit && shell.Layout == CanvasLayout.Nested && main.Panes.Count == 2);
+            Click(main.SplitButton);
+            Check("the button closes it again", !shell.IsSplit && main.Panes.Count == 1);
+        }
+        finally
+        {
+            shell.IsSplit = false;
+            shell.SplitOrientation = SplitOrientation.SideBySide;
+            shell.SplitRatio = SplitLayout.DefaultRatio;
+            TryDelete(baseDirectory);
+        }
+    }
+
+    /// <summary>A key pressed in the window, as the keyboard sends it: down from the window first.</summary>
+    private static void PressKey(Window window, Key key)
+    {
+        using var source = new System.Windows.Interop.HwndSource(new System.Windows.Interop.HwndSourceParameters("UltraExplorer split key check") { ParentWindow = new IntPtr(-3), WindowStyle = 0 });
+        window.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, key) { RoutedEvent = Keyboard.PreviewKeyDownEvent });
     }
 }

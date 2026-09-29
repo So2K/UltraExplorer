@@ -564,8 +564,115 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Where the nested canvas was looking last session.</summary>
     public NestedCameraState? RestoredNestedCamera { get; private set; }
 
-    /// <summary>Where the nested canvas is looking now; written with the rest of the canvas state.</summary>
+    /// <summary>Where the nested canvas is looking now - its first pane - written with the rest of the canvas state.</summary>
     public NestedCameraState? NestedCamera { get; set; }
+
+    /// <summary>Where the second pane of a split view was looking last session, and what it had selected; null when the view was never split.</summary>
+    public NestedPaneState? RestoredSecondPane { get; private set; }
+
+    /// <summary>
+    /// What the second pane had selected last session, found the way the
+    /// first pane's is found (see <see cref="InitializeAsync"/>): the item and
+    /// whether it is a folder, or null when it was nothing, is gone, lies in
+    /// a share not asked for yet, or the view does not open split.
+    /// </summary>
+    public SelectionItem? RestoredSecondPaneItem { get; private set; }
+
+    /// <summary>
+    /// Set before <see cref="InitializeAsync"/> when the window opens split:
+    /// only then is the second pane's selection looked for.  A view split
+    /// later starts from the place its second pane had, without it.
+    /// </summary>
+    public bool RestoresSecondPane { get; set; }
+
+    /// <summary>
+    /// The second pane of a split view as the canvas workspace keeps it: its
+    /// camera, and what it had selected when it last stopped being the pane
+    /// worked with.  The window keeps it up to date, and keeps it while the
+    /// view is not split, so a split opens where the last one was.
+    /// </summary>
+    public NestedPaneState? SecondPane { get; set; }
+
+    /// <summary>
+    /// Whether the second pane of a split view is the one being worked with.
+    /// <see cref="Selection"/> and <see cref="ActivePath"/> are then its, and
+    /// the first pane's selected path - what the workspace writes as
+    /// <see cref="ViewAllWorkspaceState.ActivePath"/> - is the other pane's
+    /// (<see cref="OtherPanePath"/>).
+    /// </summary>
+    public bool IsSecondPaneActive { get; set; }
+
+    /// <summary>
+    /// While the view is split: what the pane not being worked with has
+    /// selected, asked as the workspace is written.  Null while there is one pane.
+    /// </summary>
+    public Func<string?>? OtherPanePath { get; set; }
+
+    /// <summary>
+    /// The selections the panes of a split view keep while another pane's is
+    /// <see cref="Selection"/> (see <see cref="AddKeptSelection"/>).  Replaced
+    /// whole on a change.
+    /// </summary>
+    private ItemSelection[] _keptSelections = [];
+
+    /// <summary>
+    /// A pane that is not being worked with keeps its selection here: what
+    /// is moved away or deleted leaves it (<see cref="ForgetSelected"/>), and
+    /// what is found gone or renamed on disk leaves it or takes the new name,
+    /// as in <see cref="Selection"/>.
+    /// </summary>
+    public void AddKeptSelection(ItemSelection kept)
+    {
+        ArgumentNullException.ThrowIfNull(kept);
+        if (!ReferenceEquals(kept, Selection) && Array.IndexOf(_keptSelections, kept) < 0)
+        {
+            _keptSelections = [.. _keptSelections, kept];
+        }
+    }
+
+    /// <summary>The pane is being worked with again, or has closed: its kept selection is no longer followed.</summary>
+    public void RemoveKeptSelection(ItemSelection kept)
+    {
+        if (Array.IndexOf(_keptSelections, kept) >= 0)
+        {
+            _keptSelections = [.. _keptSelections.Where(other => !ReferenceEquals(other, kept))];
+        }
+    }
+
+    /// <summary>For the checks: how many kept selections are followed.</summary>
+    internal int KeptSelectionCount => _keptSelections.Length;
+
+    /// <summary>
+    /// Paths that were moved away or deleted, let go of by every pane's
+    /// selection: the one being worked with and every one kept.
+    /// </summary>
+    public void ForgetSelected(IReadOnlyList<string> paths)
+    {
+        Selection.Remove(paths, SelectionSource.Command);
+        foreach (var kept in _keptSelections)
+        {
+            kept.Remove(paths, SelectionSource.Command);
+        }
+    }
+
+    /// <summary>Whether any pane's selection holds something directly inside <paramref name="folder"/>.</summary>
+    private bool AnySelectedIn(string folder)
+    {
+        if (Selection.CountIn(folder) > 0)
+        {
+            return true;
+        }
+
+        foreach (var kept in _keptSelections)
+        {
+            if (kept.CountIn(folder) > 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     /// <summary>The graph's roots: every drive, and any WSL distribution or share added as one.</summary>
     public IReadOnlyList<ViewAllNodeViewModel> Roots => _graph.Roots;
@@ -588,6 +695,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             var state = await _store.LoadAsync();
             RestoredNestedCamera = state?.NestedCamera;
             NestedCamera = RestoredNestedCamera;
+            RestoredSecondPane = state?.SecondPane;
+            SecondPane = RestoredSecondPane;
 
             // Shares and distributions are asked for once the window is up
             // (ProbeExtraRootsAsync): one whose server is off would hold the
@@ -639,6 +748,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                     focus: false);
             }
 
+            if (RestoresSecondPane)
+            {
+                RestoredSecondPaneItem = await FindSecondPaneItemAsync(state?.SecondPane?.ActivePath);
+            }
+
             RebuildRenderSet();
 
             // Put back: saves may write it from now on.  One asked for while
@@ -659,6 +773,40 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>
+    /// The second pane's selection of last session, found as the first
+    /// pane's is: a node the restored graph has, or a path brought in by name
+    /// - never one in a share not asked for yet, whose server may take a
+    /// minute to say it is off.  Null for nothing found.
+    /// </summary>
+    private async Task<SelectionItem?> FindSecondPaneItemAsync(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        try
+        {
+            if (_graph.TryGetNode(path, out var known))
+            {
+                return new SelectionItem(known.FullPath, known.IsDirectory, known.Entry.SizeBytes ?? 0);
+            }
+
+            if (!_graph.IsInPendingRoot(path)
+                && PreferLightReveal
+                && await _graph.MaterializeChainAsync(path) is { IsComplete: true, Node: { } named })
+            {
+                return new SelectionItem(named.FullPath, named.IsDirectory, named.Entry.SizeBytes ?? 0);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+        }
+
+        return null;
     }
 
     /// <summary>Raised when a saved share or distribution answered and became a root, after the start.</summary>
@@ -1238,7 +1386,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// </summary>
     private async Task PruneSelectionAsync(string folder)
     {
-        if (Selection.CountIn(folder) == 0)
+        if (!AnySelectedIn(folder))
         {
             return;
         }
@@ -1259,6 +1407,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         Selection.RemoveMissingUnder(folder, present.Contains);
+        foreach (var kept in _keptSelections)
+        {
+            kept.RemoveMissingUnder(folder, present.Contains);
+        }
     }
 
     public async Task LoadMoreAsync(ViewAllNodeViewModel node)
@@ -1717,10 +1869,18 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 var state = _graph.CaptureState(new ViewAllViewportState(_viewportLocation, _viewportZoom));
 
                 // Selected last time in a share not here yet: still that.
-                state.ActivePath = _heldActivePath is { } held && Selection.Version == _heldActiveVersion
+                var active = _heldActivePath is { } held && Selection.Version == _heldActiveVersion
                     ? held
                     : ActiveNode?.FullPath ?? string.Empty;
+
+                // Split: each pane's own.  The selection is the pane being
+                // worked with's, and the other pane says what it has.
+                var other = OtherPanePath?.Invoke();
+                state.ActivePath = IsSecondPaneActive ? other ?? string.Empty : active;
                 state.NestedCamera = NestedCamera;
+                state.SecondPane = SecondPane is not { } second || OtherPanePath is null
+                    ? SecondPane
+                    : second with { ActivePath = IsSecondPaneActive ? active : other };
                 await _store.SaveAsync(state);
             }
             else
@@ -1918,56 +2078,73 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             }
         }
 
-        if ((change.Kinds & (ChangeKinds.Structural | ChangeKinds.Gone)) != 0 && Selection.CountIn(change.Key) > 0)
+        if ((change.Kinds & (ChangeKinds.Structural | ChangeKinds.Gone)) != 0 && AnySelectedIn(change.Key))
         {
             _ = PruneSelectionAsync(change.Key);
         }
     }
 
+    /// <summary>What <paramref name="path"/> is called once <paramref name="oldPath"/> is <paramref name="newPath"/>: null when it is not that or inside it.</summary>
+    private static string? Renamed(string path, string oldPath, string newPath) =>
+        string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase)
+            ? newPath
+            : path.Length > oldPath.Length
+                && path.StartsWith(oldPath, StringComparison.OrdinalIgnoreCase)
+                && path[oldPath.Length] == Path.DirectorySeparatorChar
+                    ? string.Concat(newPath, path.AsSpan(oldPath.Length))
+                    : null;
+
     /// <summary>
-    /// <paramref name="oldPath"/> is <paramref name="newPath"/> now: the
-    /// selection - the item itself, and for a folder anything selected inside
-    /// it - and the marks on them take the new name, in one change each.
+    /// One selection's part in a rename: the item itself, and for a folder
+    /// anything selected inside it, take the new name in one change.  Only a
+    /// selection that could hold something of it is looked through: the item
+    /// itself, something directly in it, or a selection small enough to look
+    /// through for something deeper.
+    /// </summary>
+    private void FollowRenameIn(ItemSelection selection, string oldPath, string newPath)
+    {
+        if (selection.Count == 0 || !(selection.Contains(oldPath) || selection.CountIn(oldPath) > 0 || selection.Count <= 4096))
+        {
+            return;
+        }
+
+        List<string>? removed = null;
+        List<SelectionItem>? added = null;
+        foreach (var path in selection.Paths)
+        {
+            if (Renamed(path, oldPath, newPath) is { } moved && selection.TryGetItem(path, out var item))
+            {
+                (removed ??= []).Add(path);
+                (added ??= []).Add(item with { Path = moved });
+            }
+        }
+
+        if (removed is not null)
+        {
+            RenamesFollowed++;
+            selection.Apply(new SelectionEdit
+            {
+                Added = added!,
+                Removed = removed,
+                Anchor = selection.Anchor is { } anchor ? Renamed(anchor, oldPath, newPath) ?? anchor : null,
+                Focus = selection.Focus is { } focus ? Renamed(focus, oldPath, newPath) ?? focus : null,
+                Source = SelectionSource.Command
+            });
+        }
+    }
+
+    /// <summary>
+    /// <paramref name="oldPath"/> is <paramref name="newPath"/> now: every
+    /// pane's selection - the item itself, and for a folder anything selected
+    /// inside it - and the marks on them take the new name, in one change each.
     /// </summary>
     private void FollowRename(string oldPath, string newPath)
     {
-        static string? Renamed(string path, string oldPath, string newPath) =>
-            string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase)
-                ? newPath
-                : path.Length > oldPath.Length
-                    && path.StartsWith(oldPath, StringComparison.OrdinalIgnoreCase)
-                    && path[oldPath.Length] == Path.DirectorySeparatorChar
-                        ? string.Concat(newPath, path.AsSpan(oldPath.Length))
-                        : null;
-
-        // Only a selection that could hold something of it is looked through:
-        // the item itself, something directly in it, or a selection small
-        // enough to look through for something deeper.
-        if (Selection.Count > 0 && (Selection.Contains(oldPath) || Selection.CountIn(oldPath) > 0 || Selection.Count <= 4096))
+        // Every pane's selection: the one being worked with, and each kept.
+        FollowRenameIn(Selection, oldPath, newPath);
+        foreach (var kept in _keptSelections)
         {
-            List<string>? removed = null;
-            List<SelectionItem>? added = null;
-            foreach (var path in Selection.Paths)
-            {
-                if (Renamed(path, oldPath, newPath) is { } moved && Selection.TryGetItem(path, out var item))
-                {
-                    (removed ??= []).Add(path);
-                    (added ??= []).Add(item with { Path = moved });
-                }
-            }
-
-            if (removed is not null)
-            {
-                RenamesFollowed++;
-                Selection.Apply(new SelectionEdit
-                {
-                    Added = added!,
-                    Removed = removed,
-                    Anchor = Selection.Anchor is { } anchor ? Renamed(anchor, oldPath, newPath) ?? anchor : null,
-                    Focus = Selection.Focus is { } focus ? Renamed(focus, oldPath, newPath) ?? focus : null,
-                    Source = SelectionSource.Command
-                });
-            }
+            FollowRenameIn(kept, oldPath, newPath);
         }
 
         foreach (var (path, mark) in _marks.Snapshot())

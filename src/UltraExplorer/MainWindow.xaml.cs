@@ -132,6 +132,8 @@ public partial class MainWindow : Window
             AttachPicker(picker);
             ConfigurePickerSelection();
         }
+
+        UpdateSplitControls();
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -1434,6 +1436,13 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Note…", "\uE70B", _viewModel.EditNoteCommand);
         AddCommandItem(menu, "Pin to Home", "\uE718", _viewModel.AddToFavoritesCommand);
         AddLayoutItems(menu);
+        if (!IsPickerMode)
+        {
+            var split = new MenuItem { Header = "Split view", InputGestureText = "Ctrl+\\" };
+            AddSplitItems(split);
+            menu.Items.Add(split);
+        }
+
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Settings…", "\uE713", OpenSettingsCommand, "Ctrl+,");
         return menu;
@@ -1922,6 +1931,14 @@ public partial class MainWindow : Window
         // Before the text boxes keep their keys: a comma typed with Ctrl is
         // nothing a text box does anything with.
         if (TryOpenSettingsFromKey(key, modifiers))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        // The split's keys too: F6 from the filter box goes to the other pane
+        // as it does from a canvas.
+        if (TryHandleSplitKey(key, modifiers))
         {
             e.Handled = true;
             return;

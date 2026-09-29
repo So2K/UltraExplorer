@@ -68,6 +68,7 @@ internal static partial class Program
             SettingsWordsChecks();
             ChromeFocusChecks(main);
             await SplitPaneWindowChecks(main, shell);
+            await SplitViewWindowChecks(main, shell);
             shell.Dispose();
         }
         finally
@@ -163,6 +164,19 @@ internal static partial class Program
         Check("the view changed elsewhere shows at once, and the minimap is the tree's only",
             window.NestedLayoutChoice.IsChecked == true && window.TreeLayoutChoice.IsChecked == false
             && !window.MinimapSwitch.IsEnabled);
+
+        // Canvas: the split view.
+        Check("the split view shows off, side by side", window.SplitSwitch.IsChecked == false && window.SplitSideBySideChoice.IsChecked == true);
+        Toggle(window.SplitSwitch);
+        await SettingsSettle();
+        Check("its switch splits the view, as Ctrl+\\ does", shell.IsSplit && window.SplitSwitch.IsChecked == true);
+        Choose(window.SplitStackedChoice);
+        await SettingsSettle();
+        Check("choosing Stacked lays the panes one above the other", shell.SplitOrientation == SplitOrientation.Stacked && window.SplitSideBySideChoice.IsChecked == false);
+        shell.IsSplit = false;
+        shell.SplitOrientation = SplitOrientation.SideBySide;
+        await SettingsSettle();
+        Check("the split changed elsewhere shows at once", window.SplitSwitch.IsChecked == false && window.SplitSideBySideChoice.IsChecked == true);
 
         // Canvas: the renderer.
         if (GpuBootstrap.ExplicitPreference is null)
@@ -572,6 +586,8 @@ internal static partial class Program
             ("the status bar's Settings", main.StatusSettingsButton),
             ("the canvas's Layers", main.CanvasLayersButton),
             ("New folder", main.NewFolderButton),
+            ("Split view", main.SplitButton),
+            ("Split view's options", main.SplitMenuButton),
             ("the filter's Previous", main.ActivePane.View.CanvasFilterPrevious),
             ("the filter's Next", main.ActivePane.View.CanvasFilterNext),
             ("Maximize", main.MaximizeButton)
