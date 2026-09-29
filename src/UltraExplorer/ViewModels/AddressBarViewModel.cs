@@ -39,7 +39,9 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// </summary>
     private static readonly char[] Wildcards = ['*', '?', '"', '<', '>', '|'];
 
-    private readonly Func<string, Task> _navigate;
+    private readonly Func<string, int, Task> _navigate;
+    private readonly Func<int> _beginNavigation;
+    private readonly Func<int, bool> _isLatestNavigation;
     private readonly Func<IReadOnlyList<string>> _recent;
     private readonly Action<string, bool> _report;
     private readonly DispatcherTimer _debounce;
@@ -56,6 +58,9 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// <summary>Which press of the recent-places button is the latest (see <see cref="ShowRecentAsync"/>).</summary>
     private int _recentTicket;
 
+    /// <summary>Which of the bar's own requests is the latest, when nothing else hands out tickets.</summary>
+    private int _ownTicket;
+
     /// <param name="navigate">Takes the window to a path that has been checked to exist.</param>
     /// <param name="recent">Where the window has already been, newest first.</param>
     /// <param name="report">Something to say to the user; the flag marks it an error.</param>
@@ -63,8 +68,30 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         Func<string, Task> navigate,
         Func<IReadOnlyList<string>> recent,
         Action<string, bool> report)
+        : this((path, _) => navigate(path), null, null, recent, report)
+    {
+    }
+
+    /// <param name="navigate">Takes the window to a path that has been checked to exist, as the navigation the ticket names.</param>
+    /// <param name="beginNavigation">
+    /// Hands out the window's next navigation ticket.  One is taken the
+    /// moment Enter is pressed, before the typed path is checked, so that
+    /// anything asked for while a slow share answers is newer and wins.
+    /// Null counts the bar's own requests only.
+    /// </param>
+    /// <param name="isLatestNavigation">Whether a ticket is still the newest; null with <paramref name="beginNavigation"/>.</param>
+    /// <param name="recent">Where the window has already been, newest first.</param>
+    /// <param name="report">Something to say to the user; the flag marks it an error.</param>
+    public AddressBarViewModel(
+        Func<string, int, Task> navigate,
+        Func<int>? beginNavigation,
+        Func<int, bool>? isLatestNavigation,
+        Func<IReadOnlyList<string>> recent,
+        Action<string, bool> report)
     {
         _navigate = navigate;
+        _beginNavigation = beginNavigation ?? (() => ++_ownTicket);
+        _isLatestNavigation = isLatestNavigation ?? (ticket => ticket == _ownTicket);
         _recent = recent;
         _report = report;
 
@@ -357,7 +384,7 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     // ---- going somewhere ---------------------------------------------------
 
     private Task OpenSegmentAsync(BreadcrumbSegment? segment)
-        => segment is null ? Task.CompletedTask : _navigate(segment.FullPath);
+        => segment is null ? Task.CompletedTask : _navigate(segment.FullPath, _beginNavigation());
 
     private async Task AcceptAsync(AddressSuggestion? suggestion)
     {
@@ -394,10 +421,21 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         }
 
         // Asked off the interface thread: a share that is offline takes as
-        // long as the network allows to say it is not there.
+        // long as the network allows to say it is not there.  The place in
+        // line is taken now, so a favourite clicked or Back pressed while it
+        // answers is newer and wins; and an answer that comes after the line
+        // was typed in again, opened or closed is not what is on screen any
+        // more - going there, closing the line over the new typing or saying
+        // the old path does not exist would all be wrong.
+        var ticket = _beginNavigation();
+        var typed = Text;
+        var wasEditing = IsEditing;
         var current = CurrentPath;
         var resolved = await Task.Run(() => Resolve(expanded, current));
-        if (_isDisposed)
+        if (_isDisposed
+            || !_isLatestNavigation(ticket)
+            || IsEditing != wasEditing
+            || !string.Equals(typed, Text, StringComparison.Ordinal))
         {
             return;
         }
@@ -409,7 +447,7 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         }
 
         EndEdit();
-        await _navigate(resolved);
+        await _navigate(resolved, ticket);
     }
 
     /// <summary>

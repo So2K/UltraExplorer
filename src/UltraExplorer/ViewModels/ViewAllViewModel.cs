@@ -403,20 +403,19 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// </summary>
     private async Task ActivateListItemAsync(string path, bool open)
     {
-        ViewAllNodeViewModel? node;
+        RevealOutcome outcome;
 
         // Held while the canvas is being driven from a row: selecting a folder on
         // the canvas would otherwise take the list into it, which would make a
         // single click open the folder.  A single click selects; it does not open.
+        // Only the row's own item is selected - a row whose item went meanwhile
+        // must not select its folder - and only while nothing newer was asked for.
         using (FolderList.HoldFolder())
         {
-            node = await RevealPathAsync(path);
-            if (node is not null)
-            {
-                SelectOnly(node);
-            }
+            outcome = await RevealAsync(path, exact: true);
         }
 
+        var node = outcome.IsExact ? outcome.Node : null;
         if (node is null)
         {
             if (open)
@@ -427,7 +426,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
-        if (!open)
+        if (!open || outcome.Superseded)
         {
             return;
         }
@@ -1119,10 +1118,48 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// there - is the same.
     /// </summary>
     public async Task<ViewAllNodeViewModel?> RevealPathAsync(string path, bool focus = true, bool select = true)
+        => (await RevealAsync(path, focus, select)).Node;
+
+    /// <summary>
+    /// A navigation's place in line, taken before whatever it has to wait for
+    /// first: a path typed into the address bar is checked off the interface
+    /// thread before it is revealed, and anything asked for meanwhile - a
+    /// favourite, Back - is newer and must win.  Hand it to
+    /// <see cref="RevealAsync"/>.
+    /// </summary>
+    public int BeginNavigation() => ++_revealTicket;
+
+    /// <summary>Whether no navigation has started since <paramref name="ticket"/> was taken.</summary>
+    public bool IsLatestNavigation(int ticket) => ticket == _revealTicket;
+
+    /// <summary>
+    /// <see cref="RevealPathAsync"/>, with what a caller that must not act on
+    /// the wrong thing needs to know about how it ended.
+    /// </summary>
+    /// <param name="ticket">
+    /// From <see cref="BeginNavigation"/>, when the navigation was asked for
+    /// before this call; otherwise a reveal that selects takes a new one.
+    /// </param>
+    /// <param name="records">
+    /// Whether the selection is a step Back and Forward can retrace; a history
+    /// step's own selection is not.
+    /// </param>
+    /// <param name="exact">
+    /// Select and fly only when the path itself was found.  A path that is
+    /// gone reveals the deepest folder still there, and selecting that for a
+    /// search result or a row that vanished would point Delete at the folder.
+    /// </param>
+    public async Task<RevealOutcome> RevealAsync(
+        string path,
+        bool focus = true,
+        bool select = true,
+        int? ticket = null,
+        bool records = true,
+        bool exact = false)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
-            return null;
+            return default;
         }
 
         // Going somewhere while an earlier navigation is still reading its way
@@ -1131,7 +1168,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         // to, whichever finishes last.  Only a reveal that selects takes a
         // new ticket; one that flies there without selecting stands down for
         // any that starts after it.
-        var ticket = select ? ++_revealTicket : _revealTicket;
+        var taken = ticket ?? (select ? ++_revealTicket : _revealTicket);
 
         IReadOnlyList<string> chain;
         string normalized;
@@ -1143,7 +1180,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         {
             MessageRequested?.Invoke($"That path cannot be opened: {ex.Message}", true);
-            return null;
+            return default;
         }
 
         ViewAllNodeViewModel? node = null;
@@ -1201,26 +1238,30 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
         if (node is null)
         {
-            return null;
+            return default;
         }
 
         // Superseded: the folders on the way are open and the node exists, but
         // the selection, the view and the history belong to the navigation
-        // that came after.
-        var superseded = ticket != _revealTicket;
-        if (select && !superseded)
+        // that came after.  Short of the path, with only the exact path
+        // wanted: the message above has said it is gone, and the selection
+        // stays where it was.
+        var superseded = taken != _revealTicket;
+        var isExact = ViewAllPath.Equals(node.FullPath, normalized);
+        var acts = !superseded && (isExact || !exact);
+        if (select && acts)
         {
-            SelectOnly(node);
+            SelectOnly(node, records);
         }
 
         RebuildRenderSet();
-        if (focus && !superseded)
+        if (focus && acts)
         {
             FocusNodeRequested?.Invoke(node, true);
         }
 
         ScheduleSave();
-        return node;
+        return new RevealOutcome(node, isExact, superseded);
     }
 
     /// <summary>
@@ -1300,15 +1341,18 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// picked, going somewhere.  One change of <see cref="Selection"/>, and a
     /// navigation for back and forward.
     /// </summary>
-    public void SelectOnly(ViewAllNodeViewModel node)
+    public void SelectOnly(ViewAllNodeViewModel node) => SelectOnly(node, records: true);
+
+    /// <param name="records">Whether going there is a step for Back and Forward; a history step's own is not.</param>
+    private void SelectOnly(ViewAllNodeViewModel node, bool records)
     {
         // Any selection made now outranks a click still reading its way down.
         _selectTicket++;
-        Selection.ReplaceSingle(node.FullPath, node.IsDirectory, node.Entry.SizeBytes ?? 0, SelectionSource.Navigation);
+        Selection.ReplaceSingle(node.FullPath, node.IsDirectory, node.Entry.SizeBytes ?? 0, SelectionSource.Navigation, records);
 
         // The same node again, or the path spelled another way: the focus is
         // this node whatever the selection made of it.
-        SetActive(node, records: true);
+        SetActive(node, records);
         SyncSelectionMirror();
     }
 
@@ -2582,3 +2626,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         StatusPathText = node.FullPath;
     }
 }
+
+/// <summary>
+/// How a <see cref="ViewAllViewModel.RevealAsync"/> ended: the node it got
+/// to (the deepest folder still there when the path is gone), whether that is
+/// the path itself, and whether a newer navigation took over meanwhile - in
+/// which case nothing was selected or flown to.
+/// </summary>
+public readonly record struct RevealOutcome(ViewAllNodeViewModel? Node, bool IsExact, bool Superseded);

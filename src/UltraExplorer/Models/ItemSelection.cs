@@ -294,14 +294,14 @@ public sealed class ItemSelection
     }
 
     /// <summary>One item alone, anchor and focus on it: a plain click, or going somewhere.</summary>
-    public void ReplaceSingle(string path, bool isDirectory, long size, SelectionSource source) =>
+    public void ReplaceSingle(string path, bool isDirectory, long size, SelectionSource source, bool recordsNavigation = true) =>
         Apply(new SelectionEdit
         {
             Clear = true,
             Added = [new SelectionItem(path, isDirectory, size)],
             Anchor = path,
             Focus = path,
-            RecordsNavigation = true,
+            RecordsNavigation = recordsNavigation,
             Source = source
         });
 

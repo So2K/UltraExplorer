@@ -61,14 +61,6 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private bool _isDisposed;
 
-    /// <summary>
-    /// How many steps back or forward are still under way.  A count, not a
-    /// flag: with two in flight, the first to finish would otherwise clear it
-    /// while the other was still going, and that one arriving would be taken
-    /// for a new place and cut off the forward history.
-    /// </summary>
-    private int _historyNavigations;
-
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
@@ -127,7 +119,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         OpenSidebarItemCommand = new AsyncRelayCommand<FavoriteItemViewModel>(OpenSidebarItemAsync, allowConcurrent: true);
 
         Address = new AddressBarViewModel(
-            path => Tree.RevealPathAsync(path),
+            (path, ticket) => Tree.RevealAsync(path, ticket: ticket),
+            Tree.BeginNavigation,
+            Tree.IsLatestNavigation,
             RecentLocations,
             (message, isError) => OnTreeMessage(message, isError));
 
@@ -149,7 +143,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         AddToFavoritesCommand = new RelayCommand(AddSelectionToFavorites);
         RemoveFavoriteCommand = new RelayCommand<FavoriteItemViewModel>(RemoveFavorite);
 
-        Search = new SearchViewModel(_iconService, path => Tree.RevealPathAsync(path), OpenSearchResult);
+        // A result selects only itself: one deleted or moved since the search
+        // would otherwise select the folder it was in, and the next Delete
+        // would recycle that folder.
+        Search = new SearchViewModel(_iconService, path => Tree.RevealAsync(path, exact: true), OpenSearchResult);
 
         FitAllCommand = new RelayCommand(() => FitAllRequested?.Invoke());
         ZoomInCommand = new RelayCommand(() => ZoomRequested?.Invoke(1.25));
@@ -968,7 +965,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void RecordNavigation(string path)
     {
-        if (_historyNavigations > 0 || string.IsNullOrWhiteSpace(path))
+        if (string.IsNullOrWhiteSpace(path))
         {
             return;
         }
@@ -1016,18 +1013,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _ = NavigateHistoryAsync(_navigationHistory[_navigationIndex]);
     }
 
-    private async Task NavigateHistoryAsync(string path)
-    {
-        _historyNavigations++;
-        try
-        {
-            await Tree.RevealPathAsync(path);
-        }
-        finally
-        {
-            _historyNavigations--;
-        }
-    }
+    /// <summary>
+    /// A step back or forward.  Only its own selection is kept out of the
+    /// history: anything asked for while it reads its way there - a favourite
+    /// clicked while a share wakes up - outranks it and is recorded as usual,
+    /// so the next step is taken from where the window really is.
+    /// </summary>
+    private Task NavigateHistoryAsync(string path) => Tree.RevealAsync(path, records: false);
 
     private async Task GoUpAsync()
     {

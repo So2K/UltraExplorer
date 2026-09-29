@@ -1816,7 +1816,13 @@ public partial class MainWindow : Window
         }
     }
 
-    /// <summary>A right-click is the Shell's menu for the result, as it would be anywhere else.</summary>
+    /// <summary>
+    /// A right-click is the Shell's menu for the result, as it would be
+    /// anywhere else.  Where the Shell has none - the result was deleted or
+    /// moved since the search - there is no menu at all: the app's own would
+    /// act on the canvas's selection, which is not what was clicked, and its
+    /// Delete would recycle the wrong items.
+    /// </summary>
     private void SearchResults_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
         if (SearchResultUnder(e) is not { } result)
@@ -1826,7 +1832,11 @@ public partial class MainWindow : Window
 
         e.Handled = true;
         _viewModel.Search.Selected = result;
-        ShowContextMenu([result.FullPath], SearchResultsList, e.GetPosition(SearchResultsList), includeCanvasCommands: false);
+        if (!ShowContextMenu([result.FullPath], SearchResultsList, e.GetPosition(SearchResultsList), includeCanvasCommands: false, fallBack: false)
+            && !Path.Exists(result.FullPath))
+        {
+            _viewModel.Toast.ShowError($"{result.Name} is no longer there.");
+        }
     }
 
     private static SearchResultViewModel? SearchResultUnder(MouseEventArgs e)

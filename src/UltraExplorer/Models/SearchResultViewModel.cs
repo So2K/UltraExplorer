@@ -1,4 +1,3 @@
-using System.Globalization;
 using System.Windows.Media;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Services.Search;
@@ -83,5 +82,10 @@ public sealed class SearchResultViewModel : ObservableObject, ISearchRow
 
     public string SizeText => IsDirectory || Size < 0 ? string.Empty : Services.FileSystemService.FormatSize(Size);
 
-    public string DateText => Modified is { } modified ? modified.ToString("g", CultureInfo.CurrentCulture) : string.Empty;
+    /// <summary>
+    /// The date as the current culture writes it, or the invariant way for a
+    /// date its calendar cannot hold (an index can report 1850 or 2107, which
+    /// Umm al-Qura refuses).
+    /// </summary>
+    public string DateText => Modified is { } modified ? CultureDates.Format(modified, "g") : string.Empty;
 }
