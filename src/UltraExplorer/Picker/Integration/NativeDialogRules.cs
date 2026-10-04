@@ -96,10 +96,25 @@ internal static partial class NativeDialogRules
                     && address[i + 2] == '\\') || (i + 1 < address.Length && address[i] == '\\' && address[i + 1] == '\\'))
             {
                 var path = address[i..].Trim(' ', '\u200e', '\u200f');
+                if (WindowsReadsAsAnother(path)) return null;
                 if (Directory.Exists(path)) return path;
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Whether Windows, given this path, would go to another folder: a name
+    /// ending in a dot ("pair." beside "pair"), which every ordinary path call
+    /// drops, so that the picker would show - and a Save would go to - the
+    /// neighbour. Only such a name is asked about; the dialog stays with
+    /// Windows, which shows the folder it means.
+    /// </summary>
+    internal static bool WindowsReadsAsAnother(string path)
+    {
+        if (!path.Split('\\').Any(part => part.EndsWith('.'))) return false;
+        try { return !string.Equals(Path.GetFullPath(path), path, StringComparison.Ordinal); }
+        catch (ArgumentException) { return true; }
     }
 
     private static readonly Dictionary<string, Guid> KnownFolderRoots = new(StringComparer.OrdinalIgnoreCase)

@@ -579,7 +579,9 @@ public sealed class FileDialogSession : ObservableObject
                 continue;
             }
 
-            var expanded = Environment.ExpandEnvironmentVariables(candidate);
+            // A replaced dialog's folder is the one it shows, as it is: a
+            // folder may be named "%OS%", and expanded it would be another.
+            var expanded = Request.IsNativeProxy ? candidate : Environment.ExpandEnvironmentVariables(candidate);
             if (Directory.Exists(expanded))
             {
                 return Path.GetFullPath(expanded);

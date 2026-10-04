@@ -289,6 +289,7 @@ internal static class FastDialogRead
             if (i > 0 && !char.IsWhiteSpace(caption[i - 1]) && caption[i - 1] is not ('\u200e' or '\u200f')) continue;
             if (network) return null;
             var path = caption[i..].Trim(' ', '\u200e', '\u200f');
+            if (NativeDialogRules.WindowsReadsAsAnother(path)) return null;
             if (!verify || Directory.Exists(path)) return path;
         }
         return names?.Match(caption);
