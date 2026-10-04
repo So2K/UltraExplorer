@@ -610,6 +610,16 @@ internal sealed class NativeDialogProxy
         // dialog it replaces did; its own placement already put it elsewhere.
         if (!DialogNative.MayActivate && monitor.Primary) return;
         var bounds = NativeDialogRules.ProxyBounds(original, monitor.Work, monitor.Scale);
+        // The window's minimum was fitted to the monitor it was made on; a
+        // prepared picker put over a dialog on a shorter one (1080p at 175 %)
+        // would keep it, and its OK and Cancel would hang below the work
+        // area. Fitted again to what this placement holds.
+        if (HwndSource.FromHwnd(handle)?.RootVisual is Window window)
+        {
+            var scale = monitor.Scale is > 0.5 and < 8 ? monitor.Scale : 1;
+            window.MinWidth = Math.Min(window.MinWidth, Math.Floor(bounds.Width / scale));
+            window.MinHeight = Math.Min(window.MinHeight, Math.Floor(bounds.Height / scale));
+        }
         // Twice: a move onto a monitor of another scale makes the window
         // rescale itself to what it was on the old one (WM_DPICHANGED); the
         // second call, on the right monitor already, sets the size meant.
