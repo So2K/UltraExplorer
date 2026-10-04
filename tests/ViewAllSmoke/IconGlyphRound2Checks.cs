@@ -38,6 +38,7 @@ internal static partial class Program
             Round2IconHoldWakeChecks();
             Round2IconTrimChecks();
             Round2GlyphTierChecks(FaceRegistry.Shared);
+            Round2GlyphAnnounceChecks(FaceRegistry.Shared);
         }
         catch (Exception ex)
         {
@@ -303,5 +304,48 @@ internal static partial class Program
         Console.WriteLine($"  {description}, first drawn at 40 px: quads {string.Join(", ", quads)}, missing {string.Join(", ", missing)} over three frames");
         Check("J122: a glyph too big for the 64 px tier, first drawn above 28 px, is drawn from the 32 px one and counted missing until then",
             quads[^1] == 1 && missing[^1] == 0 && missing[1] > 0);
+    }
+
+    // ---- J085: new glyphs announced as they are made --------------------------------------------
+
+    /// <summary>
+    /// Three thousand glyphs not made yet, asked for at once - the first view
+    /// of names in a script the warm set does not hold.  The canvases must
+    /// hear of the first ones while the rest are still being made, not only
+    /// once the whole queue is done.
+    /// </summary>
+    private static void Round2GlyphAnnounceChecks(FaceRegistry faces)
+    {
+        using var atlas = new GlyphAtlas(faces);
+        var clock = Stopwatch.StartNew();
+        var announcements = 0;
+        long firstAt = -1;
+        var pendingAtFirst = -1;
+        atlas.GlyphsArrived += () =>
+        {
+            if (Interlocked.Increment(ref announcements) == 1)
+            {
+                firstAt = clock.ElapsedMilliseconds;
+                pendingAtFirst = atlas.PendingCount;
+            }
+        };
+
+        var asked = 0;
+        foreach (var face in new[] { FaceRegistry.Regular, FaceRegistry.SemiBold })
+        {
+            var count = Math.Min(1500, (int)faces[face].GlyphCount - 1);
+            for (var glyph = 1; glyph <= count; glyph++)
+            {
+                atlas.TryGet(face, (ushort)glyph, 2, out _);
+                asked++;
+            }
+        }
+
+        atlas.WaitForPending(TimeSpan.FromSeconds(60));
+        var drained = clock.ElapsedMilliseconds;
+        Thread.Sleep(100);
+        Console.WriteLine($"  {asked} glyphs made in {drained} ms: {announcements} announcement(s), the first at {firstAt} ms with {pendingAtFirst} still queued");
+        Check("J085: a long queue of new glyphs is announced as it is made, not only once all are made",
+            drained > 100 && pendingAtFirst > 0 && firstAt < drained / 2 && announcements >= 3);
     }
 }

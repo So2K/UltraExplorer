@@ -61,6 +61,15 @@ internal sealed unsafe class GlyphAtlas : IDisposable
 
     private static readonly GlyphTier[] TierTable = [new(16, 3), new(32, 4), new(64, 8)];
 
+    /// <summary>
+    /// While a long queue is made, the glyphs made so far are announced this
+    /// often (Stopwatch ticks, 25 ms).  Announced only once the queue was
+    /// empty, the first view of names in a script the warm set does not
+    /// hold showed them with holes for as long as the whole queue took, then
+    /// every glyph at once, in one long upload.
+    /// </summary>
+    private static readonly long AnnounceTicks = Stopwatch.Frequency / 40;
+
     private readonly FaceRegistry _faces;
     private readonly object _gate = new();
     private readonly nint[] _pages = new nint[MaximumPages];
@@ -100,8 +109,9 @@ internal sealed unsafe class GlyphAtlas : IDisposable
 
     /// <summary>
     /// Raised on a background thread after glyphs that were missing have been
-    /// placed and the queue is empty: the labels that skipped them can be
-    /// drawn again.
+    /// placed and the queue is empty, and every <see cref="AnnounceTicks"/>
+    /// while a long queue is still being made: the labels that skipped them
+    /// can be drawn again.
     /// </summary>
     public event Action? GlyphsArrived;
 
@@ -735,12 +745,31 @@ internal sealed unsafe class GlyphAtlas : IDisposable
     {
         try
         {
+            // When the glyphs made since the last announcement started to be
+            // made, or zero while the queue is empty.
+            long since = 0;
             foreach (var key in _requests.GetConsumingEnumerable())
             {
+                if (since == 0)
+                {
+                    since = Stopwatch.GetTimestamp();
+                }
+
                 if (Volatile.Read(ref _disposed) == 0) Make(key);
                 Interlocked.Decrement(ref _pendingCount);
-                if (_requests.Count == 0 && Volatile.Read(ref _disposed) == 0)
+                if (Volatile.Read(ref _disposed) != 0)
                 {
+                    continue;
+                }
+
+                if (_requests.Count == 0)
+                {
+                    since = 0;
+                    GlyphsArrived?.Invoke();
+                }
+                else if (Stopwatch.GetTimestamp() - since >= AnnounceTicks)
+                {
+                    since = Stopwatch.GetTimestamp();
                     GlyphsArrived?.Invoke();
                 }
             }
