@@ -1890,15 +1890,47 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         UpdateStatus();
     }
 
-    public void OpenInDefaultApplication(ViewAllNodeViewModel node)
+    /// <summary>
+    /// Opens a file the way a double-click in Explorer does.  Whether it is a
+    /// folder after all is asked on the thread pool, and the Shell is handed
+    /// the file there too: a file on a share that has gone to sleep holds
+    /// whoever asks about it for twenty seconds, and then the Shell for as
+    /// long again, and this thread is every window's.  A folder - a link to
+    /// one, opened as a file - goes to <see cref="NativeShellService.Open"/>
+    /// here, which hands it to this app's own windows when they stand in for
+    /// Explorer.  Nothing is opened for a window closed meanwhile.
+    /// </summary>
+    public void OpenInDefaultApplication(ViewAllNodeViewModel node) => _ = OpenInDefaultApplicationAsync(node);
+
+    private async Task OpenInDefaultApplicationAsync(ViewAllNodeViewModel node)
     {
+        var path = node.FullPath;
         try
         {
-            NativeShellService.Open(node.FullPath);
+            if (await Task.Run(() => Directory.Exists(path)))
+            {
+                if (!_isDisposed)
+                {
+                    NativeShellService.Open(path);
+                }
+
+                return;
+            }
+
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            // Off an STA thread the runtime makes one of its own for the Shell.
+            await Task.Run(() => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true })?.Dispose());
         }
         catch (Exception ex)
         {
-            MessageRequested?.Invoke($"Could not open {node.DisplayName}: {ex.Message}", true);
+            if (!_isDisposed)
+            {
+                MessageRequested?.Invoke($"Could not open {node.DisplayName}: {ex.Message}", true);
+            }
         }
     }
 
