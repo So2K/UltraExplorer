@@ -76,6 +76,17 @@ public partial class App : Application
 
         base.OnStartup(e);
 
+        // A dialog worker or proxy shows the canvas as the app's window does,
+        // so its GPU is readied as the window's is, before the role runs: the
+        // label atlases made and the card's pipelines warmed.  Left to the
+        // first frame of a dialog, the GPU started without the atlases -
+        // every name was drawn with WPF - and built its pipelines in that
+        // frame.  The other roles show no canvas, and make no device.
+        if (e.Args.Contains("--dialog-worker") || e.Args.Contains("--dialog-proxy"))
+        {
+            StartGpu();
+        }
+
         if (DialogIntegrationRuntime.TryRun(this, e.Args)) return;
 
         if (HasSwitch(e.Args, "register-picker"))
