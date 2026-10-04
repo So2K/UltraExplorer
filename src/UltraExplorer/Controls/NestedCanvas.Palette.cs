@@ -761,14 +761,15 @@ public sealed partial class NestedCanvas
         // may already have matches listed under it.
         var before = _filterMatches.Count;
         var held = folder.FilterStamp == _filterStamp && (folder.FilterState & (FilterSelf | FilterInside)) != 0;
+        HashSet<NestedFolder>? kept = null;
         _filterUnconfirmed = folder.FilterStamp == _filterStamp && (folder.FilterState & FilterInside) != 0 || IsBeingJudged(folder)
-            ? MatchesAtOrUnder(folder.FullPath)
+            ? folder.IsComputer ? MatchesAtOrUnder(folder.FullPath) : MatchesReadCanChange(folder, out kept)
             : null;
         bool matched;
         HashSet<string>? gone;
         try
         {
-            matched = Evaluate(folder);
+            matched = folder.IsComputer ? Evaluate(folder) : EvaluateRead(folder, kept);
         }
         finally
         {
@@ -816,6 +817,123 @@ public sealed partial class NestedCanvas
         {
             RaiseFilterChangedWithFrame();
         }
+    }
+
+    /// <summary>
+    /// <see cref="Evaluate"/> for a folder just read, judging only what the
+    /// read can have changed: its own files, and the sub-folders it did not
+    /// have before.  A sub-folder it kept was judged already - with all that
+    /// was read below it, which this read did not touch - and keeps its
+    /// standing and its matches (<paramref name="kept"/>, and every one
+    /// judged to hold none).  Judged whole, a drive's root read again with
+    /// the filter on matched every name read on the drive, in one go on the
+    /// UI thread: a tenth of a second and more for a couple of million names,
+    /// on every change the root saw.
+    /// </summary>
+    private bool EvaluateRead(NestedFolder folder, HashSet<NestedFolder>? kept)
+    {
+        var matcher = _filter!;
+        var state = 0;
+        if (matcher(folder.Name))
+        {
+            state |= FilterSelf;
+            AddMatch(folder.FullPath);
+        }
+
+        foreach (var file in folder.Files)
+        {
+            if (matcher(file.Name))
+            {
+                state |= FilterInside;
+                AddMatch(folder.PathOf(file));
+            }
+        }
+
+        foreach (var child in folder.Children)
+        {
+            if (kept?.Contains(child) == true)
+            {
+                state |= FilterInside;
+            }
+            else if (child.FilterStamp == _filterStamp && (child.FilterState & (FilterSelf | FilterInside)) == 0)
+            {
+                // Judged to hold nothing - a read below it since was judged
+                // as it came in - and judged again it would hold nothing still.
+            }
+            else if (Evaluate(child))
+            {
+                state |= FilterInside;
+            }
+        }
+
+        if (!folder.IsLoaded)
+        {
+            state |= FilterUnknown;
+        }
+
+        if (FilterStateOf(folder) != state)
+        {
+            folder.PaletteStamp = PaletteOutOfDate;
+        }
+
+        folder.FilterStamp = _filterStamp;
+        folder.FilterState = state;
+        return (state & (FilterSelf | FilterInside)) != 0;
+    }
+
+    /// <summary>
+    /// <see cref="MatchesAtOrUnder"/> for a folder read again, leaving out
+    /// the matches the read cannot have changed: those in and under the
+    /// sub-folders the filter judged as matching or holding a match, which
+    /// are <paramref name="kept"/> as they are.  A sub-folder judged so but
+    /// with nothing listed - shown again, say, after a read had left it out -
+    /// is not kept, and is judged again.  Null when there is nothing to
+    /// confirm.
+    /// </summary>
+    private HashSet<string>? MatchesReadCanChange(NestedFolder folder, out HashSet<NestedFolder>? kept)
+    {
+        kept = null;
+        Dictionary<string, NestedFolder>? judged = null;
+        foreach (var child in folder.Children)
+        {
+            if (child.FilterStamp == _filterStamp && (child.FilterState & (FilterSelf | FilterInside)) != 0)
+            {
+                (judged ??= new Dictionary<string, NestedFolder>(StringComparer.OrdinalIgnoreCase))[child.FullPath] = child;
+            }
+        }
+
+        if (judged is null)
+        {
+            return MatchesAtOrUnder(folder.FullPath);
+        }
+
+        // A match's sub-folder is its path up to the separator after the
+        // folder's own: a sub-folder's path is the folder's and its name.
+        var lookup = judged.GetAlternateLookup<ReadOnlySpan<char>>();
+        var root = folder.FullPath;
+        var start = root.Length + (root.Length > 0 && root[^1] == Path.DirectorySeparatorChar ? 0 : 1);
+        HashSet<string>? found = null;
+        foreach (var path in _filterMatches)
+        {
+            if (!IsAtOrUnder(path, root))
+            {
+                continue;
+            }
+
+            if (path.Length > start)
+            {
+                var end = path.IndexOf(Path.DirectorySeparatorChar, start);
+                if (lookup.TryGetValue(end < 0 ? path.AsSpan() : path.AsSpan(0, end), out var child))
+                {
+                    (kept ??= []).Add(child);
+                    continue;
+                }
+            }
+
+            (found ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase)).Add(path);
+        }
+
+        return found;
     }
 
     // ---- the frame's held-back events ------------------------------------------------
