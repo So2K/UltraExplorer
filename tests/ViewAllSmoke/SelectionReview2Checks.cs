@@ -14,9 +14,10 @@ namespace ViewAllSmoke;
 /// even while the folder above it is not read; Delete counts as shown only
 /// what the canvas has on it - not a hidden folder, nor files in a folder
 /// off screen that hidden items or the Files layer took away; an added
-/// rectangle's count includes what waits for a folder not read; and Ctrl+A
-/// and Shift ranges take the matching sub-folders while a big tree's filter
-/// is still judged.
+/// rectangle's count includes what waits for a folder not read; Ctrl+A and
+/// Shift ranges take the matching sub-folders while a big tree's filter is
+/// still judged; and the list's Shift ranges run from the shared anchor even
+/// when its row is not selected.
 /// </summary>
 internal static partial class Program
 {
@@ -26,6 +27,11 @@ internal static partial class Program
         RunOnSta("selection review 2: what Delete counts as shown", SelReview2ShownCountAsync);
         RunOnSta("selection review 2: an added rectangle's count", SelReview2MarqueeCountAsync);
         RunOnSta("selection review 2: gestures while the filter is judged", SelReview2FilterSlicesAsync);
+        RunOnSta("selection review 2: the list's anchor", () =>
+        {
+            SelReview2ListAnchorChecks();
+            return Task.CompletedTask;
+        });
         return Task.CompletedTask;
     }
 
@@ -340,5 +346,36 @@ internal static partial class Program
             canvas.SetFilter(null);
             canvas.Tree = null;
         }
+    }
+
+    // ---- J116: the list's anchor --------------------------------------------------------------
+
+    /// <summary>
+    /// The list box is handed the shared anchor's row with the rows to
+    /// light: a Ctrl+click on the canvas that took an item out leaves the
+    /// anchor on that item, not selected, and the list's next Shift+click has
+    /// to run from it; an anchor with no row in the list leaves it none.
+    /// </summary>
+    private static void SelReview2ListAnchorChecks()
+    {
+        Section("selection review 2: the list's Shift ranges run from the shared anchor (J116)");
+        var items = Enumerable.Range(0, 400).Select(index => $"row {index:D3}").ToList();
+        var box = new SelectionListBox();
+        box.BeginInit();
+        box.SelectionMode = SelectionMode.Extended;
+        box.ItemsSource = items;
+        box.EndInit();
+        box.Measure(new Size(400, 300));
+        box.Arrange(new Rect(0, 0, 400, 300));
+        box.UpdateLayout();
+        box.ApplySelection(new List<string> { items[2], items[5] }, items[2]);
+        var before = box.AnchorRow;
+        box.ApplySelection(new List<string> { items[2] }, items[5]);
+        Check($"the anchor taken out by a Ctrl+click elsewhere is still where the list's Shift ranges run from ({before} then {box.AnchorRow ?? "none"})",
+            ReferenceEquals(before, items[2]) && ReferenceEquals(box.AnchorRow, items[5]) && box.SelectedItems.Count == 1);
+        box.ApplySelection(new List<string>(), items[7]);
+        Check($"so is one with nothing selected at all, after Esc ({box.AnchorRow ?? "none"})", ReferenceEquals(box.AnchorRow, items[7]));
+        box.ApplySelection(new List<string> { items[3] }, null);
+        Check($"and an anchor with no row in the list leaves it none of its own ({box.AnchorRow ?? "none"})", box.AnchorRow is null);
     }
 }
