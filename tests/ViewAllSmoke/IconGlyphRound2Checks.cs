@@ -50,6 +50,7 @@ internal static partial class Program
         {
             await Round2IconOrderChecks();
             await Round2IconDriveKeyChecks();
+            await Round2IconLetGoChecks();
             Round2IconHungChecks();
         });
         return Task.CompletedTask;
@@ -429,6 +430,37 @@ internal static partial class Program
         var paneFolder = icons.GetSmallIcon(@"S:\Users", true);
         Check("J118: the navigation pane draws a drive with its glyph, without asking the Shell about it on the UI thread, and a folder still with the folder icon",
             paneDrive is null && !asked.Contains(@"S:\") && IconSamePicture(paneFolder, folder));
+    }
+
+    // ---- J120: past 20,000 per-file icons ---------------------------------------------------
+
+    /// <summary>
+    /// 20,001 programs asked about one after the other: past the limit only
+    /// the oldest let go of, so the ones shown last - the ones on screen -
+    /// keep their icons rather than all blanking at once.
+    /// </summary>
+    private static async Task Round2IconLetGoChecks()
+    {
+        var picture = FakeShell.Picture(0x123456);
+        using var icons = new ShellIconService((_, _) => picture, Dispatcher.CurrentDispatcher);
+        const int programs = 20_001;
+        string Tool(int index) => Path.Combine(Round2Root, "many", $"tool{index:D5}.exe");
+        for (var start = 0; start < programs; start += 1000)
+        {
+            for (var index = start; index < Math.Min(programs, start + 1000); index++)
+            {
+                icons.Request(Tool(index), false, _ => { });
+            }
+
+            await IconWaitUntilAsync(() => icons.PendingCount == 0);
+        }
+
+        var recent = Enumerable.Range(programs - 1000, 1000).Count(index => icons.GetCached(Tool(index), false) is not null);
+        var kept = Enumerable.Range(0, programs).Count(index => icons.GetCached(Tool(index), false) is not null);
+        var oldestGone = icons.GetCached(Tool(0), false) is null;
+        Console.WriteLine($"  {programs} programs: {kept} icons kept, {recent} of the last thousand, the oldest {(oldestGone ? "let go" : "kept")}");
+        Check("J120: past 20,000 programs only the oldest icons are let go of: the last thousand keep theirs, and the cache stays within its limit",
+            recent == 1000 && oldestGone && kept <= 20_000);
     }
 
     // ---- J037: four hung shortcuts -------------------------------------------------------------

@@ -80,11 +80,13 @@ public sealed class ShellIconService : IDisposable
 
     /// <summary>
     /// At most this many icons of single files - programs, shortcuts and the
-    /// like, one per path - are kept; the next one lets all of them go, to be
-    /// asked for again as they are shown, so a walk through a million
-    /// programs, or one search after another, cannot grow the cache without
-    /// end.  Far more than a screen shows at once: what is on screen is asked
-    /// for again once, not over and over.
+    /// like, one per path - are kept; the next one lets the longest asked for
+    /// go, down to three quarters of it, to be asked for again as they are
+    /// shown, so a walk through a million programs, or one search after
+    /// another, cannot grow the cache without end.  Far more than a screen
+    /// shows at once: what is on screen is asked for again once, not over and
+    /// over.  Letting all of them go at once, as it did, blanked every
+    /// program and shortcut on screen together.
     /// </summary>
     private const int FileIconLimit = 20_000;
 
@@ -134,6 +136,9 @@ public sealed class ShellIconService : IDisposable
     /// </summary>
     private Queue<PendingIcon>? _openRun;
 
+    /// <summary>The order icons were asked for in (<see cref="PendingIcon.Order"/>).  Guarded by <see cref="_gate"/>.</summary>
+    private long _askOrder;
+
     /// <summary>Types of folders just read: first come first served, and only once nothing on screen is waiting.</summary>
     private readonly Queue<PendingIcon> _prefetch = new();
 
@@ -162,8 +167,11 @@ public sealed class ShellIconService : IDisposable
     /// <summary>The <see cref="_fileIconsLetGo"/> the canvas last forgot what it asked for at.</summary>
     private int _canvasLetGoSeen;
 
-    /// <summary>Icons of single files added to the cache since they were last let go of.  Guarded by <see cref="_gate"/>.</summary>
-    private int _fileIcons;
+    /// <summary>
+    /// The icons of single files in the cache, the first asked for first:
+    /// the ones <see cref="LetFileIconsGo"/> lets go of.  Guarded by <see cref="_gate"/>.
+    /// </summary>
+    private readonly PriorityQueue<string, long> _fileIcons = new();
 
     /// <summary>How often the icons of single files were let go of (<see cref="LetFileIconsGo"/>).</summary>
     private int _fileIconsLetGo;
@@ -639,7 +647,7 @@ public sealed class ShellIconService : IDisposable
         }
         else
         {
-            entry = new PendingIcon(key, path, isDirectory, visible: true);
+            entry = new PendingIcon(key, path, isDirectory, visible: true) { Order = ++_askOrder };
             _pending[key] = entry;
         }
 
@@ -907,10 +915,14 @@ public sealed class ShellIconService : IDisposable
                 icon = previous.Icon;
             }
 
-            if (!had && IsPathSpecificIcon(Path.GetExtension(entry.Key.AsSpan())) && ++_fileIcons > FileIconLimit)
+            if (!had && IsPathSpecificIcon(Path.GetExtension(entry.Key.AsSpan())))
             {
-                LetFileIconsGo();
-                _fileIcons = 1;
+                if (_fileIcons.Count >= FileIconLimit)
+                {
+                    LetFileIconsGo();
+                }
+
+                _fileIcons.Enqueue(entry.Key, entry.Order);
             }
 
             _cache[entry.Key] = new CachedIcon(icon, Provisional: !settled);
@@ -936,20 +948,17 @@ public sealed class ShellIconService : IDisposable
     }
 
     /// <summary>
-    /// Lets go of every icon of a single file in the cache, once there are
-    /// more than <see cref="FileIconLimit"/>: each is asked about again when
-    /// it is shown again, and the canvas forgets having asked
-    /// (<see cref="_fileIconsLetGo"/>).  Whoever was given one keeps it.
+    /// Lets go of the icons of single files asked for longest ago, once there
+    /// are <see cref="FileIconLimit"/>, down to three quarters of it: each is
+    /// asked about again when it is shown again, and the canvas forgets having
+    /// asked (<see cref="_fileIconsLetGo"/>).  Whoever was given one keeps it.
     /// Under the gate.
     /// </summary>
     private void LetFileIconsGo()
     {
-        foreach (var (key, _) in _cache)
+        while (_fileIcons.Count > FileIconLimit * 3 / 4 && _fileIcons.TryDequeue(out var key, out _))
         {
-            if (IsPathSpecificIcon(Path.GetExtension(key.AsSpan())))
-            {
-                _cache.TryRemove(key, out _);
-            }
+            _cache.TryRemove(key, out _);
         }
 
         Interlocked.Increment(ref _fileIconsLetGo);
@@ -1102,6 +1111,9 @@ public sealed class ShellIconService : IDisposable
         public bool Visible = visible;
         public bool ForCanvas;
         public List<Action<ImageSource?>>? Callbacks;
+
+        /// <summary>When it was asked for, counted from the service's start: the icons of single files asked for longest ago are let go of first.</summary>
+        public long Order;
     }
 
     /// <summary>One item of the on-screen stack: an icon asked for alone, or a run of rows answered in the order they were asked.</summary>
