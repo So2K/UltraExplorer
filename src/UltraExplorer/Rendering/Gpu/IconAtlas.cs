@@ -185,6 +185,16 @@ internal sealed class IconAtlas : IDisposable
     private int _nextSlot;
     private int _typeSlotCount;
     private int _fileSlotCount;
+
+    /// <summary>
+    /// How many files may be remembered before the next <see cref="TrimFiles"/>:
+    /// <see cref="FileEntryLimit"/>, or twice what the last trim kept.  Copies
+    /// of the same programs share one slot and are all kept, so with the
+    /// limit fixed every new file past it scanned every file and forgot
+    /// nothing - tens of milliseconds a frame.
+    /// </summary>
+    private int _fileTrimAt = FileEntryLimit;
+
     private long _frame;
 
     /// <summary>When the current frame's <c>ProcessArrivals</c> began (Stopwatch ticks); what a slot drawn in it is stamped with.</summary>
@@ -748,9 +758,10 @@ internal sealed class IconAtlas : IDisposable
         ref var entry = ref CollectionsMarshal.GetValueRefOrNullRef(_filesBySpan, path);
         if (Unsafe.IsNullRef(ref entry))
         {
-            if (_files.Count >= FileEntryLimit)
+            if (_files.Count >= _fileTrimAt)
             {
                 TrimFiles();
+                _fileTrimAt = Math.Max(FileEntryLimit, _files.Count * 2);
             }
 
             var key = pathString ?? path.ToString();
@@ -1337,6 +1348,7 @@ internal sealed class IconAtlas : IDisposable
         }
 
         _files.Clear();
+        _fileTrimAt = FileEntryLimit;
     }
 
     private void LinkAtHead(int slot)

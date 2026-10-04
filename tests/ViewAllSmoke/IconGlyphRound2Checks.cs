@@ -36,6 +36,7 @@ internal static partial class Program
         {
             Round2IconRestChecks();
             Round2IconHoldWakeChecks();
+            Round2IconTrimChecks();
         }
         catch (Exception ex)
         {
@@ -201,5 +202,49 @@ internal static partial class Program
         Console.WriteLine($"  two canvases, a pan from four programs to four others: {held} held after the pan, {own} with icons of their own 2.5 s into the rest");
         Check("J087: a program denied a slot held for another canvas gets one once the hold is over, with nothing else drawn",
             firstOwn == 4 && held == 4 && own == 4);
+    }
+
+    // ---- J119: copies of the same programs past the file limit ---------------------------------
+
+    /// <summary>
+    /// Ten thousand copies of one program, each in a folder of its own: one
+    /// picture, so one slot every copy shows, and nothing the trim of files
+    /// could forget.  Past the limit of 8,192 files a new copy must cost
+    /// what one cost below it, not a scan of every file.
+    /// </summary>
+    private static void Round2IconTrimChecks()
+    {
+        var source = new IconFakeSource();
+        using var atlas = new IconAtlas(new IconAtlasOptions { CachePath = null, AutoSaveInterval = TimeSpan.Zero, Source = source.Find });
+        string Copy(int index) => Path.Combine(Round2Root, "copies", $"copy-{index:D5}", "same-tool.exe");
+
+        var below = TimeSpan.Zero;
+        for (var start = 0; start < 8192; start += 512)
+        {
+            var asking = Stopwatch.StartNew();
+            for (var index = start; index < start + 512; index++)
+            {
+                atlas.SlotFor(Copy(index), "exe");
+            }
+
+            if (start < 2048)
+            {
+                below += asking.Elapsed;
+            }
+
+            IconSettle(atlas, null, null, () => atlas.PendingKeyCount == 0);
+        }
+
+        var shared = atlas.FileSlotCount;
+        var past = Stopwatch.StartNew();
+        for (var index = 8192; index < 8192 + 2048; index++)
+        {
+            atlas.SlotFor(Copy(index), "exe");
+        }
+
+        past.Stop();
+        Console.WriteLine($"  copies of one program in {shared} file slot: 2,048 new copies took {below.TotalMilliseconds:F1} ms below the file limit, {past.Elapsed.TotalMilliseconds:F1} ms past it");
+        Check("J119: past the file limit, copies of programs that share a slot cost what they cost below it",
+            shared == 1 && past.Elapsed.TotalMilliseconds < below.TotalMilliseconds * 4 + 10);
     }
 }
