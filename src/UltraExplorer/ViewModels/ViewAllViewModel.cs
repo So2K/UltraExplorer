@@ -2504,7 +2504,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             for (var index = 0; index < renames.Length; index++)
             {
                 var pair = renames[index];
-                if (NamedAgain(renames, index) is { } again)
+                if (NamedAgain(renames, index, change.Key) is { } again)
                 {
                     if (!string.Equals(again, pair.OldName, StringComparison.Ordinal))
                     {
@@ -2532,8 +2532,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// backup that moves on, or a copy that was itself renamed in, is an item
     /// moving - a swap, or a batch rename's shift or its two passes through
     /// temporary names - and the mark and the selection follow the item.
+    /// So is a copy that was selected or marked before the change: an editor's
+    /// copy is a new file nobody has picked yet, and one somebody had is an
+    /// item of its own - a renumber, IMG_2 to IMG_3 and then IMG_1 to IMG_2.
     /// </summary>
-    private static string? NamedAgain(ReadOnlySpan<RenamePair> renames, int index)
+    private string? NamedAgain(ReadOnlySpan<RenamePair> renames, int index, string folder)
     {
         var backup = renames[index].NewName;
         for (var other = 0; other < renames.Length; other++)
@@ -2560,10 +2563,34 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 }
             }
 
+            if (WasPicked(Path.Combine(folder, copy)))
+            {
+                return null;
+            }
+
             return renames[later].NewName;
         }
 
         return null;
+    }
+
+    /// <summary>Whether <paramref name="path"/> is selected in any pane or carries a mark.</summary>
+    private bool WasPicked(string path)
+    {
+        if (Selection.Contains(path) || !_marks.Get(path).IsEmpty)
+        {
+            return true;
+        }
+
+        foreach (var kept in _keptSelections)
+        {
+            if (kept.Contains(path))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>What <paramref name="path"/> is called once <paramref name="oldPath"/> is <paramref name="newPath"/>: null when it is not that or inside it.</summary>

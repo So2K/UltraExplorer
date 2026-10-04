@@ -18,9 +18,10 @@ namespace ViewAllSmoke;
 /// against the disk; a slow listing lets go only of what was selected when it
 /// began; an item found gone is said to be gone once, and only once the disk
 /// says so, and the focus goes to its folder; a navigation on the tree canvas
-/// that has been given way to stops opening the folders on its way; and a
-/// reveal racing a refresh of the folder above starts again instead of
-/// selecting a folder the graph let go of.
+/// that has been given way to stops opening the folders on its way; a reveal
+/// racing a refresh of the folder above starts again instead of selecting a
+/// folder the graph let go of; and a renumber is not taken for an editor's
+/// safe-save.
 /// </summary>
 internal static partial class Program
 {
@@ -37,6 +38,7 @@ internal static partial class Program
             await OnDispatcher(() => VmRound2GoneFocusAsync(root));
             await OnDispatcher(() => VmRound2SupersededRevealAsync(root));
             await OnDispatcher(() => VmRound2RevealRefreshRaceAsync(root));
+            await OnDispatcher(() => VmRound2RenumberAsync(root));
         }
         finally
         {
@@ -446,5 +448,61 @@ internal static partial class Program
             outcome.IsExact && Live(outcome.Node));
         Check($"nothing says it is gone ({string.Join(" | ", messages)})", !messages.Any(message => message.Contains("no longer inside", StringComparison.Ordinal)));
         Check("and what is selected is a node the graph has", Live(tree.ActiveNode) && ViewAllPath.Equals(tree.ActivePath, hidden));
+    }
+
+    // ---- J136: a renumber -------------------------------------------------------------------
+
+    private static async Task VmRound2RenumberAsync(string root)
+    {
+        Section("view model round 2: a renumber");
+        var folder = Path.Combine(root, "renumber");
+        var scratch = Path.Combine(root, "renumber-state");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(scratch);
+        string In(string name) => Path.Combine(folder, name);
+        File.WriteAllText(In("IMG_1.jpg"), "one");
+        File.WriteAllText(In("IMG_2.jpg"), "two");
+
+        using var icons = new ShellIconService();
+        var marks = new FolderMarkService(Path.Combine(scratch, "marks.json"));
+        using var tree = new ViewAllViewModel(marks, icons, Path.Combine(scratch, "tree.json"));
+        tree.PreferLightReveal = true;
+        tree.IsCanvasShown = false;
+        await tree.InitializeAsync(folder);
+        var sink = (IChangeSink)tree;
+        void Moved(params RenamePair[] renames)
+        {
+            foreach (var pair in renames)
+            {
+                File.Move(In(pair.OldName), In(pair.NewName));
+            }
+
+            sink.FolderChanged(ChangeConsumer.Nested, folder, new FolderChange(folder, ChangeKinds.Structural, Stopwatch.GetTimestamp(), renames, default));
+        }
+
+        // Both coloured, the second selected: 2 to 3, then 1 to 2.
+        marks.SetAccent(In("IMG_1.jpg"), "#3FA34D");
+        marks.SetAccent(In("IMG_2.jpg"), "#4A7BD0");
+        tree.Selection.ReplaceSingle(In("IMG_2.jpg"), false, 3, SelectionSource.Canvas);
+        Moved(new RenamePair("IMG_2.jpg", "IMG_3.jpg"), new RenamePair("IMG_1.jpg", "IMG_2.jpg"));
+        await Task.Delay(200);
+        Check($"a renumber takes each colour along with its file (IMG_2: {marks.Get(In("IMG_2.jpg")).AccentHex}, IMG_3: {marks.Get(In("IMG_3.jpg")).AccentHex})",
+            marks.Get(In("IMG_3.jpg")).AccentHex == "#4A7BD0" && marks.Get(In("IMG_2.jpg")).AccentHex == "#3FA34D" && marks.Get(In("IMG_1.jpg")).IsEmpty);
+        Check($"and the selection stays on the file it was on ({string.Join(", ", tree.Selection.Paths.Select(Path.GetFileName))})",
+            tree.Selection.Count == 1 && tree.Selection.Contains(In("IMG_3.jpg")));
+
+        // Both selected, uncoloured: 3 to 4, then 2 to 3.
+        tree.Selection.Apply(new SelectionEdit
+        {
+            Clear = true,
+            Added = [new SelectionItem(In("IMG_2.jpg"), false, 3), new SelectionItem(In("IMG_3.jpg"), false, 3)],
+            Source = SelectionSource.Canvas,
+        });
+        marks.SetAccent(In("IMG_2.jpg"), null);
+        marks.SetAccent(In("IMG_3.jpg"), null);
+        Moved(new RenamePair("IMG_3.jpg", "IMG_4.jpg"), new RenamePair("IMG_2.jpg", "IMG_3.jpg"));
+        await Task.Delay(200);
+        Check($"two selected files renumbered stay selected, both ({string.Join(", ", tree.Selection.Paths.Select(Path.GetFileName))})",
+            tree.Selection.Count == 2 && tree.Selection.Contains(In("IMG_3.jpg")) && tree.Selection.Contains(In("IMG_4.jpg")));
     }
 }
