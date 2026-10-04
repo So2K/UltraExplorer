@@ -66,6 +66,10 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     private long _quietUntil;
     private bool _disposed;
 
+    /// <summary>The snapshot on screen, and the search it answers: a walk's is ordered again for another folder rather than searched again.</summary>
+    private SearchSnapshot? _shown;
+    private SearchQuery? _shownQuery;
+
     /// <summary>Set while the wait for Everything is asking whether it is ready yet.</summary>
     private bool _askingEverything;
 
@@ -133,7 +137,31 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
             _folderSettling.Stop();
             if (IsOpen && !string.Equals(_seenFolder, _here, StringComparison.OrdinalIgnoreCase))
             {
-                _ = RunAsync();
+                // A walk is not made again for the folder: that threw away all
+                // it had found and walked every drive again from the start -
+                // at every stop while browsing, so it never got to the end.
+                // What it has found is ordered for the folder instead, and so
+                // is what it goes on to find.  One stopped at its limit holds
+                // only part of what there is, found from the folder before,
+                // and is made again from this one.
+                if (_shown is { Source: SearchSource.Walk } shown && shown.Hits.Count < SearchEngine.WalkLimit && _shownQuery is { } query)
+                {
+                    _here = SearchRanking.Normalize(HereNow());
+                    _seenFolder = _here;
+                    Apply(shown, query);
+
+                    // Made again, the search went to an Everything that had
+                    // become ready meanwhile; this one still goes to it, once
+                    // it is.
+                    if (!shown.EverythingFailed)
+                    {
+                        _waitingForEverything.Start();
+                    }
+                }
+                else
+                {
+                    _ = RunAsync();
+                }
             }
         };
 
@@ -305,6 +333,8 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         Rows = [];
         Results = [];
         _byPath = new Dictionary<string, SearchResultViewModel>(StringComparer.OrdinalIgnoreCase);
+        _shown = null;
+        _shownQuery = null;
         Summary = string.Empty;
         Status = string.Empty;
         EmptyText = string.Empty;
@@ -414,18 +444,10 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         var run = new CancellationTokenSource();
         _run = run;
         var token = run.Token;
+        _shown = null;
+        _shownQuery = null;
 
-        string? here;
-        try
-        {
-            here = HereFolder?.Invoke();
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
-        {
-            here = null;
-        }
-
-        _here = SearchRanking.Normalize(here);
+        _here = SearchRanking.Normalize(HereNow());
         _seenFolder = _here;
         _folderSettling.Stop();
         IsBusy = true;
@@ -436,7 +458,9 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
             // Started off this thread: before its first wait the engine asks
             // Everything whether it is ready - up to a second when it is busy -
             // and looks at the drives, and this is the window's thread, at
-            // every key.
+            // every key.  A walk orders what it finds from the folder the
+            // results are ordered from now, which going to another one while
+            // it runs changes (see the folder settling).
             await Task.Run(
                 () => _engine.RunAsync(
                     query,
@@ -450,7 +474,8 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
                             }
                         },
                         DispatcherPriority.Input),
-                    token),
+                    token,
+                    () => Volatile.Read(ref _here)),
                 token);
         }
         catch (OperationCanceledException)
@@ -466,9 +491,30 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>The folder a search is made from now, as the window says it.</summary>
+    private string? HereNow()
+    {
+        try
+        {
+            return HereFolder?.Invoke();
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
     /// <summary>Puts a snapshot of the results on screen, keeping what was selected when it is still there.</summary>
     private void Apply(SearchSnapshot snapshot, SearchQuery query)
     {
+        // A walk's results ordered from a folder the results are no longer
+        // ordered from - sent before the walk heard of the move, or its last,
+        // sent before the move - are ordered again for the one they are.
+        if (snapshot.Source == SearchSource.Walk && !string.Equals(snapshot.Folder, _here, StringComparison.OrdinalIgnoreCase))
+        {
+            snapshot = SearchEngine.OrderedFrom(snapshot, query, _here);
+        }
+
         var rows = new List<ISearchRow>(snapshot.Hits.Count + 2);
         var results = new List<SearchResultViewModel>(snapshot.Hits.Count);
         var byPath = new Dictionary<string, SearchResultViewModel>(snapshot.Hits.Count, StringComparer.OrdinalIgnoreCase);
@@ -546,6 +592,8 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         var selectedPath = _selected?.FullPath;
         _byPath = byPath;
         _source = snapshot.Source;
+        _shown = snapshot;
+        _shownQuery = query;
         Rows = rows;
         Results = results;
         Selected = selectedPath is not null && byPath.TryGetValue(selectedPath, out var kept)

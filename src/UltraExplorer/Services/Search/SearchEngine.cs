@@ -34,6 +34,13 @@ internal sealed record SearchSnapshot(
     /// and walk every drive again, for as long as the panel is open.
     /// </summary>
     public bool EverythingFailed { get; init; }
+
+    /// <summary>
+    /// The folder the results are ordered from (<see cref="SearchRanking"/>):
+    /// the one the search was made from, or - for a walk - the one gone to
+    /// while it ran.
+    /// </summary>
+    public string? Folder { get; init; }
 }
 
 /// <summary>
@@ -94,7 +101,14 @@ internal sealed class SearchEngine
     /// has found: once for Everything, as it goes for a walk, the last time
     /// with <see cref="SearchSnapshot.IsFinal"/>.
     /// </summary>
-    public async Task RunAsync(SearchQuery query, string? here, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
+    /// <param name="orderFrom">
+    /// The folder the results are to be ordered from now, asked - on the
+    /// walk's thread - at each of a walk's reports: going to another folder
+    /// while a walk runs orders what it has found for that one, where
+    /// searching again would throw it all away and walk every drive again.
+    /// Null keeps <paramref name="here"/>.
+    /// </param>
+    public async Task RunAsync(SearchQuery query, string? here, Action<SearchSnapshot> publish, CancellationToken cancellationToken, Func<string?>? orderFrom = null)
     {
         if (query.IsEmpty)
         {
@@ -140,7 +154,7 @@ internal sealed class SearchEngine
         var drives = DriveInfo.GetDrives()
             .Where(drive => drive.DriveType == DriveType.Fixed && drive.IsReady)
             .Select(drive => drive.RootDirectory.FullName);
-        await WalkAsync(query, here, drives, reason, failed, publish, cancellationToken).ConfigureAwait(false);
+        await WalkAsync(query, here, drives, reason, failed, publish, orderFrom, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<bool> AskEverythingAsync(SearchQuery query, string? here, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
@@ -210,12 +224,16 @@ internal sealed class SearchEngine
             SearchSource.Everything,
             true,
             $"{total:N0} found on all drives · {elapsed:0} ms · {version}",
-            elapsed));
+            elapsed)
+        {
+            Folder = here,
+        });
         return true;
     }
 
     /// <param name="drives">The roots of the drives walked after the folder searched from.</param>
-    private async Task WalkAsync(SearchQuery query, string? here, IEnumerable<string> drives, string reason, bool everythingFailed, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
+    /// <param name="orderFrom">The folder to order from now; null keeps <paramref name="here"/> (see <see cref="RunAsync"/>).</param>
+    private async Task WalkAsync(SearchQuery query, string? here, IEnumerable<string> drives, string reason, bool everythingFailed, Action<SearchSnapshot> publish, Func<string?>? orderFrom, CancellationToken cancellationToken)
     {
         var clock = Stopwatch.StartNew();
         var substs = Substs();
@@ -236,11 +254,21 @@ internal sealed class SearchEngine
 
             var fresh = walk.Drain();
 
+            // Gone to another folder meanwhile: what was found is ordered for
+            // that one, and so is what is found from now on.
+            var now = orderFrom is null ? folder : SearchRanking.Normalize(orderFrom());
+            var moved = !string.Equals(now, folder, StringComparison.OrdinalIgnoreCase);
+            if (moved)
+            {
+                folder = now;
+                hits = OrderedFrom(hits, query, folder);
+            }
+
             // The first report goes out even when nothing has been found yet:
             // until it does, the panel still shows the search before - its
             // results, its count, its first result for Enter to open - for as
             // long as the walk finds nothing, which can be all of it.
-            if (fresh.Count > 0 || finished || !reported)
+            if (fresh.Count > 0 || finished || moved || !reported)
             {
                 reported = true;
                 foreach (var hit in fresh)
@@ -257,6 +285,7 @@ internal sealed class SearchEngine
                 publish(new SearchSnapshot([.. hits], hereTotal, hits.Count - hereTotal, SearchSource.Walk, finished, status, clock.Elapsed.TotalMilliseconds)
                 {
                     EverythingFailed = everythingFailed,
+                    Folder = folder,
                 });
             }
 
@@ -265,6 +294,33 @@ internal sealed class SearchEngine
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Results ordered again from <paramref name="folder"/>: copies, since the
+    /// ones already handed out are being read on the window's thread.
+    /// </summary>
+    internal static List<SearchHit> OrderedFrom(IReadOnlyList<SearchHit> hits, SearchQuery query, string? folder)
+    {
+        var copies = new List<SearchHit>(hits.Count);
+        foreach (var hit in hits)
+        {
+            copies.Add(new SearchHit(hit.Name, hit.Directory, hit.IsFolder, hit.Size, hit.Modified, hit.Highlighted));
+        }
+
+        SearchRanking.Rank(copies, query, folder);
+        return copies;
+    }
+
+    /// <summary>
+    /// A walk's snapshot ordered from another folder, its counts with it: how
+    /// many of the results are in and under that one, and how many are not.
+    /// </summary>
+    internal static SearchSnapshot OrderedFrom(SearchSnapshot snapshot, SearchQuery query, string? folder)
+    {
+        var hits = OrderedFrom(snapshot.Hits, query, folder);
+        var hereTotal = hits.Count(hit => hit.Place != SearchPlace.Elsewhere);
+        return snapshot with { Hits = hits, HereTotal = hereTotal, ElsewhereTotal = hits.Count - hereTotal, Folder = SearchRanking.Normalize(folder) };
     }
 
     /// <summary>
