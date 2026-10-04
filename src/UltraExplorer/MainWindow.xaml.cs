@@ -375,6 +375,9 @@ public partial class MainWindow : Window
             // before it has acquired and copied an archive source's bytes.
             if (_pendingExternalDrop is { } transfer)
             {
+                // Said at once: the copy can take minutes, and a window whose
+                // close button and Alt+F4 did nothing that long looked hung.
+                if (!transfer.IsCompleted) _viewModel.Toast.ShowBusy("Closing once the drop in progress has finished…");
                 try { await transfer; }
                 catch (Exception) { /* The drop handler reports the transfer error; still save the window. */ }
             }
