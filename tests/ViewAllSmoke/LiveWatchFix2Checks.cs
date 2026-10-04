@@ -29,6 +29,7 @@ internal static partial class Program
         RunOnSta("a deleted subtree's gone folders", Fix2GoneIndexChecks);
         RunOnSta("a subtree deleted and made anew", Fix2RemadeSubtreeChecks);
         RunOnSta("a folder deleted with its contents", Fix2GoneWithContentsChecks);
+        RunOnSta("an order below a folder never listed", Fix2PartialRenameOrderChecks);
         return Task.CompletedTask;
     }
 
@@ -312,5 +313,47 @@ internal static partial class Program
         Check($"a folder on screen deleted with its contents is not read for them ({asked} reads asked)", asked == 0);
         Check($"and leaves the canvas without ever being drawn as no longer existing (failed seen: {failedSeen})",
             NestedTree.IsDetached(gone) && !failedSeen);
+    }
+
+    /// <summary>
+    /// A window opened on a path has the folders above it reached by name,
+    /// never listed: a sorted sub-folder renamed in one of them kept its
+    /// order under the old name, and lost it (J144).
+    /// </summary>
+    private static async Task Fix2PartialRenameOrderChecks()
+    {
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerPartialOrder", Guid.NewGuid().ToString("N"));
+        var parentPath = Path.Combine(baseDirectory, "work");
+        var projectPath = Path.Combine(parentPath, "Proj");
+        var target = Path.Combine(projectPath, "Sub");
+        Directory.CreateDirectory(target);
+        try
+        {
+            var orders = new FolderOrders();
+            using var tree = new NestedTree { Orders = orders };
+            tree.SetRoots([new NestedRoot(baseDirectory, "W", NestedFolderKind.Drive)]);
+            var folder = await tree.MaterializePathAsync(target);
+            var parent = folder?.Parent?.Parent;
+            if (folder is null || parent is null || !ViewAllPath.Equals(parent.FullPath, parentPath))
+            {
+                Check("the folder named is in the tree", false);
+                return;
+            }
+
+            var byDate = new ItemSort(SortColumn.Modified, true);
+            orders.SetFolder(projectPath, byDate);
+            Check("the folder holding the sorted one was reached by name and never listed", parent is { HasPartialListing: true, IsLoaded: false });
+
+            var renamedPath = Path.Combine(parentPath, "Proj2");
+            tree.OnFolderChanged(parent, new FolderChange(parent.FullPath, ChangeKinds.Structural, Stopwatch.GetTimestamp(), new[] { new RenamePair("Proj", "Proj2") }, default));
+            Check($"a sorted folder renamed below a folder never listed keeps its order under its new name ({orders.SortOf(renamedPath).Column})",
+                orders.SortOf(renamedPath) == byDate && !orders.HasOwnOrder(projectPath));
+            var renames = (ICollection)typeof(NestedTree).GetField("_renames", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(tree)!;
+            Check("and nothing waits for a listing the folder may never have", renames.Count == 0);
+        }
+        finally
+        {
+            TryDelete(baseDirectory);
+        }
     }
 }

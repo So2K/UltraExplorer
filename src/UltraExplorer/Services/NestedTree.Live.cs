@@ -348,7 +348,9 @@ public sealed partial class NestedTree : IChangeSink
     /// the new listing is applied.</item>
     /// </list>
     /// A rename within the folder is remembered, so the renamed folder can take
-    /// its listing with it when the folder's new listing comes.
+    /// its listing with it when the folder's new listing comes; and a renamed
+    /// sub-folder's own order goes to its new name, in a folder reached by
+    /// name and never listed too.
     /// </summary>
     internal void OnFolderChanged(NestedFolder folder, in FolderChange change)
     {
@@ -406,7 +408,7 @@ public sealed partial class NestedTree : IChangeSink
             }
         }
 
-        if (!change.Renames.IsEmpty && folder.IsLoaded)
+        if (!change.Renames.IsEmpty)
         {
             NoteRenames(folder, change.Renames);
         }
@@ -1047,11 +1049,15 @@ public sealed partial class NestedTree : IChangeSink
     /// <summary>
     /// Remembers renames within a folder until its next listing is applied,
     /// a handful at most; a renamed sub-folder's own order, if it has one,
-    /// goes to its new name at once (<see cref="FolderOrders.Move"/>).
+    /// goes to its new name at once (<see cref="FolderOrders.Move"/>).  A
+    /// folder reached by name and never listed - a window opened on a path
+    /// - has no listing for a renamed sub-folder to take along, and nothing
+    /// is remembered; its sub-folders' orders move all the same.
     /// </summary>
     private void NoteRenames(NestedFolder folder, ReadOnlyMemory<RenamePair> pairs)
     {
-        if (!_renames.TryGetValue(folder, out var noted))
+        List<RenamePair>? noted = null;
+        if (folder.IsLoaded && !_renames.TryGetValue(folder, out noted))
         {
             noted = [];
             _renames[folder] = noted;
@@ -1060,7 +1066,7 @@ public sealed partial class NestedTree : IChangeSink
         var moveOrders = _orders.Count > 0 && FirstToMoveOrders(pairs);
         foreach (var pair in pairs.Span)
         {
-            if (noted.Count < 16)
+            if (noted is { Count: < 16 })
             {
                 noted.Add(pair);
             }
