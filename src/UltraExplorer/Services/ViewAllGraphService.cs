@@ -880,10 +880,23 @@ public sealed class ViewAllGraphService : IDisposable
     /// what Load more had brought into the folder before it was read again,
     /// so that a refresh keeps it (see <see cref="RefreshBranchAsync"/>).
     /// </param>
-    public async Task<ViewAllExpansionResult> ExpandAsync(
+    public Task<ViewAllExpansionResult> ExpandAsync(
         ViewAllNodeViewModel node,
         CancellationToken cancellationToken = default,
         int childLimit = 0)
+        => ExpandAsync(node, cancellationToken, childLimit, open: true);
+
+    /// <param name="open">
+    /// False to read the folder without opening it, as a refresh asked to
+    /// leave a closed folder closed does (see <see cref="RefreshBranchAsync"/>):
+    /// its children are made off the tree, as a closed folder's are, and one
+    /// already read is left as it is.
+    /// </param>
+    private async Task<ViewAllExpansionResult> ExpandAsync(
+        ViewAllNodeViewModel node,
+        CancellationToken cancellationToken,
+        int childLimit,
+        bool open)
     {
         ThrowIfDisposed();
         if (!CanExpand(node))
@@ -893,6 +906,11 @@ public sealed class ViewAllGraphService : IDisposable
 
         if (node.AreChildrenLoaded)
         {
+            if (!open)
+            {
+                return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
+            }
+
             // Closed while the options changed: read again under the new
             // ones, with what was open below it opened again.
             if (_staleRoots.Remove(node))
@@ -939,11 +957,23 @@ public sealed class ViewAllGraphService : IDisposable
             ApplySnapshot(node, snapshot, added);
 
             node.AreChildrenLoaded = true;
-            node.IsExpanded = true;
+            if (open)
+            {
+                node.IsExpanded = true;
+            }
+
             node.IsTruncated = snapshot.IsTruncated;
             node.ChildLoadLimit = readOptions.SafeMaximumChildren;
             node.NotifyChildrenChanged();
-            ShowOrHideLoadedBranch(node);
+            if (node.IsExpanded)
+            {
+                ShowOrHideLoadedBranch(node);
+            }
+            else
+            {
+                HideDescendants(node);
+            }
+
             ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
@@ -965,8 +995,9 @@ public sealed class ViewAllGraphService : IDisposable
             // home share's parent, WindowsApps - and what is named below it is
             // reached that way and laid out under it.  It opens, as it did
             // when it read as empty, but stays unread, so the next opening
-            // asks the disk again.  Not one collapsed or let go of meanwhile.
-            if (ex is UnauthorizedAccessException && !token.IsCancellationRequested && !_disposed && IsLive(node))
+            // asks the disk again.  Not one collapsed or let go of meanwhile,
+            // nor one only to be read.
+            if (ex is UnauthorizedAccessException && open && !token.IsCancellationRequested && !_disposed && IsLive(node))
             {
                 node.IsExpanded = true;
                 ShowOrHideLoadedBranch(node);
@@ -1114,9 +1145,19 @@ public sealed class ViewAllGraphService : IDisposable
     /// are retained, so refreshing a branch never silently collapses the tree
     /// the user had opened or takes away what Load more brought in.
     /// </summary>
+    /// <param name="forChange">
+    /// For a refresh because something in the folder changed - on the disk,
+    /// or by a file operation - rather than one asked for, or one for a
+    /// folder about to be shown: a folder that is closed is left closed.  It
+    /// is read, and what was open in it is opened again for when it is
+    /// opened, but nothing of it is shown; without it every collapsed folder
+    /// a change touched opened itself.  Otherwise the folder is opened, as F5
+    /// and a caller about to show it want.
+    /// </param>
     public async Task<ViewAllExpansionResult> RefreshBranchAsync(
         ViewAllNodeViewModel node,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool forChange = false)
     {
         ThrowIfDisposed();
         _staleRoots.Remove(node);
@@ -1131,6 +1172,10 @@ public sealed class ViewAllGraphService : IDisposable
             _pendingRefreshes[node.FullPath] = pending;
         }
 
+        // Open once read, unless read for a change and closed - as the first
+        // refresh of it found it: a later one finds it closed by that one, to
+        // be read.
+        pending.Open |= !forChange || (pending.Refreshes == 0 && node.IsExpanded);
         pending.Refreshes++;
         try
         {
@@ -1166,9 +1211,36 @@ public sealed class ViewAllGraphService : IDisposable
                 }
             }
 
+            // A refresh of a folder inside this one still under way has
+            // emptied and closed it to read it, so what it is to open again -
+            // the folder itself among it, if it is to be open - is this
+            // one's to open again too.  Without it the folder came back
+            // closed, with everything that was open in it gone.
+            foreach (var (path, inner) in _pendingRefreshes)
+            {
+                if (ReferenceEquals(inner, pending) || !IsAtOrUnderNormalized(path, node.FullPath))
+                {
+                    continue;
+                }
+
+                if (inner.Open)
+                {
+                    previouslyExpanded.Add(path);
+                    pagedTo[path] = Math.Max(pagedTo.GetValueOrDefault(path), inner.OwnLimit);
+                }
+
+                previouslyExpanded.UnionWith(inner.Expanded);
+                named.UnionWith(inner.Named);
+                foreach (var (folder, limit) in inner.ChildLoadLimits)
+                {
+                    pagedTo[folder] = Math.Max(pagedTo.GetValueOrDefault(folder), limit);
+                }
+            }
+
             // Read as far as Load more had read it, or what it brought in
             // would go again with every change on the disk.
             var ownLimit = node.ChildLoadLimit;
+            pending.OwnLimit = Math.Max(pending.OwnLimit, ownLimit);
             RemoveDescendants(node);
             node.AreChildrenLoaded = false;
             node.IsExpanded = false;
@@ -1178,7 +1250,7 @@ public sealed class ViewAllGraphService : IDisposable
             ViewAllExpansionResult result;
             using (SuspendLayout())
             {
-                result = await ExpandAsync(node, cancellationToken, ownLimit);
+                result = await ExpandAsync(node, cancellationToken, ownLimit, pending.Open);
 
                 // Parents sort before descendants, so each re-expansion - and
                 // each child brought back by name - has already created the
@@ -1237,6 +1309,12 @@ public sealed class ViewAllGraphService : IDisposable
         public HashSet<string> Named { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public int Refreshes { get; set; }
+
+        /// <summary>Whether the folder is to be open once read (see the forChange of <see cref="RefreshBranchAsync"/>).</summary>
+        public bool Open { get; set; }
+
+        /// <summary>How far Load more had read the folder itself, for a refresh of a folder above it that starts meanwhile.</summary>
+        public int OwnLimit { get; set; }
     }
 
     /// <summary>

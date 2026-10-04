@@ -24,6 +24,8 @@ internal static partial class Program
             RunOnSta("graph review: load more merge", () => GraphLoadMoreMergeChecksAsync(root));
             RunOnSta("graph review: load more on a closed folder", () => GraphLoadMoreClosedChecksAsync(root));
             RunOnSta("graph review: layout during a refresh", () => GraphLayoutDuringRefreshChecksAsync(root));
+            RunOnSta("graph review: nested refreshes", () => GraphNestedRefreshChecksAsync(root));
+            RunOnSta("graph review: a closed folder read again", () => GraphClosedRefreshChecksAsync(root));
         }
         finally
         {
@@ -211,5 +213,92 @@ internal static partial class Program
             graph.TryGetNode(busy, out var busyAgain)
             && busyAgain.Children.Count == 60
             && busyAgain.Children.All(sub => sub.IsExpanded && sub.Children.Count == 1 && sub.Children[0].HasLayoutPosition));
+    }
+
+    // ---- J049: a folder read again while its open sub-folder is ------------------------------
+
+    /// <summary>
+    /// F5 on a folder and then on the folder above it - or the watch reading
+    /// both, in that order, during a build: the folder above found the
+    /// sub-folder already emptied and closed by its own refresh, and brought
+    /// it back closed, with everything open in it gone.
+    /// </summary>
+    private static async Task GraphNestedRefreshChecksAsync(string root)
+    {
+        Section("graph review: a folder read again while its open sub-folder is keeps the sub-folder open (J049)");
+        var top = Path.Combine(root, "nested-refresh");
+        var child = Path.Combine(top, "child");
+        var grand = Path.Combine(child, "grand");
+        Directory.CreateDirectory(grand);
+        File.WriteAllText(Path.Combine(grand, "g.txt"), "x");
+        File.WriteAllText(Path.Combine(child, "c.txt"), "x");
+
+        using var graph = new ViewAllGraphService();
+        var topNode = (await graph.AddRootAsync(top))!;
+        await graph.ExpandAsync(topNode);
+        graph.TryGetNode(child, out var childNode);
+        await graph.ExpandAsync(childNode);
+        graph.TryGetNode(grand, out var grandNode);
+        await graph.ExpandAsync(grandNode);
+
+        // Both begun before either is answered, as on the window's thread.
+        var first = graph.RefreshBranchAsync(childNode);
+        var second = graph.RefreshBranchAsync(topNode);
+        await Task.WhenAll(first, second);
+        Check("the sub-folder is open again",
+            graph.TryGetNode(child, out var childAgain) && childAgain.IsExpanded && childAgain.Children.Count == 2);
+        Check("and so is the folder open inside it, with what it holds",
+            graph.TryGetNode(grand, out var grandAgain) && grandAgain.IsExpanded
+            && graph.TryGetNode(Path.Combine(grand, "g.txt"), out var leaf) && leaf.IsTreeVisible);
+    }
+
+    // ---- J045: a closed folder read again ----------------------------------------------------
+
+    /// <summary>
+    /// A folder that has been read and closed, read again for a change in it -
+    /// a download finishing, a file operation: the refresh always ended by
+    /// opening it.  Told it is for a change, the refresh reads it, opens
+    /// again what was open inside it, and leaves it closed.
+    /// </summary>
+    private static async Task GraphClosedRefreshChecksAsync(string root)
+    {
+        Section("graph review: a closed folder read again for a change stays closed (J045)");
+        var top = Path.Combine(root, "shut");
+        var inner = Path.Combine(top, "inner");
+        var deep = Path.Combine(inner, "deep");
+        Directory.CreateDirectory(deep);
+        File.WriteAllText(Path.Combine(deep, "d.txt"), "x");
+
+        using var graph = new ViewAllGraphService();
+        var topNode = (await graph.AddRootAsync(top))!;
+        await graph.ExpandAsync(topNode);
+        graph.TryGetNode(inner, out var innerNode);
+        await graph.ExpandAsync(innerNode);
+        graph.TryGetNode(deep, out var deepNode);
+        await graph.ExpandAsync(deepNode);
+        graph.Collapse(innerNode);
+
+        File.WriteAllText(Path.Combine(inner, "new.txt"), "x");
+        await graph.RefreshBranchAsync(innerNode, forChange: true);
+        Check($"the folder read again is still closed (open: {innerNode.IsExpanded})", !innerNode.IsExpanded);
+        Check("and read: it holds the new file, off the tree",
+            innerNode.AreChildrenLoaded
+            && graph.TryGetNode(Path.Combine(inner, "new.txt"), out var added) && !added.IsTreeVisible);
+        Check("with the folder open inside it still open, for when it is opened",
+            graph.TryGetNode(deep, out var deepAgain) && deepAgain.IsExpanded && !deepAgain.IsTreeVisible
+            && deepAgain.Children.All(item => !item.IsTreeVisible));
+
+        await graph.ExpandAsync(innerNode);
+        Check("opened, it shows all of it",
+            innerNode.IsExpanded && innerNode.Children.All(item => item.IsTreeVisible && item.HasLayoutPosition)
+            && graph.TryGetNode(Path.Combine(deep, "d.txt"), out var leaf) && leaf.IsTreeVisible);
+
+        // An open folder read for a change stays open, as ever; and a
+        // closed one read for a caller about to show it opens, as ever.
+        await graph.RefreshBranchAsync(innerNode, forChange: true);
+        Check("an open folder read again for a change stays open", innerNode.IsExpanded && innerNode.Children.All(item => item.IsTreeVisible));
+        graph.Collapse(innerNode);
+        await graph.RefreshBranchAsync(innerNode);
+        Check("and a closed one read again not for a change opens, as before", innerNode.IsExpanded);
     }
 }
