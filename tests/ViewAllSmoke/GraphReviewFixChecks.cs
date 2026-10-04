@@ -29,6 +29,7 @@ internal static partial class Program
             RunOnSta("graph review: hidden folders above the selection", () => GraphHiddenAncestorChecksAsync(root));
             RunOnSta("graph review: a refresh that cannot read its folder", () => GraphUnreadableRefreshChecksAsync(root));
             RunOnSta("graph review: what was asked for by name, brought back", () => GraphNamedBatchChecksAsync(root));
+            RunOnSta("graph review: a drive reached after start-up", () => GraphLateDriveRootChecksAsync(root));
         }
         finally
         {
@@ -466,5 +467,38 @@ internal static partial class Program
         Console.WriteLine($"  note  refresh with {count} asked for by name: {watch.ElapsedMilliseconds} ms, {changes} graph changes");
         Check($"every one of the {count} is back, on the tree", names.All(path => graph.TryGetNode(path, out var back) && back.IsTreeVisible));
         Check($"announced together, not one by one ({changes} graph changes for {count})", changes <= 3);
+    }
+
+    // ---- J128: a drive reached after start-up -------------------------------------------------
+
+    /// <summary>
+    /// A drive that was not a root when it was reached - a stick plugged in
+    /// after start-up - was asked for as a folder: a plain folder root named
+    /// "E:\" at the end of the roots.  It is a drive, described as the drive
+    /// list describes it, among the drives.
+    /// </summary>
+    private static async Task GraphLateDriveRootChecksAsync(string root)
+    {
+        Section("graph review: a drive reached after start-up is a drive among the drives (J128)");
+        var letter = Path.GetPathRoot(Path.GetFullPath(Path.GetTempPath()))!;
+        var listed = (await new ViewAllFileSystemService().GetDriveRootsAsync())
+            .FirstOrDefault(drive => ViewAllPath.Equals(drive.FullPath, letter));
+        if (listed is null)
+        {
+            Console.WriteLine($"  note  {letter} is not among the drives; the check is not run");
+            return;
+        }
+
+        var folder = Path.Combine(root, "beside-drive");
+        Directory.CreateDirectory(folder);
+        using var graph = new ViewAllGraphService();
+        var share = await graph.AddRootAsync(folder);
+        var drive = await graph.AddRootAsync(letter);
+        Check($"it is a drive, named and described as the drive list names it ({drive?.Kind}, {drive?.DisplayName})",
+            drive is not null && drive.Kind == ViewAllEntryKind.Drive && drive.DisplayName == listed.DisplayName
+            && drive.Entry.SizeBytes == listed.SizeBytes);
+        Check("among the drives, ahead of a folder root added before it",
+            graph.Roots.Count == 2 && ReferenceEquals(graph.Roots[0], drive) && ReferenceEquals(graph.Roots[1], share));
+        Check("and asked for again, it is the same root", ReferenceEquals(await graph.AddRootAsync(letter), drive) && graph.Roots.Count == 2);
     }
 }

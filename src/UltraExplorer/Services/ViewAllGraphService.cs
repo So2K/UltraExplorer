@@ -446,10 +446,7 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         var root = CreateNode(entry, depth: 0, parent: null);
-        _roots.Remove(root);
-        var place = _roots.FindIndex(other => !other.IsDrive
-            || string.Compare(other.FullPath, root.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
-        _roots.Insert(place < 0 ? _roots.Count : place, root);
+        PlaceAmongDrives(root);
         RestorePosition(root);
         Reflow();
         GraphChanged?.Invoke(this, EventArgs.Empty);
@@ -468,6 +465,15 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         return root;
+    }
+
+    /// <summary>Moves a drive just made a root to where a start that found it would have put it: among the drives, in name order, ahead of every share and distribution.</summary>
+    private void PlaceAmongDrives(ViewAllNodeViewModel root)
+    {
+        _roots.Remove(root);
+        var place = _roots.FindIndex(other => !other.IsDrive
+            || string.Compare(other.FullPath, root.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
+        _roots.Insert(place < 0 ? _roots.Count : place, root);
     }
 
     /// <summary>The drive start-up went on without whose root is <paramref name="path"/>, if it has not answered or not been taken in yet.</summary>
@@ -1868,6 +1874,31 @@ public sealed class ViewAllGraphService : IDisposable
             }
         }
 
+        // A drive reached after start-up - a stick plugged in since - is a
+        // drive: described as the drive list describes one, and put among the
+        // drives.  Asked as a folder it became a plain folder root named
+        // "E:\" at the end of the roots.  One that is not ready is out of
+        // reach, as a folder that cannot be described is.
+        else if (DriveLetterRoot(directoryPath) is { } drivePath)
+        {
+            if (await DescribeDriveAsync(drivePath, cancellationToken) is not { } driveEntry)
+            {
+                return null;
+            }
+
+            if (_nodesByPath.TryGetValue(driveEntry.FullPath, out var known))
+            {
+                return known;
+            }
+
+            var drive = CreateNode(driveEntry, depth: 0, parent: null);
+            PlaceAmongDrives(drive);
+            RestorePosition(drive);
+            Reflow();
+            GraphChanged?.Invoke(this, EventArgs.Empty);
+            return drive;
+        }
+
         try
         {
             var descriptor = await _fileSystem.DescribeDirectoryAsync(directoryPath, cancellationToken);
@@ -1887,6 +1918,36 @@ public sealed class ViewAllGraphService : IDisposable
             return null;
         }
     }
+
+    /// <summary><paramref name="path"/> spelled the one way, when it is the root of a drive letter (see <see cref="IsDriveLetterRoot"/>); otherwise null.</summary>
+    private static string? DriveLetterRoot(string path)
+    {
+        try
+        {
+            var normalized = ViewAllPath.Normalize(path);
+            return IsDriveLetterRoot(normalized) ? normalized : null;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>A drive's cell as the drive list makes it (<see cref="ViewAllFileSystemService.DescribeDrive"/>), asked off the window's thread; null for a drive that is not ready or not there.</summary>
+    private static Task<ViewAllEntryDescriptor?> DescribeDriveAsync(string root, CancellationToken cancellationToken)
+        => Task.Run<ViewAllEntryDescriptor?>(
+            () =>
+            {
+                try
+                {
+                    return ViewAllFileSystemService.DescribeDrive(new DriveInfo(root));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                {
+                    return null;
+                }
+            },
+            cancellationToken);
 
     /// <summary>
     /// Reads a directory without touching the canvas, under the same enumeration
