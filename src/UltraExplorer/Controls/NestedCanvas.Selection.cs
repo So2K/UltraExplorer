@@ -613,7 +613,8 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// The count handed on while the rectangle is drawn, at most every
     /// <see cref="MarqueeCountInterval"/>: what would be selected in all if
-    /// it were let go now.
+    /// it were let go now - in an addition or a toggle, what waits for a
+    /// folder not read yet included, as the window holds it selected.
     /// </summary>
     private void CountMarquee(NestedMarquee marquee)
     {
@@ -633,7 +634,7 @@ public sealed partial class NestedCanvas
         var inside = marquee.CountSelected();
         var total = marquee.Mode == NestedSelectMode.Replace
             ? inside
-            : _selection.Count - BaseCount(marquee) + inside;
+            : _selection.Count + _selection.PendingCount - BaseCount(marquee) + inside;
         marquee.CountStale = false;
         marquee.CountRaisedAt = now;
         if (total != marquee.HitCount)

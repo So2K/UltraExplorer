@@ -11,9 +11,10 @@ namespace ViewAllSmoke;
 /// <summary>
 /// What the second review found in the selection, and what was done about
 /// it: an item added inside the folder gone into lets go of that folder
-/// even while the folder above it is not read; and Delete counts as shown
-/// only what the canvas has on it - not a hidden folder, nor files in a
-/// folder off screen that hidden items or the Files layer took away.
+/// even while the folder above it is not read; Delete counts as shown only
+/// what the canvas has on it - not a hidden folder, nor files in a folder
+/// off screen that hidden items or the Files layer took away; and an added
+/// rectangle's count includes what waits for a folder not read.
 /// </summary>
 internal static partial class Program
 {
@@ -21,6 +22,7 @@ internal static partial class Program
     {
         RunOnSta("selection review 2: the folder gone into, its parent not read", SelReview2PendingGoneIntoAsync);
         RunOnSta("selection review 2: what Delete counts as shown", SelReview2ShownCountAsync);
+        RunOnSta("selection review 2: an added rectangle's count", SelReview2MarqueeCountAsync);
         return Task.CompletedTask;
     }
 
@@ -208,6 +210,55 @@ internal static partial class Program
             Check($"thirty files selected in a folder off screen, then the Files layer off ({away}): {shown?.ToString() ?? "null"} of {shared.Count} counted shown",
                 away && shared.Count == 30 && shown == 0);
             Check("and the Files layer on again shows all thirty selected", shared.Count == 30 && Picked(canvas).Count == 30);
+        }
+        finally
+        {
+            canvas.Tree = null;
+        }
+    }
+
+    // ---- J117: an added rectangle's count ---------------------------------------------------
+
+    /// <summary>
+    /// Five files selected in a folder the canvas has not read - search
+    /// results - and a rectangle drawn with Shift to add to them: the count
+    /// by the pointer is what will be selected when it is let go, the five
+    /// included.
+    /// </summary>
+    private static async Task SelReview2MarqueeCountAsync()
+    {
+        Section("selection review 2: an added rectangle counts what waits for a folder not read (J117)");
+        var disk = new FakeDisk();
+        disk.Folder(@"Q:\");
+        disk.AddFiles(@"Q:\docs", 40, "d");
+        disk.AddFiles(@"Q:\unread", 5, "u");
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive, "1 TB free")]);
+        await LoadEverythingAsync(tree, folder => !folder.FullPath.EndsWith("unread", StringComparison.OrdinalIgnoreCase));
+        var (canvas, shared) = SelReview2Canvas(tree);
+        var docs = tree.Find(@"Q:\docs")!;
+        try
+        {
+            shared.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Added = [.. Enumerable.Range(0, 5).Select(index => new SelectionItem($@"Q:\unread\u{index:D3}.txt", false, 100))],
+                Source = SelectionSource.Navigation
+            });
+            canvas.LoadSelection(shared);
+            canvas.FlyTo(docs, 0.9, animated: false);
+            Render(canvas);
+            var waiting = canvas.SelectionState.HasPending && canvas.SelectedCount == 0;
+            var cell = canvas.ScreenRectOf(docs)!.Value;
+            var pointer = canvas.Pointer;
+            var end = At(cell, 0.6, 0.45);
+            pointer.Down(MouseButton.Left, At(cell, MarginX, 0.2), ModifierKeys.Shift);
+            pointer.Move(end);
+            canvas.RunFrameForTests(TimeSpan.FromSeconds(4000));
+            var drawing = canvas.Marquee?.HitCount ?? -1;
+            pointer.Up(MouseButton.Left, end);
+            Check($"the count while it is drawn is what is selected once it is let go ({drawing}, then {shared.Count}; five waiting: {waiting})",
+                waiting && shared.Count > 5 && drawing == shared.Count);
         }
         finally
         {

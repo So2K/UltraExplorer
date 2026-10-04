@@ -147,6 +147,9 @@ internal sealed class NestedSelection
         return count;
     }
 
+    /// <summary>How many paths wait for a folder in all: in the window's selection, not yet on the canvas.</summary>
+    public int PendingCount => CountWaiting(static _ => true);
+
     /// <summary>The paths of the folders something waits in (see <see cref="ResolvePending"/>).</summary>
     public IEnumerable<string> PendingFolders => _pending.Keys;
 
