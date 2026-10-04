@@ -112,9 +112,14 @@ public sealed class ViewAllGraphService : IDisposable
     /// separately indexed and announced - the index is rebuilt in one go after.</summary>
     private bool _arranging;
 
-    /// <summary>Depth of nested <see cref="SuspendLayout"/> scopes.</summary>
-    private int _layoutSuspended;
-    private bool _layoutPending;
+    /// <summary>
+    /// The innermost <see cref="SuspendLayout"/> scope of the operation under
+    /// way, if it holds one.  It flows with that operation across its awaits
+    /// and into what it calls, and nowhere else: a refresh holds the layout
+    /// back while it reads its sub-folders again, and a folder opened by the
+    /// user meanwhile is still laid out at once.
+    /// </summary>
+    private readonly AsyncLocal<LayoutScope?> _layoutScope = new();
     private bool _disposed;
 
     /// <summary>The node the layout pass under way is to keep in view, if any (see <see cref="ReflowAnchoredOn"/>).</summary>
@@ -669,9 +674,9 @@ public sealed class ViewAllGraphService : IDisposable
     /// </summary>
     private void Reflow()
     {
-        if (_layoutSuspended > 0)
+        if (_layoutScope.Value is { IsOpen: true } scope)
         {
-            _layoutPending = true;
+            scope.Pending = true;
             return;
         }
 
@@ -779,32 +784,54 @@ public sealed class ViewAllGraphService : IDisposable
     /// Holds the layout back until the scope closes.  Restoring a saved session
     /// expands dozens of folders one after another; laying the tree out once at
     /// the end is the difference between one pass and dozens.
+    ///
+    /// <para>Held back for the operation that takes the scope only, through
+    /// every await of it (see <see cref="_layoutScope"/>).  A count for the
+    /// whole graph held it back for everything else as well: a folder opened
+    /// while another was being read again got no places until the other's
+    /// last sub-folder had been read, and then jumped into place.</para>
     /// </summary>
     private IDisposable SuspendLayout() => new LayoutScope(this);
 
     private sealed class LayoutScope : IDisposable
     {
         private readonly ViewAllGraphService _graph;
-        private bool _closed;
+
+        /// <summary>The scope of the same operation this one is inside, which a pass held back here is handed on to.</summary>
+        private readonly LayoutScope? _outer;
 
         public LayoutScope(ViewAllGraphService graph)
         {
             _graph = graph;
-            _graph._layoutSuspended++;
+            _outer = graph._layoutScope.Value is { IsOpen: true } outer ? outer : null;
+            graph._layoutScope.Value = this;
         }
+
+        public bool IsOpen { get; private set; } = true;
+
+        /// <summary>Whether a layout pass was held back while the scope was open.</summary>
+        public bool Pending { get; set; }
 
         public void Dispose()
         {
-            if (_closed)
+            if (!IsOpen)
             {
                 return;
             }
 
-            _closed = true;
-            _graph._layoutSuspended--;
-            if (_graph._layoutSuspended == 0 && _graph._layoutPending)
+            IsOpen = false;
+            _graph._layoutScope.Value = _outer;
+            if (!Pending)
             {
-                _graph._layoutPending = false;
+                return;
+            }
+
+            if (_outer is { IsOpen: true } outer)
+            {
+                outer.Pending = true;
+            }
+            else
+            {
                 _graph.Reflow();
             }
         }

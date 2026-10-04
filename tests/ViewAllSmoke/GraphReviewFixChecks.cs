@@ -23,6 +23,7 @@ internal static partial class Program
         {
             RunOnSta("graph review: load more merge", () => GraphLoadMoreMergeChecksAsync(root));
             RunOnSta("graph review: load more on a closed folder", () => GraphLoadMoreClosedChecksAsync(root));
+            RunOnSta("graph review: layout during a refresh", () => GraphLayoutDuringRefreshChecksAsync(root));
         }
         finally
         {
@@ -165,5 +166,50 @@ internal static partial class Program
         {
             ViewAllFileSystemService.DescribeDrive = describe;
         }
+    }
+
+    // ---- J048: the layout while a folder is read again -------------------------------------
+
+    /// <summary>
+    /// A folder read again keeps the layout back until it has opened again
+    /// everything that was open in it - but the hold was the whole graph's,
+    /// so a folder opened meanwhile somewhere else got no places until the
+    /// other's last sub-folder was read, and then jumped.
+    /// </summary>
+    private static async Task GraphLayoutDuringRefreshChecksAsync(string root)
+    {
+        Section("graph review: a folder opened while another is read again is laid out at once (J048)");
+        var busy = Path.Combine(root, "busy");
+        var small = Path.Combine(root, "small");
+        Directory.CreateDirectory(small);
+        File.WriteAllText(Path.Combine(small, "a.txt"), "x");
+        File.WriteAllText(Path.Combine(small, "b.txt"), "x");
+        for (var index = 0; index < 60; index++)
+        {
+            var sub = Path.Combine(busy, $"s{index:D2}");
+            Directory.CreateDirectory(sub);
+            File.WriteAllText(Path.Combine(sub, "inside.txt"), "x");
+        }
+
+        using var graph = new ViewAllGraphService();
+        var busyNode = (await graph.AddRootAsync(busy))!;
+        await graph.ExpandAsync(busyNode);
+        foreach (var sub in busyNode.Children.ToArray())
+        {
+            await graph.ExpandAsync(sub);
+        }
+
+        var smallNode = (await graph.AddRootAsync(small))!;
+        var refresh = graph.RefreshBranchAsync(busyNode);
+        await graph.ExpandAsync(smallNode);
+        var placed = smallNode.Children.Count(child => child.IsTreeVisible && child.HasLayoutPosition);
+        var during = !refresh.IsCompleted;
+        await refresh;
+        Check($"opened while the other is still being read again ({during}), its children are placed at once ({placed} of 2)",
+            during && placed == 2);
+        Check("and the folder read again is back as it was, every sub-folder open",
+            graph.TryGetNode(busy, out var busyAgain)
+            && busyAgain.Children.Count == 60
+            && busyAgain.Children.All(sub => sub.IsExpanded && sub.Children.Count == 1 && sub.Children[0].HasLayoutPosition));
     }
 }
