@@ -404,7 +404,7 @@ internal static class DialogGuardian
                 turn = now;
                 var enabled = DialogIntegrationStore.Read().Enabled;
                 if (!enabled && active.Count == 0) break;
-                foreach (var path in Directory.EnumerateFiles(DialogIntegrationStore.SessionsPath, "*.json").Take(LeaseScanLimit).ToArray())
+                foreach (var path in LeasePaths())
                 {
                     if (active.ContainsKey(path)) continue;
                     var record = DialogLease.ReadRecord(path);
@@ -495,6 +495,18 @@ internal static class DialogGuardian
             foreach (var protection in active.Values) { DialogLease.RestoreRecord(protection.Record, true); protection.Dispose(); }
             if (entered) mutex.ReleaseMutex();
         }
+    }
+
+    /// <summary>
+    /// The leases waiting in the sessions folder. That folder can be deleted
+    /// while the watchdog runs - by the user, by a cleaner - and then holds no
+    /// lease; the next lease made creates it again. Its absence used to end
+    /// the watchdog, and with it pause dialog and folder replacement.
+    /// </summary>
+    private static string[] LeasePaths()
+    {
+        try { return Directory.EnumerateFiles(DialogIntegrationStore.SessionsPath, "*.json").Take(LeaseScanLimit).ToArray(); }
+        catch (DirectoryNotFoundException) { return []; }
     }
 
     /// <summary>
