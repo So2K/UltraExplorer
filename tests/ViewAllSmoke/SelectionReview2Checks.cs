@@ -11,13 +11,16 @@ namespace ViewAllSmoke;
 /// <summary>
 /// What the second review found in the selection, and what was done about
 /// it: an item added inside the folder gone into lets go of that folder
-/// even while the folder above it is not read.
+/// even while the folder above it is not read; and Delete counts as shown
+/// only what the canvas has on it - not a hidden folder, nor files in a
+/// folder off screen that hidden items or the Files layer took away.
 /// </summary>
 internal static partial class Program
 {
     private static Task SelectionReview2Checks()
     {
         RunOnSta("selection review 2: the folder gone into, its parent not read", SelReview2PendingGoneIntoAsync);
+        RunOnSta("selection review 2: what Delete counts as shown", SelReview2ShownCountAsync);
         return Task.CompletedTask;
     }
 
@@ -114,6 +117,101 @@ internal static partial class Program
         finally
         {
             TryDelete(root);
+        }
+    }
+
+    // ---- J055: what Delete counts as shown -------------------------------------------------
+
+    /// <summary>
+    /// Q:\proj: src, a hidden .git with two files, a.txt, b.txt and a hidden
+    /// desktop.ini; Q:\other: thirty files.  Selected with hidden items
+    /// shown, then hidden items - or the Files layer - switched off: the
+    /// canvas counts for Delete only what it still has on it, whether the
+    /// folder is on screen or not, so Delete asks about the rest.
+    /// </summary>
+    private static async Task SelReview2ShownCountAsync()
+    {
+        Section("selection review 2: Delete counts as shown only what the canvas still has on it (J055)");
+        var disk = new FakeDisk();
+        disk.Folder(@"Q:\");
+        disk.Folder(@"Q:\proj\src");
+        disk.Folder(@"Q:\proj\.git").IsHidden = true;
+        disk.AddFile(@"Q:\proj\.git", "HEAD", 10);
+        disk.AddFile(@"Q:\proj\.git", "config", 10);
+        disk.AddFile(@"Q:\proj", "a.txt", 10);
+        disk.AddFile(@"Q:\proj", "b.txt", 10);
+        disk.AddFile(@"Q:\proj", "desktop.ini", 10, hidden: true);
+        disk.AddFiles(@"Q:\other", 30, "o");
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false, IncludeHidden = true };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive, "1 TB free")]);
+        await LoadEverythingAsync(tree, _ => true);
+        var (canvas, shared) = SelReview2Canvas(tree);
+        var proj = tree.Find(@"Q:\proj")!;
+        var git = tree.Find(@"Q:\proj\.git")!;
+        var other = tree.Find(@"Q:\other")!;
+        var view = new Rect(0, 0, ViewWidth, ViewHeight);
+        bool OffScreen(NestedFolder folder) => canvas.ScreenRectOf(folder) is not { } rect || !rect.IntersectsWith(view);
+        void Hidden(bool shown)
+        {
+            tree.IncludeHidden = shown;
+            Render(canvas);
+            Render(canvas);
+        }
+
+        try
+        {
+            // On screen: .git is still selected, and not shown.
+            SelReview2GoTo(canvas, shared, proj);
+            canvas.HandleKey(Key.A, ModifierKeys.Control);
+            var all = shared.Count;
+            Hidden(false);
+            var shown = canvas.ShownOfSelection(shared.Version);
+            Check($"Ctrl+A in a folder with hidden items shown, then hidden items off: {shown?.ToString() ?? "null"} of {all} counted shown (src, a.txt and b.txt are)",
+                all == 5 && shown == 3);
+            Hidden(true);
+            Check("and nothing was let go: hidden items on again show all five selected", shared.Count == 5 && Picked(canvas).Count == 5);
+
+            // Off screen: the folder's files were never caught up.
+            SelReview2GoTo(canvas, shared, proj);
+            canvas.HandleKey(Key.A, ModifierKeys.Control);
+            canvas.FlyTo(other, 0.95, animated: false);
+            Render(canvas);
+            var away = OffScreen(proj);
+            Hidden(false);
+            shown = canvas.ShownOfSelection(shared.Version);
+            Check($"the same with the folder off screen ({away}): {shown?.ToString() ?? "null"} of {shared.Count} counted shown",
+                away && shared.Count == 5 && shown == 3);
+            Hidden(true);
+
+            // Inside a hidden folder: its files are not on the canvas either.
+            SelReview2GoTo(canvas, shared, git);
+            canvas.HandleKey(Key.A, ModifierKeys.Control);
+            canvas.FlyTo(proj, 0.9, animated: false);
+            Render(canvas);
+            Hidden(false);
+            shown = canvas.ShownOfSelection(shared.Version);
+            Check($"files selected inside a folder that hidden items off took away: {shown?.ToString() ?? "null"} of {shared.Count} counted shown",
+                shared.Count == 2 && shown == 0);
+            Hidden(true);
+
+            // The Files layer off, the folder off screen.
+            SelReview2GoTo(canvas, shared, other);
+            canvas.HandleKey(Key.A, ModifierKeys.Control);
+            canvas.FlyTo(proj, 0.95, animated: false);
+            Render(canvas);
+            away = OffScreen(other);
+            canvas.ShownLayers = CanvasLayer.All & ~CanvasLayer.Files;
+            Render(canvas);
+            shown = canvas.ShownOfSelection(shared.Version);
+            canvas.ShownLayers = CanvasLayer.All;
+            Render(canvas);
+            Check($"thirty files selected in a folder off screen, then the Files layer off ({away}): {shown?.ToString() ?? "null"} of {shared.Count} counted shown",
+                away && shared.Count == 30 && shown == 0);
+            Check("and the Files layer on again shows all thirty selected", shared.Count == 30 && Picked(canvas).Count == 30);
+        }
+        finally
+        {
+            canvas.Tree = null;
         }
     }
 }

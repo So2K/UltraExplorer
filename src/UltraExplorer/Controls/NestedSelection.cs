@@ -204,6 +204,36 @@ internal sealed class NestedSelection
 
     public bool IsSelected(NestedFolder child) => _folders.Contains(child);
 
+    /// <summary>
+    /// How many of the items held here the canvas has on it - each in a
+    /// folder still placed, and every folder above that too - as the files'
+    /// bits were last caught up (see <see cref="FilesOf"/>).  A hidden folder
+    /// still selected while hidden items are hidden is not on it, nor is
+    /// anything selected inside one: they stay selected, for showing hidden
+    /// items again to bring them back, but nothing shows them.
+    /// </summary>
+    public int CountOnCanvas()
+    {
+        var count = 0;
+        foreach (var folder in _folders)
+        {
+            if (NestedTree.IsOnCanvas(folder))
+            {
+                count++;
+            }
+        }
+
+        foreach (var (container, set) in _files)
+        {
+            if (NestedTree.IsOnCanvas(container))
+            {
+                count += set.Count;
+            }
+        }
+
+        return count;
+    }
+
     /// <summary>How many of <paramref name="container"/>'s sub-folders are selected.</summary>
     public int FoldersIn(NestedFolder container) => _foldersPerContainer.TryGetValue(container, out var count) ? count : 0;
 

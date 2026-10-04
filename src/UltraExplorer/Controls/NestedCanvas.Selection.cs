@@ -88,7 +88,8 @@ public sealed partial class NestedCanvas
     /// says it is left out; so does one in a folder too large for the canvas
     /// to list whole.  One left out of a folder the canvas has read - hidden
     /// while hidden items are hidden, or a file while the Files layer is
-    /// off - does not.
+    /// off - does not, nor does a hidden folder still selected or anything
+    /// selected inside one.
     /// </summary>
     internal int? ShownOfSelection(long version)
     {
@@ -98,7 +99,23 @@ public sealed partial class NestedCanvas
             return null;
         }
 
-        return _selection.Count + _selection.CountWaiting(path =>
+        // Files selected in a folder placed again since they were drawn -
+        // hidden items or the Files layer switched off with the folder off
+        // screen, which nothing draws - are caught up first, as drawing it
+        // would: what is no longer shown then waits, and is counted out.
+        var before = _selection.Version;
+        foreach (var container in _selection.Containers.ToArray())
+        {
+            Ensure(container);
+            _selection.FilesOf(container, _vanished);
+        }
+
+        if (_selection.Version != before)
+        {
+            SelectionChangedHere();
+        }
+
+        return _selection.CountOnCanvas() + _selection.CountWaiting(path =>
             _tree?.Find(path) is not { } folder || !folder.IsLoaded && !folder.IsComputer
             || folder.IsTruncated || folder.UnlistedFileCount > 0);
     }
