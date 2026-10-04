@@ -1,8 +1,12 @@
 using System.Diagnostics;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Threading;
 using UltraExplorer.Controls;
 using UltraExplorer.Models;
+using UltraExplorer.Picker.Integration;
 using UltraExplorer.Services;
 
 namespace ViewAllSmoke;
@@ -11,14 +15,194 @@ namespace ViewAllSmoke;
 /// What the second review found in the canvas's camera, input and frame
 /// loop, and what was done about it.  An arrow key held down keeps the item
 /// it moves to on screen at the zoom it had, rather than restarting a flight
-/// from a standstill on every repeat.
+/// from a standstill on every repeat; and when the camera comes to rest,
+/// the loop lets go of WPF's frames only once the settled picture is on its
+/// way, so WPF does not block the thread to show it.
 /// </summary>
 internal static partial class Program
 {
     private static Task CanvasMotionReview2Checks()
     {
         RunOnSta("canvas motion: an arrow key held down", CanvasMotionKeyRepeatAsync);
+        RunOnSta("canvas motion: the loop letting go at rest", CanvasMotionRestLetGoAsync);
         return Task.CompletedTask;
+    }
+
+    // ---- the loop letting go at rest (J006) -------------------------------------------------
+
+    /// <summary>
+    /// A canvas in a window on the secondary monitor - shown, never active -
+    /// zoomed in a burst of wheel steps a dozen times, each followed by a
+    /// second of rest.  The loop must not let go of WPF's Rendering in the
+    /// frame that drew the settled picture: WPF then leaves its interlocked
+    /// presentation with that frame's commit still waiting, and blocks the
+    /// UI thread until the render thread has shown it.  Every dispatcher
+    /// operation is timed - the longest one just after each letting go is
+    /// that block - and an Input-priority probe posted every few milliseconds
+    /// from another thread says how long input waited.
+    /// </summary>
+    private static async Task CanvasMotionRestLetGoAsync()
+    {
+        Section("canvas motion: at rest the loop lets go of WPF's frames without blocking the thread");
+        if (TestScreen.Target() is not { } target)
+        {
+            Console.WriteLine("  (no secondary monitor: skipped)");
+            return;
+        }
+
+        var disk = new FakeDisk();
+        for (var index = 0; index < 160; index++)
+        {
+            disk.Folder($@"Q:\big\s{index:D3}\a");
+            disk.AddFiles($@"Q:\big\s{index:D3}", 12, "f");
+        }
+
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await LoadEverythingAsync(tree, _ => true);
+        var canvas = new NestedCanvas { Tree = tree };
+        var window = new Window
+        {
+            Content = canvas,
+            Title = "UltraExplorer canvas motion: rest",
+            WindowStyle = WindowStyle.None,
+            ResizeMode = ResizeMode.NoResize,
+            ShowInTaskbar = false,
+            ShowActivated = false,
+            Width = 1000,
+            Height = 700
+        };
+
+        var dispatcher = canvas.Dispatcher;
+        var hookedField = typeof(NestedCanvas).GetField("_hookedToRendering", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var clock = Stopwatch.StartNew();
+        var started = new Dictionary<DispatcherOperation, double>();
+        var letGo = new List<(double At, bool InDrawingFrame)>();
+        var operations = new List<(double At, double Ms)>();
+        var wasHooked = false;
+        var lastLoop = 0L;
+        DispatcherHookEventHandler onStarted = (_, e) => started[e.Operation] = clock.Elapsed.TotalMilliseconds;
+        DispatcherHookEventHandler onCompleted = (_, e) =>
+        {
+            var now = clock.Elapsed.TotalMilliseconds;
+            var hooked = (bool)hookedField.GetValue(canvas)!;
+            var loop = canvas.LoopFrameCount;
+            if (started.Remove(e.Operation, out var begun))
+            {
+                operations.Add((begun, now - begun));
+                if (wasHooked && !hooked)
+                {
+                    // Let go of in this operation: in the frame that drew,
+                    // if the loop ran a frame in it and that frame drew.
+                    letGo.Add((now, loop != lastLoop && !canvas.LastFrameStats.Skipped));
+                }
+            }
+
+            wasHooked = hooked;
+            lastLoop = loop;
+        };
+
+        var probes = new List<(double At, double Waited)>();
+        var probing = true;
+        var probePending = 0;
+        long probePosted = 0;
+        Action onProbe = () =>
+        {
+            var waited = (Stopwatch.GetTimestamp() - Volatile.Read(ref probePosted)) * 1000.0 / Stopwatch.Frequency;
+            lock (probes)
+            {
+                probes.Add((clock.Elapsed.TotalMilliseconds - waited, waited));
+            }
+
+            Volatile.Write(ref probePending, 0);
+        };
+
+        var prober = new Thread(() =>
+        {
+            while (Volatile.Read(ref probing))
+            {
+                Thread.Sleep(4);
+                if (Interlocked.Exchange(ref probePending, 1) == 0)
+                {
+                    Volatile.Write(ref probePosted, Stopwatch.GetTimestamp());
+                    dispatcher.BeginInvoke(DispatcherPriority.Input, onProbe);
+                }
+            }
+        }) { IsBackground = true, Name = "input probe" };
+
+        try
+        {
+            using (ActivationGuard.GuardWindowsCreated())
+            {
+                var handle = new WindowInteropHelper(window).EnsureHandle();
+                SetWindowPos(handle, 0, target.Work.Left + 40, target.Work.Top + 40, 1000, 700, 0x0004 | 0x0010); // no z-order change, no activation
+                window.Show();
+            }
+
+            canvas.FlyTo(tree.Find(@"Q:\big")!, 0.92, animated: false);
+            await Until(() => canvas.IsIdle && !canvas.IsFrameHooked, 10_000);
+            await Task.Delay(1_500);
+            dispatcher.Hooks.OperationStarted += onStarted;
+            dispatcher.Hooks.OperationCompleted += onCompleted;
+            dispatcher.Hooks.OperationAborted += onCompleted;
+            prober.Start();
+
+            const int Rests = 12;
+            var stops = new List<double>();
+            for (var rest = 0; rest < Rests; rest++)
+            {
+                // A burst of wheel steps, in and then out again, a frame apart.
+                var zoomIn = rest % 2 == 0;
+                for (var step = 0; step < 12; step++)
+                {
+                    canvas.ZoomAt(new Point(500, 350), zoomIn ? 1.06 : 1 / 1.06);
+                    await Task.Delay(16);
+                }
+
+                stops.Add(clock.Elapsed.TotalMilliseconds);
+                await Task.Delay(1_200);
+            }
+
+            Volatile.Write(ref probing, false);
+            await Task.Delay(50);
+            var quiet = !canvas.IsFrameHooked && !(bool)hookedField.GetValue(canvas)!;
+            var worst = new List<double>();
+            lock (probes)
+            {
+                foreach (var stop in stops)
+                {
+                    worst.Add(probes.Where(probe => probe.At >= stop && probe.At < stop + 800).Select(probe => probe.Waited).DefaultIfEmpty(0).Max());
+                }
+            }
+
+            // The thread blocked just after letting go: the longest operation
+            // that began within a fifth of a second of it.
+            var blocked = letGo
+                .Select(entry => operations.Where(op => op.At >= entry.At && op.At < entry.At + 200).Select(op => op.Ms).DefaultIfEmpty(0).Max())
+                .Order()
+                .ToList();
+            worst.Sort();
+            var restsLetGo = letGo.Count;
+            var inDrawing = letGo.Count(entry => entry.InDrawingFrame);
+            Console.WriteLine($"        {Rests} rests: the loop let go {restsLetGo} times, {inDrawing} of them in the frame that drew; the thread was blocked just after letting go "
+                + $"{(blocked.Count == 0 ? 0 : blocked[blocked.Count / 2]):0} ms (median), {(blocked.Count == 0 ? 0 : blocked[^1]):0} ms at most, 50 ms or more in {blocked.Count(ms => ms >= 50)} of {blocked.Count}");
+            Console.WriteLine($"        input waited at most, per rest: median {worst[worst.Count / 2]:0.0} ms, max {worst[^1]:0.0} ms, over 100 ms in {worst.Count(wait => wait > 100)} of {worst.Count}");
+            Check($"the loop let go at every rest ({restsLetGo} of {Rests}), and lets go of WPF's frames altogether at the end ({quiet})",
+                restsLetGo >= Rests && quiet);
+            Check($"never in the frame that drew the settled picture, while WPF still had that frame to show ({inDrawing} of {restsLetGo})",
+                inDrawing == 0);
+            Check($"so letting go no longer blocks the thread for 50 ms or more, but at a rare rest ({blocked.Count(ms => ms >= 50)} of {blocked.Count})",
+                blocked.Count(ms => ms >= 50) <= Rests / 4);
+        }
+        finally
+        {
+            Volatile.Write(ref probing, false);
+            dispatcher.Hooks.OperationStarted -= onStarted;
+            dispatcher.Hooks.OperationCompleted -= onCompleted;
+            dispatcher.Hooks.OperationAborted -= onCompleted;
+            window.Close();
+            canvas.Tree = null;
+        }
     }
 
     // ---- an arrow key held down (J002) ---------------------------------------------------------
