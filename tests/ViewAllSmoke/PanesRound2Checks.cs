@@ -20,7 +20,9 @@ namespace ViewAllSmoke;
 /// rather than the overview shown while it waits (J041, J124).  A colour or
 /// a note on a drive or share that answers late is drawn once it does (J126).
 /// A new window gathers its beacons once, when its panes have their drives,
-/// not first for nothing as it reads its workspace (J079).
+/// not first for nothing as it reads its workspace (J079).  Switching to the
+/// tree keeps a selection of several items, and a navigation under way
+/// (J131).
 ///
 /// <para>The windows need the app, of which a process can only ever have the
 /// one, on the thread that made it: these checks always run in a process of
@@ -130,6 +132,7 @@ internal static partial class Program
                 await PanesLateShareCameraChecksAsync(root);
                 await PanesLateRootMarksChecksAsync(root);
                 await PanesStartBeaconChecksAsync(root);
+                await PanesTreeSwitchChecksAsync(root);
             }
         }
         finally
@@ -300,6 +303,57 @@ internal static partial class Program
         }
         finally
         {
+            shell.Dispose();
+        }
+    }
+
+    // ---- the tree canvas keeps the selection (J131) -----------------------------------
+
+    /// <summary>
+    /// Four files selected on the nested canvas, and the picture switched to
+    /// the tree: the tree opens its folders down to the one with the focus,
+    /// and the four are still what is selected - it selected the focused
+    /// file alone, and Delete then acted on one of the four.  Nor does that
+    /// reveal stand in for a navigation asked for just before it.
+    /// </summary>
+    private static async Task PanesTreeSwitchChecksAsync(string root)
+    {
+        Section("panes round 2: switching to the tree keeps the whole selection, and a navigation under way (J131)");
+        var folder = Path.Combine(root, "switch");
+        Directory.CreateDirectory(folder);
+        var files = new[] { "a.txt", "b.txt", "c.txt", "d.txt" }.Select(name => Path.Combine(folder, name)).ToArray();
+        foreach (var file in files)
+        {
+            File.WriteAllText(file, "x");
+        }
+
+        var main = ProxyWindow(out var shell);
+        try
+        {
+            await main.StartNestedForChecksAsync();
+            shell.Tree.Selection.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Container = folder,
+                Added = [.. files.Select(file => new SelectionItem(file, false, 1))],
+                Anchor = files[0],
+                Focus = files[0],
+                Source = SelectionSource.Canvas
+            });
+            Check("four files are selected on the nested canvas, the first with the focus",
+                await LiveWait(() => ViewAllPath.Equals(shell.Tree.ActivePath, files[0]), 5_000) >= 0 && shell.Tree.Selection.Count == 4);
+
+            var navigation = shell.Tree.BeginNavigation();
+            shell.Layout = CanvasLayout.Tree;
+            await main.TreeEntryForChecks;
+            Check($"on the tree, its folders opened down to the focus, all four are still selected ({shell.Tree.Selection.Count} selected)",
+                shell.Tree.Selection.Count == 4 && files.All(shell.Tree.Selection.Contains) && ViewAllPath.Equals(shell.Tree.ActivePath, files[0])
+                && shell.Tree.ActiveNode?.Parent is { IsExpanded: true });
+            Check("and a navigation asked for just before is still the one that counts", shell.Tree.IsLatestNavigation(navigation));
+        }
+        finally
+        {
+            shell.Layout = CanvasLayout.Nested;
             shell.Dispose();
         }
     }

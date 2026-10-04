@@ -607,7 +607,10 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>
     /// Back to the tree: what is selected was only brought in by name, so it
     /// is revealed properly - its folders opened - before the tree is shown,
-    /// and the reveal itself brings it into view.
+    /// and the reveal itself brings it into view.  Revealed without being
+    /// selected again: that would cut a selection of several items down to
+    /// the one with the focus, and stand in for a navigation still on its way
+    /// as one of its own.
     ///
     /// <para>With a folder of thousands on the way the reveal takes a while,
     /// and the nested canvas may be back before it is done: the tree was only
@@ -628,7 +631,7 @@ public partial class MainWindow : INestedPaneHost
         {
             if (!string.IsNullOrEmpty(tree.ActivePath))
             {
-                await tree.RevealPathAsync(tree.ActivePath);
+                await tree.RevealPathAsync(tree.ActivePath, focus: true, select: false);
             }
         }
         finally
