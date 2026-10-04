@@ -2564,11 +2564,73 @@ public partial class MainWindow : Window
         var height = Math.Min(bounds.Bottom - bounds.Top, work.Bottom - work.Top);
         var left = Math.Clamp(bounds.Left, work.Left, work.Right - width);
         var top = Math.Clamp(bounds.Top, work.Top, work.Bottom - height);
+        if (WindowStartupLocation == WindowStartupLocation.CenterScreen)
+        {
+            (left, top) = CentreInWorkArea(window, work, left, top, width, height, dpi.DpiScaleY);
+        }
+
         if (left != bounds.Left || top != bounds.Top || width != bounds.Right - bounds.Left || height != bounds.Bottom - bounds.Top)
         {
             SetWindowPos(window, IntPtr.Zero, left, top, width, height, SwpNoZOrder | SwpNoActivate);
         }
     }
+
+    /// <summary>
+    /// Where a window that opens in the middle of the screen goes, being
+    /// <paramref name="width"/> by <paramref name="height"/> on the work area
+    /// <paramref name="work"/>, from where it is (<paramref name="left"/>,
+    /// <paramref name="top"/>).  WPF centres it at the scale it was made at -
+    /// the primary monitor's - before it moves over to its own monitor and
+    /// takes that monitor's scale: on a 100 % monitor beside a 150 % primary
+    /// it was centred at one and a half times its size, shrank, and was
+    /// pushed into the monitor's corner.  So it is centred again at the size
+    /// it has now; one that WPF centred already, within its rounding, stays
+    /// exactly where it is.  And another window of the app in that very spot
+    /// - several folders opened together each open one - moves it a caption
+    /// lower and further right, as many times as it takes and the work area
+    /// allows: exactly over the other, the windows looked like one.
+    /// </summary>
+    private (int Left, int Top) CentreInWorkArea(IntPtr window, RectL work, int left, int top, int width, int height, double scale)
+    {
+        var centredLeft = work.Left + (work.Right - work.Left - width) / 2;
+        var centredTop = work.Top + (work.Bottom - work.Top - height) / 2;
+        if (Math.Abs(left - centredLeft) > 1 || Math.Abs(top - centredTop) > 1)
+        {
+            left = centredLeft;
+            top = centredTop;
+        }
+
+        var step = (int)Math.Round((System.Windows.Shell.WindowChrome.GetWindowChrome(this)?.CaptionHeight ?? 40) * scale);
+        while (step > 0 && left + step + width <= work.Right && top + step + height <= work.Bottom
+            && IsAnotherWindowAt(window, left, top))
+        {
+            left += step;
+            top += step;
+        }
+
+        return (left, top);
+    }
+
+    /// <summary>
+    /// Whether another window of the app that is shown, neither maximized nor
+    /// minimized and not on its way out, has its top left corner at
+    /// (<paramref name="left"/>, <paramref name="top"/>).  Only the app's own
+    /// thread lists its windows: a window made on another one compares with
+    /// none.
+    /// </summary>
+    private static bool IsAnotherWindowAt(IntPtr window, int left, int top) =>
+        Application.Current is { } application
+        && application.CheckAccess()
+        && application.Windows.OfType<MainWindow>().Any(other =>
+            other.IsVisible
+            && !other._closeRequested
+            && other.WindowState == WindowState.Normal
+            && new WindowInteropHelper(other).Handle is var handle
+            && handle != IntPtr.Zero
+            && handle != window
+            && GetWindowRect(handle, out var bounds)
+            && Math.Abs(bounds.Left - left) <= 1
+            && Math.Abs(bounds.Top - top) <= 1);
 
     private const int HtClient = 1;
     private const int HtCaption = 2;
