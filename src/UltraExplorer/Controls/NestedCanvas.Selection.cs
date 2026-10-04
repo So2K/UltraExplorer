@@ -993,8 +993,16 @@ public sealed partial class NestedCanvas
         return new SelectionItem(path, false, index >= 0 && index < files.Count ? files[index].Length : 0);
     }
 
-    /// <summary>Whether the filter lets a gesture take this sub-folder: always with no filter, else only a match.</summary>
-    private bool FolderMatches(NestedFolder child) => _filter is null || (FilterStateOf(child) & FilterSelf) != 0;
+    /// <summary>
+    /// Whether the filter lets a gesture take this sub-folder: always with no
+    /// filter, else only a match.  One the filter has not come to yet - a
+    /// big tree is judged a slice at a time - is judged by its name here, as
+    /// the filter will judge it: taken for no match until then, it was left
+    /// out of a Ctrl+A, a range or a rectangle, and Copy or Delete acted on
+    /// part of what the user asked for.
+    /// </summary>
+    private bool FolderMatches(NestedFolder child) =>
+        _filter is null || (child.FilterStamp == _filterStamp ? (child.FilterState & FilterSelf) != 0 : !child.IsComputer && _filter(child.Name));
 
     private bool FileMatches(in NestedFile file) => _filter is null || _filter(file.Name);
 }
