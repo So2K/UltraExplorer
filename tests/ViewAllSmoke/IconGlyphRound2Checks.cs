@@ -53,6 +53,7 @@ internal static partial class Program
             await Round2IconLetGoChecks();
             Round2IconHungChecks();
         });
+        RunOnSta("surface lock round 2", Round2SurfaceLockChecks);
         return Task.CompletedTask;
     }
 
@@ -526,5 +527,73 @@ internal static partial class Program
             release.Set();
             icons.Dispose();
         }
+    }
+
+    // ---- J077: waiting for the image lock -------------------------------------------------------
+
+    /// <summary>
+    /// WPF's render thread still holds the last frame, so a present waits its
+    /// two milliseconds for the image lock and skips.  Each failed try waits
+    /// on WPF's event through the dispatcher's synchronization context, which
+    /// makes a new handle array every time: the wait must not make hundreds.
+    /// </summary>
+    private static Task Round2SurfaceLockChecks()
+    {
+        if (!GpuDeviceSet.EnumerateAdapters().Any(adapter => !adapter.IsSoftware)
+            || GpuBootstrap.AdapterLuidForMonitor(GpuBootstrap.PrimaryMonitor) is not { } luid)
+        {
+            Console.WriteLine("  (no hardware graphics adapter: the surface lock check is skipped)");
+            return Task.CompletedTask;
+        }
+
+        using var set = GpuDeviceSet.Create(luid, shareWithWpf: true);
+        var surface = new NestedSurface(set, 1.0, 1.0);
+        try
+        {
+            SurfaceDrawer plain = (in SurfaceFrame frame) => frame.Context.ClearRenderTargetView(frame.Target, ToColor4(0xFF203040u));
+            surface.EnsureSize(200, 100);
+            var first = surface.Present(plain);
+            var canWrite = typeof(D3DImage).GetField("_canWriteEvent", BindingFlags.NonPublic | BindingFlags.Instance)?.GetValue(surface) as ManualResetEvent;
+            if (canWrite is null)
+            {
+                Console.WriteLine("  (WPF's D3DImage has no _canWriteEvent here: the surface lock check is skipped)");
+                return Task.CompletedTask;
+            }
+
+            // The render thread still copying the last frame: the event the lock waits on is not set.
+            canWrite.Reset();
+            long bytes = 0;
+            var skipped = 0;
+            var waited = 0.0;
+            const int rounds = 20;
+            try
+            {
+                surface.Present(plain);
+                for (var round = 0; round < rounds; round++)
+                {
+                    var before = GC.GetAllocatedBytesForCurrentThread();
+                    var result = surface.Present(plain);
+                    bytes += GC.GetAllocatedBytesForCurrentThread() - before;
+                    skipped += result == PresentResult.Skipped ? 1 : 0;
+                    waited += surface.LastLockMilliseconds;
+                }
+            }
+            finally
+            {
+                canWrite.Set();
+            }
+
+            var after = surface.Present(plain);
+            var perFrame = bytes / (double)rounds;
+            Console.WriteLine($"  a present that waited {waited / rounds:F2} ms for the image lock and skipped allocated {perFrame:N0} bytes on the UI thread ({skipped} of {rounds} skipped)");
+            Check("J077: waiting for the image lock does not allocate on every poll",
+                first == PresentResult.Presented && skipped == rounds && after == PresentResult.Presented && perFrame < 2048);
+        }
+        finally
+        {
+            surface.Dispose();
+        }
+
+        return Task.CompletedTask;
     }
 }
