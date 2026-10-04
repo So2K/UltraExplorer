@@ -209,6 +209,11 @@ public partial class MainWindow
 
         if (!sameDialog)
         {
+            // The new dialog's folder before anything is awaited: the
+            // replacement asks at once when it is drawn (WhenFolderDrawnAsync),
+            // and would otherwise be told so of the previous dialog's folder,
+            // drawn long ago, and uncloak the picker before this one is read.
+            _pickerStartFolder = session.CurrentFolder;
             await _viewModel.RefreshPickerNavigationPreferencesAsync();
             if (!ReferenceEquals(_picker, session)) return;
             foreach (var pane in _panes) pane.RebuildBeacons();
@@ -313,11 +318,12 @@ public partial class MainWindow
         var pane = IsNested ? ActivePane : null;
         var folder = _pickerStartFolder;
         var completion = _pickerCompletion;
+        var session = _picker;
         long mark = -1;
         TimeSpan? drawnAt = null;
         void OnFrame(object? sender, EventArgs e)
         {
-            if (!ReferenceEquals(completion, _pickerCompletion) || _pickerFinished)
+            if (!ReferenceEquals(completion, _pickerCompletion) || !ReferenceEquals(session, _picker) || _pickerFinished)
             {
                 done.TrySetResult(false);
                 return;
