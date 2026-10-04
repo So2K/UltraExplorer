@@ -1060,6 +1060,12 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether a drive is there to be offered.  Asked of an offline network
+    /// drive, it holds the thread until the network gives up on it.
+    /// </summary>
+    internal static Func<DriveInfo, bool> DriveReady { get; set; } = static drive => drive.IsReady;
+
     private static void AddDrives(List<AddressSuggestion> found, HashSet<string> seen, string prefix)
     {
         DriveInfo[] drives;
@@ -1074,22 +1080,23 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
         foreach (var drive in drives)
         {
-            string name;
-            try
-            {
-                if (!drive.IsReady)
-                {
-                    continue;
-                }
-
-                name = drive.Name;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            // The letter first, which is only a name: asked before it whether
+            // it was ready, every drive was asked at every pause in the
+            // typing, an offline network one holding the thread each time.
+            var name = drive.Name;
+            if (prefix.Length > 0 && !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            if (prefix.Length > 0 && !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            try
+            {
+                if (!DriveReady(drive))
+                {
+                    continue;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 continue;
             }

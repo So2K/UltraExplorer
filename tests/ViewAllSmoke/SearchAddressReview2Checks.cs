@@ -27,6 +27,7 @@ internal static partial class Program
         RunOnSta("search: going to another folder while walking", SearchWalkFolderMoveAsync);
         RunOnSta("search: a walk ordered from the folder gone to", SearchWalkOrderedFromAsync);
         RunOnSta("search: a walk's reports on screen", SearchWalkReportsAsync);
+        AddressDrivePrefixChecks();
         return Task.CompletedTask;
     }
 
@@ -358,5 +359,51 @@ internal static partial class Program
             statuses.SequenceEqual(["report 5"]));
         typeof(SearchViewModel).GetField("_run", flags)!.SetValue(search, null);
         search.Close();
+    }
+
+    /// <summary>
+    /// J110: the address bar's suggestions asked every drive whether it was
+    /// ready before looking at whether its letter was the one typed - and
+    /// asked of an offline network drive, that holds the thread until the
+    /// network gives up on it, at every pause in the typing.  Counted here
+    /// by the drives asked.
+    /// </summary>
+    private static void AddressDrivePrefixChecks()
+    {
+        Section("address bar: only the drives the letters typed could mean are asked whether they are ready (J110)");
+        var seam = typeof(AddressBarViewModel).GetProperty("DriveReady", BindingFlags.NonPublic | BindingFlags.Static);
+        if (seam is null)
+        {
+            Check("the question put to each drive can be counted", false);
+            return;
+        }
+
+        var before = seam.GetValue(null);
+        var asked = new List<string>();
+        seam.SetValue(null, (Func<DriveInfo, bool>)(drive =>
+        {
+            asked.Add(drive.Name);
+            return drive.IsReady;
+        }));
+        try
+        {
+            var system = Path.GetPathRoot(Environment.SystemDirectory)!;
+            var found = AddressBarViewModel.Collect(system[..1], []);
+            Check($"typing '{system[..1]}' asks that drive alone ({string.Join(" ", asked)} of {DriveInfo.GetDrives().Length})",
+                asked.SequenceEqual([system]) && found.Any(suggestion => suggestion.Kind == AddressSuggestionKind.Drive && suggestion.FullPath == system));
+
+            asked.Clear();
+            AddressBarViewModel.Collect("uxnodrive", []);
+            Check($"a name no drive starts with asks none ({asked.Count})", asked.Count == 0);
+
+            asked.Clear();
+            var every = AddressBarViewModel.Collect(string.Empty, []);
+            Check($"an empty line still offers every drive that is ready ({asked.Count} asked, {every.Count(suggestion => suggestion.Kind == AddressSuggestionKind.Drive)} offered)",
+                asked.Count == DriveInfo.GetDrives().Length && every.Any(suggestion => suggestion.FullPath == system));
+        }
+        finally
+        {
+            seam.SetValue(null, before);
+        }
     }
 }
