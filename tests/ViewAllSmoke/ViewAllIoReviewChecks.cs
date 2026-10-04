@@ -1,4 +1,8 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
 
@@ -6,8 +10,9 @@ namespace ViewAllSmoke;
 
 /// <summary>
 /// The tree's reading and saving, from the second full review: a folder whose
-/// name ends in a dot or a space (J051), and a folder with more entries than
-/// one read takes (J050).
+/// name ends in a dot or a space (J051), a folder with more entries than one
+/// read takes (J050), and the workspace save after the camera comes to rest
+/// (J017).
 /// </summary>
 internal static partial class Program
 {
@@ -15,6 +20,7 @@ internal static partial class Program
     {
         await FolderNamedWithADotIsReadAsItselfAsync();
         await FolderPastTheCapKeepsItsFoldersAsync();
+        await WorkspaceSaveStaysOffTheUiThreadAsync();
     }
 
     // ---- J051: a folder whose name ends in a dot or a space ----------------
@@ -184,5 +190,215 @@ internal static partial class Program
         {
             TryDelete(root);
         }
+    }
+
+    // ---- J017: the workspace save after the camera comes to rest -------------
+
+    /// <summary>
+    /// The save that follows every rest of the camera, started on the UI
+    /// thread as the window's timer starts it.  It opened, flushed and moved
+    /// its file there - milliseconds on an idle disk, hundreds when anything
+    /// else has the file: the search indexer or a virus scanner holding it
+    /// keeps the move waiting until it lets go, and every window was frozen
+    /// for that.  Here the test holds the file as they do (an oplock that
+    /// caches its handle) and lets go 300 ms after the move asks for it,
+    /// and what is measured is the time a thread standing in for the UI
+    /// thread spends on the save.
+    /// </summary>
+    private static async Task WorkspaceSaveStaysOffTheUiThreadAsync()
+    {
+        Section("view-all io: the workspace is saved off the UI thread (J017)");
+        var folder = Path.Combine(Path.GetTempPath(), "UltraExplorerWorkspaceSave", Guid.NewGuid().ToString("N"));
+        try
+        {
+            // A canvas used for a long while: sixty thousand nodes.
+            var state = new ViewAllWorkspaceState
+            {
+                ViewportX = 12,
+                ViewportY = 34,
+                ViewportZoom = 0.5,
+                ActivePath = @"C:\canvas\folder-000001",
+                Nodes = Enumerable.Range(0, 60_000)
+                    .Select(index => new ViewAllNodeState($@"C:\canvas\folder-{index:D6}", index * 2.5, index * 0.5, index % 3 == 0, index % 2 == 0))
+                    .ToList()
+            };
+            var statePath = Path.Combine(folder, "view-all.workspace.json");
+            var store = new ViewAllWorkspaceStore(statePath);
+
+            // Once first, so what is measured is the save and not its first
+            // run, and so there is a file for something else to hold.
+            await store.SaveAsync(state);
+
+            using var ui = new TimedUiThread();
+            var watch = Stopwatch.StartNew();
+            await ui.RunAsync(() => store.SaveAsync(state));
+            watch.Stop();
+            var idle = ui.BusyMilliseconds;
+
+            using var holder = HeldFile.Hold(statePath, TimeSpan.FromMilliseconds(300));
+            using var held = new TimedUiThread();
+            var heldWatch = Stopwatch.StartNew();
+            await held.RunAsync(() => store.SaveAsync(state));
+            heldWatch.Stop();
+            var busy = held.BusyMilliseconds;
+            Check($"the file was held, and let go once the save asked for it ({holder.Describe()})", holder.WasAskedFor);
+            Check($"while it waits for the file the UI thread is free ({busy:0.0} ms of a {heldWatch.Elapsed.TotalMilliseconds:0} ms save on the UI thread; idle disk {idle:0.0} ms of {watch.Elapsed.TotalMilliseconds:0} ms)",
+                holder.WasAskedFor && busy < 100);
+
+            var loaded = await store.LoadAsync();
+            Check("and the workspace is written whole all the same",
+                loaded is { ViewportZoom: 0.5, ActivePath: @"C:\canvas\folder-000001" }
+                && loaded.Nodes.Count == 60_000
+                && loaded.Nodes[^1] == state.Nodes[^1]);
+            Check("with no temporary file left beside it",
+                Directory.GetFiles(folder).Select(Path.GetFileName).SequenceEqual(["view-all.workspace.json"]));
+        }
+        finally
+        {
+            TryDelete(folder);
+        }
+    }
+
+    /// <summary>
+    /// A thread standing in for the UI thread: it runs what is posted to it
+    /// one at a time, as a dispatcher does, and adds up how long it was busy.
+    /// </summary>
+    private sealed class TimedUiThread : SynchronizationContext, IDisposable
+    {
+        private readonly BlockingCollection<(SendOrPostCallback Callback, object? State)> _queue = [];
+        private long _busyTicks;
+
+        public TimedUiThread()
+        {
+            new Thread(Pump) { IsBackground = true, Name = "timed UI thread" }.Start();
+        }
+
+        public double BusyMilliseconds => Stopwatch.GetElapsedTime(0, Interlocked.Read(ref _busyTicks)).TotalMilliseconds;
+
+        public override void Post(SendOrPostCallback d, object? state) => _queue.Add((d, state));
+
+        public override void Send(SendOrPostCallback d, object? state) => throw new NotSupportedException();
+
+        /// <summary>Starts <paramref name="work"/> on this thread, and completes with it.</summary>
+        public Task RunAsync(Func<Task> work)
+        {
+            var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Post(async _ =>
+            {
+                try
+                {
+                    await work();
+                    done.SetResult();
+                }
+                catch (Exception ex)
+                {
+                    done.SetException(ex);
+                }
+            }, null);
+            return done.Task;
+        }
+
+        public void Dispose() => _queue.CompleteAdding();
+
+        private void Pump()
+        {
+            SetSynchronizationContext(this);
+            foreach (var (callback, state) in _queue.GetConsumingEnumerable())
+            {
+                var start = Stopwatch.GetTimestamp();
+                callback(state);
+                Interlocked.Add(ref _busyTicks, Stopwatch.GetTimestamp() - start);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A file held as the search indexer or a virus scanner holds one: open,
+    /// with an oplock that caches its handle.  Whatever then wants to replace
+    /// the file waits while the holder is told and lets go, which this one
+    /// does <c>delay</c> after it is told.
+    /// </summary>
+    private sealed class HeldFile : IDisposable
+    {
+        private const uint FsctlRequestOplock = 0x00090240;
+        private const int ErrorIoPending = 997;
+        private readonly SafeFileHandle _handle;
+        private readonly ManualResetEvent _broken = new(false);
+        private readonly IntPtr _buffers;
+        private readonly Task _letGo;
+        private readonly string _failure;
+
+        private HeldFile(string path, TimeSpan delay)
+        {
+            _buffers = Marshal.AllocHGlobal(256);
+            for (var offset = 0; offset < 256; offset++)
+            {
+                Marshal.WriteByte(_buffers, offset, 0);
+            }
+
+            // REQUEST_OPLOCK_INPUT_BUFFER: version 1, 12 bytes, read and handle caching, a request.
+            Marshal.WriteInt16(_buffers, 0, 1);
+            Marshal.WriteInt16(_buffers, 2, 12);
+            Marshal.WriteInt32(_buffers, 4, 1 | 2);
+            Marshal.WriteInt32(_buffers, 8, 1);
+
+            // The OVERLAPPED, whose event is set when the oplock is broken.
+            var overlapped = _buffers + 64;
+            Marshal.WriteIntPtr(overlapped, IntPtr.Size == 8 ? 24 : 16, _broken.SafeWaitHandle.DangerousGetHandle());
+
+            _handle = CreateFile(path, 0x80000000, 7, IntPtr.Zero, 3, 0x40000000, IntPtr.Zero);
+            if (_handle.IsInvalid)
+            {
+                _failure = $"open failed {Marshal.GetLastWin32Error()}";
+            }
+            else if (DeviceIoControl(_handle, FsctlRequestOplock, _buffers, 12, _buffers + 32, 24, IntPtr.Zero, overlapped)
+                || Marshal.GetLastWin32Error() != ErrorIoPending)
+            {
+                _failure = "no oplock granted";
+            }
+            else
+            {
+                _failure = string.Empty;
+            }
+
+            var held = Stopwatch.StartNew();
+            _letGo = Task.Run(() =>
+            {
+                if (_failure.Length == 0 && _broken.WaitOne(TimeSpan.FromSeconds(10)))
+                {
+                    WasAskedFor = true;
+                    AskedAfter = held.Elapsed;
+                    Thread.Sleep(delay);
+                }
+
+                _handle.Dispose();
+            });
+        }
+
+        public bool WasAskedFor { get; private set; }
+
+        public TimeSpan AskedAfter { get; private set; }
+
+        public static HeldFile Hold(string path, TimeSpan delay) => new(path, delay);
+
+        public string Describe() => _failure.Length > 0 ? _failure : WasAskedFor ? $"asked for {AskedAfter.TotalMilliseconds:0} ms in" : "never asked for";
+
+        public void Dispose()
+        {
+            _letGo.Wait(TimeSpan.FromSeconds(15));
+            _handle.Dispose();
+
+            // The request ends when its handle closes; its buffers go after it.
+            _broken.WaitOne(TimeSpan.FromSeconds(1));
+            Marshal.FreeHGlobal(_buffers);
+            _broken.Dispose();
+        }
+
+        [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControl(SafeFileHandle handle, uint code, IntPtr input, int inputSize, IntPtr output, int outputSize, IntPtr returned, IntPtr overlapped);
     }
 }

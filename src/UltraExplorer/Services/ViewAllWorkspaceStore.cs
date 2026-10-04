@@ -63,7 +63,14 @@ public sealed class ViewAllWorkspaceStore
         await _saving.WaitAsync(cancellationToken);
         try
         {
-            await SaveSnapshotAsync(state, cancellationToken);
+            // Off the caller's thread, which is the UI thread after every
+            // rest of the camera: the open, the flush and the move each wait
+            // for the disk, and the move for anything else that has the file
+            // - the search indexer, a virus scanner - so a save froze every
+            // window for tens to hundreds of milliseconds, often just as the
+            // next gesture began.  The state is the caller's own copy, taken
+            // before the save, so nothing else touches it meanwhile.
+            await Task.Run(() => SaveSnapshotAsync(state, cancellationToken), cancellationToken);
         }
         finally
         {
