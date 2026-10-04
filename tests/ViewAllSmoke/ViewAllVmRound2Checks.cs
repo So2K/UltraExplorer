@@ -15,8 +15,9 @@ namespace ViewAllSmoke;
 /// thread; colouring or clearing a large selection on the tree canvas rebuilds
 /// its batched layers once, not once an item; a size changing in a folder the
 /// graph has never read does not have what was brought into it by name checked
-/// against the disk; and a slow listing lets go only of what was selected when
-/// it began.
+/// against the disk; a slow listing lets go only of what was selected when it
+/// began; and an item found gone is said to be gone once, and only once the
+/// disk says so, and the focus goes to its folder.
 /// </summary>
 internal static partial class Program
 {
@@ -30,6 +31,7 @@ internal static partial class Program
             await OnDispatcher(() => VmRound2ColourBatchAsync(root));
             await OnDispatcher(() => VmRound2HiddenGraphChangeAsync(root));
             await OnDispatcher(() => VmRound2SlowPruneAsync(root));
+            await OnDispatcher(() => VmRound2GoneFocusAsync(root));
         }
         finally
         {
@@ -286,5 +288,49 @@ internal static partial class Program
         sink.FolderChanged(ChangeConsumer.Nested, folder, new FolderChange(folder, ChangeKinds.Structural, Stopwatch.GetTimestamp() + 1, default, default));
         await WaitUntil(() => !tree.Selection.Contains(doomed), 3_000);
         Check("an item selected before the listing and gone from it is let go of, as ever", !tree.Selection.Contains(doomed));
+    }
+
+    // ---- J130: an item found gone ----------------------------------------------------------
+
+    private static async Task VmRound2GoneFocusAsync(string root)
+    {
+        Section("view model round 2: an item found gone");
+        var folder = Path.Combine(root, "gone");
+        var scratch = Path.Combine(root, "gone-state");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(scratch);
+        File.WriteAllText(Path.Combine(folder, "kept.txt"), "kept");
+
+        using var icons = new ShellIconService();
+        using var tree = NewTree(scratch, icons);
+        tree.PreferLightReveal = true;
+        tree.IsCanvasShown = false;
+        await tree.InitializeAsync(folder);
+        var messages = new List<string>();
+        var refreshed = new List<string>();
+        tree.MessageRequested += (message, _) => messages.Add(message);
+        tree.PathRefreshed += refreshed.Add;
+        int NoLongerInside() => messages.Count(message => message.Contains("is no longer inside", StringComparison.Ordinal));
+
+        // A tile for a file deleted from outside, clicked.
+        var gone = Path.Combine(folder, "gone.txt");
+        tree.Selection.ReplaceSingle(gone, false, 4, SelectionSource.Canvas);
+        await WaitUntil(() => !tree.Selection.Contains(gone) && refreshed.Count > 0, 3_000);
+        await Task.Delay(500);
+        var folderRefreshes = refreshed.Count(path => ViewAllPath.Equals(path, folder));
+        Check($"an item found gone is said to be gone once ({NoLongerInside()} times)", NoLongerInside() == 1);
+        Check($"and its folder is read again once ({folderRefreshes} times)", folderRefreshes == 1);
+        Check("and it is let go of, as ever", !tree.Selection.Contains(gone));
+        Check($"and the focus goes to its folder, so nothing asks for it again ({tree.FocusedPath})", ViewAllPath.Equals(tree.FocusedPath, folder));
+
+        // One the disk cannot be asked about - a name no volume takes, as a
+        // share that has stopped answering for a moment cannot be asked -
+        // is not said to be gone, and stays selected.
+        messages.Clear();
+        var unreadable = Path.Combine(folder, new string('x', 300) + ".txt");
+        tree.Selection.ReplaceSingle(unreadable, false, 0, SelectionSource.Canvas);
+        await Task.Delay(800);
+        Check($"an item the disk cannot be asked about is not said to be gone ({string.Join(" | ", messages)})", NoLongerInside() == 0);
+        Check("and stays selected", tree.Selection.Contains(unreadable));
     }
 }

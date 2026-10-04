@@ -1669,6 +1669,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// before still reads its way down: then, as when superseded, nothing is
     /// selected or flown to.
     /// </param>
+    /// <param name="holdGone">
+    /// Handed the message that the path is no longer inside the folder the
+    /// reveal got to, in place of the toast: for a caller that says so only
+    /// once the disk has.  A share that did not answer for a moment has not
+    /// lost anything.
+    /// </param>
     public async Task<RevealOutcome> RevealAsync(
         string path,
         bool focus = true,
@@ -1676,7 +1682,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         int? ticket = null,
         bool records = true,
         bool exact = false,
-        long? selectionVersion = null)
+        long? selectionVersion = null,
+        Action<string>? holdGone = null)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
@@ -1716,11 +1723,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             node = result.Node;
             if (result.MissingStep is { } missing)
             {
-                MessageRequested?.Invoke(
-                    node is null
-                        ? "That drive is not available on this machine."
-                        : $"{Path.GetFileName(missing)} is no longer inside {node.DisplayName}.",
-                    true);
+                ReportMissing(missing, node, holdGone);
             }
         }
         else
@@ -1752,11 +1755,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                         var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
                         if (adopted is null)
                         {
-                            MessageRequested?.Invoke(
-                                node is null
-                                    ? "That drive is not available on this machine."
-                                    : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
-                                true);
+                            ReportMissing(step, node, holdGone);
                             break;
                         }
 
@@ -1826,6 +1825,29 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     }
 
     /// <summary>
+    /// Says that a path asked for is not there: its drive, or the step of it
+    /// no longer inside the folder the reveal got to - that one handed to
+    /// <paramref name="holdGone"/> instead when there is one (see <see cref="RevealAsync"/>).
+    /// </summary>
+    private void ReportMissing(string missing, ViewAllNodeViewModel? reached, Action<string>? holdGone)
+    {
+        if (reached is null)
+        {
+            MessageRequested?.Invoke("That drive is not available on this machine.", true);
+            return;
+        }
+
+        var message = $"{Path.GetFileName(missing)} is no longer inside {reached.DisplayName}.";
+        if (holdGone is not null)
+        {
+            holdGone(message);
+            return;
+        }
+
+        MessageRequested?.Invoke(message, true);
+    }
+
+    /// <summary>
     /// Selects a path picked somewhere other than this graph - on the nested
     /// canvas - bringing its node into being first if it has to.  Two clicks in
     /// quick succession both have to read their way down, and the second one
@@ -1889,11 +1911,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     }
 
     /// <summary>Makes sure a path has a node, without selecting it or moving the canvas.</summary>
-    public async Task<ViewAllNodeViewModel?> MaterializeAsync(string path)
+    public Task<ViewAllNodeViewModel?> MaterializeAsync(string path) => MaterializeAsync(path, holdGone: null);
+
+    /// <param name="path">The path to give a node.</param>
+    /// <param name="holdGone">Handed the message that the path is gone instead of the toast (see <see cref="RevealAsync"/>).</param>
+    private async Task<ViewAllNodeViewModel?> MaterializeAsync(string path, Action<string>? holdGone)
     {
         var node = TryGetNode(path, out var known)
             ? known
-            : await RevealPathAsync(path, focus: false, select: false);
+            : (await RevealAsync(path, focus: false, select: false, holdGone: holdGone)).Node;
         return node is not null && IsExactly(node, path) ? node : null;
     }
 
@@ -3111,15 +3137,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// Gives the focus its node, without selecting anything or moving a
     /// canvas.  While the list is what picked it, the list keeps its folder
     /// meanwhile, as a click on a row always has.  A path found gone is let
-    /// go of, and its folder read again.
+    /// go of, its folder read again, and said to be gone - once, and only
+    /// when the disk says so: a share that did not answer for a moment has
+    /// lost nothing.  The focus goes to the folder with it, as when a
+    /// refresh finds the focus gone (see <see cref="ReleaseRemovedFocus"/>):
+    /// left on the gone path, letting go of it was a change of the selection
+    /// that asked for the path all over again, and said so twice.
     /// </summary>
     private async Task FocusAsync(string path, int ticket, bool records, bool holdList)
     {
         using var hold = holdList ? FolderList.HoldFolder() : null;
         ViewAllNodeViewModel? node;
+        string? gone = null;
         try
         {
-            node = await MaterializeAsync(path);
+            node = await MaterializeAsync(path, message => gone = message);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -3139,8 +3171,20 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             // is selected in it is not to be let go of meanwhile.
             if (await IsGoneAsync(path) && !_isDisposed)
             {
-                Selection.Remove([path], SelectionSource.Command);
-                if (Path.GetDirectoryName(path) is { Length: > 0 } parent)
+                var parent = Path.GetDirectoryName(path);
+                var focused = ViewAllPath.Equals(Selection.Focus ?? string.Empty, path);
+                Selection.Apply(new SelectionEdit
+                {
+                    Removed = [path],
+                    Focus = focused && !string.IsNullOrEmpty(parent) ? parent : null,
+                    Source = SelectionSource.Command
+                });
+                if (gone is not null)
+                {
+                    MessageRequested?.Invoke(gone, true);
+                }
+
+                if (!string.IsNullOrEmpty(parent))
                 {
                     await RefreshPathAsync(parent);
                 }
