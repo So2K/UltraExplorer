@@ -78,6 +78,12 @@ internal static partial class Program
                 && listing.Folders.Select(entry => entry.Name).SequenceEqual(listing.Folders.Select(entry => entry.Name).Order(NameOrder)));
             Check($"and its name sorts make no comparer per comparison: at most 160 bytes per entry besides the names ({beyond / entries:N0})",
                 beyond <= 160 * entries + 64 * 1024);
+
+            // A file is 40 bytes and a folder 24 in the arrays the listing
+            // keeps; lists grown by doubling and copied leave about as much
+            // again thrown away, most of it on the large object heap.
+            Check($"and its lists leave nothing thrown away as they grow: at most 64 bytes per entry besides the names ({beyond / entries:N0})",
+                beyond <= 64 * entries + 64 * 1024);
         }
         finally
         {
