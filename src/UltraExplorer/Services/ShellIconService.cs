@@ -91,8 +91,14 @@ public sealed class ShellIconService : IDisposable
     /// <summary>Callbacks are called at most this often: one batch per frame of a 60 Hz display.</summary>
     private const double CallbackIntervalMilliseconds = 16;
 
-    /// <summary>At most this many threads ask the Shell, however many are stuck.</summary>
-    private const int MaximumWorkerCount = 4;
+    /// <summary>
+    /// At most this many threads ask the Shell, however many are stuck.  A
+    /// new one starts only when every one is stuck, so this is how many
+    /// icons the network can hold up at once: with four, four shortcuts to a
+    /// server that is off took every thread, and the rows on screen waited
+    /// for the network's timeout.
+    /// </summary>
+    private const int MaximumWorkerCount = 12;
 
     /// <summary>How often the watchdog looks while work waits.</summary>
     private const int WatchIntervalMilliseconds = 1000;

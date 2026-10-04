@@ -49,6 +49,7 @@ internal static partial class Program
         RunOnSta("icon service round 2 on a dispatcher", async () =>
         {
             await Round2IconOrderChecks();
+            Round2IconHungChecks();
         });
         return Task.CompletedTask;
     }
@@ -392,5 +393,70 @@ internal static partial class Program
         Console.WriteLine($"  300 rows asked top to bottom, then 3 of a newer list: the top row was the Shell's question {topRank + 1} of {asked.Length}; the first three asked: {string.Join(", ", asked.Take(3).Select(Path.GetFileName))}");
         Check("J016: a list's rows are answered top to bottom, the top row first of them", done && topRank == newer.Length && asked.Skip(newer.Length).SequenceEqual(rows, StringComparer.OrdinalIgnoreCase));
         Check("J016: and a newer list's rows go before an older one's, top to bottom too", done && asked.Take(newer.Length).SequenceEqual(newer, StringComparer.OrdinalIgnoreCase));
+    }
+
+    // ---- J037: four hung shortcuts -------------------------------------------------------------
+
+    /// <summary>
+    /// Four shortcuts to a server that is off, each holding a worker for the
+    /// network's timeout: the next icon asked for must still be answered
+    /// within seconds, not when the network gives up.
+    /// </summary>
+    private static void Round2IconHungChecks()
+    {
+        using var release = new ManualResetEventSlim(false);
+        var asked = new ConcurrentQueue<string>();
+        ImageSource? Extract(string path, bool isDirectory)
+        {
+            asked.Enqueue(path);
+            if (path.Contains("offline", StringComparison.OrdinalIgnoreCase))
+            {
+                release.Wait(TimeSpan.FromSeconds(90));
+            }
+
+            return FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(path));
+        }
+
+        static bool Within(TimeSpan limit, Func<bool> done)
+        {
+            var clock = Stopwatch.StartNew();
+            while (!done())
+            {
+                if (clock.Elapsed > limit)
+                {
+                    return false;
+                }
+
+                Thread.Sleep(5);
+            }
+
+            return true;
+        }
+
+        var icons = new ShellIconService(Extract, Dispatcher.CurrentDispatcher);
+        try
+        {
+            for (var index = 0; index < 4; index++)
+            {
+                icons.Request($@"\\offline\share\Desktop\offline{index}.lnk", false, _ => { });
+            }
+
+            var hung = Stopwatch.StartNew();
+            var allHung = Within(TimeSpan.FromSeconds(40), () => asked.Count(path => path.Contains("offline", StringComparison.OrdinalIgnoreCase)) >= 4);
+            hung.Stop();
+            var healthy = Path.Combine(Round2Root, "hung", "healthy.txt");
+            icons.Request(healthy, false, _ => { });
+            var clock = Stopwatch.StartNew();
+            var answered = Within(TimeSpan.FromSeconds(15), () => icons.GetCached(healthy, false) is not null);
+            clock.Stop();
+            Console.WriteLine($"  four workers hung on shortcuts after {hung.Elapsed.TotalSeconds:F1} s; the next icon {(answered ? "was answered" : "was still not answered")} after {clock.Elapsed.TotalSeconds:F1} s");
+            Check("J037: with four workers hung on shortcuts to a server that is off, the next icon is answered within seconds",
+                allHung && answered && clock.Elapsed < TimeSpan.FromSeconds(10));
+        }
+        finally
+        {
+            release.Set();
+            icons.Dispose();
+        }
     }
 }
