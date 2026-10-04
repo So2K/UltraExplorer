@@ -20,10 +20,86 @@ internal static partial class Program
             Section("tree reading fixes");
             ReaderAllocationChecks();
             await NamedChildOrderChecks();
+            await TildeLookupChecks();
         });
 
         return Task.CompletedTask;
     }
+
+    // ---- looking a path up (J033) ------------------------------------------------------
+
+    /// <summary>
+    /// A path with a '~' in it - "~$Report.docx", "$Windows.~BT" - is looked
+    /// up as fast as one without: the beacons look theirs up every frame, and
+    /// normalising such a path asked the file system for the long form of
+    /// every name on the way.  A short name Windows made ("PROGRA~1") still
+    /// finds the folder it stands for.
+    /// </summary>
+    private static async Task TildeLookupChecks()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerTilde", Guid.NewGuid().ToString("N"));
+        var plain = Path.Combine(root, "plain", "deeper", "leaf");
+        var tilde = Path.Combine(root, "with~tilde", "deeper", "Backup~old");
+        var longName = Path.Combine(root, "Long folder name");
+        Directory.CreateDirectory(plain);
+        Directory.CreateDirectory(tilde);
+        Directory.CreateDirectory(longName);
+        try
+        {
+            using var tree = new NestedTree();
+            tree.SetRoots([new NestedRoot(root, "T", NestedFolderKind.Drive)]);
+            var opened = await tree.MaterializePathAsync(tilde);
+            await tree.MaterializePathAsync(plain);
+            await tree.MaterializePathAsync(longName);
+            Check("a folder with a '~' in its path is found by that path, and by the path of a file in it",
+                opened is not null && ReferenceEquals(tree.Find(tilde), opened)
+                && ReferenceEquals(tree.FindNearest(Path.Combine(tilde, "~$Report.docx")), opened));
+
+            static double MicrosecondsPerFind(NestedTree tree, string path)
+            {
+                tree.Find(path);
+                var started = Stopwatch.GetTimestamp();
+                for (var run = 0; run < 200; run++)
+                {
+                    tree.Find(path);
+                }
+
+                return Stopwatch.GetElapsedTime(started).TotalMicroseconds / 200;
+            }
+
+            var plainCost = MicrosecondsPerFind(tree, Path.Combine(plain, "report.docx"));
+            var tildeCost = MicrosecondsPerFind(tree, Path.Combine(tilde, "~$Report.docx"));
+            Console.WriteLine($"        a look-up takes {plainCost:0.0} us without a '~' and {tildeCost:0.0} us with one");
+            Check($"and looking it up costs about what a path without one does ({tildeCost:0.0} us against {plainCost:0.0} us)",
+                tildeCost < 100 && tildeCost < 10 * plainCost + 20);
+
+            var alias = ShortPath(longName);
+            if (alias is not null && alias.Contains('~') && !string.Equals(alias, longName, StringComparison.OrdinalIgnoreCase))
+            {
+                Check($"a short name Windows made still finds the folder it stands for ({Path.GetFileName(alias)})",
+                    tree.Find(longName) is { } named && ReferenceEquals(tree.Find(alias), named));
+            }
+            else
+            {
+                Console.WriteLine("        (this volume makes no short names: the short-name look-up is not checked)");
+            }
+        }
+        finally
+        {
+            TryDelete(Path.GetDirectoryName(root)!);
+        }
+    }
+
+    /// <summary>The short form of a path, or null when the volume gives none.</summary>
+    private static string? ShortPath(string path)
+    {
+        var buffer = new char[1024];
+        var length = GetShortPathNameW(path, buffer, buffer.Length);
+        return length > 0 && length < buffer.Length ? new string(buffer, 0, (int)length) : null;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetShortPathNameW(string longPath, char[] shortPath, int length);
 
     // ---- what a read allocates (J011, J078) --------------------------------------------
 
