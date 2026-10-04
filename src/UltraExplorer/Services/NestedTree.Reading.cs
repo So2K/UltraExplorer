@@ -298,9 +298,12 @@ public sealed partial class NestedTree
                 Enqueue(folder, ReadKind.Refresh);
                 break;
 
+            // Heard from the hub once its read begins (see Read), not here: a
+            // folder drawn for the first time is one of thousands in a frame
+            // flying into a big folder, most of them never read before they
+            // leave the screen again.
             case NestedLoadState.NotLoaded:
                 Enqueue(folder, ReadKind.Load);
-                OnFirstReadQueued(folder);
                 break;
 
             // A share that did not answer, a drive that was not ready: worth
@@ -824,6 +827,18 @@ public sealed partial class NestedTree
             _lifetimeToken.ThrowIfCancellationRequested();
             var path = folder.FullPath;
 
+            // A folder read for the first time is registered with the hub here,
+            // before its listing is taken, so a file written after that and
+            // before the listing is applied marks it out of date.  Here rather
+            // than when the canvas queued it: registering thousands of folders
+            // inside the frame that first drew them doubled that frame, and
+            // the ones that left the screen unread stayed registered for ever.
+            // The tree counts it as its own once the read is applied.
+            if (pick.Kind == ReadKind.Load && _changes is { } hub)
+            {
+                hub.Register(ChangeConsumer.Nested, path, folder);
+            }
+
             // Where changes are not watched as they happen, the directory's own
             // time is what polling compares: a volume that refuses a watch, a
             // share - whose watch is let go when nothing shows it - and any
@@ -1069,6 +1084,10 @@ public sealed partial class NestedTree
             folder.ErrorMessage = listing.ErrorMessage;
             folder.FailedAt = Stopwatch.GetTimestamp();
             folder.IsRetryable = listing.IsRetryable;
+
+            // Kept registered, as one read: a change heard in it - made again,
+            // a device back - is what has it read again.
+            Register(folder);
             _batch.Applied.Add(folder);
             Answer(folder, request);
             return true;

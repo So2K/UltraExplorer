@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Watch;
 
 namespace ViewAllSmoke;
 
@@ -22,6 +23,7 @@ internal static partial class Program
             await NamedChildOrderChecks();
             await TildeLookupChecks();
             await FileLookupChecks();
+            await FirstDrawRegistrationChecks();
         });
 
         return Task.CompletedTask;
@@ -133,6 +135,58 @@ internal static partial class Program
             && tree.Find(@"Q:\report.txt") is null && tree.FindNearest(@"Q:\report.txt") == drive);
         Check($"and the file's path costs about what the folder does ({fileCost:0.0} us against {folderCost:0.0} us)",
             fileCost < 25 && fileCost < 5 * folderCost + 10);
+    }
+
+    // ---- registering with the hub (J008) -------------------------------------------------
+
+    /// <summary>
+    /// Folders the canvas draws for the first time are registered with the
+    /// hub when their reads begin, not in the frame that drew them: a frame
+    /// that queues hundreds registers none, and the ones that leave the
+    /// screen unread are never registered - only the folders read are.
+    /// </summary>
+    private static async Task FirstDrawRegistrationChecks()
+    {
+        const int Count = 300;
+        using var disk = new GatedDisk();
+        var names = Enumerable.Range(0, Count).Select(index => $"f{index:D3}").ToArray();
+        foreach (var name in names)
+        {
+            disk.Disk.Folder($@"Q:\{name}");
+        }
+
+        using var hub = new ChangeHub(TimeProvider.System);
+        hub.AddRootForTests(@"Q:\", arm: false);
+        using var tree = new NestedTree(disk.Disk.Read) { Changes = hub };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await tree.LoadAsync(tree.Find(@"Q:\")!);
+        var folders = names.Select(name => tree.Find($@"Q:\{name}")!).ToArray();
+        var before = hub.Registry.NestedTargets;
+
+        disk.Gating = true;
+        tree.BeginFrame();
+        var allocated = GC.GetAllocatedBytesForCurrentThread();
+        foreach (var folder in folders)
+        {
+            tree.Request(folder, 40);
+        }
+
+        allocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+        var afterFrame = hub.Registry.NestedTargets - before;
+        Console.WriteLine($"        a frame that draws {Count} folders for the first time registers {afterFrame} with the hub and allocates {allocated / Count:N0} bytes a folder");
+        Check($"a frame that draws {Count} folders for the first time registers at most the {NestedTree.LocalReadSlots} it begins to read ({afterFrame})",
+            folders.All(folder => folder.QueuedRead == ReadKind.Load) && afterFrame <= NestedTree.LocalReadSlots);
+
+        // The view moves on: the rest are never read.
+        tree.BeginFrame();
+        tree.BeginFrame();
+        tree.BeginFrame();
+        disk.Open();
+        await WaitUntil(() => tree.PendingCount == 0 && folders.All(folder => folder.QueuedRead == ReadKind.None), 5_000);
+        var read = folders.Count(folder => folder.IsLoaded);
+        var registered = hub.Registry.NestedTargets - before;
+        Check($"and once they left the screen, only the folders read are registered ({read} read, {registered} registered with the hub, {tree.LiveRegisteredCount - 1} by the tree)",
+            read is > 0 and < Count && registered == read && tree.LiveRegisteredCount - 1 == read);
     }
 
     /// <summary>The short form of a path, or null when the volume gives none.</summary>
