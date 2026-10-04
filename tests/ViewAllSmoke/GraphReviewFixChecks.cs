@@ -27,6 +27,7 @@ internal static partial class Program
             RunOnSta("graph review: nested refreshes", () => GraphNestedRefreshChecksAsync(root));
             RunOnSta("graph review: a closed folder read again", () => GraphClosedRefreshChecksAsync(root));
             RunOnSta("graph review: hidden folders above the selection", () => GraphHiddenAncestorChecksAsync(root));
+            RunOnSta("graph review: a refresh that cannot read its folder", () => GraphUnreadableRefreshChecksAsync(root));
         }
         finally
         {
@@ -352,5 +353,76 @@ internal static partial class Program
             && innerAgain is not null && ReferenceEquals(innerAgain.Parent, cacheAgain));
         Check("while a hidden file selected itself goes, as ever", !graph.TryGetNode(secret, out _));
         Check("and so does a hidden folder nothing is selected in", !graph.TryGetNode(otherHidden, out _));
+    }
+
+    // ---- J162: a refresh that cannot read its folder ------------------------------------------
+
+    /// <summary>
+    /// A folder read again at a moment it cannot be listed - a share that
+    /// blinks; here a folder whose listing is denied for a moment: the refresh
+    /// emptied and closed it before it read, so everything that was open in it
+    /// was gone for good, and no longer watched.  Read first, it keeps all of
+    /// it and says the folder could not be read; once it can be, it is read as
+    /// ever.
+    /// </summary>
+    private static async Task GraphUnreadableRefreshChecksAsync(string root)
+    {
+        Section("graph review: a refresh that cannot read its folder keeps everything open in it (J162)");
+        var top = Path.Combine(root, "blink");
+        var sub = Path.Combine(top, "sub");
+        var deep = Path.Combine(sub, "deep");
+        var leafPath = Path.Combine(deep, "d.txt");
+        Directory.CreateDirectory(deep);
+        File.WriteAllText(leafPath, "x");
+        File.WriteAllText(Path.Combine(top, "t.txt"), "x");
+
+        using var graph = new ViewAllGraphService();
+        var topNode = (await graph.AddRootAsync(top))!;
+        await graph.ExpandAsync(topNode);
+        graph.TryGetNode(sub, out var subNode);
+        await graph.ExpandAsync(subNode);
+        graph.TryGetNode(deep, out var deepNode);
+        await graph.ExpandAsync(deepNode);
+
+        var directory = new DirectoryInfo(top);
+        var deny = new FileSystemAccessRule(WindowsIdentity.GetCurrent().User!, FileSystemRights.ListDirectory, AccessControlType.Deny);
+        var security = directory.GetAccessControl();
+        security.AddAccessRule(deny);
+        directory.SetAccessControl(security);
+        try
+        {
+            try
+            {
+                _ = Directory.GetFileSystemEntries(top);
+                Console.WriteLine("  note  listing could not be denied here; the check is not run");
+                return;
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+
+            await graph.RefreshBranchAsync(topNode, forChange: true);
+            Check($"the folder that could not be read stays open with what it held (open: {topNode.IsExpanded}, {topNode.Children.Count} of 2)",
+                topNode.IsExpanded && topNode.Children.Count == 2);
+            Check("and so does the folder open in it, with the one open in that, all of it on the tree",
+                graph.TryGetNode(sub, out var subKept) && subKept.IsExpanded
+                && graph.TryGetNode(deep, out var deepKept) && deepKept.IsExpanded
+                && graph.TryGetNode(leafPath, out var leafKept) && leafKept is { IsTreeVisible: true, HasLayoutPosition: true });
+            Check($"while it says it could not be read ({topNode.ErrorMessage})", topNode.ErrorMessage == "Access denied");
+        }
+        finally
+        {
+            var restore = directory.GetAccessControl();
+            restore.RemoveAccessRule(deny);
+            directory.SetAccessControl(restore);
+        }
+
+        File.WriteAllText(Path.Combine(top, "new.txt"), "x");
+        await graph.RefreshBranchAsync(topNode, forChange: true);
+        Check("read again once it can be, it has what is new, with all that was open still open and the error gone",
+            topNode.IsExpanded && topNode.Children.Count == 3 && topNode.ErrorMessage.Length == 0
+            && graph.TryGetNode(sub, out var subAgain) && subAgain.IsExpanded
+            && graph.TryGetNode(deep, out var deepAgain) && deepAgain.IsExpanded
+            && graph.TryGetNode(leafPath, out var leafAgain) && leafAgain.IsTreeVisible);
     }
 }
