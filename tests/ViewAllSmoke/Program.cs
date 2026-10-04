@@ -169,6 +169,7 @@ internal static partial class Program
         await Group(LiveWatchFix2Checks);
         await Group(LiveWatchFix2WindowChecks);
         await Group(GraphReviewFixChecks);
+        await Group(ViewAllIoReviewChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

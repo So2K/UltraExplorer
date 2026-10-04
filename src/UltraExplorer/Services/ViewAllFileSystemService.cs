@@ -412,7 +412,13 @@ public sealed class ViewAllFileSystemService
         => Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var directory = new DirectoryInfo(ViewAllPath.Normalize(directoryPath));
+
+            // Asked for as the graph spells it, a name's end and all (see
+            // ForWindows): "backup." was read as its neighbour "backup", whose
+            // entries were then listed - and deleted and renamed - under its
+            // name, and a lone "lonely." could not be read at all.
+            var normalized = ViewAllPath.Normalize(directoryPath);
+            var directory = new DirectoryInfo(ForWindows(normalized));
             if (!directory.Exists)
             {
                 throw new DirectoryNotFoundException($"Folder no longer exists: {directoryPath}");
@@ -483,8 +489,11 @@ public sealed class ViewAllFileSystemService
                     }
 
                     var kind = isDirectory ? ViewAllEntryKind.Folder : ViewAllEntryKind.File;
+
+                    // Joined onto the folder's own path: read through the
+                    // extended-length form, an entry's full path carries it.
                     entries.Add(new ViewAllEntryDescriptor(
-                        ViewAllPath.Normalize(info.FullName),
+                        ViewAllPath.Normalize(Path.Join(normalized, info.Name)),
                         info.Name,
                         kind,
                         isHidden,
