@@ -1,4 +1,6 @@
 using System.Collections.Concurrent;
+using System.Collections.Specialized;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
@@ -24,6 +26,7 @@ internal static partial class Program
         RunOnSta("search: a walk's first report", SearchWalkFirstReportAsync);
         RunOnSta("search: going to another folder while walking", SearchWalkFolderMoveAsync);
         RunOnSta("search: a walk ordered from the folder gone to", SearchWalkOrderedFromAsync);
+        RunOnSta("search: a walk's reports on screen", SearchWalkReportsAsync);
         return Task.CompletedTask;
     }
 
@@ -268,5 +271,92 @@ internal static partial class Program
         {
             TryDelete(root);
         }
+    }
+
+    /// <summary>
+    /// J028: every report of a walk - one each 120 ms while it finds things -
+    /// was a new list for the list box, which laid out every row in sight
+    /// again for it, 35 to 50 ms a time; and every report was put on screen,
+    /// one after the other, however far the window had fallen behind.  The
+    /// reports of the same walk are now merged into the list in place, and of
+    /// those that come while the window is busy only the newest is shown.
+    /// </summary>
+    private static async Task SearchWalkReportsAsync()
+    {
+        Section("search: a walk's reports are merged into the list, the newest only (J028)");
+        const BindingFlags flags = BindingFlags.NonPublic | BindingFlags.Instance;
+        const string here = @"C:\UxStream";
+        using var icons = new ShellIconService();
+        using var search = new SearchViewModel(icons, _ => Task.CompletedTask, (_, _) => { });
+        SearchOpenForTest(search, here);
+        var query = SearchQuery.Parse("report");
+
+        // Found in an order of their own, so that what each report adds falls between what was shown.
+        var found = Enumerable.Range(0, 300)
+            .Select(index => (index * 37) % 300)
+            .Select(index => new SearchHit($"report {index:D3}.txt", index % 3 == 0 ? here : $@"D:\UxStream\{index % 7}", false, index, null, null))
+            .ToArray();
+        SearchApplyForTest(search, SearchWalkedFrom(here, query, true, found[..30]), query);
+        var shown = search.Results.ToArray();
+        var replaced = 0;
+        var resets = 0;
+        ((INotifyPropertyChanged)search).PropertyChanged += (_, e) => replaced += e.PropertyName == nameof(SearchViewModel.Rows) ? 1 : 0;
+        if (search.Rows is INotifyCollectionChanged rows)
+        {
+            rows.CollectionChanged += (_, e) => resets += e.Action == NotifyCollectionChangedAction.Reset ? 1 : 0;
+        }
+
+        for (var count = 60; count <= found.Length; count += 30)
+        {
+            SearchApplyForTest(search, SearchWalkedFrom(here, query, true, found[..count]), query);
+        }
+
+        Check($"nine more reports of the walk are merged into the list on screen (a new list {replaced} times, emptied {resets} times)",
+            replaced == 0 && resets == 0 && search.Rows is INotifyCollectionChanged);
+        Check("a result shown before is still the same row", shown.All(row => search.Results.Contains(row)));
+
+        using var atOnce = new SearchViewModel(icons, _ => Task.CompletedTask, (_, _) => { });
+        SearchOpenForTest(atOnce, here);
+        SearchApplyForTest(atOnce, SearchWalkedFrom(here, query, true, found), query);
+        static string Said(ISearchRow row) => row switch
+        {
+            SearchHeaderRow header => $"[{header.Title} {header.CountText} {header.Detail}]",
+            SearchResultViewModel result => $"{result.FullPath} {result.Location} {result.Place} {string.Concat(result.NameSegments.Select(segment => segment.IsMatch ? $"<{segment.Text}>" : segment.Text))}",
+            _ => "?",
+        };
+        Check($"and the list says what one shown at once says, row by row ({search.Rows.Count} rows)",
+            search.Rows.Select(Said).SequenceEqual(atOnce.Rows.Select(Said)) && ReferenceEquals(search.Selected, search.Results[0]));
+
+        // Five reports come while the window is busy with something else.
+        var publisher = typeof(SearchViewModel).GetMethod("Publisher", flags);
+        if (publisher is null)
+        {
+            Check("the reports of a walk are put on screen by one that keeps only the newest", false);
+            search.Close();
+            return;
+        }
+
+        using var run = new CancellationTokenSource();
+        typeof(SearchViewModel).GetField("_run", flags)!.SetValue(search, run);
+        var publish = (Action<SearchSnapshot>)publisher.Invoke(search, [run, query, Dispatcher.CurrentDispatcher])!;
+        var statuses = new List<string>();
+        ((INotifyPropertyChanged)search).PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SearchViewModel.Status))
+            {
+                statuses.Add(search.Status);
+            }
+        };
+        for (var report = 1; report <= 5; report++)
+        {
+            publish(SearchWalkedFrom(here, query, true, found) with { Status = $"report {report}" });
+        }
+
+        await SearchUntil(() => statuses.Count > 0, 2_000);
+        await SearchUntil(() => false, 200);
+        Check($"of five reports that came while the window was busy, only the newest is put on screen ({string.Join(", ", statuses)})",
+            statuses.SequenceEqual(["report 5"]));
+        typeof(SearchViewModel).GetField("_run", flags)!.SetValue(search, null);
+        search.Close();
     }
 }
