@@ -336,12 +336,22 @@ public partial class MainWindow : INestedPaneHost
         ActivePane.Enter(fromStartup);
     }
 
-    /// <summary>A share or distribution the workspace lists answered after the start: the nested canvas shows it too.</summary>
+    /// <summary>
+    /// A share or distribution the workspace lists answered after the start:
+    /// the nested canvas shows it too, and a camera the last session left in
+    /// it is put back, as for a drive that answered late (see
+    /// <see cref="OnDriveAddedForNested"/>).  Shares are only looked for once
+    /// the window is up, so a camera left in one always waits for it.
+    /// </summary>
     private void OnExtraRootAdded(ViewAllNodeViewModel root)
     {
         if (_nestedReady)
         {
             SyncNestedRoots();
+            foreach (var pane in _panes)
+            {
+                pane.DriveArrived(root.FullPath);
+            }
         }
     }
 

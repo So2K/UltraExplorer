@@ -577,10 +577,18 @@ internal sealed class NestedPane
     /// <summary>
     /// The camera as it is now, kept for the next session: it came to rest,
     /// or the window or the pane is being closed.  One still on its way back
-    /// keeps where it was going.
+    /// keeps where it was going, and so does one waiting for its drive or
+    /// share to answer (<see cref="_cameraOnLateDrive"/>): the overview shown
+    /// meanwhile, saved, would stand for the place from then on.
     /// </summary>
     public void CaptureCamera()
     {
+        if (_cameraOnLateDrive is { } waiting)
+        {
+            KeptCamera = waiting;
+            return;
+        }
+
         if (!_cameraRestoring && Canvas.CaptureCamera() is { } camera)
         {
             KeptCamera = camera;
