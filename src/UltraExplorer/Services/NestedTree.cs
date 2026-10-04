@@ -372,6 +372,7 @@ public sealed partial class NestedTree : IDisposable
     /// A case-sensitive folder (a WSL tree) can hold names that differ in case
     /// alone, "Build" and "build": the one spelt exactly as asked is the one
     /// meant, and only a name spelt like neither takes the first of them.
+    /// The name of one of its files is not scanned for.
     /// </summary>
     internal static NestedFolder? FindChild(NestedFolder folder, string name)
     {
@@ -426,6 +427,16 @@ public sealed partial class NestedTree : IDisposable
                 {
                     high = middle - 1;
                 }
+            }
+
+            // A name that is one of the folder's files is no sub-folder's - a
+            // folder cannot hold a file and a folder of one name - and the
+            // path of a file always comes this way: a file's beacon, looked
+            // up every frame, scanned all twenty-five thousand sub-folders of
+            // its folder for nothing.  Its files are in name order too.
+            if (SearchFiles(folder.AllFiles, name) >= 0)
+            {
+                return null;
             }
         }
 

@@ -21,6 +21,7 @@ internal static partial class Program
             ReaderAllocationChecks();
             await NamedChildOrderChecks();
             await TildeLookupChecks();
+            await FileLookupChecks();
         });
 
         return Task.CompletedTask;
@@ -88,6 +89,50 @@ internal static partial class Program
         {
             TryDelete(Path.GetDirectoryName(root)!);
         }
+    }
+
+    // ---- looking a file's path up (J093) -------------------------------------------------
+
+    /// <summary>
+    /// The path of a file in a folder of twenty-five thousand sub-folders -
+    /// a file's beacon, looked up every frame - is found to be no folder by
+    /// a binary search, not a look at every sub-folder.
+    /// </summary>
+    private static async Task FileLookupChecks()
+    {
+        const int Folders = 25_000;
+        NestedEntry[] entries = [.. Enumerable.Range(0, Folders).Select(index => new NestedEntry($"f{index:D6}", false, false))];
+        NestedFile[] files = [new NestedFile("aaa.txt", false, 1), new NestedFile("report.txt", false, 2), new NestedFile("zzz.txt", false, 3)];
+        NestedListing Read(string path, CancellationToken token) =>
+            string.Equals(path, @"Q:\", StringComparison.OrdinalIgnoreCase)
+                ? new NestedListing(entries, files.Length, 0, false) { Files = files }
+                : new NestedListing([], 0, 0, false);
+
+        using var tree = new NestedTree(Read);
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        var drive = tree.Find(@"Q:\")!;
+        await tree.LoadAsync(drive);
+
+        static double MicrosecondsPerFind(NestedTree tree, string path)
+        {
+            tree.Find(path);
+            var started = Stopwatch.GetTimestamp();
+            for (var run = 0; run < 500; run++)
+            {
+                tree.Find(path);
+            }
+
+            return Stopwatch.GetElapsedTime(started).TotalMicroseconds / 500;
+        }
+
+        var folderCost = MicrosecondsPerFind(tree, @"Q:\f012345");
+        var fileCost = MicrosecondsPerFind(tree, @"Q:\report.txt");
+        Console.WriteLine($"        among {Folders:N0} sub-folders a folder is found in {folderCost:0.0} us, a file's path in {fileCost:0.0} us");
+        Check("a folder among them is found, and a file's path is no folder",
+            drive.AllChildren.Length == Folders && tree.Find(@"Q:\f012345") is { Name: "f012345" }
+            && tree.Find(@"Q:\report.txt") is null && tree.FindNearest(@"Q:\report.txt") == drive);
+        Check($"and the file's path costs about what the folder does ({fileCost:0.0} us against {folderCost:0.0} us)",
+            fileCost < 25 && fileCost < 5 * folderCost + 10);
     }
 
     /// <summary>The short form of a path, or null when the volume gives none.</summary>
