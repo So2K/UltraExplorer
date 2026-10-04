@@ -678,8 +678,8 @@ public sealed partial class NestedCanvas
     /// (see <see cref="OnTreeSortChanged"/>): the anchor when it fills most
     /// of the view, otherwise the deepest folder covering the whole of it.
     /// Null for an overview of This PC, which is no folder.  A walk up from
-    /// the anchor through the rectangles of the last picture, so it is cheap
-    /// enough to ask after every move of the camera.
+    /// the anchor through the rectangles its way up has at the camera now,
+    /// so it is cheap enough to ask after every move of the camera.
     /// </summary>
     public NestedFolder? FolderInView
     {
@@ -695,6 +695,13 @@ public sealed partial class NestedCanvas
                 return _anchor.IsComputer ? null : _anchor;
             }
 
+            // The rectangles are those of the camera now, not of the last
+            // picture: asked straight after a move - as the sort headers ask
+            // on every one - those still had the folder just left covering
+            // the view.  Taken as the folders are placed, so asking never
+            // places anything, even between a change of order and the canvas
+            // taking its bearings from it (OnTreeSortChanged).
+            BuildChainAsPlaced();
             for (var folder = _anchor; folder is not null; folder = folder.Parent)
             {
                 if (_chain.TryGetValue(folder, out var rect) && Covers(rect.X, rect.Y, rect.W))

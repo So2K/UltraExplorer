@@ -28,6 +28,7 @@ internal static partial class Program
         RunOnSta("canvas motion: the arrows after the focused item went", CanvasMotionFocusAfterRemovalAsync);
         RunOnSta("canvas motion: a middle click that does not move", CanvasMotionStillMiddleClickAsync);
         RunOnSta("canvas motion: the hover after the wheel", CanvasMotionHoverAfterWheelAsync);
+        RunOnSta("canvas motion: the folder in view after a move", CanvasMotionFolderInViewAsync);
         return Task.CompletedTask;
     }
 
@@ -239,6 +240,75 @@ internal static partial class Program
                 !(underPointer is { } under && ReferenceEquals(under.Folder, named) && under.FileIndex < 0)
                 && afterWheel is { } now && underPointer is { } truth
                 && ReferenceEquals(now.Folder, truth.Folder) && now.FileIndex == truth.FileIndex);
+        }
+        finally
+        {
+            canvas.Tree = null;
+        }
+    }
+
+    // ---- the folder in view after a move (J082) ----------------------------------------------
+
+    /// <summary>
+    /// The view inside a folder, on one of its sub-folders, then panned
+    /// until the folder's edge comes into it: asked straight after the move -
+    /// as the sort headers ask on every move of the camera - the folder in
+    /// view is the one the view is in now, not the one the last picture had.
+    /// </summary>
+    private static async Task CanvasMotionFolderInViewAsync()
+    {
+        Section("canvas motion: the folder in view straight after a move is where the view is now");
+        var disk = new FakeDisk();
+        for (var index = 0; index < 9; index++)
+        {
+            disk.Folder($@"Q:\outer\c{index}");
+        }
+
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await LoadEverythingAsync(tree, _ => true);
+        var canvas = new NestedCanvas { Tree = tree, FramesByHandForTests = true, DpiOverride = new DpiScale(1, 1) };
+        canvas.Measure(new Size(1000, 700));
+        canvas.Arrange(new Rect(0, 0, 1000, 700));
+        canvas.UpdateLayout();
+        var outer = tree.Find(@"Q:\outer")!;
+        var time = TimeSpan.FromSeconds(1000);
+        string? atMove = null;
+        var moving = false;
+        try
+        {
+            // The sub-folder nearest the middle of the folder, two thirds of the view wide.
+            canvas.FlyTo(outer, 0.92, animated: false);
+            time = await MotionFramesAsync(canvas, time, 2);
+            var whole = canvas.ScreenRectOf(outer)!.Value;
+            var centre = new Point(whole.X + whole.Width / 2, whole.Y + whole.Height / 2);
+            var inner = outer.Children.OrderBy(child => canvas.ScreenRectOf(child) is { } cell
+                ? Math.Pow(cell.X + cell.Width / 2 - centre.X, 2) + Math.Pow(cell.Y + cell.Height / 2 - centre.Y, 2)
+                : double.MaxValue).First();
+            canvas.FlyTo(inner, 0.65, animated: false);
+            time = await MotionFramesAsync(canvas, time, 2);
+            var inside = canvas.FolderInView;
+            var around = canvas.ScreenRectOf(outer)!.Value;
+
+            // As the sort headers do: asked on the camera's move.
+            canvas.CameraChanged += () =>
+            {
+                if (moving)
+                {
+                    atMove ??= canvas.FolderInView?.FullPath ?? "This PC";
+                }
+            };
+
+            // Panned until the folder's left edge is a little way into the view.
+            moving = true;
+            canvas.Pan(new Vector(60 - around.Left, 0));
+            moving = false;
+            time = await MotionFramesAsync(canvas, time, 1);
+            var drawn = canvas.FolderInView?.FullPath ?? "This PC";
+            Console.WriteLine($"        inside {inside?.FullPath} on {inner.Name}; panned its edge in: at the move {atMove}, once drawn {drawn}");
+            Check($"inside the folder, it is the folder in view ({inside?.FullPath})", ReferenceEquals(inside, outer));
+            Check($"straight after the move the folder in view is the one drawn next ({atMove}, drawn {drawn})",
+                atMove is not null && atMove == drawn && drawn != outer.FullPath);
         }
         finally
         {
