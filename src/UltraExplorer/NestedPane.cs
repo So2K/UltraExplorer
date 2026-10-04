@@ -159,6 +159,24 @@ internal sealed class NestedPane
     private bool _movedByUser;
 
     /// <summary>
+    /// Set while the camera was last moved by the user's own hand - the
+    /// wheel, a drag, a zoom key - in a window or a file dialog alike; a move
+    /// of the program's own clears it.
+    /// </summary>
+    private bool _movedByHand;
+
+    /// <summary>
+    /// The folder the view is in, known only by the way to a deeper one (a
+    /// partial listing), as the user's hand left the camera in it and it is
+    /// let be listed: the folder in view - the one nearest the middle of the
+    /// view - and its place and size in the folder's own frame, where that is
+    /// one unit wide.  The listing places it among its sisters, smaller and
+    /// elsewhere, while the folder holding the view stays put: noted, it is
+    /// kept where it was on screen instead (<see cref="OnFolderLoadedKeepInView"/>).
+    /// </summary>
+    private (NestedFolder Sparse, NestedFolder Child, double X, double Y, double Scale)? _sparseInView;
+
+    /// <summary>
     /// Set while the camera the last session left is on its way back - the
     /// folders on the way still being read - and nothing has moved it since:
     /// the canvas shows an overview meanwhile, which is no place to keep.
@@ -294,14 +312,27 @@ internal sealed class NestedPane
         // a deeper one, and is listed once the camera goes into it.  Any
         // other drawn - beside the folder in view, known by a beacon's
         // chain - is listed as every folder drawn there is.
-        Tree.PartialListingReadAllowed = folder => !Canvas.IsCameraMoving && Canvas.Anchor is { } anchor
-            && (anchor.IsComputer ? !_host.IsPickerMode
-                : MainWindow.IsNestedPathInside(folder.FullPath, anchor.FullPath)
-                    || !MainWindow.IsNestedPathInside(anchor.FullPath, folder.FullPath));
+        // The one the view is in, listed where the user's hand brought the
+        // camera to rest, keeps the folder in view where it is on screen
+        // (NoteSparseInView).
+        Tree.PartialListingReadAllowed = folder =>
+        {
+            var allowed = !Canvas.IsCameraMoving && Canvas.Anchor is { } anchor
+                && (anchor.IsComputer ? !_host.IsPickerMode
+                    : MainWindow.IsNestedPathInside(folder.FullPath, anchor.FullPath)
+                        || !MainWindow.IsNestedPathInside(anchor.FullPath, folder.FullPath));
+            if (allowed && ReferenceEquals(folder, Canvas.Anchor))
+            {
+                NoteSparseInView(folder);
+            }
+
+            return allowed;
+        };
         Canvas.MarkLookup = _viewModel.Marks.Get;
         Canvas.IconLookup = LookUpFileIcon;
         Canvas.IconArrivals = _iconInbox;
         Tree.FolderLoaded += OnFolderLoadedForIcons;
+        Tree.FolderLoaded += OnFolderLoadedKeepInView;
         Canvas.OpenRequested += OnOpenRequested;
         Canvas.FavoriteLinkRequested += OnFavoriteLinkRequested;
         Canvas.ContextMenuRequested += OnContextMenuRequested;
@@ -400,6 +431,7 @@ internal sealed class NestedPane
         KeptSelection.Changed -= OnKeptSelectionChanged;
         _viewModel.Tree.RemoveKeptSelection(KeptSelection);
         Tree.FolderLoaded -= OnFolderLoadedForIcons;
+        Tree.FolderLoaded -= OnFolderLoadedKeepInView;
         Canvas.OpenRequested -= OnOpenRequested;
         Canvas.FavoriteLinkRequested -= OnFavoriteLinkRequested;
         Canvas.ContextMenuRequested -= OnContextMenuRequested;
@@ -638,6 +670,7 @@ internal sealed class NestedPane
         // Whose move it was is told after it (OnUserCameraMoved): one of the
         // program's own, a flight's frame, takes the dialog nowhere.
         _movedByUser = false;
+        _movedByHand = false;
 
         if (_host.IsActivePane(this))
         {
@@ -660,6 +693,7 @@ internal sealed class NestedPane
     /// </summary>
     private void OnUserCameraMoved()
     {
+        _movedByHand = true;
         if (!_host.IsPickerMode)
         {
             return;
@@ -1236,6 +1270,91 @@ internal sealed class NestedPane
     /// its names is big enough to carry one.
     /// </summary>
     private void OnFolderLoadedForIcons(NestedFolder folder) => _viewModel.Icons.Prefetch(folder);
+
+    /// <summary>
+    /// The folder the view is in is let be listed, though known only by the
+    /// way to a deeper one: if the user's hand brought the camera there, the
+    /// folder in view - the one nearest the middle of the view - is noted
+    /// with its place, for <see cref="OnFolderLoadedKeepInView"/>.  Asked
+    /// while the canvas draws, so only the camera and the places are read.
+    /// </summary>
+    private void NoteSparseInView(NestedFolder sparse)
+    {
+        _sparseInView = null;
+        if (!_movedByHand || Canvas.CaptureCamera() is not { Width: > 0 } camera)
+        {
+            return;
+        }
+
+        // The middle of the view, in the folder's own frame.
+        var x = -camera.X / camera.Width;
+        var y = -camera.Y / camera.Width;
+        NestedFolder? nearest = null;
+        var best = double.MaxValue;
+        foreach (var child in sparse.Children)
+        {
+            var dx = Math.Max(0, Math.Max(child.OffsetX - x, x - child.OffsetX - child.Scale));
+            var dy = Math.Max(0, Math.Max(child.OffsetY - y, y - child.OffsetY - child.Scale * NestedLayout.CellHeight));
+            var distance = dx * dx + dy * dy;
+            if (distance < best)
+            {
+                best = distance;
+                nearest = child;
+            }
+        }
+
+        if (nearest is not null)
+        {
+            _sparseInView = (sparse, nearest, nearest.OffsetX, nearest.OffsetY, nearest.Scale);
+        }
+    }
+
+    /// <summary>
+    /// The folder the view is in was listed where the user's hand left the
+    /// camera (<see cref="NoteSparseInView"/>).  It stays put on screen, as
+    /// the folder holding the view always does, and the folder in view went
+    /// from filling it to one cell among its sisters, smaller and elsewhere:
+    /// a jump the moment the camera came to rest.  The camera follows the
+    /// folder in view instead, so it stays where it was, as it was, and its
+    /// sisters come in around it.  Not after a flight, which went to the
+    /// folder itself, nor while the camera moves on.  Told as the listing is
+    /// taken in, before the frame that shows it.
+    /// </summary>
+    private void OnFolderLoadedKeepInView(NestedFolder folder)
+    {
+        if (_sparseInView is not { } noted || !ReferenceEquals(noted.Sparse, folder))
+        {
+            return;
+        }
+
+        _sparseInView = null;
+        if (!_movedByHand || Canvas.IsCameraMoving || !ReferenceEquals(Canvas.Anchor, folder)
+            || !ReferenceEquals(noted.Child.Parent, folder) || noted.Child.Index < 0
+            || Canvas.ScreenRectOf(folder) is not { Width: > 0 } cell
+            || Canvas.ScreenRectOf(noted.Child) is not { Width: > 0 } now)
+        {
+            return;
+        }
+
+        var was = new Rect(cell.X + noted.X * cell.Width, cell.Y + noted.Y * cell.Width,
+            noted.Scale * cell.Width, noted.Scale * cell.Width * NestedLayout.CellHeight);
+        // Nothing moves on screen: a file dialog still takes the folder the
+        // user's hand brought the view to, as it would have without this.
+        var movedByUser = _movedByUser;
+        var factor = was.Width / now.Width;
+        if (Math.Abs(factor - 1) > 1e-6)
+        {
+            // Zoomed about the one point that takes it from where it is now
+            // to where it was.
+            Canvas.ZoomAt(new Point((was.X - factor * now.X) / (1 - factor), (was.Y - factor * now.Y) / (1 - factor)), factor);
+        }
+        else if (Math.Abs(was.X - now.X) > 0.01 || Math.Abs(was.Y - now.Y) > 0.01)
+        {
+            Canvas.Pan(new Vector(was.X - now.X, was.Y - now.Y));
+        }
+
+        _movedByUser = movedByUser;
+    }
 
     // ---- the order ---------------------------------------------------------------
 

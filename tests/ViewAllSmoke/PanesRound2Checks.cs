@@ -24,7 +24,9 @@ namespace ViewAllSmoke;
 /// not first for nothing as it reads its workspace (J079).  Switching to the
 /// tree keeps a selection of several items, and a navigation under way
 /// (J131).  Shift+F5 or Shift+F6 pressed again while a copy or a move to the
-/// other pane is on its way sends nothing more (J065).
+/// other pane is on its way sends nothing more (J065).  Zoomed out of a
+/// folder opened by name, the folder stays where it is when its parent is
+/// listed, rather than jumping to a speck elsewhere (J026).
 ///
 /// <para>The windows need the app, of which a process can only ever have the
 /// one, on the thread that made it: these checks always run in a process of
@@ -136,6 +138,7 @@ internal static partial class Program
                 await PanesStartBeaconChecksAsync(root);
                 await PanesTreeSwitchChecksAsync(root);
                 await PanesSendTwiceChecksAsync(root);
+                await PanesSparseParentChecksAsync(root);
             }
         }
         finally
@@ -436,6 +439,131 @@ internal static partial class Program
             MainViewModel.ItemExists = existsBefore;
             held.Set();
             shell.IsSplit = false;
+            shell.Dispose();
+        }
+    }
+
+    // ---- zooming out of a folder opened by name (J026) --------------------------------
+
+    /// <summary>
+    /// A folder opened by name - a folder launch, a mark, the address bar -
+    /// is reached through its parent known only by the way to it: the folder
+    /// fills it.  Zoomed out with the wheel to see the parent, the folder
+    /// stood where it was until the camera came to rest and the parent was
+    /// listed, and then shrank to a speck among its sisters elsewhere on
+    /// screen.  It stays where it is, as it is, while they come in around it.
+    /// A flight to such a parent, which goes to the parent itself, keeps it
+    /// framed as ever while its folders come in inside it.
+    /// </summary>
+    private static async Task PanesSparseParentChecksAsync(string root)
+    {
+        Section("panes round 2: zooming out of a folder opened by name keeps it in place when its parent is listed (J026)");
+        var drive = Path.Combine(root, "sparse-drive");
+        var parent = Path.Combine(drive, "projects");
+        var opened = Path.Combine(parent, "m-opened");
+        var flownTo = Path.Combine(drive, "archive");
+        var flownToChild = Path.Combine(flownTo, "m-kept");
+        for (var index = 0; index < 40; index++)
+        {
+            Directory.CreateDirectory(Path.Combine(parent, $"sister{index:D2}"));
+            Directory.CreateDirectory(Path.Combine(flownTo, $"sister{index:D2}"));
+        }
+
+        Directory.CreateDirectory(Path.Combine(opened, "inside"));
+        Directory.CreateDirectory(flownToChild);
+        File.WriteAllText(Path.Combine(opened, "notes.txt"), "opened by name");
+        var main = ProxyWindow(out var shell);
+        try
+        {
+            await main.StartNestedForChecksAsync();
+            var pane = main.FirstPane;
+            var tree = pane.Tree;
+            var canvas = pane.Canvas;
+            canvas.FramesByHandForTests = true;
+            var time = TimeSpan.FromSeconds(500);
+            async Task Frames(Func<bool> until, int most)
+            {
+                for (var frame = 0; frame < most && !until(); frame++)
+                {
+                    await Task.Delay(10);
+                    canvas.RunFrameForTests(time += TimeSpan.FromMilliseconds(16));
+                }
+            }
+
+            // Nothing read for being drawn until the folder has landed, as a
+            // folder launch keeps the drives unread until it has.
+            tree.IsReadingOnDemand = false;
+            main.UseNestedDrivesForChecks([new NestedRoot(drive, "S", NestedFolderKind.Drive)]);
+
+            // Opened by name, as a folder launch lands: framed, and read.
+            var folder = await tree.MaterializePathAsync(opened);
+            if (folder is not null)
+            {
+                await tree.LoadAsync(folder);
+                canvas.FlyTo(folder, 0.92, animated: false);
+            }
+
+            tree.IsReadingOnDemand = true;
+            await Task.Delay(180);
+            await Frames(() => false, 5);
+            var sparse = tree.Find(parent);
+            Check("landed on the folder, its parent known only by the way to it",
+                folder is not null && ReferenceEquals(canvas.Anchor, folder) && sparse is { HasPartialListing: true, IsLoaded: false });
+            if (folder is null || sparse is null)
+            {
+                return;
+            }
+
+            // Zoomed out with the wheel, about the middle, until the parent
+            // holds the view.
+            var middle = new Point(canvas.ActualWidth / 2, canvas.ActualHeight / 2);
+            for (var step = 0; step < 4; step++)
+            {
+                canvas.Pointer.Wheel(middle, -120, ModifierKeys.Control);
+            }
+
+            canvas.RenderNow();
+            var before = canvas.ScreenRectOf(folder);
+            Check($"zoomed out, the parent holds the view, still unlisted, with the folder {PanesRect(before)} in it",
+                ReferenceEquals(canvas.Anchor, sparse) && sparse is { IsLoaded: false } && before is { Width: > 300 });
+
+            // The camera comes to rest: the parent is listed.
+            await Task.Delay(180);
+            await Frames(() => sparse.IsLoaded, 200);
+            await Frames(() => false, 3);
+            var after = canvas.ScreenRectOf(folder);
+            var steady = before is { } b && after is { } a
+                && Math.Abs(a.X - b.X) < 1 && Math.Abs(a.Y - b.Y) < 1 && Math.Abs(a.Width - b.Width) < 1;
+            var view = new Rect(0, 0, canvas.ActualWidth, canvas.ActualHeight);
+            var sistersInView = sparse.Children.Count(child => !ReferenceEquals(child, folder)
+                && canvas.ScreenRectOf(child) is { } cell && cell.IntersectsWith(view));
+            Check($"once the parent is listed ({sparse.Children.Count} folders in it), the folder stays where it was, as it was ({PanesRect(before)} -> {PanesRect(after)}), its sisters around it ({sistersInView} in view)",
+                sparse.IsLoaded && sparse.Children.Count == 41 && steady && sistersInView > 0);
+
+            // A flight to a parent known only by the way to a folder in it:
+            // the parent is framed, and stays framed as it is listed.
+            var kept = await tree.MaterializePathAsync(flownToChild);
+            var flown = tree.Find(flownTo);
+            if (flown is not null)
+            {
+                canvas.FlyTo(flown, 0.92, animated: false);
+            }
+
+            canvas.RenderNow();
+            var framed = flown is null ? null : canvas.ScreenRectOf(flown);
+            var keptBefore = kept is null ? null : canvas.ScreenRectOf(kept);
+            await Task.Delay(180);
+            await Frames(() => flown?.IsLoaded == true, 200);
+            await Frames(() => false, 3);
+            var framedAfter = flown is null ? null : canvas.ScreenRectOf(flown);
+            var keptAfter = kept is null ? null : canvas.ScreenRectOf(kept);
+            Check($"flown to a parent known only by the way, it stays framed as it is listed ({PanesRect(framed)} -> {PanesRect(framedAfter)}), its folder one cell of {flown?.Children.Count} ({PanesRect(keptBefore)} -> {PanesRect(keptAfter)})",
+                flown is { IsLoaded: true, Children.Count: 41 } && framed is { } f && framedAfter is { } fa
+                && Math.Abs(f.X - fa.X) < 1 && Math.Abs(f.Y - fa.Y) < 1 && Math.Abs(f.Width - fa.Width) < 1
+                && keptBefore is { } kb && keptAfter is { } ka && ka.Width < kb.Width / 2);
+        }
+        finally
+        {
             shell.Dispose();
         }
     }
