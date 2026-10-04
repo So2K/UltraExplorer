@@ -245,17 +245,19 @@ public partial class MainWindow
             && selection.LastSource == SelectionSource.Navigation
             && !ViewAllPath.Equals(folder, session.CurrentFolder))
         {
-            OpenPickerNestedFolder(folder);
+            // A move of the view is not a choice: a folder the user typed into
+            // Select Folder's name box stays the answer.
+            OpenPickerNestedFolder(folder, keepTypedName: true);
         }
     }
 
-    internal void OpenPickerNestedFolder(string path)
+    internal void OpenPickerNestedFolder(string path, bool keepTypedName = false)
     {
         if (_picker is not { } session) return;
         session.CurrentFolder = path;
         _viewModel.Tree.Selection.Apply(new SelectionEdit
         { Clear = true, Focus = path, Source = SelectionSource.Navigation });
-        if (session.PicksFolders) session.FileNameText = string.Empty;
+        if (session.PicksFolders && !(keepTypedName && session.HasTypedName)) session.FileNameText = string.Empty;
     }
 
     internal void OpenPickerNestedFile(string path)

@@ -197,6 +197,13 @@ public sealed class FileDialogSession : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Whether the name box holds a name of the user's own: not empty, and
+    /// put there neither by a selection nor by the dialog as it opened.
+    /// </summary>
+    internal bool HasTypedName => _selectionNameText is null && _fileNameText.Trim().Length > 0
+        && !string.Equals(_fileNameText, Request.FileName, StringComparison.Ordinal);
+
     /// <summary>The folder the canvas is showing, which bare names resolve against.</summary>
     public string CurrentFolder
     {
