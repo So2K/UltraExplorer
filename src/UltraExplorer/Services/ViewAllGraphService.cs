@@ -1037,6 +1037,21 @@ public sealed class ViewAllGraphService : IDisposable
 
             var added = new List<ViewAllNodeViewModel>();
             ApplySnapshot(node, snapshot, added);
+
+            // A new child is made on the tree, which is where it belongs only
+            // under a folder that is open on it.  Load more on a closed one
+            // left the page on the tree under a folder the layout does not
+            // measure, and a child of it placed by hand had every layout pass
+            // after that throw.
+            if (node.IsExpanded)
+            {
+                ShowOrHideLoadedBranch(node);
+            }
+            else
+            {
+                HideDescendants(node);
+            }
+
             node.ChildLoadLimit = nextLimit;
             node.IsTruncated = snapshot.IsTruncated;
             node.NotifyChildrenChanged();
@@ -2082,6 +2097,11 @@ public sealed class ViewAllGraphService : IDisposable
         ViewAllDirectorySnapshot snapshot,
         ICollection<ViewAllNodeViewModel> added)
     {
+        // The folder's children as a set, made the first time an entry is
+        // found already there: a page of Load more lists again every entry
+        // the folder holds, and looking each up in the list itself was one
+        // pass over tens of thousands of children per entry.
+        HashSet<ViewAllNodeViewModel>? held = null;
         foreach (var entry in snapshot.Entries)
         {
             if (_nodesByPath.TryGetValue(entry.FullPath, out var existing))
@@ -2091,7 +2111,8 @@ public sealed class ViewAllGraphService : IDisposable
                     // Listed by its folder now: one of the folder's own, which
                     // a refresh brings back by listing it.
                     _namedOnly.Remove(existing);
-                    if (!parent.Children.Contains(existing))
+                    held ??= new HashSet<ViewAllNodeViewModel>(parent.Children, ReferenceEqualityComparer.Instance);
+                    if (held.Add(existing))
                     {
                         parent.Children.Add(existing);
                     }
