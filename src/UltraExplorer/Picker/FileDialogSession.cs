@@ -279,10 +279,23 @@ public sealed class FileDialogSession : ObservableObject
         _ => $"Selected files ({_pendingSelection.Count})"
     };
 
-    /// <summary>Where the one choice is; nothing for a drive, which is in no folder.</summary>
-    public string PendingSelectionLocation => _pendingSelection.Count == 1
-        ? Path.GetDirectoryName(_pendingSelection[0]) is { Length: > 0 } parent ? $"Location: {parent}" : string.Empty
-        : string.Join(Environment.NewLine, _pendingSelection);
+    /// <summary>
+    /// Where the one choice is (nothing for a drive, which is in no folder);
+    /// of several, the first <see cref="ListedChoices"/> and how many more.
+    /// Thousands chosen at once (Ctrl+A over photos to upload) were each laid
+    /// out in the footer's wrapping text on every further click; the tip over
+    /// it still names them all.
+    /// </summary>
+    public string PendingSelectionLocation => _pendingSelection.Count switch
+    {
+        1 => Path.GetDirectoryName(_pendingSelection[0]) is { Length: > 0 } parent ? $"Location: {parent}" : string.Empty,
+        <= ListedChoices => string.Join(Environment.NewLine, _pendingSelection),
+        _ => string.Join(Environment.NewLine, _pendingSelection.Take(ListedChoices))
+            + Environment.NewLine + $"and {_pendingSelection.Count - ListedChoices:N0} more"
+    };
+
+    /// <summary>How many of several chosen paths the footer lists.</summary>
+    private const int ListedChoices = 10;
 
     /// <summary>A path's own name, or the whole path for a drive, which has none.</summary>
     private static string NameOrPath(string path) =>
