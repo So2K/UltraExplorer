@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows.Interop;
 using System.Windows.Threading;
@@ -24,6 +25,15 @@ public partial class MainWindow
     private bool _driveRescanRunning;
     private bool _driveRescanAgain;
 
+    /// <summary>Completed when the drives are asked to be listed again while a listing is under way: what that listing stops waiting on, so the next starts at once.</summary>
+    private TaskCompletionSource? _driveRescanWake;
+
+    /// <summary>Lists the drives again once a mapped drive missing from them answers (<see cref="RetryMissingRemoteDrivesAsync"/>).</summary>
+    private DispatcherTimer? _remoteDriveRetryTimer;
+
+    /// <summary>Mapped drives the canvas keeps although they did not answer ready when the drives were last listed (<see cref="TakeDriveAnswer"/>).</summary>
+    private readonly HashSet<string> _remoteDrivesWaiting = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Set when the drives changed before the nested canvas was ready: they are listed again once it is.</summary>
     private bool _nestedDrivesMissed;
 
@@ -33,12 +43,16 @@ public partial class MainWindow
         _volumeNotifications = new VolumeNotifications(_viewModel.Changes, Dispatcher);
         SourceInitialized += OnSourceInitializedForDevices;
         Activated += OnActivatedForChanges;
+        _remoteDriveRetryTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = RemoteDriveRetryInterval };
+        _remoteDriveRetryTimer.Tick += OnRemoteDriveRetryTick;
+        _remoteDriveRetryTimer.Start();
     }
 
     private void DetachDevices()
     {
         SourceInitialized -= OnSourceInitializedForDevices;
         Activated -= OnActivatedForChanges;
+        _remoteDriveRetryTimer?.Stop();
         _driveRescanTimer?.Stop();
         _volumeNotifications?.Dispose();
         _volumeNotifications = null;
@@ -93,6 +107,14 @@ public partial class MainWindow
     /// unread cell; one gone is dropped.  The kinds of volume behind the
     /// letters are looked up afresh too, since a letter can now be something
     /// else.
+    ///
+    /// <para>The pane and the canvas are asked at once, and the canvas takes
+    /// each drive's answer as it comes (<see cref="TakeDriveAnswersAsync"/>):
+    /// one after the other, each waiting for every drive, a stick plugged in
+    /// beside a drive mapped to a server that is off reached the pane after
+    /// the twenty seconds that drive takes to answer and the canvas after
+    /// twenty more.  Asked again meanwhile, the listing under way stops
+    /// waiting and the next starts at once.</para>
     /// </summary>
     private async Task RescanDrivesAsync()
     {
@@ -100,6 +122,7 @@ public partial class MainWindow
         if (_driveRescanRunning)
         {
             _driveRescanAgain = true;
+            _driveRescanWake?.TrySetResult();
             return;
         }
 
@@ -109,24 +132,42 @@ public partial class MainWindow
             do
             {
                 _driveRescanAgain = false;
+                var again = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _driveRescanWake = again;
                 VolumeKinds.Invalidate();
                 _viewModel.Changes.InvalidateVolumes();
-                await _viewModel.RefreshDrivesAsync();
-                if (_closeRequested) return;
+                var pane = _viewModel.RefreshDrivesAsync();
+                var canvasListed = false;
                 if (!_nestedReady)
                 {
                     // The canvas copies the drives as it starts, maybe before
                     // this change: it is listed again for once it is ready.
                     _nestedDrivesMissed = true;
+                }
+                else if (await TakeDriveAnswersAsync(new ViewAllFileSystemService().AskDriveRoots(), again.Task))
+                {
+                    canvasListed = true;
+                }
+                else
+                {
+                    if (_closeRequested) return;
                     continue;
                 }
 
-                var roots = await new ViewAllFileSystemService().GetDriveRootsAsync();
                 if (_closeRequested) return;
-                _nestedDrives.Clear();
-                _nestedDrives.AddRange(roots.Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
-                SyncNestedRoots();
-                DriveRescans++;
+                await Task.WhenAny(pane, again.Task);
+                if (_closeRequested) return;
+                if (!pane.IsCompleted)
+                {
+                    // Asked again: the newer listing replaces this one in the pane.
+                    continue;
+                }
+
+                await pane;
+                if (canvasListed)
+                {
+                    DriveRescans++;
+                }
             }
             while (_driveRescanAgain);
         }
@@ -136,9 +177,196 @@ public partial class MainWindow
         }
         finally
         {
+            _driveRescanWake = null;
             _driveRescanRunning = false;
         }
     }
+
+    /// <summary>
+    /// Puts the nested canvas's drives right from <paramref name="asked"/>,
+    /// one answer at a time: a letter no longer there - a stick pulled out -
+    /// goes at once, with nothing to ask it; a drive that answers ready joins
+    /// in name order, or is described afresh; one that answers not ready
+    /// goes - unless it is a mapped drive whose server does not answer just
+    /// now, a NAS rebooting, which keeps its cell and everything read in it,
+    /// and is asked about again (<see cref="RetryMissingRemoteDrivesAsync"/>).
+    /// False when the drives were asked to be listed again before every
+    /// answer came: what is still to come is let go.  The panes are given
+    /// the drives at least once, as every listing gave them.
+    /// </summary>
+    private async Task<bool> TakeDriveAnswersAsync(IReadOnlyList<(string Path, Task<ViewAllEntryDescriptor?> Answer)> asked, Task again)
+    {
+        var synced = false;
+        _remoteDrivesWaiting.RemoveWhere(path => !asked.Any(question => ViewAllPath.Equals(question.Path, path)));
+        if (_nestedDrives.RemoveAll(drive => !asked.Any(question => ViewAllPath.Equals(question.Path, drive.FullPath))) > 0)
+        {
+            SyncNestedRoots();
+            synced = true;
+        }
+
+        var waiting = asked.ToList();
+        while (waiting.Count > 0)
+        {
+            await Task.WhenAny(waiting.Select(question => (Task)question.Answer).Append(again));
+            if (_closeRequested || again.IsCompleted)
+            {
+                return false;
+            }
+
+            var changed = false;
+            for (var index = waiting.Count - 1; index >= 0; index--)
+            {
+                var (path, answer) = waiting[index];
+                if (answer.IsCompleted)
+                {
+                    waiting.RemoveAt(index);
+                    changed |= TakeDriveAnswer(path, await answer);
+                }
+            }
+
+            if (changed)
+            {
+                SyncNestedRoots();
+                synced = true;
+            }
+        }
+
+        if (!synced)
+        {
+            SyncNestedRoots();
+        }
+
+        return true;
+    }
+
+    /// <summary>One drive's answer into the canvas's drives; whether they changed.</summary>
+    private bool TakeDriveAnswer(string path, ViewAllEntryDescriptor? answer)
+    {
+        var at = _nestedDrives.FindIndex(drive => ViewAllPath.Equals(drive.FullPath, path));
+        if (answer is null)
+        {
+            if (at < 0)
+            {
+                return false;
+            }
+
+            if (VolumeKinds.IsNetwork(path))
+            {
+                _remoteDrivesWaiting.Add(path);
+                return false;
+            }
+
+            _nestedDrives.RemoveAt(at);
+            return true;
+        }
+
+        _remoteDrivesWaiting.Remove(path);
+        var drive = new NestedRoot(answer.FullPath, answer.DisplayName, NestedFolderKind.Drive, answer.SecondaryText);
+        if (at >= 0)
+        {
+            if (_nestedDrives[at] == drive)
+            {
+                return false;
+            }
+
+            _nestedDrives[at] = drive;
+            return true;
+        }
+
+        var place = _nestedDrives.FindIndex(existing => string.Compare(existing.FullPath, drive.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
+        _nestedDrives.Insert(place < 0 ? _nestedDrives.Count : place, drive);
+        return true;
+    }
+
+    /// <summary>
+    /// A mapped drive whose server did not answer when the drives were
+    /// listed - at logon, before the network was up; while a NAS rebooted -
+    /// was left out of the canvas and the pane until the next volume came or
+    /// went, which for most people meant until the next start.  Every
+    /// <see cref="RemoteDriveRetryInterval"/>, each mapped letter that neither
+    /// the canvas nor the navigation pane has, or that the canvas keeps
+    /// without an answer, is asked whether it is ready - which letters are
+    /// mapped is told by the session's own table of mappings, without asking
+    /// any server - and the drives are listed again once one is.  A letter
+    /// the pane has answered when the drives were last listed, and is no
+    /// reason to list them again: the checks give the canvas drives of their
+    /// own beside the pane's, and a window they leave open would otherwise
+    /// have its drives put back.  The question is shared by every window
+    /// (<see cref="AskRemoteDrive"/>).
+    /// </summary>
+    private async Task RetryMissingRemoteDrivesAsync()
+    {
+        // A listing on its way already, or about to be: put off again, it
+        // would never come while the drives were asked about more often than
+        // a volume message waits for the next.
+        if (_closeRequested || !_nestedReady || _driveRescanRunning || _driveRescanTimer?.IsEnabled == true)
+        {
+            return;
+        }
+
+        var listed = _nestedDrives.Select(drive => drive.FullPath).Concat(_viewModel.Drives.Select(drive => drive.Path)).ToArray();
+        var waiting = _remoteDrivesWaiting.ToArray();
+        var missing = await Task.Run(() => DriveInfo.GetDrives()
+            .Where(drive =>
+            {
+                var path = ViewAllPath.Normalize(drive.Name);
+                return VolumeKinds.IsNetwork(path)
+                    && (!listed.Any(known => ViewAllPath.Equals(known, path)) || waiting.Any(known => ViewAllPath.Equals(known, path)));
+            })
+            .ToArray());
+        if (missing.Length == 0 || _closeRequested)
+        {
+            return;
+        }
+
+        var answers = await Task.WhenAll(missing.Select(AskRemoteDrive));
+        if (answers.Any(ready => ready) && !_closeRequested)
+        {
+            ScheduleDriveRescan();
+        }
+    }
+
+    private void OnRemoteDriveRetryTick(object? sender, EventArgs e) => _ = RetryMissingRemoteDrivesAsync();
+
+    /// <summary>The question put to each mapped letter left out, and when it was put: one per letter for every window, at most once an interval.</summary>
+    private static readonly Dictionary<string, (Task<bool> Answer, long Asked)> RemoteDriveAnswers = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Whether a mapped drive answers ready, asked as the canvas asks a drive
+    /// (<see cref="ViewAllFileSystemService.DescribeDrive"/>) on a thread of
+    /// its own: one whose server is off takes some twenty seconds to say it
+    /// is not.  Every window of the process shares the question - the answer
+    /// on its way, or one given within the last interval - so a drive left
+    /// out holds one thread at a time, however many windows are open.
+    /// </summary>
+    private static Task<bool> AskRemoteDrive(DriveInfo drive)
+    {
+        lock (RemoteDriveAnswers)
+        {
+            if (RemoteDriveAnswers.TryGetValue(drive.Name, out var known)
+                && (!known.Answer.IsCompleted || Stopwatch.GetElapsedTime(known.Asked) < RemoteDriveRetryInterval))
+            {
+                return known.Answer;
+            }
+
+            var answer = Task.Run(() =>
+            {
+                try
+                {
+                    return ViewAllFileSystemService.DescribeDrive(drive) is not null;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    return false;
+                }
+            });
+            RemoteDriveAnswers[drive.Name] = (answer, Stopwatch.GetTimestamp());
+            return answer;
+        }
+    }
+
+    /// <summary>How often the drives are listed again while a mapped drive is missing from them; tests shorten it before a window is made.</summary>
+    internal static TimeSpan RemoteDriveRetryInterval { get; set; } = TimeSpan.FromSeconds(60);
 
     /// <summary>Times the drives were listed again for a volume arriving or leaving.</summary>
     internal int DriveRescans { get; private set; }
