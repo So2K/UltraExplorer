@@ -26,6 +26,7 @@ internal static partial class Program
             RunOnSta("graph review: layout during a refresh", () => GraphLayoutDuringRefreshChecksAsync(root));
             RunOnSta("graph review: nested refreshes", () => GraphNestedRefreshChecksAsync(root));
             RunOnSta("graph review: a closed folder read again", () => GraphClosedRefreshChecksAsync(root));
+            RunOnSta("graph review: hidden folders above the selection", () => GraphHiddenAncestorChecksAsync(root));
         }
         finally
         {
@@ -300,5 +301,56 @@ internal static partial class Program
         graph.Collapse(innerNode);
         await graph.RefreshBranchAsync(innerNode);
         Check("and a closed one read again not for a change opens, as before", innerNode.IsExpanded);
+    }
+
+    // ---- J057: hidden folders above what is selected -----------------------------------------
+
+    /// <summary>
+    /// Hidden items hidden while something inside a hidden folder is
+    /// selected - a file in ProgramData or AppData: the refresh of the open
+    /// folders left the hidden folder out of the listing and let go of
+    /// everything under it, the selection with it.  The folders above what is
+    /// selected are kept by name, as a folder typed into the address bar is;
+    /// what is selected is listed again if it may be shown, and a hidden item
+    /// itself, or a hidden folder nothing is selected in, still goes.
+    /// </summary>
+    private static async Task GraphHiddenAncestorChecksAsync(string root)
+    {
+        Section("graph review: hiding hidden items keeps the hidden folders above the selection (J057)");
+        var top = Path.Combine(root, "hidden-above");
+        var cache = Path.Combine(top, ".cache");
+        var inner = Path.Combine(cache, "inner.txt");
+        var otherHidden = Path.Combine(top, ".other");
+        var secret = Path.Combine(top, "secret.txt");
+        Directory.CreateDirectory(cache);
+        Directory.CreateDirectory(otherHidden);
+        File.WriteAllText(inner, "x");
+        File.WriteAllText(Path.Combine(otherHidden, "x.txt"), "x");
+        File.WriteAllText(secret, "x");
+        File.WriteAllText(Path.Combine(top, "plain.txt"), "x");
+        File.SetAttributes(cache, File.GetAttributes(cache) | FileAttributes.Hidden);
+        File.SetAttributes(otherHidden, File.GetAttributes(otherHidden) | FileAttributes.Hidden);
+        File.SetAttributes(secret, File.GetAttributes(secret) | FileAttributes.Hidden);
+
+        using var graph = new ViewAllGraphService(new ViewAllGraphOptions(IncludeHidden: true));
+        var topNode = (await graph.AddRootAsync(top))!;
+        await graph.ExpandAsync(topNode);
+        graph.TryGetNode(cache, out var cacheNode);
+        graph.TryGetNode(otherHidden, out var otherNode);
+        await graph.ExpandAsync(cacheNode);
+        await graph.ExpandAsync(otherNode);
+        graph.TryGetNode(inner, out var innerNode);
+        graph.TryGetNode(secret, out var secretNode);
+        innerNode.IsSelected = true;
+        secretNode.IsSelected = true;
+
+        await graph.ApplyOptionsAsync(graph.Options with { IncludeHidden = false });
+        Check("the file selected inside the hidden folder is still there, on the tree",
+            graph.TryGetNode(inner, out var innerAgain) && innerAgain.IsTreeVisible);
+        Check("under its hidden folder, kept open",
+            graph.TryGetNode(cache, out var cacheAgain) && cacheAgain.IsExpanded && cacheAgain.IsTreeVisible
+            && innerAgain is not null && ReferenceEquals(innerAgain.Parent, cacheAgain));
+        Check("while a hidden file selected itself goes, as ever", !graph.TryGetNode(secret, out _));
+        Check("and so does a hidden folder nothing is selected in", !graph.TryGetNode(otherHidden, out _));
     }
 }

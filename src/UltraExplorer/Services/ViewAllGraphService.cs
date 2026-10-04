@@ -1209,6 +1209,20 @@ public sealed class ViewAllGraphService : IDisposable
                 {
                     named.Add(descendant.FullPath);
                 }
+
+                // Nor the folders above what is selected, once the listing
+                // leaves them out - a hidden folder, as hidden items are
+                // hidden - which let go of the selection with them: they are
+                // asked for by name, as a folder typed into the address bar
+                // is.  Not what is selected itself: a hidden item selected
+                // goes with the rest.
+                if (descendant.IsSelected)
+                {
+                    for (var folder = descendant.Parent; folder is not null && !ReferenceEquals(folder, node); folder = folder.Parent)
+                    {
+                        named.Add(folder.FullPath);
+                    }
+                }
             }
 
             // A refresh of a folder inside this one still under way has
