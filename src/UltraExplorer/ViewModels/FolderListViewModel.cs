@@ -33,7 +33,7 @@ namespace UltraExplorer.ViewModels;
 /// </summary>
 public sealed class FolderListViewModel : ObservableObject
 {
-    /// <summary>Rows that get a real Shell icon; the rest keep the glyph.</summary>
+    /// <summary>Rows asked for their Shell icon as the list fills; the rest ask when first shown (<see cref="FolderListItem.AskForIcon"/>).</summary>
     private const int IconBudget = 300;
 
     /// <summary>
@@ -55,6 +55,9 @@ public sealed class FolderListViewModel : ObservableObject
     private readonly Func<string, bool, Task> _activate;
     private readonly Func<string, bool> _isOnCanvas;
     private readonly ShellIconService _icons;
+
+    /// <summary><see cref="IconWhenShown"/>, made once: handed to every row past the ones asked for as the list fills.</summary>
+    private readonly Func<FolderListItem, System.Windows.Media.ImageSource?> _iconWhenShown;
 
     private readonly List<FolderListItem> _all = [];
 
@@ -155,6 +158,7 @@ public sealed class FolderListViewModel : ObservableObject
         _activate = activate;
         _isOnCanvas = isOnCanvas;
         _icons = icons;
+        _iconWhenShown = IconWhenShown;
 
         ActivateCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: true));
         RevealCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: false));
@@ -960,15 +964,51 @@ public sealed class FolderListViewModel : ObservableObject
             rows.Add(item);
             _byPath.TryAdd(item.FullPath, item);
 
-            if (rows.Count <= IconBudget && item.Icon is null)
+            if (rows.Count <= IconBudget)
             {
-                // Answers synchronously when the icon is already known, so a
-                // folder that has been looked at once fills in with no flicker.
-                _icons.Request(item.FullPath, item.IsDirectory, icon => item.Icon = icon);
+                item.AskForIcon = null;
+                if (item.Icon is null)
+                {
+                    // Answers synchronously when the icon is already known, so a
+                    // folder that has been looked at once fills in with no flicker.
+                    _icons.Request(item.FullPath, item.IsDirectory, icon => item.Icon = icon);
+                }
+            }
+            else
+            {
+                // Past those, a row asks when the list box first shows it.
+                item.AskForIcon = _iconWhenShown;
             }
         }
 
         return rows;
+    }
+
+    /// <summary>
+    /// A row's icon, asked for as the list box first shows it
+    /// (<see cref="FolderListItem.AskForIcon"/>).  One already known is
+    /// handed back at once, while the binding that asked is still reading it
+    /// - told through the row, it would be a change in the middle of that
+    /// read; one the Shell has yet to answer comes through the row later.
+    /// </summary>
+    private System.Windows.Media.ImageSource? IconWhenShown(FolderListItem item)
+    {
+        System.Windows.Media.ImageSource? known = null;
+        var asking = true;
+        _icons.Request(item.FullPath, item.IsDirectory, icon =>
+        {
+            if (asking)
+            {
+                known = icon;
+            }
+            else
+            {
+                item.Icon = icon;
+            }
+        });
+
+        asking = false;
+        return known;
     }
 
     private Task Activate(FolderListItem? item, bool open)

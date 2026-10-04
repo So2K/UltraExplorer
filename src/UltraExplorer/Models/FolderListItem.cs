@@ -168,9 +168,29 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
 
     public ImageSource? Icon
     {
-        get => _icon;
+        get
+        {
+            // Shown for the first time without one: asked for now.  An icon
+            // already known is the answer; any other comes through the setter.
+            if (_icon is null && AskForIcon is { } ask)
+            {
+                AskForIcon = null;
+                _icon = ask(this);
+            }
+
+            return _icon;
+        }
         set => SetProperty(ref _icon, value);
     }
+
+    /// <summary>
+    /// How the row asks for its icon the first time it is shown without one,
+    /// given by the list to the rows past the ones it asks for as it fills.
+    /// The list box makes rows only for what is on screen and binds the icon
+    /// of each as it makes it, so a row scrolled to is asked for then - not
+    /// five thousand rows at once, and not never.  Let go of once used.
+    /// </summary>
+    internal Func<FolderListItem, ImageSource?>? AskForIcon { get; set; }
 
     /// <summary>
     /// Whether the canvas already holds a node for this object.  A row that is

@@ -33,6 +33,7 @@ internal static partial class Program
         RunOnSta("list leaves a deleted folder without the canvas", ListGoneLeavesCanvasAsync);
         RunOnSta("list leaves a folder found gone as it is read", ListGoneOnReadAsync);
         RunOnSta("list leaves a deleted folder, end to end", ListGoneEndToEndAsync);
+        RunOnSta("list icons past the first rows", ListIconsPastBudgetAsync);
         return Task.CompletedTask;
     }
 
@@ -171,5 +172,61 @@ internal static partial class Program
         {
             TryDelete(baseDirectory);
         }
+    }
+
+    /// <summary>
+    /// J015: rows past the three hundredth were never asked for an icon -
+    /// not as the list filled, nor when scrolled to - and kept the glyph for
+    /// good, however well known their type's icon was.  A row asks for its
+    /// icon when the list box first shows it - binds its icon - and only
+    /// then: five thousand programs are not five thousand questions.
+    /// </summary>
+    private static async Task ListIconsPastBudgetAsync()
+    {
+        Section("folder list round 2: icons for rows past the first");
+        var folder = Path.Combine(Path.GetTempPath(), "UltraExplorerListIcons");
+        var picture = BitmapSource.Create(1, 1, 96, 96, PixelFormats.Bgra32, null, new byte[4], 4);
+        picture.Freeze();
+        using var icons = new ShellIconService((_, _) => picture, Dispatcher.CurrentDispatcher);
+        string[] types = [".txt", ".png", ".log", ".dat", ".exe"];
+        var names = Enumerable.Range(0, 5_000).Select(index => $"f{index:D4}{types[index % types.Length]}").ToArray();
+        var list = new FolderListViewModel(
+            (path, _, _) => Task.FromResult(ReviewSnapshot(path, false, names)),
+            (_, _) => Task.CompletedTask,
+            _ => false,
+            icons) { IsVisible = true };
+
+        await list.NavigateAsync(folder);
+        var first = await LiveWait(() => list.Items.Take(300).All(row => row.Icon is not null), 3_000);
+        await Task.Delay(100);
+        var askedAtFill = icons.ExtractionCount;
+        Check($"the first rows have their icons as the list fills ({first} ms)", first >= 0);
+
+        // What the list box does for a row it shows: binds its icon.
+        var shown = list.Items.Skip(4_000).Take(40).ToList();
+        var images = shown.Select(row =>
+        {
+            var image = new Image { DataContext = row };
+            image.SetBinding(Image.SourceProperty, new Binding(nameof(FolderListItem.Icon)));
+            return image;
+        }).ToList();
+        var settled = await LiveWait(() => images.All(image => image.Source is not null), 2_000);
+        var missing = images.Count(image => image.Source is null);
+        Check($"rows scrolled to past the first three hundred get their icons ({missing} of {images.Count} without one, {settled} ms)",
+            missing == 0);
+
+        // Programs are asked about one by one: the rows never shown are not.
+        var programsShown = shown.Count(row => row.DisplayName.EndsWith(".exe", StringComparison.Ordinal));
+        var asked = icons.ExtractionCount - askedAtFill;
+        Check($"only the rows shown are asked for ({asked} questions for {programsShown} programs shown, of {names.Length / types.Length} in the folder)",
+            asked <= programsShown + types.Length);
+
+        // Ordered afresh, a row that moved past the first rows is asked for when shown too.
+        list.Sort = new ItemSort(SortColumn.Name, Descending: true);
+        var moved = list.Items[4_321];
+        var movedImage = new Image { DataContext = moved };
+        movedImage.SetBinding(Image.SourceProperty, new Binding(nameof(FolderListItem.Icon)));
+        var resorted = await LiveWait(() => movedImage.Source is not null, 2_000);
+        Check($"after another order, a row shown far down still gets its icon ({resorted} ms)", resorted >= 0);
     }
 }
