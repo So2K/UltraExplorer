@@ -2662,6 +2662,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
+        // A folder never read holds only what was brought in by name, and
+        // reading it again is asking the disk about each of those - a log
+        // growing beside four thousand files picked on the nested canvas was
+        // four thousand questions a write.  Only something added, removed or
+        // renamed can have taken one of them away.
+        if (!node.AreChildrenLoaded && (change.Kinds & (ChangeKinds.Structural | ChangeKinds.Gone)) == 0)
+        {
+            return;
+        }
+
         if (_graphReadDirectly.TryGetValue(node.FullPath, out var readAt)
             && change.FirstTicks <= readAt
             && System.Diagnostics.Stopwatch.GetElapsedTime(change.FirstTicks, readAt) <= GraphEchoWindow)

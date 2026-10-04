@@ -12,8 +12,10 @@ namespace ViewAllSmoke;
 /// <summary>
 /// What the second review of the canvas's view model found, and what was done
 /// about it: opening a file asks the disk and the Shell off the interface
-/// thread; and colouring or clearing a large selection on the tree canvas
-/// rebuilds its batched layers once, not once an item.
+/// thread; colouring or clearing a large selection on the tree canvas rebuilds
+/// its batched layers once, not once an item; and a size changing in a folder
+/// the graph has never read does not have what was brought into it by name
+/// checked against the disk.
 /// </summary>
 internal static partial class Program
 {
@@ -25,6 +27,7 @@ internal static partial class Program
         {
             await OnDispatcher(() => VmRound2OpenFileAsync(root));
             await OnDispatcher(() => VmRound2ColourBatchAsync(root));
+            await OnDispatcher(() => VmRound2HiddenGraphChangeAsync(root));
         }
         finally
         {
@@ -137,5 +140,104 @@ internal static partial class Program
         tree.ApplyAccent([paths[0]], "#3FA34D");
         Check("one item coloured rebuilds the layers at once, as ever",
             invalidations == 1 && node.Children.First(child => child.FullPath == paths[0]).AccentHex == "#3FA34D");
+    }
+
+    // ---- J095: a file changing in a folder of the graph, with the tree canvas away --------
+
+    private static async Task VmRound2HiddenGraphChangeAsync(string root)
+    {
+        Section("view model round 2: a file changing in a folder of the graph, with the tree canvas away");
+        const int count = 2_000;
+        var folder = Path.Combine(root, "growing");
+        var named = Path.Combine(root, "named");
+        var scratch = Path.Combine(root, "growing-state");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(named);
+        Directory.CreateDirectory(scratch);
+        for (var index = 0; index < count; index++)
+        {
+            File.WriteAllText(Path.Combine(folder, $"item-{index:D4}.bin"), "x");
+        }
+
+        var log = Path.Combine(folder, "log.txt");
+        File.WriteAllText(log, "start");
+        var namedLog = Path.Combine(named, "log.txt");
+        var namedPicks = Enumerable.Range(0, 40).Select(index => Path.Combine(named, $"picked-{index:D2}.txt")).ToArray();
+        File.WriteAllText(namedLog, "start");
+        foreach (var pick in namedPicks)
+        {
+            File.WriteAllText(pick, "picked");
+        }
+
+        using var icons = new ShellIconService();
+        using var tree = NewTree(scratch, icons);
+        tree.PreferLightReveal = true;
+        tree.IsCanvasShown = false;
+        await tree.InitializeAsync(folder);
+        var sink = (IChangeSink)tree;
+        FolderChange Grown(string path)
+        {
+            File.AppendAllText(path, new string('x', 2_000));
+            var info = new FileInfo(path);
+            return new FolderChange(Path.GetDirectoryName(path)!, ChangeKinds.Content, Stopwatch.GetTimestamp(), default,
+                new[] { new FileDelta(info.Name, info.Length, info.LastWriteTimeUtc.Ticks) });
+        }
+
+        // A folder holding only what was brought in by name - items picked
+        // on the nested canvas one after another - and one of them selected.
+        // A size changing in it cannot have taken any of them away.
+        foreach (var pick in namedPicks)
+        {
+            await tree.MaterializeAsync(pick);
+        }
+
+        tree.Selection.ReplaceSingle(namedPicks[0], false, 6, SelectionSource.Canvas);
+        await Task.Delay(150);
+        if (!tree.TryGetNode(named, out var namedNode) || namedNode.AreChildrenLoaded)
+        {
+            Check("the named folder is on the graph, not read", false);
+            return;
+        }
+
+        var before = tree.GraphRefreshesForChanges;
+        for (var index = 0; index < 5; index++)
+        {
+            sink.FolderChanged(ChangeConsumer.Graph, namedNode, Grown(namedLog));
+            await Task.Delay(60);
+        }
+
+        await Task.Delay(200);
+        var looks = tree.GraphRefreshesForChanges - before;
+        Check($"a size changing in a folder never read does not have its {namedNode.Children.Count} named items checked against the disk ({looks} looks for 5 changes)",
+            looks == 0);
+
+        // Something going from it still is, as ever.
+        File.Delete(namedPicks[0]);
+        before = tree.GraphRefreshesForChanges;
+        sink.FolderChanged(ChangeConsumer.Graph, namedNode,
+            new FolderChange(named, ChangeKinds.Structural, Stopwatch.GetTimestamp(), default, default));
+        await WaitUntil(() => !tree.TryGetNode(namedPicks[0], out _) && !tree.Selection.Contains(namedPicks[0]), 3_000);
+        Check("an item going from such a folder still takes its node and its selection with it",
+            tree.GraphRefreshesForChanges - before == 1 && !tree.TryGetNode(namedPicks[0], out _) && !tree.Selection.Contains(namedPicks[0]));
+
+        // A folder read on the tree - opened from the list, say - whose log
+        // the status bar names: read again as it grows, as ever, so the bar
+        // shows its size now.
+        var node = await tree.MaterializeAsync(folder);
+        if (node is null)
+        {
+            Check("the folder is on the graph", false);
+            return;
+        }
+
+        await tree.ExpandAsync(node);
+        tree.Selection.ReplaceSingle(log, false, new FileInfo(log).Length, SelectionSource.Canvas);
+        await Task.Delay(150);
+        var shown = tree.StatusCountText;
+        before = tree.GraphRefreshesForChanges;
+        sink.FolderChanged(ChangeConsumer.Graph, node, Grown(log));
+        await WaitUntil(() => tree.StatusCountText != shown, 3_000);
+        Check($"the item the status bar names, growing in a folder read, is read again and the bar follows it ({shown} to {tree.StatusCountText})",
+            tree.GraphRefreshesForChanges - before == 1 && tree.StatusCountText != shown);
     }
 }
