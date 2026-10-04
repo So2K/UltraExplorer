@@ -6,13 +6,15 @@ namespace ViewAllSmoke;
 
 /// <summary>
 /// The tree's reading and saving, from the second full review: a folder whose
-/// name ends in a dot or a space (J051).
+/// name ends in a dot or a space (J051), and a folder with more entries than
+/// one read takes (J050).
 /// </summary>
 internal static partial class Program
 {
     private static async Task ViewAllIoReviewChecks()
     {
         await FolderNamedWithADotIsReadAsItselfAsync();
+        await FolderPastTheCapKeepsItsFoldersAsync();
     }
 
     // ---- J051: a folder whose name ends in a dot or a space ----------------
@@ -101,6 +103,86 @@ internal static partial class Program
             {
                 // Left in the temp folder.
             }
+        }
+    }
+
+    // ---- J050: a folder with more entries than one read takes ---------------
+
+    /// <summary>
+    /// A camera folder: forty pictures, and the folders Archive, Screens and
+    /// Videos, read with a cap of thirty-two.  The file system hands out
+    /// Archive, then the pictures, then Screens and Videos; cut where the
+    /// thirty-second entry fell, the list, a dialog and the tree showed
+    /// Archive alone, in the order the folders lead in, and nothing offered
+    /// to load the other two.
+    /// </summary>
+    private static async Task FolderPastTheCapKeepsItsFoldersAsync()
+    {
+        Section("view-all io: a folder past the cap still shows every sub-folder (J050)");
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerCapFolders", Guid.NewGuid().ToString("N"));
+        string[] folders = ["Archive", "Screens", "Videos"];
+        try
+        {
+            foreach (var folder in folders)
+            {
+                Directory.CreateDirectory(Path.Combine(root, folder));
+            }
+
+            for (var index = 1; index <= 40; index++)
+            {
+                File.WriteAllBytes(Path.Combine(root, $"IMG_{index:D4}.jpg"), []);
+            }
+
+            var files = new ViewAllFileSystemService();
+            var options = new ViewAllGraphOptions(MaximumChildrenPerFolder: 32);
+            string Describe(IEnumerable<ViewAllEntryDescriptor> entries, bool isTruncated)
+            {
+                var list = entries.ToList();
+                var shownFolders = list.Where(entry => entry.Kind == ViewAllEntryKind.Folder).Select(entry => entry.DisplayName);
+                return $"{list.Count} entries, folders [{string.Join(", ", shownFolders)}]{(isTruncated ? ", cut short" : string.Empty)}";
+            }
+
+            // Every folder, then as many pictures as are left room for, in
+            // name order, and the read still says it was cut short.
+            bool Kept(IReadOnlyList<ViewAllEntryDescriptor> entries, bool isTruncated, bool filesByName = true)
+            {
+                var pictures = entries.Skip(folders.Length).Select(entry => entry.DisplayName).ToList();
+                return isTruncated
+                    && entries.Count == 32
+                    && entries.Take(folders.Length).Select(entry => entry.DisplayName).SequenceEqual(folders)
+                    && entries.Skip(folders.Length).All(entry => entry.Kind == ViewAllEntryKind.File)
+                    && (!filesByName || pictures.SequenceEqual(pictures.Order(StringComparer.CurrentCultureIgnoreCase)));
+            }
+
+            // The list and a dialog, in the default order.
+            var listed = await files.GetChildrenAsync(root, options, default, ItemSort.Default, keepFirstShown: true);
+            Check($"the list in names from A shows every folder ({Describe(listed.Entries, listed.IsTruncated)})",
+                Kept(listed.Entries, listed.IsTruncated));
+
+            // The tree's own read, which keeps the first ones read.
+            var read = await files.GetChildrenAsync(root, options);
+            Check($"so does the tree's read ({Describe(read.Entries, read.IsTruncated)})", Kept(read.Entries, read.IsTruncated));
+
+            // Newest first already read them all; it still does.
+            var newest = await files.GetChildrenAsync(root, options, default, new ItemSort(SortColumn.Modified, true), keepFirstShown: true);
+            Check($"and the list newest first, as before ({Describe(newest.Entries, newest.IsTruncated)})",
+                Kept(newest.Entries, newest.IsTruncated, filesByName: false));
+
+            // On the tree itself, and Load more brings in the rest once.
+            using var graph = new ViewAllGraphService(options);
+            var top = (await graph.AddRootAsync(root))!;
+            var expansion = await graph.ExpandAsync(top);
+            var children = top.Children.Select(child => child.Entry).ToList();
+            Check($"the tree opens the folder with every sub-folder ({Describe(children, expansion.IsTruncated)})",
+                Kept(children, expansion.IsTruncated));
+            var more = await graph.LoadMoreAsync(top, additionalChildren: 64);
+            Check($"and Load more brings in the rest, each once ({top.Children.Count} children)",
+                !more.IsTruncated && top.Children.Count == 43
+                && top.Children.Select(child => child.FullPath).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 43);
+        }
+        finally
+        {
+            TryDelete(root);
         }
     }
 }
