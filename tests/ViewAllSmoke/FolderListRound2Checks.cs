@@ -34,6 +34,7 @@ internal static partial class Program
         RunOnSta("list leaves a folder found gone as it is read", ListGoneOnReadAsync);
         RunOnSta("list leaves a deleted folder, end to end", ListGoneEndToEndAsync);
         RunOnSta("list icons past the first rows", ListIconsPastBudgetAsync);
+        RunOnSta("list filter in a folder that could not be read", ListFilterKeepsFailureAsync);
         return Task.CompletedTask;
     }
 
@@ -228,5 +229,49 @@ internal static partial class Program
         movedImage.SetBinding(Image.SourceProperty, new Binding(nameof(FolderListItem.Icon)));
         var resorted = await LiveWait(() => movedImage.Source is not null, 2_000);
         Check($"after another order, a row shown far down still gets its icon ({resorted} ms)", resorted >= 0);
+    }
+
+    /// <summary>
+    /// J114: a filter typed in a folder that could not be read - access
+    /// denied, a share gone - put "This folder is empty." in place of why,
+    /// and clearing the filter left it there; likewise with no folder.
+    /// </summary>
+    private static async Task ListFilterKeepsFailureAsync()
+    {
+        Section("folder list round 2: a filter where nothing could be read");
+        var denied = Path.Combine(Path.GetTempPath(), "UltraExplorerListDenied");
+        var broken = Path.Combine(Path.GetTempPath(), "UltraExplorerListBroken");
+        using var icons = new ShellIconService();
+        var list = new FolderListViewModel(
+            (path, _, _) => Task.FromException<ViewAllDirectorySnapshot>(ViewAllPath.Equals(path, denied)
+                ? new UnauthorizedAccessException("denied for the check")
+                : new IOException("not readable for the check")),
+            (_, _) => Task.CompletedTask,
+            _ => false,
+            icons);
+
+        list.IsVisible = true;
+        var nothing = list.EmptyText;
+        list.Filter = "abc";
+        var filtered = list.EmptyText;
+        list.Filter = string.Empty;
+        Check($"with no folder, a filter keeps saying nothing is selected ({nothing} | {filtered} | {list.EmptyText})",
+            nothing == "Nothing is selected." && filtered == nothing && list.EmptyText == nothing);
+
+        await list.NavigateAsync(denied);
+        var said = list.EmptyText;
+        list.Filter = "abc";
+        filtered = list.EmptyText;
+        list.Filter = string.Empty;
+        Check($"a folder denied keeps saying so through a filter and after it ({said} | {filtered} | {list.EmptyText})",
+            said == "Access denied." && filtered == said && list.EmptyText == said);
+
+        await list.NavigateAsync(broken);
+        said = list.EmptyText;
+        list.Filter = "abc";
+        filtered = list.EmptyText;
+        list.Filter = string.Empty;
+        Check($"a folder that could not be read keeps saying so ({said} | {filtered} | {list.EmptyText})",
+            said == "This folder could not be read." && filtered == said && list.EmptyText == said);
     }
 }

@@ -74,6 +74,15 @@ public sealed class FolderListViewModel : ObservableObject
     private string _countText = string.Empty;
     private string _filter = string.Empty;
     private string _emptyText = string.Empty;
+
+    /// <summary>
+    /// What the list says while it has no rows read, when that is not that
+    /// the folder is empty: that there is no folder, or why it could not be
+    /// read.  Null once a read found the folder, empty or not.  A filter
+    /// typed meanwhile, or cleared, keeps saying it (<see cref="UpdateEmptyText"/>).
+    /// </summary>
+    private string? _noRowsText;
+
     private bool _isVisible;
     private int _held;
 
@@ -805,7 +814,7 @@ public sealed class FolderListViewModel : ObservableObject
             _byPath.Clear();
             ReplaceRows([]);
             CountText = string.Empty;
-            EmptyText = FolderPath.Length == 0 ? "Nothing is selected." : string.Empty;
+            EmptyText = _noRowsText = FolderPath.Length == 0 ? "Nothing is selected." : string.Empty;
             return;
         }
 
@@ -825,6 +834,7 @@ public sealed class FolderListViewModel : ObservableObject
             _readSort = sort;
             _staleWhileHidden = false;
             _unreadableRetried = false;
+            _noRowsText = null;
 
             _all.Clear();
             foreach (var entry in snapshot.Entries)
@@ -859,7 +869,7 @@ public sealed class FolderListViewModel : ObservableObject
             _byPath.Clear();
             ReplaceRows([]);
             CountText = string.Empty;
-            EmptyText = exception is UnauthorizedAccessException
+            EmptyText = _noRowsText = exception is UnauthorizedAccessException
                 ? "Access denied."
                 : "This folder could not be read.";
 
@@ -925,11 +935,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>
     /// What to say when no row is shown, and nothing when one is.  A folder
     /// with more entries than one read holds was filtered among the rows read
-    /// only, and says so: a name past them is not "nothing".
+    /// only, and says so: a name past them is not "nothing".  With no rows
+    /// read, why (<see cref="_noRowsText"/>) - "Access denied." is not "This
+    /// folder is empty." for having had a filter typed over it.
     /// </summary>
     private void UpdateEmptyText() =>
         EmptyText = Items.Count == 0
-            ? _all.Count == 0 ? "This folder is empty."
+            ? _all.Count == 0 ? _noRowsText ?? "This folder is empty."
                 : _isTruncated ? $"Nothing matches “{_filter.Trim()}” among the first {_all.Count:N0}."
                 : $"Nothing matches “{_filter.Trim()}”."
             : string.Empty;
@@ -1249,6 +1261,7 @@ public sealed class FolderListViewModel : ObservableObject
     {
         LiveMerges++;
         _readSort = sort;
+        _noRowsText = null;
         var previous = new Dictionary<string, FolderListItem>(_all.Count, StringComparer.OrdinalIgnoreCase);
         foreach (var item in _all)
         {
@@ -1503,7 +1516,7 @@ public sealed class FolderListViewModel : ObservableObject
         _byPath.Clear();
         ReplaceRows([]);
         CountText = string.Empty;
-        EmptyText = reason;
+        EmptyText = _noRowsText = reason;
         _listedWriteTicks = 0;
     }
 
