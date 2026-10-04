@@ -82,6 +82,23 @@ public sealed class ViewAllGraphService : IDisposable
     internal static readonly TimeSpan DriveAnswerWait = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    /// Drives found slow to answer, by every graph in the process, by root:
+    /// the question still out, or when one that was not waited for answered
+    /// not ready.  Each new window - Explorer's replacement, Win+E, a dialog's
+    /// picker - waited the whole <see cref="DriveAnswerWait"/> again for a
+    /// drive mapped to a server that is off, and asked it again besides; now
+    /// it takes the question still out instead, and waits for neither (see
+    /// <see cref="AddDriveRootsAsync"/>).
+    /// </summary>
+    private static readonly Dictionary<string, SlowDrive> SlowDrives = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How long a drive that answered not ready, too late to be waited for, is still taken for slow: a drive back meanwhile answers its next question at once, and comes in as soon as it does.</summary>
+    internal static readonly TimeSpan SlowDriveMemory = TimeSpan.FromMinutes(10);
+
+    /// <summary>A drive found slow: its question still out, or answered not ready at <see cref="NotReadySince"/>.</summary>
+    private sealed record SlowDrive(Task<ViewAllEntryDescriptor?> Answer, DateTime? NotReadySince);
+
+    /// <summary>
     /// What refreshes of a folder still under way owe it: the sub-folders that
     /// were open before, to be opened again once the folder has been read.  By
     /// the folder's path, and shared by every refresh of it in flight - a
@@ -367,14 +384,47 @@ public sealed class ViewAllGraphService : IDisposable
     /// each that has answered ready within <see cref="DriveAnswerWait"/> is
     /// made a root, in name order, as a start that waited for every drive
     /// made them; the rest are left to answer in their own time
-    /// (<see cref="_pendingDrives"/>).
+    /// (<see cref="_pendingDrives"/>).  A drive another start in the process
+    /// already found slow (<see cref="SlowDrives"/>) is not waited for: its
+    /// question still out is taken over, and it comes in, or is passed over,
+    /// when that answers.
     /// </summary>
     private async Task AddDriveRootsAsync(CancellationToken cancellationToken)
     {
-        var drives = _fileSystem.AskDriveRoots(cancellationToken);
+        var asked = _fileSystem.AskDriveRoots(cancellationToken);
+        var drives = new List<(string Path, Task<ViewAllEntryDescriptor?> Answer)>(asked.Count);
+        var slow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (SlowDrives)
+        {
+            foreach (var (path, answer) in asked)
+            {
+                if (SlowDrives.TryGetValue(path, out var known))
+                {
+                    if (!known.Answer.IsCompleted)
+                    {
+                        slow.Add(path);
+                        drives.Add((path, known.Answer));
+                        continue;
+                    }
+
+                    if (known.NotReadySince is { } since && DateTime.UtcNow - since < SlowDriveMemory)
+                    {
+                        slow.Add(path);
+                    }
+                    else
+                    {
+                        SlowDrives.Remove(path);
+                    }
+                }
+
+                drives.Add((path, answer));
+            }
+        }
+
         try
         {
-            await Task.WhenAll(drives.Select(drive => drive.Answer)).WaitAsync(DriveAnswerWait, cancellationToken);
+            await Task.WhenAll(drives.Where(drive => !slow.Contains(drive.Path)).Select(drive => drive.Answer))
+                .WaitAsync(DriveAnswerWait, cancellationToken);
         }
         catch (TimeoutException)
         {
@@ -389,12 +439,69 @@ public sealed class ViewAllGraphService : IDisposable
             if (!answer.IsCompleted)
             {
                 _pendingDrives[path] = answer;
+                RememberSlowDrive(path, answer);
+                continue;
             }
-            else if (answer.Result is { } entry)
+
+            if (answer.Result is { } entry)
             {
+                // One taken for slow that has answered ready all the same is
+                // back: the next start waits for it as for any other.
+                if (slow.Contains(path))
+                {
+                    lock (SlowDrives)
+                    {
+                        SlowDrives.Remove(path);
+                    }
+                }
+
                 RestorePosition(CreateNode(entry, depth: 0, parent: null));
             }
         }
+    }
+
+    /// <summary>
+    /// Notes a drive whose question start-up went on without (see
+    /// <see cref="SlowDrives"/>), for the next start in the process to take
+    /// over: until it answers, then - answered not ready - for
+    /// <see cref="SlowDriveMemory"/>.  One that answers ready, or fails, is
+    /// asked afresh and waited for as ever by the next start.
+    /// </summary>
+    private static void RememberSlowDrive(string path, Task<ViewAllEntryDescriptor?> answer)
+    {
+        lock (SlowDrives)
+        {
+            if (SlowDrives.TryGetValue(path, out var known) && ReferenceEquals(known.Answer, answer))
+            {
+                return;
+            }
+
+            SlowDrives[path] = new SlowDrive(answer, NotReadySince: null);
+        }
+
+        _ = answer.ContinueWith(
+            done =>
+            {
+                lock (SlowDrives)
+                {
+                    if (!SlowDrives.TryGetValue(path, out var known) || !ReferenceEquals(known.Answer, done))
+                    {
+                        return;
+                    }
+
+                    if (done.IsCompletedSuccessfully && done.Result is null)
+                    {
+                        SlowDrives[path] = known with { NotReadySince = DateTime.UtcNow };
+                    }
+                    else
+                    {
+                        SlowDrives.Remove(path);
+                    }
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>

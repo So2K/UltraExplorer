@@ -30,6 +30,7 @@ internal static partial class Program
             RunOnSta("graph review: a refresh that cannot read its folder", () => GraphUnreadableRefreshChecksAsync(root));
             RunOnSta("graph review: what was asked for by name, brought back", () => GraphNamedBatchChecksAsync(root));
             RunOnSta("graph review: a drive reached after start-up", () => GraphLateDriveRootChecksAsync(root));
+            RunOnSta("graph review: a drive slow to answer, for every window", () => GraphSlowDriveChecksAsync());
         }
         finally
         {
@@ -500,5 +501,149 @@ internal static partial class Program
         Check("among the drives, ahead of a folder root added before it",
             graph.Roots.Count == 2 && ReferenceEquals(graph.Roots[0], drive) && ReferenceEquals(graph.Roots[1], share));
         Check("and asked for again, it is the same root", ReferenceEquals(await graph.AddRootAsync(letter), drive) && graph.Roots.Count == 2);
+    }
+
+    // ---- J021: a drive slow to answer, for every window ---------------------------------------
+
+    /// <summary>
+    /// A drive mapped to a server that is off takes some twenty seconds to say
+    /// it is not ready.  Start-up waits <see cref="ViewAllGraphService.DriveAnswerWait"/>
+    /// for it and goes on; but every new window - Explorer's replacement,
+    /// Win+E, a dialog's picker - waited that whole second again, and asked
+    /// the drive again besides.  A window started while the question is still
+    /// out, or soon after the drive answered not ready, does not wait for it;
+    /// the drive still comes in when it answers ready.
+    /// </summary>
+    private static async Task GraphSlowDriveChecksAsync()
+    {
+        Section("graph review: a window started while a drive is slow to answer does not wait for it again (J021)");
+        var drives = await new ViewAllFileSystemService().GetDriveRootsAsync();
+        var temp = Path.GetPathRoot(Path.GetFullPath(Path.GetTempPath()));
+        var held = drives.FirstOrDefault(drive => !ViewAllPath.Equals(drive.FullPath, temp ?? string.Empty) && !ReferenceEquals(drive, drives[0]))
+            ?? drives.FirstOrDefault(drive => !ViewAllPath.Equals(drive.FullPath, temp ?? string.Empty));
+        if (held is null)
+        {
+            Console.WriteLine("  note  no drive here but the one the temporary folder is on; the check is not run");
+            return;
+        }
+
+        bool HasHeld(ViewAllGraphService graph) => graph.Roots.Any(node => ViewAllPath.Equals(node.FullPath, held.FullPath));
+        var others = drives.Count - 1;
+        using var slow = new SlowDriveFake(held.FullPath);
+
+        // Held: the question stays out.
+        using var first = new ViewAllGraphService();
+        var watch = Stopwatch.StartNew();
+        await first.InitializeAsync();
+        var firstWait = watch.ElapsedMilliseconds;
+        using var second = new ViewAllGraphService();
+        watch.Restart();
+        await second.InitializeAsync();
+        var secondWait = watch.ElapsedMilliseconds;
+        Check($"the first start waits for it a while ({firstWait} ms), the next does not, while its question is out ({secondWait} ms)",
+            firstWait >= 800 && secondWait < 400);
+        Check("and that start has every other drive", second.Roots.Count == others && !HasHeld(second));
+
+        slow.Release();
+        var both = await LiveWait(() => HasHeld(first) && HasHeld(second), 10_000) >= 0;
+        Check("answered ready, it comes into both", both && first.Roots.Count == drives.Count && second.Roots.Count == drives.Count);
+
+        // Answers not ready, late: as a drive mapped to a server that is off.
+        slow.AnswerNotReadyAfter(TimeSpan.FromMilliseconds(1_500));
+        using var third = new ViewAllGraphService();
+        watch.Restart();
+        await third.InitializeAsync();
+        var thirdWait = watch.ElapsedMilliseconds;
+        var answered = await LiveWait(() => slow.Answered == slow.Asked, 10_000) >= 0;
+        using var fourth = new ViewAllGraphService();
+        watch.Restart();
+        await fourth.InitializeAsync();
+        var fourthWait = watch.ElapsedMilliseconds;
+        Check($"answered not ready too late to be waited for ({thirdWait} ms, answered: {answered}), the next start does not wait for it ({fourthWait} ms)",
+            answered && thirdWait >= 800 && fourthWait < 400);
+        Check("and has every other drive", fourth.Roots.Count == others && !HasHeld(fourth));
+
+        // Back: answers at once, and comes in as soon as it does - which also
+        // has the process forget it was slow.
+        await LiveWait(() => slow.Answered == slow.Asked, 10_000);
+        slow.AnswerAtOnce();
+        using var fifth = new ViewAllGraphService();
+        await fifth.InitializeAsync();
+        var back = await LiveWait(() => HasHeld(fifth), 10_000) >= 0;
+        Check("a drive that answers again comes in as soon as it does", back);
+        using var sixth = new ViewAllGraphService();
+        await sixth.InitializeAsync();
+        Check("and the next start has it among the drives at once", HasHeld(sixth) && sixth.Roots.Count == drives.Count);
+    }
+
+    /// <summary>
+    /// One drive answering slowly (<see cref="ViewAllFileSystemService.DescribeDrive"/>):
+    /// held until released, answering not ready after a delay, or answering
+    /// at once; counts how often it was asked and has answered.  Disposing
+    /// lets it go and puts the real question back.
+    /// </summary>
+    private sealed class SlowDriveFake : IDisposable
+    {
+        private readonly Func<DriveInfo, ViewAllEntryDescriptor?> _real = ViewAllFileSystemService.DescribeDrive;
+        private readonly string _held;
+        private readonly ManualResetEventSlim _released = new();
+        private TimeSpan? _notReadyAfter;
+        private int _asked;
+        private int _answered;
+
+        public SlowDriveFake(string held)
+        {
+            _held = held;
+            ViewAllFileSystemService.DescribeDrive = Describe;
+        }
+
+        public int Asked => Volatile.Read(ref _asked);
+
+        public int Answered => Volatile.Read(ref _answered);
+
+        public void Release() => _released.Set();
+
+        public void AnswerNotReadyAfter(TimeSpan delay)
+        {
+            _notReadyAfter = delay;
+            _released.Set();
+        }
+
+        public void AnswerAtOnce()
+        {
+            _notReadyAfter = null;
+            _released.Set();
+        }
+
+        public void Dispose()
+        {
+            _released.Set();
+            ViewAllFileSystemService.DescribeDrive = _real;
+        }
+
+        private ViewAllEntryDescriptor? Describe(DriveInfo drive)
+        {
+            if (!ViewAllPath.Equals(ViewAllPath.Normalize(drive.RootDirectory.FullName), _held))
+            {
+                return _real(drive);
+            }
+
+            Interlocked.Increment(ref _asked);
+            try
+            {
+                if (_notReadyAfter is { } delay)
+                {
+                    Thread.Sleep(delay);
+                    return null;
+                }
+
+                _released.Wait(TimeSpan.FromSeconds(20));
+                return _real(drive);
+            }
+            finally
+            {
+                Interlocked.Increment(ref _answered);
+            }
+        }
     }
 }
