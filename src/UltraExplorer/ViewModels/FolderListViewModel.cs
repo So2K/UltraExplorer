@@ -691,7 +691,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// its own little explorer: going up a level to look at a sibling should not
     /// mean opening that whole branch out on the canvas first.
     /// </summary>
-    public async Task NavigateAsync(string path, bool remember = true)
+    /// <param name="moveCanvas">
+    /// Whether the canvas comes along once the folder is read.  Not when the
+    /// list only leaves a folder that went from disk (<see cref="LeaveGoneFolderAsync"/>):
+    /// the canvas going there selects the folder above, and the next Delete -
+    /// meant for something in the folder that went - would recycle it whole.
+    /// </param>
+    public async Task NavigateAsync(string path, bool remember = true, bool moveCanvas = true)
     {
         string normalized;
         try
@@ -729,7 +735,7 @@ public sealed class FolderListViewModel : ObservableObject
 
         var version = _folderVersion;
         await ReloadAsync();
-        if (version != _folderVersion || !ViewAllPath.Equals(normalized, FolderPath)) return;
+        if (version != _folderVersion || !ViewAllPath.Equals(normalized, FolderPath) || !moveCanvas) return;
 
         // The canvas comes along.  Going into a folder already moved it - the
         // row was clicked - and going back up leaving it behind was the half of
@@ -852,6 +858,15 @@ public sealed class FolderListViewModel : ObservableObject
             EmptyText = exception is UnauthorizedAccessException
                 ? "Access denied."
                 : "This folder could not be read.";
+
+            // Gone before the list came to it - the canvas still pointing at
+            // it, the change that said it went heard before the list was
+            // there: no change is coming to take the list out of it, so it
+            // leaves as it would have, for the nearest folder above.
+            if (exception is DirectoryNotFoundException)
+            {
+                _ = LeaveGoneFolderAsync(FolderPath, exception);
+            }
         }
         finally
         {
@@ -1347,9 +1362,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>
     /// The list's folder went from disk.  The list goes to the nearest folder
     /// above it that is still there, as Explorer does when the folder it shows
-    /// is deleted; a folder only renamed or replaced in the same place and back
-    /// already is simply read again.  One still there that a read for a change
-    /// could not list (<paramref name="failure"/>) - a dangling junction, a
+    /// is deleted - the list alone: taken along, the canvas would select that
+    /// folder, for the next Delete to recycle it whole, and what the canvas
+    /// had selected in the folder that went is the tree's to let go of.  So
+    /// is a folder found gone as it is read (<see cref="ReloadAsync"/>) left.
+    /// A folder only renamed or replaced in the same place and back already
+    /// is simply read again.  One still there that a read could not list
+    /// (<paramref name="failure"/>) - a dangling junction, a
     /// folder taken out of reach - is tried once more a moment later, and
     /// failing again says so and waits for the next change: read again at
     /// once, it would fail again at once, over and over.  With nothing above
@@ -1429,7 +1448,7 @@ public sealed class FolderListViewModel : ObservableObject
         }
 
         LeftGoneFolders++;
-        await NavigateAsync(nearest, remember: false);
+        await NavigateAsync(nearest, remember: false, moveCanvas: false);
     }
 
     /// <summary>
