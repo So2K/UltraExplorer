@@ -1518,7 +1518,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// no longer on disk is let go, in one change.  The folder is listed once,
     /// off the UI thread - a folder of ten thousand selected files is one
     /// read, not ten thousand questions - and only when something in it is
-    /// selected at all.
+    /// selected at all.  Only what was selected when the listing began can be
+    /// missing from it: a folder made or an item renamed, and selected, while
+    /// a share took seconds to list is not in the listing, and stays.
     /// </summary>
     private async Task PruneSelectionAsync(string folder)
     {
@@ -1527,6 +1529,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
+        var asked = SelectedIn(folder);
         HashSet<string> present;
         try
         {
@@ -1542,11 +1545,41 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
-        Selection.RemoveMissingUnder(folder, present.Contains);
+        bool Stays(string path) => present.Contains(path) || !asked.Contains(path);
+        Selection.RemoveMissingUnder(folder, Stays);
         foreach (var kept in _keptSelections)
         {
-            kept.RemoveMissingUnder(folder, present.Contains);
+            kept.RemoveMissingUnder(folder, Stays);
         }
+    }
+
+    /// <summary>What every pane's selection holds directly inside <paramref name="folder"/>.</summary>
+    private HashSet<string> SelectedIn(string folder)
+    {
+        var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Collect(ItemSelection selection)
+        {
+            if (selection.CountIn(folder) == 0)
+            {
+                return;
+            }
+
+            foreach (var path in selection.Paths)
+            {
+                if (ItemSelection.ParentOf(path).Equals(folder.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                {
+                    selected.Add(path);
+                }
+            }
+        }
+
+        Collect(Selection);
+        foreach (var kept in _keptSelections)
+        {
+            Collect(kept);
+        }
+
+        return selected;
     }
 
     public async Task LoadMoreAsync(ViewAllNodeViewModel node)

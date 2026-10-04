@@ -13,9 +13,10 @@ namespace ViewAllSmoke;
 /// What the second review of the canvas's view model found, and what was done
 /// about it: opening a file asks the disk and the Shell off the interface
 /// thread; colouring or clearing a large selection on the tree canvas rebuilds
-/// its batched layers once, not once an item; and a size changing in a folder
-/// the graph has never read does not have what was brought into it by name
-/// checked against the disk.
+/// its batched layers once, not once an item; a size changing in a folder the
+/// graph has never read does not have what was brought into it by name checked
+/// against the disk; and a slow listing lets go only of what was selected when
+/// it began.
 /// </summary>
 internal static partial class Program
 {
@@ -28,6 +29,7 @@ internal static partial class Program
             await OnDispatcher(() => VmRound2OpenFileAsync(root));
             await OnDispatcher(() => VmRound2ColourBatchAsync(root));
             await OnDispatcher(() => VmRound2HiddenGraphChangeAsync(root));
+            await OnDispatcher(() => VmRound2SlowPruneAsync(root));
         }
         finally
         {
@@ -239,5 +241,50 @@ internal static partial class Program
         await WaitUntil(() => tree.StatusCountText != shown, 3_000);
         Check($"the item the status bar names, growing in a folder read, is read again and the bar follows it ({shown} to {tree.StatusCountText})",
             tree.GraphRefreshesForChanges - before == 1 && tree.StatusCountText != shown);
+    }
+
+    // ---- J129: a slow listing and an item selected since -----------------------------------
+
+    private static async Task VmRound2SlowPruneAsync(string root)
+    {
+        Section("view model round 2: a slow listing and an item selected since it began");
+        var folder = Path.Combine(root, "prune");
+        var scratch = Path.Combine(root, "prune-state");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(scratch);
+        var first = Path.Combine(folder, "first.txt");
+        File.WriteAllText(first, "first");
+
+        using var icons = new ShellIconService();
+        using var tree = NewTree(scratch, icons);
+        tree.PreferLightReveal = true;
+        tree.IsCanvasShown = false;
+        await tree.InitializeAsync(folder);
+        tree.Selection.ReplaceSingle(first, false, 5, SelectionSource.Canvas);
+        await Task.Delay(150);
+
+        // A change in the folder: what is selected in it is checked against
+        // a listing made off this thread.  The listing is done before this
+        // thread looks at it again - a share taking its time - and meanwhile
+        // a folder is made and selected, as New folder does.
+        var sink = (IChangeSink)tree;
+        sink.FolderChanged(ChangeConsumer.Nested, folder, new FolderChange(folder, ChangeKinds.Structural, Stopwatch.GetTimestamp(), default, default));
+        Thread.Sleep(500);
+        var made = Path.Combine(folder, "New folder");
+        Directory.CreateDirectory(made);
+        tree.Selection.ReplaceSingle(made, true, 0, SelectionSource.Command);
+        await Task.Delay(400);
+        Check($"an item made and selected while an older listing was under way stays selected ({tree.Selection.Count} selected, there: {Directory.Exists(made)})",
+            tree.Selection.Count == 1 && tree.Selection.Contains(made));
+
+        // What was selected when the listing began and is not in it still goes.
+        var doomed = Path.Combine(folder, "doomed.txt");
+        File.WriteAllText(doomed, "doomed");
+        tree.Selection.ReplaceSingle(doomed, false, 6, SelectionSource.Canvas);
+        await Task.Delay(150);
+        File.Delete(doomed);
+        sink.FolderChanged(ChangeConsumer.Nested, folder, new FolderChange(folder, ChangeKinds.Structural, Stopwatch.GetTimestamp() + 1, default, default));
+        await WaitUntil(() => !tree.Selection.Contains(doomed), 3_000);
+        Check("an item selected before the listing and gone from it is let go of, as ever", !tree.Selection.Contains(doomed));
     }
 }
