@@ -25,7 +25,82 @@ internal static partial class Program
     {
         RunOnSta("canvas motion: an arrow key held down", CanvasMotionKeyRepeatAsync);
         RunOnSta("canvas motion: the loop letting go at rest", CanvasMotionRestLetGoAsync);
+        RunOnSta("canvas motion: the arrows after the focused item went", CanvasMotionFocusAfterRemovalAsync);
         return Task.CompletedTask;
+    }
+
+    // ---- the arrows after the focused item went (J053) ----------------------------------------
+
+    /// <summary>
+    /// A file clicked, then deleted: the window lets go of it and moves only
+    /// the focus to its folder, which is not selected (I004).  The arrows -
+    /// and Shift with them - then move within that folder, as they did when
+    /// the focus stayed on the item that went (I118): never to the folder's
+    /// neighbour, nor taking the folder itself into a range, which the next
+    /// Delete would recycle whole.
+    /// </summary>
+    private static async Task CanvasMotionFocusAfterRemovalAsync()
+    {
+        Section("canvas motion: the arrows after the focused file was deleted stay in its folder");
+        var disk = BuildSafetyWorld();
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots(
+        [
+            new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive, "1 TB free"),
+            new NestedRoot(@"R:\", "R:", NestedFolderKind.Drive, "1 TB free")
+        ]);
+        await LoadEverythingAsync(tree, _ => true);
+        var canvas = new NestedCanvas { Tree = tree, DpiOverride = new DpiScale(1, 1) };
+        canvas.Measure(new Size(ViewWidth, ViewHeight));
+        canvas.Arrange(new Rect(0, 0, ViewWidth, ViewHeight));
+        canvas.UpdateLayout();
+
+        // The window's side, as a pane has it (see SelectionSafetyCanvasAsync).
+        var shared = new ItemSelection();
+        canvas.SelectionCommitted += edit =>
+        {
+            shared.Apply(edit);
+            if (canvas.SelectedCount != shared.Count)
+            {
+                canvas.LoadSelection(shared);
+            }
+            else
+            {
+                canvas.AcknowledgeSelection(shared.Version);
+            }
+        };
+
+        var docs = tree.Find(SafetyDocs)!;
+        try
+        {
+            foreach (var (key, modifiers) in new[] { (Key.Down, ModifierKeys.None), (Key.Right, ModifierKeys.None), (Key.Down, ModifierKeys.Shift) })
+            {
+                canvas.FlyTo(docs, 0.9, animated: false);
+                Render(canvas);
+                canvas.Pointer.Click(TilePoint(canvas.ScreenRectOf(docs)!.Value, docs, 9));
+                var name = docs.Files[9].Name;
+                var gone = docs.PathOf(docs.Files[9]);
+                disk.Folder(SafetyDocs).Files.RemoveAll(file => file.Name == name);
+                await tree.RefreshAsync(docs);
+
+                // What the window does once the file is gone
+                // (ViewAllViewModel.ReleaseRemovedFocus): the file is let go,
+                // and only the focus moves, to its folder.
+                shared.Apply(new SelectionEdit { Removed = [gone], Source = SelectionSource.Command });
+                shared.Apply(new SelectionEdit { Focus = docs.FullPath, Source = SelectionSource.Command });
+                canvas.LoadSelection(shared);
+                Render(canvas);
+                canvas.HandleKey(key, modifiers);
+                var picked = shared.Paths.ToList();
+                var label = modifiers == ModifierKeys.Shift ? $"Shift+{key}" : key.ToString();
+                Check($"{label} after the focused file was deleted selects within its folder, never the folder or one beside it ({string.Join(", ", picked)})",
+                    picked.Count > 0 && picked.All(path => ItemSelection.ParentOf(path).Equals(docs.FullPath, StringComparison.OrdinalIgnoreCase)));
+            }
+        }
+        finally
+        {
+            canvas.Tree = null;
+        }
     }
 
     // ---- the loop letting go at rest (J006) -------------------------------------------------

@@ -140,6 +140,12 @@ public sealed partial class NestedCanvas
         }
 
         var active = ActiveTarget();
+        if (isArrow && FocusLeftByRemoval() is not null)
+        {
+            // No item to move from: the arrows start inside the folder (Neighbour).
+            active = null;
+        }
+
         switch (key)
         {
             case Key.Enter when active is { } target:
@@ -909,6 +915,26 @@ public sealed partial class NestedCanvas
     }
 
     /// <summary>
+    /// The folder the window moved the focus to when the item it was on went
+    /// - deleted, moved away - or null.  Only the focus moves there, onto the
+    /// folder the clicks and keys were last in: the folder is not selected,
+    /// and the anchor went with the item.  That folder is no item to move
+    /// from, but where the arrows start, as they did while the focus stayed
+    /// on the item that went: moved from as an item, Down went to the folder
+    /// beside it, and Shift+Down took the folder itself into a range for the
+    /// next Delete to recycle whole.
+    /// </summary>
+    private NestedFolder? FocusLeftByRemoval() =>
+        _selection.Active is { Folder: { } folder }
+        && _selection.Anchor is null
+        && ReferenceEquals(folder, _selection.CurrentFolder)
+        && !_selection.IsSelected(folder)
+        && !NestedTree.IsDetached(folder)
+        && NestedTree.IsOnCanvas(folder)
+            ? folder
+            : null;
+
+    /// <summary>
     /// The next folder or file in the direction of an arrow: sub-folders move
     /// over their parent's grid, files over their folder's.
     /// </summary>
@@ -930,11 +956,14 @@ public sealed partial class NestedCanvas
             // Nothing selected yet: start at the first folder in the one in
             // view, or its first file if it holds only files.  The focus on
             // an item that went - deleted, moved away - starts in the folder
-            // it was in instead, wherever the view is.
-            var start = active is null && _selection.Active is { Container: var left }
-                && !NestedTree.IsDetached(left) && NestedTree.IsOnCanvas(left)
-                ? left
-                : _anchor;
+            // it was in instead, wherever the view is; so does the focus the
+            // window moved to that folder once the item had gone.
+            var start = active is null && FocusLeftByRemoval() is { } emptied
+                ? emptied
+                : active is null && _selection.Active is { Container: var left }
+                    && !NestedTree.IsDetached(left) && NestedTree.IsOnCanvas(left)
+                    ? left
+                    : _anchor;
             if (start is not null)
             {
                 Ensure(start);
