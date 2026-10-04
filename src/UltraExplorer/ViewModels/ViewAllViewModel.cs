@@ -499,7 +499,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         var node = outcome.IsExact ? outcome.Node : null;
         if (node is null)
         {
-            if (open)
+            // Given way to on its way down, it stopped short of the row: not gone.
+            if (open && !outcome.Superseded)
             {
                 MessageRequested?.Invoke($"{Path.GetFileName(path)} could not be shown", true);
             }
@@ -1747,6 +1748,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 var lost = false;
                 foreach (var step in chain)
                 {
+                    // Given way to - Back twice on a slow share - it opens no
+                    // more folders on its way: they would only reflow the tree
+                    // under the navigation that came after it.
+                    if (select && node is not null && taken != LatestRevealOf(holder))
+                    {
+                        break;
+                    }
+
                     if (!_graph.TryGetNode(step, out var found))
                     {
                         // The step may simply be filtered out of its parent - hidden,
@@ -1787,11 +1796,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return default;
         }
 
-        // Superseded: the folders on the way are open and the node exists, but
-        // the selection, the view and the history belong to the navigation
-        // that came after.  Short of the path, with only the exact path
-        // wanted: the message above has said it is gone, and the selection
-        // stays where it was.
+        // Superseded: the folders on the way are open, as far as it got before
+        // it was given way to, and the node exists, but the selection, the
+        // view and the history belong to the navigation that came after.
+        // Short of the path, with only the exact path wanted: the message
+        // above has said it is gone, and the selection stays where it was.
         var superseded = taken != LatestRevealOf(holder) || selectionVersion is { } version && version != Selection.Version;
         var isExact = ViewAllPath.Equals(node.FullPath, normalized);
         var acts = !superseded && (isExact || !exact);

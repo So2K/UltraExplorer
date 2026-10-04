@@ -16,8 +16,9 @@ namespace ViewAllSmoke;
 /// its batched layers once, not once an item; a size changing in a folder the
 /// graph has never read does not have what was brought into it by name checked
 /// against the disk; a slow listing lets go only of what was selected when it
-/// began; and an item found gone is said to be gone once, and only once the
-/// disk says so, and the focus goes to its folder.
+/// began; an item found gone is said to be gone once, and only once the disk
+/// says so, and the focus goes to its folder; and a navigation on the tree
+/// canvas that has been given way to stops opening the folders on its way.
 /// </summary>
 internal static partial class Program
 {
@@ -32,6 +33,7 @@ internal static partial class Program
             await OnDispatcher(() => VmRound2HiddenGraphChangeAsync(root));
             await OnDispatcher(() => VmRound2SlowPruneAsync(root));
             await OnDispatcher(() => VmRound2GoneFocusAsync(root));
+            await OnDispatcher(() => VmRound2SupersededRevealAsync(root));
         }
         finally
         {
@@ -332,5 +334,66 @@ internal static partial class Program
         await Task.Delay(800);
         Check($"an item the disk cannot be asked about is not said to be gone ({string.Join(" | ", messages)})", NoLongerInside() == 0);
         Check("and stays selected", tree.Selection.Contains(unreadable));
+    }
+
+    // ---- J132: a navigation given way to on the tree canvas -------------------------------
+
+    private static async Task VmRound2SupersededRevealAsync(string root)
+    {
+        Section("view model round 2: a navigation on the tree canvas given way to");
+        var folder = Path.Combine(root, "superseded");
+        var scratch = Path.Combine(root, "superseded-state");
+        var a = Path.Combine(folder, "a");
+        var b = Path.Combine(a, "b");
+        var c = Path.Combine(b, "c");
+        var deep = Path.Combine(c, "d");
+        var other = Path.Combine(folder, "other");
+        var listed = Path.Combine(folder, "x", "y", "z", "row.ultraexplorer-round2");
+        var elsewhere = Path.Combine(folder, "elsewhere");
+        foreach (var path in new[] { deep, other, elsewhere, Path.GetDirectoryName(listed)!, scratch })
+        {
+            Directory.CreateDirectory(path);
+        }
+
+        foreach (var path in new[] { a, b, c })
+        {
+            for (var index = 0; index < 12; index++)
+            {
+                File.WriteAllText(Path.Combine(path, $"file-{index:D2}.txt"), "x");
+            }
+        }
+
+        File.WriteAllText(listed, "a row");
+
+        using var icons = new ShellIconService();
+        using var tree = NewTree(scratch, icons);
+        await tree.InitializeAsync(folder);
+        if (!tree.TryGetNode(folder, out var top))
+        {
+            Check("the folder is on the tree", false);
+            return;
+        }
+
+        await tree.ExpandAsync(top);
+        bool Open(string path) => tree.TryGetNode(path, out var found) && found.IsExpanded;
+
+        // Back, and Back again at once: the first is still reading its way down.
+        var first = tree.RevealAsync(deep, focus: false);
+        var second = tree.RevealAsync(other, focus: false);
+        var outcomes = await Task.WhenAll(first, second);
+        Check($"a navigation given way to stops opening the folders on its way (b open: {Open(b)}, c open: {Open(c)})",
+            outcomes[0].Superseded && !Open(b) && !Open(c));
+        Check("and the later one has the selection", !outcomes[1].Superseded && ViewAllPath.Equals(tree.ActivePath, other));
+
+        // A row opened from the list and given way to while it is found says
+        // nothing about it, as ever, and nothing is opened.
+        var messages = new List<string>();
+        tree.MessageRequested += (message, _) => messages.Add(message);
+        var activate = typeof(ViewAllViewModel).GetMethod("ActivateListItemAsync", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var opening = (Task)activate.Invoke(tree, [listed, true])!;
+        var away = tree.RevealAsync(elsewhere, focus: false);
+        await Task.WhenAll(opening, away);
+        Check($"a row given way to while it was found says nothing ({string.Join(" | ", messages)})", messages.Count == 0);
+        Check("and the later navigation has the selection", ViewAllPath.Equals(tree.ActivePath, elsewhere));
     }
 }
