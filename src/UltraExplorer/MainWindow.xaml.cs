@@ -1179,17 +1179,55 @@ public partial class MainWindow : Window
     private IDataObject? _dropData;
     private string[] _dropPaths = [];
     private Task<bool>? _pendingExternalDrop;
+    private bool _holdingExternalDrop;
 
-    bool INestedPaneHost.CompleteExternalDrop(Func<Task<bool>> beginTransfer)
-        => CompleteExternalDrop(beginTransfer);
+    bool INestedPaneHost.CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
+        => CompleteExternalDrop(data, paths, reported, beginTransfer);
 
-    private bool CompleteExternalDrop(Func<Task<bool>> beginTransfer)
+    /// <summary>
+    /// Runs a drop's transfer: true when the drop is to be reported as done.
+    /// A drop of files from the temporary folder holds its source until they
+    /// are copied; any other lets its source go at once (see
+    /// <see cref="ExternalFileDrop"/>).  A drop that would have to be held
+    /// while another is held is refused: its frame inside the first one's
+    /// would keep the first source blocked until the second ended.  Close
+    /// waits for every transfer still running.
+    /// </summary>
+    private bool CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
     {
-        if (_closeRequested || _pendingExternalDrop is not null) return false;
-        var transfer = beginTransfer();
-        _pendingExternalDrop = transfer;
-        try { return ExternalFileDrop.Complete(Dispatcher, transfer); }
-        finally { _pendingExternalDrop = null; }
+        if (_closeRequested) return false;
+        if (!ExternalFileDrop.MustHold(paths))
+        {
+            TrackExternalDrop(ExternalFileDrop.Continue(data, beginTransfer, reported));
+            return true;
+        }
+
+        if (_holdingExternalDrop) return false;
+        _holdingExternalDrop = true;
+        try { return ExternalFileDrop.Complete(Dispatcher, beginTransfer, TrackExternalDrop); }
+        finally { _holdingExternalDrop = false; }
+    }
+
+    /// <summary>Keeps a dropped transfer in what Close waits for until it has ended.</summary>
+    private void TrackExternalDrop(Task<bool> transfer)
+    {
+        var all = _pendingExternalDrop is { } earlier ? AfterBothAsync(earlier, transfer) : transfer;
+        _pendingExternalDrop = all;
+        _ = ForgetExternalDropAsync(all);
+    }
+
+    private async Task ForgetExternalDropAsync(Task<bool> all)
+    {
+        try { await all; }
+        catch (Exception) { /* The drop's own toast reports the failure. */ }
+        if (ReferenceEquals(_pendingExternalDrop, all)) _pendingExternalDrop = null;
+    }
+
+    private static async Task<bool> AfterBothAsync(Task<bool> first, Task<bool> second)
+    {
+        try { await first; }
+        catch (Exception) { /* Reported by its own drop. */ }
+        return await second;
     }
 
     /// <summary>The last folder the drag was over, and whether its items may not go in (see <see cref="IsDropRefused"/>).</summary>
@@ -1242,7 +1280,7 @@ public partial class MainWindow : Window
             var effect = DropEffectFor(e, paths, target.FullPath);
             if (effect == DragDropEffects.None) return;
 
-            if (CompleteExternalDrop(() => _viewModel.DropIntoPathWithResultAsync(
+            if (CompleteExternalDrop(e.Data, paths, ReportedDropEffect(effect), () => _viewModel.DropIntoPathWithResultAsync(
                     paths, target.FullPath, move: effect == DragDropEffects.Move)))
                 e.Effects = ReportedDropEffect(effect);
         }

@@ -94,9 +94,13 @@ internal interface INestedPaneHost
     /// <summary>The drag left or was dropped: what it carried is not kept for the next one.</summary>
     void ForgetDropPaths();
 
-    /// <summary>Keeps an OLE source's temporary files alive until transfer ends.</summary>
-    bool CompleteExternalDrop(Func<Task<bool>> beginTransfer)
-        => ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, beginTransfer());
+    /// <summary>
+    /// Runs a drop's transfer, keeping an OLE source's temporary files alive
+    /// until they are copied: true when the drop is reported as
+    /// <paramref name="reported"/>.
+    /// </summary>
+    bool CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
+        => ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, beginTransfer);
 }
 
 /// <summary>
@@ -1701,7 +1705,7 @@ internal sealed class NestedPane
             var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
             if (effect == DragDropEffects.None) return;
 
-            if (_host.CompleteExternalDrop(() => _viewModel.DropIntoPathWithResultAsync(
+            if (_host.CompleteExternalDrop(e.Data, paths, MainWindow.ReportedDropEffect(effect), () => _viewModel.DropIntoPathWithResultAsync(
                     paths, target.FullPath, move: effect == DragDropEffects.Move)))
                 e.Effects = MainWindow.ReportedDropEffect(effect);
         }

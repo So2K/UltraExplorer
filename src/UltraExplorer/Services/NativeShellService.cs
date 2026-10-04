@@ -268,7 +268,7 @@ public sealed class NativeShellService
 
         if (sourceArray.Length == 0 && beside.Length == 0)
         {
-            return Task.CompletedTask;
+            return Started(Task.CompletedTask);
         }
 
         ThrowIfAnyRoot([.. sourceArray, .. beside], move ? "moved" : "copied");
@@ -277,7 +277,7 @@ public sealed class NativeShellService
 
         // What asks the disk - each item still there, the target made - on
         // the operation's own thread (see OperationItemExists).
-        return RunStaAsync(() =>
+        return Started(RunStaAsync(() =>
         {
             var present = sourceArray.Where(OperationItemExists).ToArray();
             var presentBeside = beside.Where(OperationItemExists).ToArray();
@@ -296,8 +296,21 @@ public sealed class NativeShellService
             {
                 RunShellOperation(owner, FileOperation.Copy, presentBeside, targetDirectory, flags | FileOperationFlags.RenameOnCollision);
             }
-        });
+        }));
     }
+
+    /// <summary>
+    /// Set by a drop that holds its source program until the source's files
+    /// have been copied (see <see cref="ExternalFileDrop"/>), for the copy or
+    /// move <see cref="CopyOrMoveAsync"/> starts within that drop: handed the
+    /// Shell's operation, it lets the source go the moment the operation
+    /// ends - before the drop goes on to read the folders again - and hands
+    /// back what the drop then waits on.  Unset, the operation is waited on
+    /// as it is.
+    /// </summary>
+    internal static AsyncLocal<Func<Task, Task>?> CopyStarted { get; } = new();
+
+    private static Task Started(Task operation) => CopyStarted.Value is { } started ? started(operation) : operation;
 
     /// <summary>
     /// Deletes items as one operation of the Shell's own.  To the Recycle Bin,
