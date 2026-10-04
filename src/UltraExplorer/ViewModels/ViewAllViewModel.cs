@@ -2034,15 +2034,51 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Colours every path given - the selection's, which need not have nodes.</summary>
     public void ApplyAccent(IEnumerable<string> paths, string? accentHex)
     {
-        foreach (var path in paths)
+        BeginMarkBatch();
+        try
         {
-            bool? isDirectory = TryGetNode(path, out var node)
-                ? node.IsDirectory
-                : Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : null;
-            _marks.SetAccent(path, accentHex, isDirectory);
+            foreach (var path in paths)
+            {
+                bool? isDirectory = TryGetNode(path, out var node)
+                    ? node.IsDirectory
+                    : Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : null;
+                _marks.SetAccent(path, accentHex, isDirectory);
+            }
+        }
+        finally
+        {
+            EndMarkBatch();
         }
 
         ScheduleSave();
+    }
+
+    /// <summary>
+    /// How many batches of marks are being changed right now (see
+    /// <see cref="BeginMarkBatch"/>), and whether one of them has recoloured
+    /// a node of the graph.
+    /// </summary>
+    private int _markBatches;
+    private bool _markBatchRecoloured;
+
+    /// <summary>
+    /// Many marks about to change at once - a selection of thousands coloured
+    /// or cleared, a folder renamed with marks inside it.  Each node still
+    /// takes its colour as its mark changes, but the tree canvas's batched
+    /// layers, which are drawn again whole, are told once, after the last
+    /// (<see cref="EndMarkBatch"/>), rather than once a mark.
+    /// </summary>
+    private void BeginMarkBatch() => _markBatches++;
+
+    private void EndMarkBatch()
+    {
+        if (--_markBatches > 0 || !_markBatchRecoloured)
+        {
+            return;
+        }
+
+        _markBatchRecoloured = false;
+        InvalidateCanvas();
     }
 
     public void ApplyNote(ViewAllNodeViewModel node, string? note) => ApplyNote(node.FullPath, note);
@@ -2516,23 +2552,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             FollowRenameIn(kept, oldPath, newPath);
         }
 
-        foreach (var (path, mark) in _marks.Snapshot())
+        BeginMarkBatch();
+        try
         {
-            if (Renamed(path, oldPath, newPath) is not { } moved)
-            {
-                continue;
-            }
-
-            // The old name is let go of before the new one takes the mark.
-            // Marks are kept without regard to case, so after a rename that
-            // only changed the case - Photos to photos - the two names are one
-            // key, and clearing the old name last would clear the mark it had
-            // just been given.  This way round the mark also takes the new
-            // spelling.
-            _marks.SetAccent(path, null);
-            _marks.SetNote(path, null);
-            _marks.SetAccent(moved, mark.AccentHex, mark.IsDirectory);
-            _marks.SetNote(moved, mark.Note);
+            _marks.Move(oldPath, newPath);
+        }
+        finally
+        {
+            EndMarkBatch();
         }
     }
 
@@ -2934,7 +2961,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         node.Note = mark.Note;
 
         // Zoomed out the canvas is one cached geometry per colour, so a recolour
-        // is not visible until it is rebuilt.
+        // is not visible until it is rebuilt - once for a whole batch of marks.
+        if (_markBatches > 0)
+        {
+            _markBatchRecoloured = true;
+            return;
+        }
+
         InvalidateCanvas();
     }
 
