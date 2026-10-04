@@ -223,6 +223,15 @@ public partial class MainWindow : Window
                 Editor.ViewportZoom = _viewModel.Tree.RestoredViewportZoom;
                 Editor.ViewportLocation = _viewModel.Tree.RestoredViewportLocation;
             }
+            else if (_folderInitialPath is not null)
+            {
+                // A window opened for a folder - every Explorer-replacement
+                // window - has no saved view either, but its folder is on its
+                // way (ApplyFolderInvocationAsync) and the start has put the
+                // camera on it already.  Framing This PC here flew out from the
+                // folder, and the flight ran on until the folder landed and the
+                // view snapped back to it.
+            }
             else
             {
                 // First run: the profile branch is already open, so framing the
