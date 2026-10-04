@@ -310,6 +310,34 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         {
             missing++;
         }
+        else
+        {
+            // Too big for this tier: drawn from the nearest smaller field
+            // that has it.  A glyph first drawn at this tier's sizes had that
+            // one asked for by nothing, and stayed out for good; it is asked
+            // for here, and missing until it is made.
+            for (var lower = tier - 1; lower >= 0; lower--)
+            {
+                var lowSlot = SlotOf(face, glyph, lower);
+                if (lowSlot == Unavailable)
+                {
+                    continue;
+                }
+
+                if (lowSlot == Unknown)
+                {
+                    Request(face, glyph, lower);
+                    lowSlot = SlotOf(face, glyph, lower);
+                }
+
+                if (lowSlot == Pending)
+                {
+                    missing++;
+                }
+
+                break;
+            }
+        }
 
         // At an equal distance favour more detail over magnifying the
         // smaller field. Only the cold path checks neighbouring tiers.

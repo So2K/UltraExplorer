@@ -37,6 +37,7 @@ internal static partial class Program
             Round2IconRestChecks();
             Round2IconHoldWakeChecks();
             Round2IconTrimChecks();
+            Round2GlyphTierChecks(FaceRegistry.Shared);
         }
         catch (Exception ex)
         {
@@ -246,5 +247,61 @@ internal static partial class Program
         Console.WriteLine($"  copies of one program in {shared} file slot: 2,048 new copies took {below.TotalMilliseconds:F1} ms below the file limit, {past.Elapsed.TotalMilliseconds:F1} ms past it");
         Check("J119: past the file limit, copies of programs that share a slot cost what they cost below it",
             shared == 1 && past.Elapsed.TotalMilliseconds < below.TotalMilliseconds * 4 + 10);
+    }
+
+    // ---- J122: a glyph too big for the largest tier, first drawn large --------------------------
+
+    /// <summary>
+    /// A glyph wider than four em first drawn at 40 px: its 64 px field is
+    /// too big, and with no 32 px field asked for before, the atlas must ask
+    /// for that one rather than leave the glyph out for good.
+    /// </summary>
+    private static void Round2GlyphTierChecks(FaceRegistry faces)
+    {
+        var capture = new TextLayoutCapture(faces);
+        ShapedText? found = null;
+        var description = string.Empty;
+        foreach (var candidate in new[] { "\uFDFD", "\U0001242B", "\U00012219", "\U0001241D", "\uFDFA", "\u0BF5", "\uA9C1" })
+        {
+            var shaped = capture.Shape(candidate, FaceRegistry.Regular, "en-us");
+            if (shaped is not { Count: 1 })
+            {
+                continue;
+            }
+
+            var info = faces[shaped.Faces[0]];
+            var metrics = new Vortice.DirectWrite.GlyphMetrics[1];
+            info.Face.GetDesignGlyphMetrics([shaped.Glyphs[0]], metrics, false);
+            var inkWidth = ((int)metrics[0].AdvanceWidth - metrics[0].LeftSideBearing - metrics[0].RightSideBearing) / info.UnitsPerEm;
+            var inkHeight = ((int)metrics[0].AdvanceHeight - metrics[0].TopSideBearing - metrics[0].BottomSideBearing) / info.UnitsPerEm;
+            var side = Math.Max(inkWidth, inkHeight);
+            if (side * GlyphAtlas.Tiers[2].Em > GlyphRasterizer.MaximumSide + 2 && side * GlyphAtlas.Tiers[1].Em < GlyphRasterizer.MaximumSide - 8)
+            {
+                found = shaped;
+                description = $"U+{char.ConvertToUtf32(candidate, 0):X4} in {info.FamilyName}, {side:F2} em";
+                break;
+            }
+        }
+
+        if (found is null)
+        {
+            Console.WriteLine("  (no glyph between four and eight em found on this machine: skipped)");
+            return;
+        }
+
+        using var atlas = new GlyphAtlas(faces);
+        var quads = new List<int>();
+        var missing = new List<int>();
+        for (var emit = 0; emit < 3; emit++)
+        {
+            var sink = new TextGlyphCountingSink();
+            missing.Add(atlas.Emit(ref sink, found, found.Whole, 10, 80, 40, 0xFFFFFFFF, 0, snap: false));
+            quads.Add(sink.Quads);
+            atlas.WaitForPending(TimeSpan.FromSeconds(10));
+        }
+
+        Console.WriteLine($"  {description}, first drawn at 40 px: quads {string.Join(", ", quads)}, missing {string.Join(", ", missing)} over three frames");
+        Check("J122: a glyph too big for the 64 px tier, first drawn above 28 px, is drawn from the 32 px one and counted missing until then",
+            quads[^1] == 1 && missing[^1] == 0 && missing[1] > 0);
     }
 }
