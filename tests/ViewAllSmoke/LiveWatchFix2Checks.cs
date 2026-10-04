@@ -28,6 +28,7 @@ internal static partial class Program
         Section("live watch, round 2");
         RunOnSta("a deleted subtree's gone folders", Fix2GoneIndexChecks);
         RunOnSta("a subtree deleted and made anew", Fix2RemadeSubtreeChecks);
+        RunOnSta("a folder deleted with its contents", Fix2GoneWithContentsChecks);
         return Task.CompletedTask;
     }
 
@@ -246,5 +247,70 @@ internal static partial class Program
         {
             TryDelete(baseDirectory);
         }
+    }
+
+    /// <summary>
+    /// Shift+Del, or rm -rf, of a folder on screen: it hears its contents go
+    /// and its own path go in one change.  Read for its contents, it failed
+    /// and was drawn as a red cell saying it no longer exists until its
+    /// parent's listing took it off (J090).
+    /// </summary>
+    private static async Task Fix2GoneWithContentsChecks()
+    {
+        var disk = new FakeDisk();
+        disk.AddFiles(@"Q:\del\P\X", 5, "x");
+        disk.Folder(@"Q:\del\P\Y");
+        using var tree = new NestedTree(disk.Read);
+        tree.SetRoots([new NestedRoot(@"Q:\del", "Q", NestedFolderKind.Drive)]);
+        var top = tree.Root.Children.Single();
+        await tree.LoadAsync(top);
+        var parent = NestedTree.FindChild(top, "P")!;
+        await tree.LoadAsync(parent);
+        var gone = NestedTree.FindChild(parent, "X")!;
+        await tree.LoadAsync(gone);
+
+        void Draw()
+        {
+            tree.BeginFrame();
+            tree.Request(parent, 900);
+            if (!NestedTree.IsDetached(gone))
+            {
+                tree.Request(gone, 400);
+            }
+        }
+
+        for (var frame = 0; frame <= NestedTree.ExpireAfterFrames; frame++)
+        {
+            Draw();
+        }
+
+        // The parent's listing takes its moment, as a real one does: a read
+        // of the folder itself, failing at once, is applied before it.
+        disk.Hook = (path, _) =>
+        {
+            if (path.Equals(@"Q:\del\P", StringComparison.OrdinalIgnoreCase))
+            {
+                Thread.Sleep(150);
+            }
+
+            return null;
+        };
+        disk.Remove(@"Q:\del\P\X");
+        var rereads = tree.LiveRereadsAsked;
+        tree.OnFolderChanged(gone, new FolderChange(gone.FullPath, ChangeKinds.Structural | ChangeKinds.Gone, Stopwatch.GetTimestamp(), default, default));
+        var asked = tree.LiveRereadsAsked - rereads;
+        var failedSeen = false;
+        var clock = Stopwatch.StartNew();
+        while (clock.ElapsedMilliseconds < 3_000 && !NestedTree.IsDetached(gone))
+        {
+            Draw();
+            failedSeen |= gone.LoadState == NestedLoadState.Failed;
+            await Task.Delay(4);
+        }
+
+        failedSeen |= gone.LoadState == NestedLoadState.Failed;
+        Check($"a folder on screen deleted with its contents is not read for them ({asked} reads asked)", asked == 0);
+        Check($"and leaves the canvas without ever being drawn as no longer existing (failed seen: {failedSeen})",
+            NestedTree.IsDetached(gone) && !failedSeen);
     }
 }

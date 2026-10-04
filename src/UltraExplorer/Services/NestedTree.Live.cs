@@ -334,8 +334,9 @@ public sealed partial class NestedTree : IChangeSink
     /// screen - its parent's own change would be read only if the parent's
     /// cell were drawn, and a cell bigger than the view never is - and a
     /// look at whether its name is a folder's again, which has it read
-    /// again if so.  Gone with a folder above it, nothing at all: that
-    /// folder's own change does it;</item>
+    /// again if so.  The folder itself is never read for it, whatever went
+    /// on inside it as it went: a read would only fail.  Gone with a folder
+    /// above it, nothing at all: that folder's own change does it;</item>
     /// <item>files grew or were written to, and the hub knows their new sizes
     /// and times: those are put into the listing as they are, with no read;</item>
     /// <item>only a sub-folder's own date moved: nothing, unless the folders
@@ -390,6 +391,13 @@ public sealed partial class NestedTree : IChangeSink
                 {
                     _ = CheckNameTakenAsync(folder);
                 }
+
+                // Deleted with what was in it - Shift+Del, rm -rf - the folder
+                // hears its contents go too, and read for that it would only
+                // fail, and be drawn as a red cell saying it no longer exists
+                // until its parent's listing takes it off.  A folder made anew
+                // under its name is caught above.
+                return;
             }
 
             if ((kinds & ~(ChangeKinds.Gone | ChangeKinds.AncestorGone)) == 0)
