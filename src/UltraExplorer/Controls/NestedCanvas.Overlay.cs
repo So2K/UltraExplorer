@@ -1159,7 +1159,11 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// The folders the view is inside whose names have scrolled off the top:
     /// deep in, every visible cell belongs to something whose title is far
-    /// above the screen, and this says what.
+    /// above the screen, and this says what.  A title more than half above
+    /// the top edge is off the screen too: its name is cut off there.  A
+    /// folder opened in a parent that holds little else lands with the
+    /// parent's title across the edge, and the parent's name was nowhere -
+    /// neither readable on its title nor in the trail.
     /// </summary>
     private void DrawTrail(DrawingContext dc)
     {
@@ -1175,7 +1179,7 @@ public sealed partial class NestedCanvas
         var probe = new Point(_viewWidth / 2, Math.Min(_viewHeight / 2, 80));
         while (true)
         {
-            if (y + w * NestedLayout.HeaderHeight < 0 && !folder.IsComputer)
+            if (y + w * NestedLayout.HeaderHeight / 2 < 0 && !folder.IsComputer)
             {
                 trail.Add(folder);
             }
@@ -1205,7 +1209,7 @@ public sealed partial class NestedCanvas
                 (x, y, w) = (x + child.OffsetX * w, y + child.OffsetY * w, w * child.Scale);
             }
 
-            if (y + w * NestedLayout.HeaderHeight >= 0)
+            if (y + w * NestedLayout.HeaderHeight / 2 >= 0)
             {
                 break;
             }
@@ -1281,6 +1285,9 @@ public sealed partial class NestedCanvas
     }
 
     private readonly List<NestedFolder> _trail = [];
+
+    /// <summary>For tests: the folders the last picture of the marks named in the trail, outermost first.</summary>
+    internal IReadOnlyList<NestedFolder> TrailForTests => _trail;
     private readonly List<NestedFolder?> _trailShown = [];
     private readonly List<(NestedFolder? Folder, string? Name)> _trailKey = [];
     private readonly List<Hotspot> _trailHotspots = [];
