@@ -398,6 +398,21 @@ internal sealed class NativeDialogAutomation : IDisposable
             throw new IOException("The application did not accept the selected name.");
     }
 
+    /// <summary>
+    /// Before the answer is handed back, while the original is still hidden
+    /// under the picker: the answer's file type chosen, and the dialog's
+    /// controls looked at once more - fields the application added for that
+    /// type (metadata) leave the dialog with Windows. Done here, not in
+    /// <see cref="Submit"/>, so that the dialog back on screen is not kept
+    /// waiting for a walk of its controls, nor the answer lost to one.
+    /// </summary>
+    public void PrepareSubmit(FileDialogResult result)
+    {
+        RequireOwnedMutation();
+        ApplyFilter(result.FileTypeIndex);
+        RefreshChrome();
+    }
+
     public void Submit(FileDialogResult result)
     {
         RequireOwnedMutation();
@@ -405,7 +420,6 @@ internal sealed class NativeDialogAutomation : IDisposable
         // click in a directory with thousands of items, while the native
         // dialog is already back on screen waiting to receive its result.
         ApplyFilter(result.FileTypeIndex);
-        RefreshChrome();
         SetName(NativeDialogRules.TypedResult(result));
         RequireOwnedMutation();
         DialogNative.Click(_handle, 1);

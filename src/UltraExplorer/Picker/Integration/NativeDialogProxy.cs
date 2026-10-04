@@ -216,6 +216,10 @@ internal sealed class NativeDialogProxy
             if (!DialogLease.BelongsToWindow(_lease.Record)) return;
             await _pending.WaitAsync(TimeSpan.FromSeconds(8));
             if (_fallback || !DialogLease.BelongsToWindow(_lease.Record)) return;
+            if (result.Accepted)
+                await FromDialogAsync(_thread.Run(() => { _automation!.PrepareSubmit(result); return true; }).WaitAsync(TimeSpan.FromSeconds(4)),
+                    "the answer could not be handed to its dialog");
+            if (_fallback || !DialogLease.BelongsToWindow(_lease.Record)) return;
             // The original window is visible before the application can open
             // any overwrite/sharing/custom warning. Native validation is final.
             _lease.Restore(true);
