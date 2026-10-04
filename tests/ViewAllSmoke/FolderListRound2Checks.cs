@@ -34,6 +34,7 @@ internal static partial class Program
         RunOnSta("list leaves a folder found gone as it is read", ListGoneOnReadAsync);
         RunOnSta("list leaves a deleted folder, end to end", ListGoneEndToEndAsync);
         RunOnSta("list icons past the first rows", ListIconsPastBudgetAsync);
+        RunOnSta("list while the next folder is read", ListLoadingAsync);
         RunOnSta("list filter in a folder that could not be read", ListFilterKeepsFailureAsync);
         return Task.CompletedTask;
     }
@@ -229,6 +230,78 @@ internal static partial class Program
         movedImage.SetBinding(Image.SourceProperty, new Binding(nameof(FolderListItem.Icon)));
         var resorted = await LiveWait(() => movedImage.Source is not null, 2_000);
         Check($"after another order, a row shown far down still gets its icon ({resorted} ms)", resorted >= 0);
+    }
+
+    /// <summary>
+    /// J027: while the next folder was read, the list kept the folder
+    /// before's rows and count under the next one's name - for seconds on a
+    /// slow share - and Enter, a double-click or a click acted on those rows.
+    /// A moment into a read that is taking its time, the rows go and the
+    /// list says it is loading; a row of the folder before is not acted on.
+    /// Reading the same folder again keeps its rows where they are.
+    /// </summary>
+    private static async Task ListLoadingAsync()
+    {
+        Section("folder list round 2: the next folder being read");
+        var before = Path.Combine(Path.GetTempPath(), "UltraExplorerListBefore");
+        var next = Path.Combine(Path.GetTempPath(), "UltraExplorerListNext");
+        using var icons = new ShellIconService();
+        TaskCompletionSource<ViewAllDirectorySnapshot>? gate = null;
+        var activated = new List<string>();
+        var list = new FolderListViewModel(
+            (path, _, _) => ViewAllPath.Equals(path, next) && gate is { } slow
+                ? slow.Task
+                : Task.FromResult(ViewAllPath.Equals(path, next)
+                    ? ReviewSnapshot(path, false, "n1.txt", "n2.txt")
+                    : ReviewSnapshot(path, false, "b1.txt", "b2.txt", "b3.txt")),
+            (path, _) => { activated.Add(path); return Task.CompletedTask; },
+            _ => false,
+            icons) { IsVisible = true };
+
+        await list.NavigateAsync(before);
+        activated.Clear();
+        var old = list.Items[0];
+        gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var going = list.NavigateAsync(next);
+        list.RevealCommand.Execute(old);
+        list.ActivateCommand.Execute(old);
+        list.OpenFirstMatchCommand.Execute(null);
+        await Task.Delay(20);
+        Check($"a row of the folder before, clicked, opened or entered while the next is read, is not acted on ({activated.Count} acted on)",
+            activated.Count == 0);
+
+        var cleared = await LiveWait(() => list.Items.Count == 0, 1_500);
+        Check($"a moment into a slow read, the rows of the folder before go ({cleared} ms, {list.Items.Count} rows left)", cleared is >= 0 and < 1_000);
+        Check($"with no count, and the list says it is loading ({list.CountText}|{list.EmptyText})",
+            list.CountText.Length == 0 && list.EmptyText == "Loading…");
+        list.Filter = "n";
+        Check($"a filter typed meanwhile still says it is loading ({list.EmptyText})", list.EmptyText == "Loading…");
+        list.Filter = string.Empty;
+
+        gate.SetResult(ReviewSnapshot(next, false, "n1.txt", "n2.txt"));
+        await going;
+        Check($"the read in, its rows are shown ({list.Items.Count}, {list.CountText}, {list.EmptyText})",
+            list.Items.Count == 2 && list.CountText == "2" && list.EmptyText.Length == 0);
+        Check("and the list's own step took the canvas there", activated.Count == 1 && ViewAllPath.Equals(activated[0], next));
+
+        // The same folder read again - F5, a change - keeps its rows meanwhile.
+        var kept = list.Items[0];
+        gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        var again = list.ReloadAsync();
+        await Task.Delay(400);
+        Check($"the same folder read again keeps its rows while it is read ({list.Items.Count}, {list.EmptyText})",
+            list.Items.Count == 2 && ReferenceEquals(list.Items[0], kept) && list.EmptyText.Length == 0);
+        activated.Clear();
+        list.RevealCommand.Execute(kept);
+        Check("and they can be clicked meanwhile", activated.Count == 1);
+        gate.SetResult(ReviewSnapshot(next, false, "n1.txt", "n2.txt"));
+        await again;
+
+        // A read that answers at once never shows the loading state.
+        gate = null;
+        await list.NavigateAsync(before);
+        Check($"a folder read at once shows its rows with no loading state ({list.Items.Count}, {list.EmptyText})",
+            list.Items.Count == 3 && list.EmptyText.Length == 0);
     }
 
     /// <summary>

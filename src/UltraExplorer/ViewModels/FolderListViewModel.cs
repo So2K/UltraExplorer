@@ -51,6 +51,11 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>How long after a read for a change failed, its folder still there, it is tried the once more (see <see cref="LeaveGoneFolderAsync"/>).</summary>
     private static readonly TimeSpan UnreadableRetryTime = TimeSpan.FromSeconds(1);
 
+    /// <summary>How long the next folder's read may take before the rows of the folder before give way to <see cref="LoadingText"/>.</summary>
+    private static readonly TimeSpan LoadingDelay = TimeSpan.FromMilliseconds(150);
+
+    private const string LoadingText = "Loading…";
+
     private readonly Func<string, ItemSort, CancellationToken, Task<ViewAllDirectorySnapshot>> _read;
     private readonly Func<string, bool, Task> _activate;
     private readonly Func<string, bool> _isOnCanvas;
@@ -70,6 +75,13 @@ public sealed class FolderListViewModel : ObservableObject
 
     private string _folderPath = string.Empty;
     private long _folderVersion;
+
+    /// <summary>
+    /// The <see cref="_folderVersion"/> whose read the rows shown - or the
+    /// reason there are none - came from: behind it while the next folder is
+    /// read, when the rows are still the folder before's.
+    /// </summary>
+    private long _rowsVersion;
     private string _title = "No folder";
     private string _countText = string.Empty;
     private string _filter = string.Empty;
@@ -825,7 +837,13 @@ public sealed class FolderListViewModel : ObservableObject
         try
         {
             var sort = _sort;
-            var snapshot = await _read(FolderPath, sort, cancellation.Token);
+            var reading = _read(FolderPath, sort, cancellation.Token);
+            if (!reading.IsCompleted && _rowsVersion != _folderVersion)
+            {
+                _ = ShowLoadingLaterAsync(cancellation);
+            }
+
+            var snapshot = await reading;
             if (cancellation.IsCancellationRequested)
             {
                 return;
@@ -835,6 +853,7 @@ public sealed class FolderListViewModel : ObservableObject
             _staleWhileHidden = false;
             _unreadableRetried = false;
             _noRowsText = null;
+            _rowsVersion = _folderVersion;
 
             _all.Clear();
             foreach (var entry in snapshot.Entries)
@@ -865,6 +884,7 @@ public sealed class FolderListViewModel : ObservableObject
             // An overtaken provider can fail after the new folder succeeded.
             // Its error must not erase that folder or its current status.
             if (cancellation.IsCancellationRequested || !ReferenceEquals(_load, cancellation)) return;
+            _rowsVersion = _folderVersion;
             _all.Clear();
             _byPath.Clear();
             ReplaceRows([]);
@@ -898,6 +918,28 @@ public sealed class FolderListViewModel : ObservableObject
         if (_liveAgain && _load is null && !_liveReading)
         {
             _ = RefreshLiveAsync();
+        }
+    }
+
+    /// <summary>
+    /// The rows shown are another folder's, and this one's read is taking its
+    /// time - a share, a folder of thousands.  A moment from now, still under
+    /// way, it takes them away and the list says it is loading, rather than
+    /// show the folder before under this one's name, its rows and count
+    /// passing for this folder's and answering Enter and a double-click as if
+    /// they were.  Only on a thread that can be come back to - the window's.
+    /// </summary>
+    private async Task ShowLoadingLaterAsync(CancellationTokenSource load)
+    {
+        if (SynchronizationContext.Current is null)
+        {
+            return;
+        }
+
+        await Task.Delay(LoadingDelay);
+        if (ReferenceEquals(_load, load) && _rowsVersion != _folderVersion)
+        {
+            ShowEmpty(LoadingText);
         }
     }
 
@@ -1024,7 +1066,16 @@ public sealed class FolderListViewModel : ObservableObject
     }
 
     private Task Activate(FolderListItem? item, bool open)
-        => item is null ? Task.CompletedTask : ActivateOwn(item.FullPath, open);
+        => item is null || IsLeftOver(item) ? Task.CompletedTask : ActivateOwn(item.FullPath, open);
+
+    /// <summary>
+    /// A row of the folder before, still shown while the list's own folder is
+    /// read: it is not in the folder the list's name says, and a click, Enter
+    /// or a double-click on it is not meant for what it would act on.  An
+    /// item handed in from elsewhere, not one of the rows shown, is not one.
+    /// </summary>
+    private bool IsLeftOver(FolderListItem item) =>
+        _rowsVersion != _folderVersion && ReferenceEquals(RowFor(item.FullPath), item);
 
     // ---- changes on disk ---------------------------------------------------------
 
@@ -1262,6 +1313,7 @@ public sealed class FolderListViewModel : ObservableObject
         LiveMerges++;
         _readSort = sort;
         _noRowsText = null;
+        _rowsVersion = _folderVersion;
         var previous = new Dictionary<string, FolderListItem>(_all.Count, StringComparer.OrdinalIgnoreCase);
         foreach (var item in _all)
         {
