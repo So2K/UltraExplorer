@@ -1556,12 +1556,17 @@ public sealed partial class NestedCanvas
         }
         else if (folder.Children.Count == 0 && folder.Files.Count == 0)
         {
-            message = folder.FileCount switch
-            {
-                0 => "Empty folder",
-                1 => "1 hidden file",
-                _ => NoteText(HiddenFilesNote, folder.FileCount)
-            };
+            // With a file type chosen - a dialog's "Images" - the files a
+            // folder would show are left out for not being of it, not for
+            // being hidden: a folder of documents said "37 hidden files".
+            message = _tree?.FileNameFilter is not null && FilesBehindLayer(folder) is > 0 and var other
+                ? NoteText(OtherTypeNote, other)
+                : folder.FileCount switch
+                {
+                    0 => "Empty folder",
+                    1 => "1 hidden file",
+                    _ => NoteText(HiddenFilesNote, folder.FileCount)
+                };
         }
         else if (folder.UnlistedFileCount > 0 && Shows(CanvasLayer.Files))
         {
@@ -1597,6 +1602,7 @@ public sealed partial class NestedCanvas
     private const int UnlistedFilesNote = 2;
     private const int TruncatedNote = 3;
     private const int FilesNote = 4;
+    private const int OtherTypeNote = 5;
 
     /// <summary>The files the files layer keeps off a folder: every one it counted, less the hidden ones while hidden items are not shown.</summary>
     private int FilesBehindLayer(NestedFolder folder) =>
@@ -1619,6 +1625,7 @@ public sealed partial class NestedCanvas
             HiddenFilesNote => $"{count:N0} hidden files",
             UnlistedFilesNote => $"{count:N0} more files are not drawn",
             FilesNote => $"{count:N0} files",
+            OtherTypeNote => $"No files of this type ({count:N0})",
             _ => $"Only the first {count:N0} folders are shown"
         });
     }
@@ -1665,8 +1672,11 @@ public sealed partial class NestedCanvas
             return string.Empty;
         }
 
+        // With a file type chosen, the files a title counts are the ones of
+        // that type the folder shows; with every type, all it holds, shown
+        // or hidden.
         var folders = folder.Children.Count;
-        var files = folder.FileCount;
+        var files = _tree?.FileNameFilter is not null && folder.PlacedShowFiles ? folder.Files.Count : folder.FileCount;
         if (folders == 0 && files == 0)
         {
             return string.Empty;

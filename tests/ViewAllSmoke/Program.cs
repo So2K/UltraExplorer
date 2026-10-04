@@ -182,6 +182,7 @@ internal static partial class Program
         await Group(FilterTileMatchChecks);
         await Group(FilterRereadChecks);
         await Group(FilterStepChecks);
+        await Group(TypeFilterNoteChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.
