@@ -1353,6 +1353,7 @@ public sealed class ViewAllGraphService : IDisposable
                 // node the next path needs.  Taken as the lists stand now: a
                 // refresh that starts meanwhile adds to them, and restores what
                 // it added itself.
+                var adoptedAny = false;
                 foreach (var path in previouslyExpanded
                              .Union(named, StringComparer.OrdinalIgnoreCase)
                              .OrderBy(PathDepth)
@@ -1367,18 +1368,29 @@ public sealed class ViewAllGraphService : IDisposable
                         // and only if it is still on the disk.
                         if (!named.Contains(path)
                             || !TryGetNode(Path.GetDirectoryName(path) ?? string.Empty, out var folder)
-                            || await AdoptChildAsync(folder, path, cancellationToken) is not { } adopted)
+                            || await AdoptChildAsync(folder, path, cancellationToken, announce: false) is not { } adopted)
                         {
                             continue;
                         }
 
                         restored = adopted;
+                        adoptedAny = true;
                     }
 
                     if (!restored.IsExpanded && previouslyExpanded.Contains(path))
                     {
                         await ExpandAsync(restored, cancellationToken, pagedTo.GetValueOrDefault(path));
                     }
+                }
+
+                // What was brought back by name is announced once, not once
+                // each: a folder hundreds had been asked for in by name raised
+                // as many graph changes, each after a pass over every link.
+                if (adoptedAny)
+                {
+                    Reflow();
+                    UpdateEdgeVisibility();
+                    GraphChanged?.Invoke(this, EventArgs.Empty);
                 }
             }
 
@@ -1419,10 +1431,22 @@ public sealed class ViewAllGraphService : IDisposable
     /// type filters away.  Naming something is a stronger statement than any
     /// display rule, which is how the address bar has always behaved.
     /// </summary>
-    public async Task<ViewAllNodeViewModel?> AdoptChildAsync(
+    public Task<ViewAllNodeViewModel?> AdoptChildAsync(
         ViewAllNodeViewModel parent,
         string childPath,
         CancellationToken cancellationToken = default)
+        => AdoptChildAsync(parent, childPath, cancellationToken, announce: true);
+
+    /// <param name="announce">
+    /// False to leave the layout pass, the links and the announcement to the
+    /// caller, who brings many back at once and announces them together (see
+    /// <see cref="RefreshBranchAsync"/>).
+    /// </param>
+    private async Task<ViewAllNodeViewModel?> AdoptChildAsync(
+        ViewAllNodeViewModel parent,
+        string childPath,
+        CancellationToken cancellationToken,
+        bool announce)
     {
         ThrowIfDisposed();
         if (!parent.IsDirectory)
@@ -1510,9 +1534,13 @@ public sealed class ViewAllGraphService : IDisposable
         _edges.Add(edge);
         _incomingEdges[child.Id] = edge;
         parent.NotifyChildrenChanged();
-        Reflow();
-        UpdateEdgeVisibility();
-        GraphChanged?.Invoke(this, EventArgs.Empty);
+        if (announce)
+        {
+            Reflow();
+            UpdateEdgeVisibility();
+            GraphChanged?.Invoke(this, EventArgs.Empty);
+        }
+
         return child;
     }
 

@@ -28,6 +28,7 @@ internal static partial class Program
             RunOnSta("graph review: a closed folder read again", () => GraphClosedRefreshChecksAsync(root));
             RunOnSta("graph review: hidden folders above the selection", () => GraphHiddenAncestorChecksAsync(root));
             RunOnSta("graph review: a refresh that cannot read its folder", () => GraphUnreadableRefreshChecksAsync(root));
+            RunOnSta("graph review: what was asked for by name, brought back", () => GraphNamedBatchChecksAsync(root));
         }
         finally
         {
@@ -424,5 +425,46 @@ internal static partial class Program
             && graph.TryGetNode(sub, out var subAgain) && subAgain.IsExpanded
             && graph.TryGetNode(deep, out var deepAgain) && deepAgain.IsExpanded
             && graph.TryGetNode(leafPath, out var leafAgain) && leafAgain.IsTreeVisible);
+    }
+
+    // ---- J133: what was asked for by name, brought back by a refresh --------------------------
+
+    /// <summary>
+    /// A folder in which many items were asked for by name that its listing
+    /// leaves out - hidden files, with hidden items off: a refresh brought each
+    /// back on its own, each with a pass over every link and an announcement
+    /// of its own.  They are announced together now, and all come back.
+    /// </summary>
+    private static async Task GraphNamedBatchChecksAsync(string root)
+    {
+        Section("graph review: what was asked for by name is brought back by a refresh in one announcement (J133)");
+        const int count = 200;
+        var folder = Path.Combine(root, "named-many");
+        Directory.CreateDirectory(folder);
+        File.WriteAllText(Path.Combine(folder, "shown.txt"), "x");
+        var names = new List<string>(count);
+        for (var index = 0; index < count; index++)
+        {
+            var path = Path.Combine(folder, $"h{index:D3}.txt");
+            File.WriteAllText(path, "x");
+            File.SetAttributes(path, File.GetAttributes(path) | FileAttributes.Hidden);
+            names.Add(path);
+        }
+
+        using var graph = new ViewAllGraphService(new ViewAllGraphOptions(IncludeHidden: false));
+        var node = (await graph.AddRootAsync(folder))!;
+        await graph.ExpandAsync(node);
+        foreach (var path in names)
+        {
+            await graph.AdoptChildAsync(node, path);
+        }
+
+        var changes = 0;
+        graph.GraphChanged += (_, _) => changes++;
+        var watch = Stopwatch.StartNew();
+        await graph.RefreshBranchAsync(node);
+        Console.WriteLine($"  note  refresh with {count} asked for by name: {watch.ElapsedMilliseconds} ms, {changes} graph changes");
+        Check($"every one of the {count} is back, on the tree", names.All(path => graph.TryGetNode(path, out var back) && back.IsTreeVisible));
+        Check($"announced together, not one by one ({changes} graph changes for {count})", changes <= 3);
     }
 }
