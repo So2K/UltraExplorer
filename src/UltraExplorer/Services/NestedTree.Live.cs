@@ -341,7 +341,8 @@ public sealed partial class NestedTree : IChangeSink
     /// and times: those are put into the listing as they are, with no read;</item>
     /// <item>only a sub-folder's own date moved: nothing, unless the folders
     /// are ordered by date, or the sub-folder was hidden or shown by its
-    /// attributes, when that is a change like any other;</item>
+    /// attributes - or more sub-folders moved than the change could list,
+    /// any of which may have been - when that is a change like any other;</item>
     /// <item>anything else: the folder is marked out of date, and if it was
     /// drawn in the last few frames it is queued to be read again at once, at
     /// the priority its size on screen gives it.  It is drawn as it was until
@@ -417,9 +418,11 @@ public sealed partial class NestedTree : IChangeSink
         // when a sub-folder's own date moved in the same change and the
         // folder is ordered by date, which only a read puts right.  A
         // sub-folder hidden or shown by its attributes comes as its date
-        // moving, and only a read puts it in or takes it out.
+        // moving, and only a read puts it in or takes it out - and when more
+        // moved than the change could list, attrib +h * /d on a dozen, which
+        // did cannot be told without one.
         var structural = (kinds & ChangeKinds.Structural) != 0
-            || (kinds & ChangeKinds.DirDate) != 0 && HiddenChanged(folder, change.Folders.Span);
+            || (kinds & ChangeKinds.DirDate) != 0 && (change.FoldersIncomplete || HiddenChanged(folder, change.Folders.Span));
         var byDate = SortOf(folder).Column == SortColumn.Modified;
         if (!structural && (kinds & ChangeKinds.Content) != 0 && ((kinds & ChangeKinds.DirDate) == 0 || !byDate)
             && TryPatchFiles(folder, change.Files.Span))

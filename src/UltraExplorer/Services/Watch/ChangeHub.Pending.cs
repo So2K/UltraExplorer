@@ -647,7 +647,8 @@ public sealed partial class ChangeHub
                 change.Renames is { } renames ? renames.AsMemory(0, change.RenameCount) : default,
                 change.Files is { } files && !change.FilesIncomplete ? files.AsMemory(0, change.FileCount) : default)
             {
-                Folders = change.Folders is { } folders && !change.FoldersIncomplete ? folders.AsMemory(0, change.FolderCount) : default
+                Folders = change.Folders is { } folders && !change.FoldersIncomplete ? folders.AsMemory(0, change.FolderCount) : default,
+                FoldersIncomplete = change.FoldersIncomplete
             };
             if (interest is not null && change.IsNetwork && (change.Kinds & ChangeKinds.Gone) == 0)
             {

@@ -114,6 +114,14 @@ public readonly struct FolderChange(string key, ChangeKinds kinds, long firstTic
     /// compares the attributes with what it has.
     /// </summary>
     public ReadOnlyMemory<FileDelta> Folders { get; init; }
+
+    /// <summary>
+    /// More sub-folders' own entries changed than <see cref="Folders"/> lists,
+    /// which is then empty: whether any of them was hidden or shown - attrib
+    /// +h * /d, the Hidden box on a dozen at once - cannot be told from the
+    /// change, and a consumer that shows hidden folders apart reads the folder.
+    /// </summary>
+    public bool FoldersIncomplete { get; init; }
 }
 
 /// <summary>

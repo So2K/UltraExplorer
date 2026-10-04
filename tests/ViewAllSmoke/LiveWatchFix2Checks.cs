@@ -30,6 +30,7 @@ internal static partial class Program
         RunOnSta("a subtree deleted and made anew", Fix2RemadeSubtreeChecks);
         RunOnSta("a folder deleted with its contents", Fix2GoneWithContentsChecks);
         RunOnSta("an order below a folder never listed", Fix2PartialRenameOrderChecks);
+        RunOnSta("a dozen sub-folders hidden at once", Fix2ManyHiddenChecks);
         return Task.CompletedTask;
     }
 
@@ -354,6 +355,66 @@ internal static partial class Program
         finally
         {
             TryDelete(baseDirectory);
+        }
+    }
+
+    /// <summary>
+    /// attrib +h * /d, or the Hidden box on a dozen folders at once: each
+    /// is told only as its own date moving, and past eight the change lists
+    /// none of them - so none was seen to be hidden, and the canvas showed
+    /// all of them as before (J044).
+    /// </summary>
+    private static async Task Fix2ManyHiddenChecks()
+    {
+        foreach (var count in new[] { 1, 11 })
+        {
+            var disk = new FakeDisk();
+            for (var index = 0; index < count; index++)
+            {
+                disk.Folder($@"Q:\hid\P\f{index:D2}");
+            }
+
+            var time = new ManualTime();
+            using var hub = new ChangeHub(time);
+            var watch = hub.AddRootForTests(@"Q:\hid", arm: false);
+            using var tree = new NestedTree(disk.Read);
+            tree.Changes = hub;
+            tree.SetRoots([new NestedRoot(@"Q:\hid", "Q", NestedFolderKind.Drive)]);
+            var top = tree.Root.Children.Single();
+            await tree.LoadAsync(top);
+            var parent = NestedTree.FindChild(top, "P")!;
+            await tree.LoadAsync(parent);
+
+            void Draw()
+            {
+                tree.BeginFrame();
+                tree.Request(parent, 900);
+            }
+
+            for (var frame = 0; frame <= NestedTree.ExpireAfterFrames; frame++)
+            {
+                Draw();
+            }
+
+            var records = new List<(int, string, long, uint)>();
+            for (var index = 0; index < count; index++)
+            {
+                disk.Folder($@"Q:\hid\P\f{index:D2}").IsHidden = true;
+                records.Add((3, $@"P\f{index:D2}", 0, 0x10 | 0x2));
+            }
+
+            hub.FeedForTests(watch, NotifyRecords(true, [.. records]), details: true);
+            time.Advance(3_000);
+            DrainHub(hub, tree);
+            var clock = Stopwatch.StartNew();
+            int Hidden() => parent.AllChildren.Count(child => child.IsHidden);
+            while (clock.ElapsedMilliseconds < 3_000 && Hidden() < count)
+            {
+                Draw();
+                await Task.Delay(8);
+            }
+
+            Check($"{count} sub-folder{(count == 1 ? string.Empty : "s")} hidden at once {(count == 1 ? "is" : "are")} hidden on the canvas ({Hidden()} of {count})", Hidden() == count);
         }
     }
 }
