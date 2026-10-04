@@ -338,7 +338,10 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     private Hotspot? _pressHotspot;
 
     private NestedHit? _hover;
-    private Point _hoverPoint;
+
+    /// <summary>Where the pointer rests over the canvas; not a number while it is elsewhere, as before it first comes in.</summary>
+    private Point _hoverPoint = new(double.NaN, double.NaN);
+
     private NestedFolder? _dropTarget;
     private string _activePath = string.Empty;
     private Func<string, FolderMark>? _markLookup;

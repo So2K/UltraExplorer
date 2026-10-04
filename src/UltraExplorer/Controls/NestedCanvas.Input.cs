@@ -838,6 +838,29 @@ public sealed partial class NestedCanvas
         }
     }
 
+    /// <summary>
+    /// The camera moved since the hover was worked out.  What a name or a mark
+    /// under the pointer means is taken from where the last frame drew them,
+    /// so a hover worked out straight after a move - the wheel's - can name
+    /// the folder whose name was under the pointer before it, and a flight or
+    /// a zoom key leaves the pointer resting on something else altogether.
+    /// </summary>
+    private bool _hoverStale;
+
+    /// <summary>
+    /// A frame has drawn the names and the marks for where the camera is now:
+    /// the hover is worked out again where the pointer rests, unless it rests
+    /// nowhere on the canvas or a button is down.
+    /// </summary>
+    private void RefreshHover()
+    {
+        _hoverStale = false;
+        if (_press == PressKind.None && double.IsFinite(_hoverPoint.X) && double.IsFinite(_hoverPoint.Y))
+        {
+            UpdateHover(_hoverPoint);
+        }
+    }
+
     private void UpdateHover(Point point)
     {
         var wasOnTip = HotspotAt(_hoverPoint) is { Tip: not null };

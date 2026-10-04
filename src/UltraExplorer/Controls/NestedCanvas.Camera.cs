@@ -710,6 +710,7 @@ public sealed partial class NestedCanvas
     private void AfterCameraMove()
     {
         _lastMotion = System.Diagnostics.Stopwatch.GetTimestamp();
+        _hoverStale = true;
         RequestFrame(Layers.All);
         CameraChanged?.Invoke();
     }

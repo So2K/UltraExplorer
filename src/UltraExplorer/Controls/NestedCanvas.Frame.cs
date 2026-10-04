@@ -1471,6 +1471,14 @@ public sealed partial class NestedCanvas
             }
         }
 
+        // The names and the marks the hover is taken from are drawn for this
+        // camera now, and shown: a hover worked out for the camera before -
+        // by the wheel, or none at all for a flight - is worked out again.
+        if (_hoverStale && (layers & (Layers.Labels | Layers.Decor)) == (Layers.Labels | Layers.Decor) && (!decorAfterPresent || shown))
+        {
+            RefreshHover();
+        }
+
         LastAllocations = new FrameAllocations(sceneAllocated, labelsAllocated, decorAllocated, presentAllocated);
         LastFrameLayers = layers;
         return shown;

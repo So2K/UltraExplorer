@@ -27,6 +27,7 @@ internal static partial class Program
         RunOnSta("canvas motion: the loop letting go at rest", CanvasMotionRestLetGoAsync);
         RunOnSta("canvas motion: the arrows after the focused item went", CanvasMotionFocusAfterRemovalAsync);
         RunOnSta("canvas motion: a middle click that does not move", CanvasMotionStillMiddleClickAsync);
+        RunOnSta("canvas motion: the hover after the wheel", CanvasMotionHoverAfterWheelAsync);
         return Task.CompletedTask;
     }
 
@@ -164,6 +165,83 @@ internal static partial class Program
         {
             disk.Hook = null;
             gate.Release();
+            canvas.Tree = null;
+        }
+    }
+
+    // ---- the hover after the wheel (J081) ------------------------------------------------------
+
+    /// <summary>
+    /// The pointer resting on a folder's name pill, and the wheel turned
+    /// under it: the outline and the tag go to what is under the pointer
+    /// once the view has moved, not to the folder whose name was there
+    /// before - which the names drawn for the old view still said.
+    /// </summary>
+    private static async Task CanvasMotionHoverAfterWheelAsync()
+    {
+        Section("canvas motion: the hover after the wheel is what is under the pointer");
+        var disk = new FakeDisk();
+        for (var index = 0; index < 160; index++)
+        {
+            disk.AddFiles($@"Q:\top\f{index:D3}", 2, "x");
+        }
+
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await LoadEverythingAsync(tree, _ => true);
+        var canvas = new NestedCanvas { Tree = tree, FramesByHandForTests = true, DpiOverride = new DpiScale(1, 1) };
+        canvas.Measure(new Size(1000, 700));
+        canvas.Arrange(new Rect(0, 0, 1000, 700));
+        canvas.UpdateLayout();
+        var hoverField = typeof(NestedCanvas).GetField("_hover", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var grabsField = typeof(NestedCanvas).GetField("_labelHotspots", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        NestedHit? Hover() => (NestedHit?)hoverField.GetValue(canvas);
+        static string Name(NestedHit? hit) => hit is { } shown ? $"{shown.Folder.Name}{(shown.FileIndex >= 0 ? $" #{shown.FileIndex}" : string.Empty)}" : "nothing";
+        var time = TimeSpan.FromSeconds(1000);
+        try
+        {
+            canvas.FlyTo(tree.Find(@"Q:\top")!, 0.92, animated: false);
+            time = await MotionFramesAsync(canvas, time, 2);
+
+            // A name pill well inside the view, with room below it for the
+            // view to move up past it.
+            Point? on = null;
+            NestedFolder? named = null;
+            foreach (var grab in (System.Collections.IEnumerable)grabsField.GetValue(canvas)!)
+            {
+                var bounds = (Rect)grab.GetType().GetProperty("Bounds")!.GetValue(grab)!;
+                var folder = (NestedFolder)grab.GetType().GetProperty("Folder")!.GetValue(grab)!;
+                var centre = new Point(bounds.X + bounds.Width / 2, bounds.Y + bounds.Height / 2);
+                if (folder.Parent?.Name == "top" && centre.X > 100 && centre.X < 900 && centre.Y > 100 && centre.Y < 400)
+                {
+                    on = centre;
+                    named = folder;
+                    break;
+                }
+            }
+
+            if (on is not { } point || named is null)
+            {
+                Check("a folder's name pill is drawn to rest the pointer on", false);
+                return;
+            }
+
+            canvas.Pointer.Move(point);
+            var first = Hover();
+            canvas.Pointer.Wheel(point, -240);
+            time = await MotionFramesAsync(canvas, time, 1);
+            var afterWheel = Hover();
+            canvas.Pointer.Move(point);
+            var underPointer = Hover();
+            Console.WriteLine($"        on {named.Name}'s name: hover {Name(first)}; after the wheel and a frame {Name(afterWheel)}; what is under the pointer {Name(underPointer)}");
+            Check($"the pointer on a folder's name hovers that folder ({Name(first)})", first is { } was && ReferenceEquals(was.Folder, named));
+            Check($"after the wheel, once the view is drawn, the hover is what is under the pointer ({Name(afterWheel)}, under it {Name(underPointer)})",
+                !(underPointer is { } under && ReferenceEquals(under.Folder, named) && under.FileIndex < 0)
+                && afterWheel is { } now && underPointer is { } truth
+                && ReferenceEquals(now.Folder, truth.Folder) && now.FileIndex == truth.FileIndex);
+        }
+        finally
+        {
             canvas.Tree = null;
         }
     }
