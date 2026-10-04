@@ -959,7 +959,7 @@ public sealed partial class NestedCanvas
         // label must not suddenly become a full timestamp and take back the
         // filename's characters halfway through a zoom.
         var column = folder.PlacedSort.Column;
-        var faded = file.IsHidden || _filter is not null && !_filter(file.Name);
+        var faded = file.IsHidden || _filter is not null && !FilterTakesFile(folder, job.Index);
         var ink = faded ? TextDimColour : TextColour;
         var available = right - cursor;
         var metadataRight = right;

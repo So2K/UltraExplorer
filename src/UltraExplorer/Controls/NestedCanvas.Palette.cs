@@ -96,6 +96,9 @@ public sealed partial class NestedCanvas
         _filterMatches.Clear();
         _filterMatchSet.Clear();
         _filterJudging = null;
+        _fileFilterAnswers.Clear();
+        _lastFileFilterFolder = null;
+        _lastFileFilterAnswers = null;
         if (matcher is not null && _tree is not null)
         {
             var judging = new FilterJudging(_tree, _tree.IsSorting ? -1 : _tree.SortGeneration);
@@ -496,8 +499,112 @@ public sealed partial class NestedCanvas
             return null;
         }
 
-        return tests.Count == 1 ? tests[0] : name => tests.Any(test => test(name));
+        if (tests.Count == 1)
+        {
+            return tests[0];
+        }
+
+        // A loop rather than Any: Any's lambda closed over the name, a new
+        // closure and delegate for every name asked about.
+        var all = tests.ToArray();
+        return name =>
+        {
+            foreach (var test in all)
+            {
+                if (test(name))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
     }
+
+    // ---- which files the filter takes, kept per folder ----------------------------------
+
+    /// <summary>
+    /// Which of a folder's shown files the filter takes, as far as they have
+    /// been asked about: under the filter of <see cref="Stamp"/>, for the
+    /// list of files <see cref="Files"/> - a folder read or placed again has
+    /// a new list, and is asked about afresh.  Two bits per file, whether it
+    /// was asked and what the answer was.
+    /// </summary>
+    private sealed class FileFilterAnswers(IReadOnlyList<NestedFile> files, int stamp)
+    {
+        public IReadOnlyList<NestedFile> Files { get; } = files;
+
+        public int Stamp { get; } = stamp;
+
+        private readonly ulong[] _asked = new ulong[(files.Count + 63) / 64];
+        private readonly ulong[] _taken = new ulong[(files.Count + 63) / 64];
+
+        /// <summary>Whether the filter takes the file at <paramref name="index"/>, asking it only the first time.</summary>
+        public bool Takes(int index, Func<string, bool> filter)
+        {
+            var word = index >> 6;
+            var bit = 1UL << (index & 63);
+            if ((_asked[word] & bit) != 0)
+            {
+                return (_taken[word] & bit) != 0;
+            }
+
+            _asked[word] |= bit;
+            if (!filter(Files[index].Name))
+            {
+                return false;
+            }
+
+            _taken[word] |= bit;
+            return true;
+        }
+    }
+
+    /// <summary>The answers kept, by folder; let go of together when there are many, and asked again as the folders are drawn.</summary>
+    private readonly Dictionary<NestedFolder, FileFilterAnswers> _fileFilterAnswers = [];
+
+    /// <summary>The folder last looked up in <see cref="_fileFilterAnswers"/> and its answers: a folder's labels come one after another.</summary>
+    private FileFilterAnswers? _lastFileFilterAnswers;
+    private NestedFolder? _lastFileFilterFolder;
+
+    /// <summary>Folders whose answers are kept at most; past it they are all let go of and asked again as they are drawn.</summary>
+    private const int MaximumFileFilterFolders = 4096;
+
+    /// <summary>
+    /// What the filter says about <paramref name="folder"/>'s files, kept
+    /// from frame to frame.  Each file's tile and name were faded or lit by
+    /// asking the filter on every frame - a regular expression per tile for a
+    /// wildcard, some six milliseconds a frame for a folder of twenty
+    /// thousand files in view; now each file is asked once per filter, the
+    /// first time it is drawn, and the frames after look its answer up.
+    /// </summary>
+    private FileFilterAnswers FileFilterAnswersOf(NestedFolder folder)
+    {
+        var files = folder.Files;
+        if (ReferenceEquals(folder, _lastFileFilterFolder) && _lastFileFilterAnswers is { } last
+            && ReferenceEquals(last.Files, files) && last.Stamp == _filterStamp)
+        {
+            return last;
+        }
+
+        if (!_fileFilterAnswers.TryGetValue(folder, out var answers) || !ReferenceEquals(answers.Files, files) || answers.Stamp != _filterStamp)
+        {
+            if (_fileFilterAnswers.Count >= MaximumFileFilterFolders)
+            {
+                _fileFilterAnswers.Clear();
+            }
+
+            answers = new FileFilterAnswers(files, _filterStamp);
+            _fileFilterAnswers[folder] = answers;
+        }
+
+        _lastFileFilterFolder = folder;
+        _lastFileFilterAnswers = answers;
+        return answers;
+    }
+
+    /// <summary>Whether the filter on now takes the file at <paramref name="index"/> among <paramref name="folder"/>'s shown files.</summary>
+    private bool FilterTakesFile(NestedFolder folder, int index) => FileFilterAnswersOf(folder).Takes(index, _filter!);
 
     /// <summary>
     /// Works out, below one folder, what matches and what holds a match.
