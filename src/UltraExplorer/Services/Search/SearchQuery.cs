@@ -65,7 +65,10 @@ internal sealed class SearchQuery
 
     /// <summary>
     /// Everything's query for the text, leaving out what is under each of
-    /// <paramref name="excluded"/>: <c>!path:"L:\"</c>.
+    /// <paramref name="excluded"/>: <c>!path:"L:\"</c>.  A quote still open at
+    /// the end of the text - "my doc, typed on the way to "my doc" - is closed
+    /// first, as Everything would close it: left open, it took the folders
+    /// left out into the phrase, and nothing was found until it was closed.
     /// </summary>
     public string Excluding(IReadOnlyCollection<string> excluded)
     {
@@ -75,6 +78,11 @@ internal sealed class SearchQuery
         }
 
         var builder = new StringBuilder(Text);
+        if (Text.Count(character => character == '"') % 2 != 0)
+        {
+            builder.Append('"');
+        }
+
         foreach (var folder in excluded)
         {
             builder.Append(" !").Append(PathTerm(folder));
