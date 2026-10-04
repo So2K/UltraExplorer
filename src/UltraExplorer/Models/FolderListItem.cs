@@ -12,7 +12,6 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
 {
     private ViewAllEntryDescriptor _entry = entry;
     private ImageSource? _icon;
-    private bool _isOnCanvas;
     private bool _isNew;
     private SortColumn _detailColumn;
     private string? _detail;
@@ -196,13 +195,15 @@ public sealed class FolderListItem(ViewAllEntryDescriptor entry) : ObservableObj
     /// Whether the canvas already holds a node for this object.  A row that is
     /// not on the canvas can still be clicked - it is revealed first - but saying
     /// so up front is the difference between "the list lies" and "the list knows
-    /// more than the canvas does".
+    /// more than the canvas does".  Asked of the canvas when read, not told to
+    /// every row of every refill: the question normalises the row's path, and
+    /// a key typed in the filter of a folder of five thousand files spent
+    /// nearly all its time asking it, for an answer nothing on screen shows.
     /// </summary>
-    public bool IsOnCanvas
-    {
-        get => _isOnCanvas;
-        set => SetProperty(ref _isOnCanvas, value);
-    }
+    public bool IsOnCanvas => CanvasHolds?.Invoke(FullPath) == true;
+
+    /// <summary>How <see cref="IsOnCanvas"/> is answered: the canvas, asked by path, given by the list that made the row.</summary>
+    internal Func<string, bool>? CanvasHolds { get; init; }
 
     /// <summary>
     /// The row appeared while the folder was being shown - something new on

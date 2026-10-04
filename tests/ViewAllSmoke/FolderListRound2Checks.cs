@@ -35,6 +35,7 @@ internal static partial class Program
         RunOnSta("list leaves a deleted folder, end to end", ListGoneEndToEndAsync);
         RunOnSta("list icons past the first rows", ListIconsPastBudgetAsync);
         RunOnSta("list while the next folder is read", ListLoadingAsync);
+        RunOnSta("list refill cost", ListRefillCostAsync);
         RunOnSta("list filter in a folder that could not be read", ListFilterKeepsFailureAsync);
         return Task.CompletedTask;
     }
@@ -302,6 +303,52 @@ internal static partial class Program
         await list.NavigateAsync(before);
         Check($"a folder read at once shows its rows with no loading state ({list.Items.Count}, {list.EmptyText})",
             list.Items.Count == 3 && list.EmptyText.Length == 0);
+    }
+
+    /// <summary>
+    /// J088: every refill - a key typed in the filter, another order, a
+    /// change merged - asked the canvas, row by row, whether it held a node
+    /// for the row's path, normalising every path on the way, for a value
+    /// nothing showed.  A row is asked about when that is read, and only then.
+    /// </summary>
+    private static async Task ListRefillCostAsync()
+    {
+        Section("folder list round 2: what a refill costs");
+        var folder = Path.Combine(Path.GetTempPath(), "UltraExplorerListRefill");
+        var names = Enumerable.Range(0, 5_000).Select(index => $"f{index:D4}.txt").ToArray();
+        using var icons = new ShellIconService();
+        using var graph = new ViewAllGraphService();
+        var asked = 0;
+        var list = new FolderListViewModel(
+            (path, _, _) => Task.FromResult(ReviewSnapshot(path, false, names)),
+            (_, _) => Task.CompletedTask,
+            path => { asked++; return graph.TryGetNode(path, out _); },
+            icons) { IsVisible = true };
+        await list.NavigateAsync(folder);
+
+        // A filter of blanks is no filter: each of these refills the rows whole.
+        for (var warm = 0; warm < 4; warm++)
+        {
+            list.Filter = warm % 2 == 0 ? " " : string.Empty;
+        }
+
+        asked = 0;
+        const int Refills = 40;
+        var watch = Stopwatch.StartNew();
+        for (var refill = 0; refill < Refills; refill++)
+        {
+            list.Filter = refill % 2 == 0 ? " " : string.Empty;
+        }
+
+        watch.Stop();
+        var each = watch.Elapsed.TotalMilliseconds / Refills;
+        Console.WriteLine($"  info  a refill of {list.Items.Count:N0} rows takes {each:0.00} ms; the canvas was asked {asked / Refills:N0} times a refill");
+        Check($"a refill asks the canvas nothing about its rows ({asked / Refills:N0} questions a refill, {each:0.00} ms)", asked == 0);
+        Check("and still shows every row", list.Items.Count == names.Length);
+
+        asked = 0;
+        var onCanvas = list.Items[4_321].IsOnCanvas;
+        Check($"a row read for whether the canvas holds it asks then, for itself ({asked} asked, {onCanvas})", asked == 1 && !onCanvas);
     }
 
     /// <summary>

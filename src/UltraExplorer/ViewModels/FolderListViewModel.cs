@@ -858,7 +858,7 @@ public sealed class FolderListViewModel : ObservableObject
             _all.Clear();
             foreach (var entry in snapshot.Entries)
             {
-                _all.Add(new FolderListItem(entry));
+                _all.Add(new FolderListItem(entry) { CanvasHolds = _isOnCanvas });
             }
 
             _isTruncated = snapshot.IsTruncated;
@@ -1013,7 +1013,6 @@ public sealed class FolderListViewModel : ObservableObject
         _byPath.Clear();
         foreach (var item in matched)
         {
-            item.IsOnCanvas = _isOnCanvas(item.FullPath);
             item.DetailColumn = _sort.Column;
             rows.Add(item);
             _byPath.TryAdd(item.FullPath, item);
@@ -1332,7 +1331,7 @@ public sealed class FolderListViewModel : ObservableObject
                 continue;
             }
 
-            var added = new FolderListItem(entry) { IsNew = true };
+            var added = new FolderListItem(entry) { IsNew = true, CanvasHolds = _isOnCanvas };
             _newRows.Add((added, now));
             _all.Add(added);
         }
