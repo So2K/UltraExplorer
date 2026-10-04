@@ -113,9 +113,6 @@ internal sealed class IconAtlas : IDisposable
     /// <summary>A soft limit on remembered files; past it the ones that hold no slot of their own are forgotten.</summary>
     private const int FileEntryLimit = 8192;
 
-    /// <summary>How long a file that could not have a slot waits before asking again.</summary>
-    private const int DeniedRetryFrames = 120;
-
     /// <summary>At most this many arrivals are looked at in one frame, however many of them cost no upload.</summary>
     private const int ArrivalsPerFrameLimit = 1024;
 
@@ -125,6 +122,17 @@ internal sealed class IconAtlas : IDisposable
     /// of their screens, however many frames ago that was (<see cref="RecentlyDrawnElsewhere"/>).
     /// </summary>
     private static readonly long RecentlyDrawnTicks = Stopwatch.Frequency / 2;
+
+    /// <summary>
+    /// How long a file that could not have a slot waits before asking again
+    /// (Stopwatch ticks, a quarter of a second) - and it asks only once a
+    /// slot could be given to it (<see cref="FileSlotFree"/>).  Counted in
+    /// frames, as it was, with every slot on screen the answers it brought
+    /// were denied again, and each one drew the names again, which was the
+    /// next frame to count: the Shell was asked over and over and the names
+    /// drawn at the display's rate, at rest, for good.
+    /// </summary>
+    private static readonly long DeniedRetryTicks = Stopwatch.Frequency / 4;
 
     /// <summary>
     /// Asked for at start-up, before any folder is read: the types most
@@ -192,6 +200,15 @@ internal sealed class IconAtlas : IDisposable
     /// <summary>Who <see cref="ArrivalsPending"/> wakes, and how many of them: one per canvas drawing from the atlas.  Changed under the gate.</summary>
     private Action? _arrivalsPending;
     private int _listeners;
+
+    /// <summary>
+    /// Wakes the canvases once a hold for another canvas has run out
+    /// (<see cref="WakeAfterHold"/>): when the Stopwatch says it is due, or
+    /// zero; and when it last woke them.  Under the gate.
+    /// </summary>
+    private Timer? _holdWake;
+    private long _holdWakeDue;
+    private long _holdWokenAt;
 
     public IconAtlas(IconAtlasOptions? options = null)
     {
@@ -682,6 +699,8 @@ internal sealed class IconAtlas : IDisposable
         lock (_gate)
         {
             _active = null;
+            _holdWake?.Dispose();
+            _holdWake = null;
         }
     }
 
@@ -750,7 +769,7 @@ internal sealed class IconAtlas : IDisposable
                 Touch(entry.Slot);
                 _extractor.Enqueue(new IconRequest(entry.Key, IconKeyKind.File, IconPriority.Revalidate));
                 return entry.Slot;
-            case KeyState.Denied when _frame - entry.Frame > DeniedRetryFrames:
+            case KeyState.Denied when _frameTicks - entry.DeniedTicks > DeniedRetryTicks && FileSlotFree():
                 entry.State = KeyState.Pending;
                 _extractor.Enqueue(new IconRequest(entry.Key, IconKeyKind.File, IconPriority.Visible));
                 return -1;
@@ -969,14 +988,25 @@ internal sealed class IconAtlas : IDisposable
         if (slot < 0)
         {
             var victim = _lruTail;
-            if (victim < 0 || _lastUsedFrame[victim] >= _frame - 1 || RecentlyDrawnElsewhere(victim))
+            if (victim < 0 || OnScreen(victim))
             {
                 // Every file slot was drawn in the last frame, or may still be
                 // on another canvas's screen: taking one would only have it
                 // asked for again.  Its type's icon shows for now.
                 entry.State = KeyState.Denied;
-                entry.Frame = _frame;
+                entry.DeniedTicks = _frameTicks;
                 _files[key] = entry;
+                if (victim >= 0 && _lastUsedFrame[victim] < _frame - 1 && _frameTicks - _holdWokenAt > RecentlyDrawnTicks)
+                {
+                    // Held only because another canvas may still show it.
+                    // At rest nothing is drawn to ask again, so the canvases
+                    // are woken once the hold is over - but not for what
+                    // that wake itself was denied, or two canvases with more
+                    // programs between them than there are slots would wake
+                    // each other twice a second.
+                    WakeAfterHold(_frameTicks + RecentlyDrawnTicks + Stopwatch.Frequency / 20);
+                }
+
                 return false;
             }
 
@@ -1198,6 +1228,71 @@ internal sealed class IconAtlas : IDisposable
     /// </summary>
     private bool RecentlyDrawnElsewhere(int slot)
         => _listeners > 1 && _frameTicks - _lastUsedTicks[slot] < RecentlyDrawnTicks;
+
+    /// <summary>Whether a file slot may be on a screen: drawn in the frame just gone, or recently on another canvas's.  Under the gate.</summary>
+    private bool OnScreen(int slot) => _lastUsedFrame[slot] >= _frame - 1 || RecentlyDrawnElsewhere(slot);
+
+    /// <summary>
+    /// Whether a file's icon arriving now would be given a slot: the region
+    /// has room, or its least recently drawn slot is on no screen.  What a
+    /// file that was denied one waits for before it asks the Shell again, so
+    /// that more programs on screen than the region holds cost nothing once
+    /// the region is full of them.  Under the gate.
+    /// </summary>
+    private bool FileSlotFree()
+        => _fileSlotCount < _options.PerFileCapacity && (_freeSlots.Count > 0 || _nextSlot < _slotData.Length)
+            || _lruTail >= 0 && !OnScreen(_lruTail);
+
+    /// <summary>
+    /// Wakes every canvas at <paramref name="dueTicks"/>, or later when a
+    /// wake is already due later: a file was denied a slot held for another
+    /// canvas, and at rest no frame would ask for it again.  Under the gate.
+    /// </summary>
+    private void WakeAfterHold(long dueTicks)
+    {
+        if (dueTicks <= _holdWakeDue || Volatile.Read(ref _disposed) != 0)
+        {
+            return;
+        }
+
+        _holdWakeDue = dueTicks;
+        _holdWake ??= new Timer(_ => OnHoldOver());
+        _holdWake.Change(MillisecondsUntil(dueTicks), Timeout.Infinite);
+    }
+
+    /// <summary>The hold has run out: the canvases are woken, as an arrival wakes them, to draw the names and ask again.</summary>
+    private void OnHoldOver()
+    {
+        lock (_gate)
+        {
+            if (Volatile.Read(ref _disposed) != 0 || _holdWakeDue == 0)
+            {
+                return;
+            }
+
+            if (Stopwatch.GetTimestamp() < _holdWakeDue)
+            {
+                // Put off meanwhile by a later denial.
+                _holdWake?.Change(MillisecondsUntil(_holdWakeDue), Timeout.Infinite);
+                return;
+            }
+
+            _holdWakeDue = 0;
+            _holdWokenAt = Stopwatch.GetTimestamp();
+        }
+
+        try
+        {
+            Volatile.Read(ref _arrivalsPending)?.Invoke();
+        }
+        catch (Exception)
+        {
+            // A subscriber's failure is not the timer's.
+        }
+    }
+
+    private static int MillisecondsUntil(long ticks)
+        => (int)Math.Clamp((ticks - Stopwatch.GetTimestamp()) * 1000 / Stopwatch.Frequency + 1, 1, int.MaxValue);
 
     /// <summary>
     /// Forgets the files that hold no slot of their own - those shown with
@@ -1461,7 +1556,7 @@ internal sealed class IconAtlas : IDisposable
         /// <summary>A file the Shell had no icon of its own for: its type's shows.</summary>
         UseType,
 
-        /// <summary>A file that arrived when every file slot was on screen; asked again later.</summary>
+        /// <summary>A file that arrived when every file slot was on screen; asked again once a slot could be given to it.</summary>
         Denied
     }
 
@@ -1478,6 +1573,8 @@ internal sealed class IconAtlas : IDisposable
         public int Slot = slot;
         public KeyState State = state;
         public IconPriority Queued = queued;
-        public long Frame;
+
+        /// <summary>When a file was last denied a slot (Stopwatch ticks, the frame's).</summary>
+        public long DeniedTicks;
     }
 }
