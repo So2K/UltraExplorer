@@ -31,6 +31,7 @@ internal static partial class Program
         RunOnSta("a folder deleted with its contents", Fix2GoneWithContentsChecks);
         RunOnSta("an order below a folder never listed", Fix2PartialRenameOrderChecks);
         RunOnSta("a dozen sub-folders hidden at once", Fix2ManyHiddenChecks);
+        RunOnSta("a batch rename", Fix2BatchRenameChecks);
         return Task.CompletedTask;
     }
 
@@ -415,6 +416,78 @@ internal static partial class Program
             }
 
             Check($"{count} sub-folder{(count == 1 ? string.Empty : "s")} hidden at once {(count == 1 ? "is" : "are")} hidden on the canvas ({Hidden()} of {count})", Hidden() == count);
+        }
+    }
+
+    /// <summary>
+    /// PowerRename of thirty coloured photos, in one burst: the change listed
+    /// the first eight renames alone, so the other twenty-two lost their
+    /// colour, their note and their place in the selection (J062).
+    /// </summary>
+    private static async Task Fix2BatchRenameChecks()
+    {
+        const int Photos = 30;
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerBatchRename", Guid.NewGuid().ToString("N"));
+        var (hub, time, watch, sink) = FedHub(baseDirectory);
+        using var _ = hub;
+        var folder = Path.Combine(watch.Key, "Photos");
+        var scratch = Path.Combine(baseDirectory, "state");
+        Directory.CreateDirectory(folder);
+        Directory.CreateDirectory(scratch);
+        try
+        {
+            var list = new object();
+            hub.Register(ChangeConsumer.List, folder, list);
+            var records = new List<(int, string, long, uint)>();
+            for (var index = 0; index < Photos; index++)
+            {
+                records.Add((4, $@"Photos\IMG_{index:D4}.jpg", 0, 0));
+                records.Add((5, $@"Photos\Holiday {index:D2}.jpg", 0, 0));
+            }
+
+            hub.FeedForTests(watch, NotifyRecords(false, [.. records]), details: false);
+            time.Advance(600);
+            DrainHub(hub, sink);
+            var change = sink.For(list).SingleOrDefault();
+            Check($"a batch rename of {Photos} items in one burst is told with every pair ({change.Renames.Length})", change.Renames.Length == Photos);
+
+            // The folder list's view model takes the pairs: marks, notes and selection follow.
+            for (var index = 0; index < Photos; index++)
+            {
+                File.WriteAllText(Path.Combine(folder, $"Holiday {index:D2}.jpg"), "jpg");
+            }
+
+            using var icons = new ShellIconService();
+            var marks = new FolderMarkService(Path.Combine(scratch, "marks.json"));
+            using var tree = new ViewAllViewModel(marks, icons, Path.Combine(scratch, "tree.json"));
+            tree.PreferLightReveal = true;
+            tree.IsCanvasShown = false;
+            await tree.InitializeAsync(folder);
+            var added = new List<SelectionItem>();
+            for (var index = 0; index < Photos; index++)
+            {
+                var old = Path.Combine(folder, $"IMG_{index:D4}.jpg");
+                marks.SetAccent(old, "#3FA34D");
+                marks.SetNote(old, $"photo {index}");
+                added.Add(new SelectionItem(old, false, index));
+            }
+
+            tree.Selection.Apply(new SelectionEdit { Clear = true, Added = added, Source = SelectionSource.Canvas });
+            if (change.Renames.Length > 0)
+            {
+                ((IChangeSink)tree).FolderChanged(ChangeConsumer.List, list, change);
+            }
+
+            await Task.Delay(300);
+            var coloured = Enumerable.Range(0, Photos).Count(index =>
+                marks.Get(Path.Combine(folder, $"Holiday {index:D2}.jpg")) is { AccentHex: "#3FA34D" } mark && mark.Note == $"photo {index}");
+            var selected = Enumerable.Range(0, Photos).Count(index => tree.Selection.Contains(Path.Combine(folder, $"Holiday {index:D2}.jpg")));
+            Check($"each renamed photo keeps its colour and note ({coloured} of {Photos})", coloured == Photos);
+            Check($"and its place in the selection ({selected} of {Photos})", selected == Photos);
+        }
+        finally
+        {
+            TryDelete(baseDirectory);
         }
     }
 }

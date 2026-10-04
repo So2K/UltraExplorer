@@ -279,7 +279,8 @@ public sealed partial class ChangeHub
     /// Merges one record's change into its folder's pending change: on a
     /// watcher's thread, for a registered folder.  Allocates only for what a
     /// change carries - a rename's names, a changed file's or sub-folder's
-    /// name - and only up to <see cref="MaximumDetails"/> of each.
+    /// name - and only up to <see cref="MaximumDetails"/> of each, or
+    /// <see cref="MaximumRenames"/> renames, whose list grows as they come.
     /// </summary>
     internal void Note(string key, ChangeKinds kinds, WatchRoot root, in ChangeRecord record, ReadOnlySpan<char> leaf, ReadOnlySpan<char> renamedFrom)
     {
@@ -305,9 +306,13 @@ public sealed partial class ChangeHub
                 AddFolder(change, leaf, in record);
             }
 
-            if (!renamedFrom.IsEmpty && change.RenameCount < MaximumDetails)
+            if (!renamedFrom.IsEmpty && change.RenameCount < MaximumRenames)
             {
-                change.Renames ??= new RenamePair[MaximumDetails];
+                if (change.Renames is null || change.RenameCount == change.Renames.Length)
+                {
+                    Array.Resize(ref change.Renames, change.Renames is null ? MaximumDetails : Math.Min(change.Renames.Length * 2, MaximumRenames));
+                }
+
                 change.Renames[change.RenameCount++] = new RenamePair(renamedFrom.ToString(), leaf.ToString());
             }
 
