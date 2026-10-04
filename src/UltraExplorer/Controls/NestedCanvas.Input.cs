@@ -539,7 +539,9 @@ public sealed partial class NestedCanvas
             return true;
         }
 
-        if (_pressIntent == PressIntent.Pan)
+        // Taking the mouse raises a move where it already is: a pan of
+        // nothing, which neither moves the camera nor is the user moving it.
+        if (_pressIntent == PressIntent.Pan && point != _panLast)
         {
             Pan(point - _panLast);
             _panLast = point;
@@ -653,10 +655,16 @@ public sealed partial class NestedCanvas
     /// The wheel, as Figma has it: Ctrl zooms at the pointer, Shift pans
     /// sideways, nothing pans up and down.  During a rectangle too - its
     /// start stays on its content, and its mode stays what the press made it.
+    /// A turn of nothing moves nothing, and is no move of the user's.
     /// </summary>
     internal void PointerWheel(Point point, int delta, ModifierKeys modifiers)
     {
         RetryFailedFrames();
+        if (delta == 0)
+        {
+            return;
+        }
+
         if ((modifiers & ModifierKeys.Control) != 0)
         {
             ZoomAt(point, Math.Pow(1.2, delta / 120.0));

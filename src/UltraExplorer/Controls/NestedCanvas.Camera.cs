@@ -192,9 +192,14 @@ public sealed partial class NestedCanvas
 
     public void ZoomBy(double factor) => ZoomAt(new Point(_viewWidth / 2, _viewHeight / 2), factor);
 
+    /// <summary>
+    /// Moves the view by <paramref name="delta"/>.  A pan of nothing does
+    /// nothing at all: it would otherwise let go of a camera still on its way
+    /// - a flight reading its way there, one being put back - for no move.
+    /// </summary>
     public void Pan(Vector delta)
     {
-        if (!double.IsFinite(delta.X) || !double.IsFinite(delta.Y)) return;
+        if (!double.IsFinite(delta.X) || !double.IsFinite(delta.Y) || delta.X == 0 && delta.Y == 0) return;
         EnsureCamera();
         if (_anchor is null || !double.IsFinite(_ax + delta.X) || !double.IsFinite(_ay + delta.Y))
         {

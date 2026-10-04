@@ -26,6 +26,7 @@ internal static partial class Program
         RunOnSta("canvas motion: an arrow key held down", CanvasMotionKeyRepeatAsync);
         RunOnSta("canvas motion: the loop letting go at rest", CanvasMotionRestLetGoAsync);
         RunOnSta("canvas motion: the arrows after the focused item went", CanvasMotionFocusAfterRemovalAsync);
+        RunOnSta("canvas motion: a middle click that does not move", CanvasMotionStillMiddleClickAsync);
         return Task.CompletedTask;
     }
 
@@ -99,6 +100,70 @@ internal static partial class Program
         }
         finally
         {
+            canvas.Tree = null;
+        }
+    }
+
+    // ---- a middle click that does not move (J107) ----------------------------------------------
+
+    /// <summary>
+    /// A flight to a folder still reading its way there, and meanwhile a
+    /// middle click that never moves - capturing the mouse raises a move at
+    /// the very point it went down - and a wheel notch of nothing.  Neither
+    /// moves the camera, so neither is the user's move: the flight still
+    /// lands, and nobody is told the user moved the view.
+    /// </summary>
+    private static async Task CanvasMotionStillMiddleClickAsync()
+    {
+        Section("canvas motion: a middle click that does not move leaves the camera alone");
+        var disk = new FakeDisk();
+        disk.Folder(@"Q:\slow\child");
+        disk.Folder(@"Q:\ready");
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await tree.LoadAsync(tree.Find(@"Q:\")!);
+        var canvas = new NestedCanvas { Tree = tree, FramesByHandForTests = true, DpiOverride = new DpiScale(1, 1) };
+        canvas.Measure(new Size(1000, 700));
+        canvas.Arrange(new Rect(0, 0, 1000, 700));
+        canvas.UpdateLayout();
+        canvas.FitAll(animated: false);
+        using var gate = new SemaphoreSlim(0);
+        var entered = 0;
+        disk.Hook = (path, token) =>
+        {
+            if (path == @"Q:\slow")
+            {
+                Interlocked.Increment(ref entered);
+                gate.Wait(token);
+            }
+
+            return null;
+        };
+
+        var userMoves = 0;
+        canvas.UserCameraMoved += () => userMoves++;
+        try
+        {
+            var before = canvas.CaptureCamera();
+            var going = canvas.FlyToPathAsync(@"Q:\slow\child", animated: false);
+            await WaitUntil(() => Volatile.Read(ref entered) == 1, 3000);
+            var point = new Point(500, 350);
+            canvas.Pointer.Down(MouseButton.Middle, point);
+            canvas.Pointer.Move(point);
+            canvas.Pointer.Up(MouseButton.Middle, point);
+            canvas.Pointer.Wheel(point, 0);
+            var after = canvas.CaptureCamera();
+            gate.Release();
+            var arrived = await going;
+            Check($"a middle click and a wheel notch that move nothing are not the user moving the view ({userMoves} moves, camera {(after == before ? "unchanged" : "changed")})",
+                userMoves == 0 && after == before);
+            Check($"so the flight asked for before them still lands ({arrived}, at {canvas.CaptureCamera()?.AnchorPath})",
+                arrived && canvas.CaptureCamera()?.AnchorPath == @"Q:\slow\child");
+        }
+        finally
+        {
+            disk.Hook = null;
+            gate.Release();
             canvas.Tree = null;
         }
     }
