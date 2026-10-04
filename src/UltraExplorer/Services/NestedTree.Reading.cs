@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using UltraExplorer.Controls;
 using UltraExplorer.Models;
 using UltraExplorer.Services.Watch;
@@ -951,12 +952,22 @@ public sealed partial class NestedTree
     private static NestedFolder[] WithNamedSince(NestedFolder[] children, NestedFolder[] namedSince)
     {
         NestedFolder[] all = [.. children, .. namedSince];
-        Array.Sort(all, static (left, right) =>
-        {
-            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
-            return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
-        });
+        var culture = CultureInfo.CurrentCulture.CompareInfo;
+        Array.Sort(all, (left, right) => NameOrder(culture, left.Name, right.Name));
         return all;
+    }
+
+    /// <summary>
+    /// The order a reader lists names in: culture order ignoring case, then
+    /// ordinal between names that calls equal.  The culture's rules are taken
+    /// once by the caller rather than through StringComparer.CurrentCultureIgnoreCase,
+    /// which makes a new comparer each time it is asked for - once per
+    /// comparison, in a sort.
+    /// </summary>
+    private static int NameOrder(CompareInfo culture, string left, string right)
+    {
+        var order = culture.Compare(left, right, CompareOptions.IgnoreCase);
+        return order != 0 ? order : string.CompareOrdinal(left, right);
     }
 
     // ---- applying --------------------------------------------------------------
