@@ -46,6 +46,10 @@ internal static partial class Program
             Check("icon and glyph round 2 checks ran to the end", false);
         }
 
+        RunOnSta("icon service round 2 on a dispatcher", async () =>
+        {
+            await Round2IconOrderChecks();
+        });
         return Task.CompletedTask;
     }
 
@@ -347,5 +351,46 @@ internal static partial class Program
         Console.WriteLine($"  {asked} glyphs made in {drained} ms: {announcements} announcement(s), the first at {firstAt} ms with {pendingAtFirst} still queued");
         Check("J085: a long queue of new glyphs is announced as it is made, not only once all are made",
             drained > 100 && pendingAtFirst > 0 && firstAt < drained / 2 && announcements >= 3);
+    }
+
+    // ---- J016: a list's rows answered top to bottom ---------------------------------------------
+
+    /// <summary>
+    /// The folder list asks for its first rows top to bottom, in one go, and
+    /// the Shell's worker is busy meanwhile: the top row must be the first of
+    /// them it answers.  A newer list - a search run again - still goes
+    /// before an older one, its rows top to bottom too.
+    /// </summary>
+    private static async Task Round2IconOrderChecks()
+    {
+        using var gate = new ManualResetEventSlim(false);
+        var shell = new FakeShell(".exe") { Gate = gate };
+        using var icons = new ShellIconService(shell.Extract, Dispatcher.CurrentDispatcher);
+        icons.Request(Path.Combine(Round2Root, "order", "hold.aaa"), false, _ => { });
+        IconSpinUntil(() => !shell.Asked.IsEmpty);
+        await Task.Yield();
+
+        var answered = 0;
+        var rows = Enumerable.Range(0, 300).Select(index => Path.Combine(Round2Root, "order", "list", $"tool{index:D3}.exe")).ToArray();
+        foreach (var row in rows)
+        {
+            icons.Request(row, false, _ => answered++);
+        }
+
+        await Task.Yield();
+        var newer = new[] { "found-a.exe", "found-b.exe", "found-c.exe" }.Select(name => Path.Combine(Round2Root, "order", "search", name)).ToArray();
+        foreach (var row in newer)
+        {
+            icons.Request(row, false, _ => answered++);
+        }
+
+        gate.Set();
+        var done = await IconWaitUntilAsync(() => answered == rows.Length + newer.Length);
+        var asked = shell.Asked.Skip(1).ToArray();
+        var expected = newer.Concat(rows).ToArray();
+        var topRank = Array.IndexOf(asked, rows[0]);
+        Console.WriteLine($"  300 rows asked top to bottom, then 3 of a newer list: the top row was the Shell's question {topRank + 1} of {asked.Length}; the first three asked: {string.Join(", ", asked.Take(3).Select(Path.GetFileName))}");
+        Check("J016: a list's rows are answered top to bottom, the top row first of them", done && topRank == newer.Length && asked.Skip(newer.Length).SequenceEqual(rows, StringComparer.OrdinalIgnoreCase));
+        Check("J016: and a newer list's rows go before an older one's, top to bottom too", done && asked.Take(newer.Length).SequenceEqual(newer, StringComparer.OrdinalIgnoreCase));
     }
 }

@@ -112,8 +112,21 @@ public sealed class ShellIconService : IDisposable
     /// </summary>
     private readonly Dictionary<string, PendingIcon> _pending = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Asked for by something on screen: newest first.</summary>
-    private readonly Stack<PendingIcon> _visible = new();
+    /// <summary>
+    /// Asked for by something on screen: newest first.  Each item is one
+    /// icon the canvas asked for, or a run of the rows a list asked for in
+    /// one go (<see cref="_openRun"/>), answered in the order they were asked.
+    /// </summary>
+    private readonly Stack<VisibleAsk> _visible = new();
+
+    /// <summary>
+    /// The run on <see cref="_visible"/> that the rows a list asks for join
+    /// until the dispatcher operation asking them is over, or null.  A list
+    /// asks top to bottom, and one at a time on the stack the top row was
+    /// answered last; in a run the top row is answered first, and a newer
+    /// list's run still goes before an older one's.  Guarded by <see cref="_gate"/>.
+    /// </summary>
+    private Queue<PendingIcon>? _openRun;
 
     /// <summary>Types of folders just read: first come first served, and only once nothing on screen is waiting.</summary>
     private readonly Queue<PendingIcon> _prefetch = new();
@@ -316,7 +329,7 @@ public sealed class ShellIconService : IDisposable
             // between the first look and here, and then nobody would ever call back.
             if (!_cache.TryGetValue(key, out cached) || cached.Provisional)
             {
-                (AskVisible(key, path, isDirectory).Callbacks ??= []).Add(completed);
+                (AskVisible(key, path, isDirectory, inOrder: true).Callbacks ??= []).Add(completed);
                 return false;
             }
         }
@@ -576,11 +589,12 @@ public sealed class ShellIconService : IDisposable
 
     /// <summary>
     /// Something on screen waits for <paramref name="key"/>: the entry that
-    /// will answer it, on top of the stack.  A type only a prefetch had asked
-    /// for is asked about this file instead - the file on screen is the one
-    /// that speaks for its type.  Inside the lock.
+    /// will answer it, on top of the stack - or, <paramref name="inOrder"/>,
+    /// behind the rows asked for before it in the same run.  A type only a
+    /// prefetch had asked for is asked about this file instead - the file on
+    /// screen is the one that speaks for its type.  Inside the lock.
     /// </summary>
-    private PendingIcon AskVisible(string key, string path, bool isDirectory)
+    private PendingIcon AskVisible(string key, string path, bool isDirectory, bool inOrder = false)
     {
         if (_pending.TryGetValue(key, out var entry))
         {
@@ -599,10 +613,56 @@ public sealed class ShellIconService : IDisposable
             _pending[key] = entry;
         }
 
-        _visible.Push(entry);
+        if (inOrder && JoinRun() is { } run)
+        {
+            run.Enqueue(entry);
+        }
+        else
+        {
+            _visible.Push(new VisibleAsk(entry, null));
+        }
+
         WatchWhileWaiting();
         Monitor.Pulse(_gate);
         return entry;
+    }
+
+    /// <summary>
+    /// The run a row asked for now joins: the open one, or a new one on top
+    /// of the stack that is closed once the dispatcher operation asking is
+    /// over.  Null on a thread without a dispatcher, where nothing would
+    /// close it: the row goes on the stack alone.  Inside the lock.
+    /// </summary>
+    private Queue<PendingIcon>? JoinRun()
+    {
+        if (_openRun is { } open)
+        {
+            return open;
+        }
+
+        var dispatcher = Dispatcher.FromThread(Thread.CurrentThread);
+        if (dispatcher is null || dispatcher.HasShutdownStarted)
+        {
+            return null;
+        }
+
+        var run = new Queue<PendingIcon>();
+        _openRun = run;
+        _visible.Push(new VisibleAsk(null, run));
+        dispatcher.BeginInvoke(DispatcherPriority.Send, () => CloseRun(run));
+        return run;
+    }
+
+    /// <summary>The operation that asked for <paramref name="run"/>'s rows is over: the next rows asked for are a newer run.</summary>
+    private void CloseRun(Queue<PendingIcon> run)
+    {
+        lock (_gate)
+        {
+            if (ReferenceEquals(_openRun, run))
+            {
+                _openRun = null;
+            }
+        }
     }
 
     // ---- the worker ------------------------------------------------------------------
@@ -717,7 +777,7 @@ public sealed class ShellIconService : IDisposable
         {
             while (!_disposed)
             {
-                if (_visible.TryPop(out entry!) || _prefetch.TryDequeue(out entry!))
+                if (TryTakeVisible(out entry!) || _prefetch.TryDequeue(out entry!))
                 {
                     if (!_pending.TryGetValue(entry.Key, out var current) || !ReferenceEquals(current, entry))
                     {
@@ -739,6 +799,41 @@ public sealed class ShellIconService : IDisposable
         path = string.Empty;
         isDirectory = false;
         visible = false;
+        return false;
+    }
+
+    /// <summary>
+    /// The newest on-screen entry: the top of the stack, or the first row of
+    /// the run on top, which leaves the stack with its last row.  Inside the lock.
+    /// </summary>
+    private bool TryTakeVisible(out PendingIcon entry)
+    {
+        while (_visible.TryPeek(out var top))
+        {
+            if (top.Run is not { } run)
+            {
+                _visible.Pop();
+                entry = top.Entry!;
+                return true;
+            }
+
+            var taken = run.TryDequeue(out entry!);
+            if (run.Count == 0)
+            {
+                _visible.Pop();
+                if (ReferenceEquals(run, _openRun))
+                {
+                    _openRun = null;
+                }
+            }
+
+            if (taken)
+            {
+                return true;
+            }
+        }
+
+        entry = null!;
         return false;
     }
 
@@ -978,6 +1073,9 @@ public sealed class ShellIconService : IDisposable
         public bool ForCanvas;
         public List<Action<ImageSource?>>? Callbacks;
     }
+
+    /// <summary>One item of the on-screen stack: an icon asked for alone, or a run of rows answered in the order they were asked.</summary>
+    private readonly record struct VisibleAsk(PendingIcon? Entry, Queue<PendingIcon>? Run);
 
     /// <summary>A thread asking the Shell, and since when it has been on its current icon (Stopwatch ticks), or zero while it waits for one.</summary>
     private sealed class IconWorker(Thread thread)
