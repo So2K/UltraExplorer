@@ -49,6 +49,7 @@ internal static partial class Program
         RunOnSta("icon service round 2 on a dispatcher", async () =>
         {
             await Round2IconOrderChecks();
+            await Round2IconDriveKeyChecks();
             Round2IconHungChecks();
         });
         return Task.CompletedTask;
@@ -393,6 +394,41 @@ internal static partial class Program
         Console.WriteLine($"  300 rows asked top to bottom, then 3 of a newer list: the top row was the Shell's question {topRank + 1} of {asked.Length}; the first three asked: {string.Join(", ", asked.Take(3).Select(Path.GetFileName))}");
         Check("J016: a list's rows are answered top to bottom, the top row first of them", done && topRank == newer.Length && asked.Skip(newer.Length).SequenceEqual(rows, StringComparer.OrdinalIgnoreCase));
         Check("J016: and a newer list's rows go before an older one's, top to bottom too", done && asked.Take(newer.Length).SequenceEqual(newer, StringComparer.OrdinalIgnoreCase));
+    }
+
+    // ---- J118: drives have icons of their own ---------------------------------------------------
+
+    /// <summary>
+    /// Two drives, a folder and a WSL distribution: each drive shows its own
+    /// icon, not the folder's.  The navigation pane, which asks on the UI
+    /// thread, draws a drive with its glyph rather than ask the Shell about it
+    /// there - a drive mapped to a server that is off can take the network's
+    /// timeout to answer.
+    /// </summary>
+    private static async Task Round2IconDriveKeyChecks()
+    {
+        var asked = new ConcurrentQueue<string>();
+        ImageSource? Extract(string path, bool isDirectory)
+        {
+            asked.Enqueue(path);
+            return FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(path));
+        }
+
+        using var icons = new ShellIconService(Extract, Dispatcher.CurrentDispatcher);
+        ImageSource? q = null, r = null, folder = null, wsl = null;
+        icons.Request(@"Q:\", true, icon => q = icon);
+        icons.Request(@"R:\", true, icon => r = icon);
+        icons.Request(@"Q:\folder", true, icon => folder = icon);
+        icons.Request(@"\\wsl$\Ubuntu", true, icon => wsl = icon);
+        var done = await IconWaitUntilAsync(() => q is not null && r is not null && folder is not null && wsl is not null);
+        Console.WriteLine($"  drives Q: and R:, a folder and \\\\wsl$\\Ubuntu: the Shell was asked about {string.Join(", ", asked)}");
+        Check("J118: each drive and WSL distribution has an icon of its own, not the folder's",
+            done && !IconSamePicture(q, r) && !IconSamePicture(q, folder) && !IconSamePicture(r, folder) && !IconSamePicture(wsl, folder));
+
+        var paneDrive = icons.GetSmallIcon(@"S:\", true);
+        var paneFolder = icons.GetSmallIcon(@"S:\Users", true);
+        Check("J118: the navigation pane draws a drive with its glyph, without asking the Shell about it on the UI thread, and a folder still with the folder icon",
+            paneDrive is null && !asked.Contains(@"S:\") && IconSamePicture(paneFolder, folder));
     }
 
     // ---- J037: four hung shortcuts -------------------------------------------------------------

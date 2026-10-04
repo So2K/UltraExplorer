@@ -465,10 +465,21 @@ public sealed class ShellIconService : IDisposable
 
     /// <summary>
     /// Blocking resolution, for the handful of navigation-pane entries where the
-    /// icon is part of the initial layout.
+    /// icon is part of the initial layout.  Null for a drive, a share or a WSL
+    /// distribution, which the pane draws with its glyph: each has an icon of
+    /// its own, and asking the Shell for one here, on the UI thread, waits for
+    /// the network when the drive is mapped to a server that is off.
     /// </summary>
     public ImageSource? GetSmallIcon(string path, bool isDirectory)
-        => _cache.GetOrAdd(KeyOf(path, isDirectory), _ => new CachedIcon(_extract(path, isDirectory), Provisional: false)).Icon;
+    {
+        var key = KeyOf(path, isDirectory);
+        if (isDirectory && !ReferenceEquals(key, FolderKey))
+        {
+            return null;
+        }
+
+        return _cache.GetOrAdd(key, _ => new CachedIcon(_extract(path, isDirectory), Provisional: false)).Icon;
+    }
 
     public void Dispose()
     {
@@ -521,15 +532,16 @@ public sealed class ShellIconService : IDisposable
 
     /// <summary>
     /// The key an icon is cached under: one for every folder, the path for a
-    /// file whose icon is its own, and otherwise the file's type - its
-    /// extension, lower case and without the dot, or empty for none - the
-    /// same string as <see cref="NestedFile.Extension"/>.
+    /// drive, a share or a WSL distribution and for a file whose icon is its
+    /// own, and otherwise the file's type - its extension, lower case and
+    /// without the dot, or empty for none - the same string as
+    /// <see cref="NestedFile.Extension"/>.
     /// </summary>
     internal static string KeyOf(string path, bool isDirectory)
     {
         if (isDirectory)
         {
-            return FolderKey;
+            return IsRoot(path) ? path : FolderKey;
         }
 
         var extension = Path.GetExtension(path.AsSpan());
@@ -547,6 +559,18 @@ public sealed class ShellIconService : IDisposable
         Span<char> lower = type.Length <= 64 ? stackalloc char[type.Length] : new char[type.Length];
         type.ToLowerInvariant(lower);
         return new string(lower);
+    }
+
+    /// <summary>
+    /// Whether a folder is the root of a drive, a share or a WSL distribution
+    /// (<c>C:\</c>, <c>\\server\share</c>, <c>\\wsl$\Ubuntu</c>): the Shell
+    /// draws each of those with an icon of its own.  Kept under the one key
+    /// of every folder, they all showed a plain folder.
+    /// </summary>
+    private static bool IsRoot(string path)
+    {
+        var root = Path.GetPathRoot(path.AsSpan());
+        return !root.IsEmpty && root.Length >= path.AsSpan().TrimEnd(@"\/").Length;
     }
 
     /// <summary>
