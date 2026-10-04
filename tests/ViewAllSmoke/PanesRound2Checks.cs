@@ -19,6 +19,8 @@ namespace ViewAllSmoke;
 /// answers after the start is put back once it does, and kept meanwhile
 /// rather than the overview shown while it waits (J041, J124).  A colour or
 /// a note on a drive or share that answers late is drawn once it does (J126).
+/// A new window gathers its beacons once, when its panes have their drives,
+/// not first for nothing as it reads its workspace (J079).
 ///
 /// <para>The windows need the app, of which a process can only ever have the
 /// one, on the thread that made it: these checks always run in a process of
@@ -127,6 +129,7 @@ internal static partial class Program
             {
                 await PanesLateShareCameraChecksAsync(root);
                 await PanesLateRootMarksChecksAsync(root);
+                await PanesStartBeaconChecksAsync(root);
             }
         }
         finally
@@ -251,7 +254,69 @@ internal static partial class Program
         }
     }
 
+    // ---- a new window gathers its beacons once (J079) ----------------------------------
+
+    /// <summary>
+    /// A window reads its workspace before its panes have their drives, and
+    /// the favourite links setting read with it is said to have changed,
+    /// whatever it was.  Each pane gathered every mark into beacons for it
+    /// and looked for each one in a tree with nothing in it, only to do it
+    /// all again once it had its drives.  It gathers them then alone; a
+    /// change of the setting once the pane has its drives gathers them again
+    /// at once, as ever.
+    /// </summary>
+    private static async Task PanesStartBeaconChecksAsync(string root)
+    {
+        Section("panes round 2: a new window gathers its beacons once, when its panes have their drives (J079)");
+        var main = ProxyWindow(out var shell);
+        try
+        {
+            for (var index = 0; index < 2_000; index++)
+            {
+                shell.Marks.Seed(Path.Combine(root, "many-marks", $"folder{index / 50:D2}", $"file{index:D4}.txt"), "#3A96DD", string.Empty);
+            }
+
+            // As reading the workspace says it, before the panes have drives.
+            var pane = main.FirstPane;
+            var before = PanesBeacons(pane.Canvas);
+            var watch = Stopwatch.StartNew();
+            PanesRaisePropertyChanged(shell, nameof(MainViewModel.ShowFavoriteLinks));
+            var raised = watch.Elapsed.TotalMilliseconds;
+            await LiveWait(() => !PanesResolving(pane.Canvas), 10_000);
+            var looked = watch.Elapsed.TotalMilliseconds;
+            Check($"read before the panes have their drives, the favourite links setting gathers no beacons ({PanesBeacons(pane.Canvas).Count} gathered in {raised:0.0} ms, looked for until {looked:0.0} ms)",
+                !pane.IsReady && ReferenceEquals(PanesBeacons(pane.Canvas), before));
+
+            await main.StartNestedForChecksAsync();
+            Check($"once they have, the pane gathers every mark ({PanesBeacons(pane.Canvas).Count} beacons)", PanesBeacons(pane.Canvas).Count >= 2_000);
+
+            var gathered = PanesBeacons(pane.Canvas);
+            var shown = shell.ShowFavoriteLinks;
+            shell.ShowFavoriteLinks = !shown;
+            var regathered = !ReferenceEquals(PanesBeacons(pane.Canvas), gathered) && pane.Canvas.ShowFavoriteLinks == !shown;
+            shell.ShowFavoriteLinks = shown;
+            Check("and a change of the setting from then on shows or hides the links and gathers the beacons again at once, as ever", regathered);
+            await LiveWait(() => !PanesResolving(pane.Canvas), 10_000);
+        }
+        finally
+        {
+            shell.Dispose();
+        }
+    }
+
     // ---- helpers -----------------------------------------------------------------------
+
+    /// <summary>The beacons <paramref name="canvas"/> was last given, as given: a new list each time they are gathered.</summary>
+    private static IReadOnlyList<NestedBeacon> PanesBeacons(NestedCanvas canvas) =>
+        (IReadOnlyList<NestedBeacon>)typeof(NestedCanvas).GetField("_beacons", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(canvas)!;
+
+    /// <summary>Whether <paramref name="canvas"/> is still looking for the folders of its beacons.</summary>
+    private static bool PanesResolving(NestedCanvas canvas) =>
+        (bool)typeof(NestedCanvas).GetField("_beaconResolverRunning", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(canvas)!;
+
+    /// <summary>A property of the window's model said to have changed, as the model says it when it reads its workspace.</summary>
+    private static void PanesRaisePropertyChanged(MainViewModel shell, string property) =>
+        typeof(UltraExplorer.Infrastructure.ObservableObject).GetMethod("OnPropertyChanged", BindingFlags.Instance | BindingFlags.NonPublic, [typeof(string)])!.Invoke(shell, [property]);
 
     /// <summary>The beacons <paramref name="canvas"/> looked for and found nowhere, not to be looked for again until it is told to.</summary>
     private static IReadOnlySet<string> PanesUnresolvable(NestedCanvas canvas) =>

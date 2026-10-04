@@ -550,7 +550,15 @@ public partial class MainWindow : INestedPaneHost
                 foreach (var pane in _panes)
                 {
                     pane.Canvas.ShowFavoriteLinks = _viewModel.ShowFavoriteLinks;
-                    pane.RebuildBeacons();
+
+                    // Said as the workspace is read, before the pane has its
+                    // drives: it gathers its beacons once it has them (see
+                    // NestedPane.Initialize), and every mark gathered and
+                    // looked for in an empty tree now would be for nothing.
+                    if (pane.IsReady)
+                    {
+                        pane.RebuildBeacons();
+                    }
                 }
                 break;
         }
