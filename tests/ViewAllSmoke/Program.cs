@@ -163,6 +163,7 @@ internal static partial class Program
         await Group(ListSearchReviewChecks);
         await Group(CrossClusterRound2Checks);
         await Group(CanvasMotionReview2Checks);
+        await Group(SelectionReview2Checks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

@@ -150,6 +150,35 @@ internal sealed class NestedSelection
     /// <summary>The paths of the folders something waits in (see <see cref="ResolvePending"/>).</summary>
     public IEnumerable<string> PendingFolders => _pending.Keys;
 
+    /// <summary>
+    /// Takes <paramref name="folder"/> out of what waits for its parent to be
+    /// read: the folder gone into, when the folder above it is too big to
+    /// have been listed yet or behind a link the canvas does not read.  True
+    /// when it waited there, and was in the window's selection.
+    /// </summary>
+    public bool TakeWaiting(NestedFolder folder)
+    {
+        if (_pending.Count == 0 || folder.Parent is not { } parent || !_pending.TryGetValue(parent.FullPath, out var names))
+        {
+            return false;
+        }
+
+        // In This PC a drive or a share waits by its whole path, as Load names it.
+        var name = parent.IsComputer ? folder.FullPath : folder.Name;
+        if (names.RemoveAll(waiting => string.Equals(waiting, name, StringComparison.OrdinalIgnoreCase)) == 0)
+        {
+            return false;
+        }
+
+        if (names.Count == 0)
+        {
+            _pending.Remove(parent.FullPath);
+        }
+
+        Version++;
+        return true;
+    }
+
     /// <summary>Every folder something selected is directly inside; for drawing, which visits only these.</summary>
     public IReadOnlyList<NestedFolder> Containers
     {

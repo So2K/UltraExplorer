@@ -262,14 +262,17 @@ public sealed partial class NestedCanvas
     /// folder above it out, their paths added to <paramref name="removed"/>:
     /// kept, a Delete or a Move would act on the whole folder rather than on
     /// what was picked in it.  True when there were any; the edit's items are
-    /// then not all in one folder.
+    /// then not all in one folder.  One still waiting for the folder above
+    /// it to be read - gone into by its path, under a link or a folder too
+    /// big to have been listed yet - is selected in the window all the same,
+    /// and goes too.
     /// </summary>
     private bool DeselectFoldersAbove(NestedFolder container, List<string> removed)
     {
         var any = false;
         for (var folder = container; folder.Parent is not null; folder = folder.Parent)
         {
-            if (_selection.SetFolder(folder, false))
+            if (_selection.SetFolder(folder, false) || _selection.TakeWaiting(folder))
             {
                 removed.Add(folder.FullPath);
                 any = true;
