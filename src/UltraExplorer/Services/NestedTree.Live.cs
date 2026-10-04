@@ -46,9 +46,19 @@ public sealed partial class NestedTree : IChangeSink
     /// Folders whose own path went - removed, or renamed or moved away -
     /// while their parent's listing still holds them: until a listing of the
     /// parent drops them, or their name turns out to be another folder's now
-    /// (<see cref="CheckNameTakenAsync"/>).
+    /// (<see cref="CheckNameTakenAsync"/>).  None below another of them
+    /// (<see cref="NoteGone"/>).
     /// </summary>
     private readonly HashSet<NestedFolder> _goneByPath = [];
+
+    /// <summary>
+    /// The folders of <see cref="_goneByPath"/> by the parent whose listing
+    /// holds them: what an applied listing looks its own up in.  Gone
+    /// through whole for every apply anywhere, a deleted subtree of twenty
+    /// thousand read folders whose parent was off screen cost every apply
+    /// for the rest of the session a copy of them all.
+    /// </summary>
+    private readonly Dictionary<NestedFolder, List<NestedFolder>> _goneByParent = [];
 
     /// <summary>Dropped folders whose read descendants are still to be taken off the hub, a slice at a time.</summary>
     private readonly Queue<NestedFolder> _droppedSweep = new();
@@ -376,8 +386,7 @@ public sealed partial class NestedTree : IChangeSink
                 // one that went.  Asked about when the parent's next listing
                 // still holds it; at once only when nothing is on its way to
                 // the parent, whose listing may already be one taken since.
-                _goneByPath.Add(folder);
-                if (!parent.NeedsRefresh && parent.QueuedRead == ReadKind.None)
+                if (NoteGone(folder) && !parent.NeedsRefresh && parent.QueuedRead == ReadKind.None)
                 {
                     _ = CheckNameTakenAsync(folder);
                 }
@@ -506,24 +515,135 @@ public sealed partial class NestedTree : IChangeSink
     /// <summary>Asks again about the folders of <paramref name="parent"/> whose own path went and that its listing just applied still holds.</summary>
     private void CheckNamesTaken(NestedFolder parent)
     {
-        foreach (var gone in _goneByPath.ToArray())
+        if (!_goneByParent.TryGetValue(parent, out var gone))
         {
-            if (ReferenceEquals(gone.Parent, parent))
+            return;
+        }
+
+        foreach (var folder in gone.ToArray())
+        {
+            _ = CheckNameTakenAsync(folder);
+        }
+    }
+
+    /// <summary>
+    /// Notes a folder whose own path went (<see cref="_goneByPath"/>), under
+    /// its parent; false when it is not noted, being below a folder noted
+    /// already.  Deleted with all that was read in it - npm ci, cargo clean,
+    /// rm -rf - every read folder of the subtree is heard to go, deepest
+    /// first, and each one noted lets go of those noted below it: only a
+    /// listing of a folder that is still there could ask about them, and a
+    /// folder above that went has none, while one made anew under its name
+    /// has everything read below it marked out of date (<see cref="TakeName"/>).
+    /// </summary>
+    private bool NoteGone(NestedFolder folder)
+    {
+        for (var above = folder.Parent; above is not null; above = above.Parent)
+        {
+            if (_goneByPath.Contains(above))
             {
-                _ = CheckNameTakenAsync(gone);
+                return false;
             }
+        }
+
+        if (!_goneByPath.Add(folder))
+        {
+            return true;
+        }
+
+        if (folder.Parent is { } parent)
+        {
+            if (!_goneByParent.TryGetValue(parent, out var siblings))
+            {
+                siblings = [];
+                _goneByParent[parent] = siblings;
+            }
+
+            siblings.Add(folder);
+        }
+
+        if (_goneByParent.Remove(folder, out var below))
+        {
+            foreach (var child in below)
+            {
+                _goneByPath.Remove(child);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>Takes a folder off <see cref="_goneByPath"/>, and off its parent's entry with it.</summary>
+    private void ForgetGone(NestedFolder folder)
+    {
+        if (!_goneByPath.Remove(folder) || folder.Parent is not { } parent || !_goneByParent.TryGetValue(parent, out var siblings))
+        {
+            return;
+        }
+
+        siblings.Remove(folder);
+        if (siblings.Count == 0)
+        {
+            _goneByParent.Remove(parent);
         }
     }
 
     /// <summary>
     /// The folder's name is another folder's now: what was read in it and
-    /// below it belongs to the one that went, so it is read again at once,
-    /// and what was read below it as it is drawn, as F5 does.
+    /// below it belongs to the one that went.  On screen it is read again at
+    /// once, and what was read below it as it is drawn, as F5 does.  Off
+    /// screen it and everything read below it are only marked out of date,
+    /// and read when drawn - the folder itself at once only when a read
+    /// slot is free, never ahead of the folders on screen: read at once
+    /// whatever it took, a deleted and remade subtree - npm ci, a clean
+    /// build - had every folder of it read before anything on screen, each
+    /// level's listing asking about the next.  Whatever was noted below it
+    /// goes with it: marked out of date, those folders are read again anyway.
     /// </summary>
     private void TakeName(NestedFolder folder)
     {
-        _goneByPath.Remove(folder);
-        RefreshDeep(folder);
+        ForgetGone(folder);
+        if (_goneByPath.Count > 0)
+        {
+            List<NestedFolder>? below = null;
+            foreach (var gone in _goneByPath)
+            {
+                if (folder.Contains(gone))
+                {
+                    (below ??= []).Add(gone);
+                }
+            }
+
+            if (below is not null)
+            {
+                foreach (var gone in below)
+                {
+                    ForgetGone(gone);
+                }
+            }
+        }
+
+        if (IsInView(folder))
+        {
+            RefreshDeep(folder);
+            return;
+        }
+
+        if (_disposed || IsDetached(folder))
+        {
+            return;
+        }
+
+        folder.IsStale = true;
+        lock (_gate)
+        {
+            if (folder.LoadState is not (NestedLoadState.NotLoaded or NestedLoadState.Queued))
+            {
+                EnqueueLocked(folder, ReadKind.Refresh, sticky: false);
+            }
+        }
+
+        MarkStaleBelow(folder);
     }
 
     /// <summary>
@@ -635,6 +755,12 @@ public sealed partial class NestedTree : IChangeSink
         }
 
         Refresh(folder);
+        MarkStaleBelow(folder);
+    }
+
+    /// <summary>Has every folder read below <paramref name="folder"/> marked out of date in the walk of background slices, the ones on screen queued as it reaches them.</summary>
+    private void MarkStaleBelow(NestedFolder folder)
+    {
         foreach (var child in folder.AllChildren)
         {
             if (child.IsLoaded)
@@ -713,7 +839,7 @@ public sealed partial class NestedTree : IChangeSink
             CarryOverRenames(folder, result, renames);
         }
 
-        if (_goneByPath.Count > 0)
+        if (_goneByParent.Count > 0)
         {
             CheckNamesTaken(folder);
         }
@@ -766,7 +892,15 @@ public sealed partial class NestedTree : IChangeSink
     partial void OnForgotten(NestedFolder folder)
     {
         _renames.Remove(folder);
-        _goneByPath.Remove(folder);
+        ForgetGone(folder);
+        if (_goneByParent.Remove(folder, out var gone))
+        {
+            foreach (var child in gone)
+            {
+                _goneByPath.Remove(child);
+            }
+        }
+
         if (_registered.Remove(folder))
         {
             _changes?.Unregister(ChangeConsumer.Nested, folder.FullPath, folder);
@@ -798,7 +932,7 @@ public sealed partial class NestedTree : IChangeSink
                 // A rename waiting for a listing that will never come would
                 // keep the folder, and the branch it is in, alive.
                 _renames.Remove(child);
-                _goneByPath.Remove(child);
+                ForgetGone(child);
                 if (child.AllChildren.Length > 0)
                 {
                     _droppedSweep.Enqueue(child);
