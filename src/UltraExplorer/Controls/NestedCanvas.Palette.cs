@@ -74,12 +74,13 @@ public sealed partial class NestedCanvas
     /// separated by ';'.  Only what has been read can match: a folder not read
     /// yet stays half faded until it is, and then it is judged like the rest.
     ///
-    /// The first <see cref="FilterNamesAtOnce"/> names read are judged before
-    /// this returns - all of them, but in a window that has read a few big
-    /// drives - and the rest a slice at a time between the frames and the
-    /// input (<see cref="JudgeFilterOn"/>), lighting folders and adding
-    /// matches as it goes.  Judged in one go, a filter over a tree read for
-    /// hours held the window still for most of a second on every key.
+    /// The names read are judged before this returns - all of them, but in
+    /// a window that has read a few big drives - for some ten milliseconds
+    /// past the first <see cref="FilterNamesAlwaysAtOnce"/>, and the rest a
+    /// slice at a time between the frames and the input (<see cref="JudgeFilterOn"/>),
+    /// lighting folders and adding matches as it goes.  Judged in one go, a
+    /// filter over a tree read for hours held the window still for most of a
+    /// second on every key.
     /// </summary>
     public void SetFilter(string? text)
     {
@@ -102,23 +103,50 @@ public sealed partial class NestedCanvas
         if (matcher is not null && _tree is not null)
         {
             var judging = new FilterJudging(_tree, _tree.IsSorting ? -1 : _tree.SortGeneration);
+            var started = System.Diagnostics.Stopwatch.GetTimestamp();
             judging.Steps.Add(EnterForFilter(_tree.Root));
 
-            // Counted in names rather than time, so a tree of any but the
-            // biggest size is judged before this returns however busy the
-            // machine.  A thread whose dispatcher nobody runs has nobody to
-            // judge the rest later: it judges everything now, as it always did.
-            var budget = SynchronizationContext.Current is DispatcherSynchronizationContext
-                ? new FrameBudget { Deadline = long.MaxValue, Items = FilterNamesAtOnce }
-                : FrameBudget.Unlimited;
-            if (JudgeFilter(judging, ref budget))
+            // The order the matches are listed in is the judging's own, the
+            // order on screen, until a read adds one out of it
+            // (OnFolderLoadedForFilter).
+            _filterOrderGeneration = judging.OrderGeneration;
+
+            // The first names are judged whatever the clock says, so a tree
+            // of a few thousand names - nearly any view - is judged before
+            // this returns however busy the machine; past them, only until
+            // the slice's time is up.  Counted in names alone, the slice was
+            // a quarter of a million of them: 20 to 200 ms on every key,
+            // depending on the pattern.  A thread whose dispatcher nobody
+            // runs has nobody to judge the rest later: it judges everything
+            // now, as it always did.
+            bool judged;
+            if (SynchronizationContext.Current is DispatcherSynchronizationContext)
+            {
+                var always = new FrameBudget { Deadline = long.MaxValue, Items = FilterNamesAlwaysAtOnce };
+                judged = JudgeFilter(judging, ref always);
+                if (!judged)
+                {
+                    var timed = new FrameBudget
+                    {
+                        Deadline = started + (long)(FilterFirstSliceMs * System.Diagnostics.Stopwatch.Frequency / 1000),
+                        Items = FilterNamesAtOnce - FilterNamesAlwaysAtOnce
+                    };
+                    judged = JudgeFilter(judging, ref timed);
+                }
+            }
+            else
+            {
+                var budget = FrameBudget.Unlimited;
+                judged = JudgeFilter(judging, ref budget);
+            }
+
+            if (judged)
             {
                 FilterJudged(judging);
             }
             else
             {
                 _filterJudging = judging;
-                _filterOrderGeneration = judging.OrderGeneration;
                 (_filterDriver ??= new DispatcherFrameDriver(Dispatcher, JudgeFilterOn, () => _filterJudging is not null, DispatcherPriority.Background)).Wake();
             }
         }
@@ -128,8 +156,14 @@ public sealed partial class NestedCanvas
         RaiseFilterChanged();
     }
 
-    /// <summary>How many names <see cref="SetFilter"/> judges before it leaves the rest to slices between the frames: about ten milliseconds' worth.</summary>
+    /// <summary>At most how many names <see cref="SetFilter"/> judges before it leaves the rest to slices between the frames.</summary>
     private const int FilterNamesAtOnce = 250_000;
+
+    /// <summary>Names <see cref="SetFilter"/> judges whatever the time: a few milliseconds' worth for the slowest pattern.</summary>
+    private const int FilterNamesAlwaysAtOnce = 16_384;
+
+    /// <summary>How long <see cref="SetFilter"/> judges, past <see cref="FilterNamesAlwaysAtOnce"/>, before it leaves the rest to slices.</summary>
+    private const double FilterFirstSliceMs = 10;
 
     /// <summary>Names judged between two looks at the budget: a folder of files is judged whole, however many it holds.</summary>
     private const int FilterNamesPerCheck = 512;
@@ -378,14 +412,15 @@ public sealed partial class NestedCanvas
 
     /// <summary>
     /// The whole tree is judged.  Gathered while the tree was still placing
-    /// folders for a new order - or across a change of order - the list is in
-    /// a mixture of orders: it is put in the current one when the placing is
-    /// done.
+    /// folders for a new order - or across a change of order, or with reads
+    /// adding matches out of the judging's order (<see cref="PlaceReadMatches"/>)
+    /// - the list is in a mixture of orders: it is put in the current one
+    /// when the placing is done.
     /// </summary>
     private void FilterJudged(FilterJudging judging)
     {
         var tree = judging.Tree;
-        var placed = !tree.IsSorting && judging.OrderGeneration == tree.SortGeneration;
+        var placed = !tree.IsSorting && judging.OrderGeneration == tree.SortGeneration && _filterOrderGeneration == judging.OrderGeneration;
         _filterOrderGeneration = placed ? tree.SortGeneration : -1;
         if (!placed)
         {
@@ -424,13 +459,20 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// Goes to the next match (or the previous one), selects it and flies to
     /// where it can be read.  False when nothing matches.  Next is next in
-    /// the order on screen, even straight after the order changed.
+    /// the order on screen, even straight after the order changed.  A match
+    /// that is no longer there - its drive gone, its folder deleted or hidden
+    /// - is let go of, and the step goes on to the one after it.
     /// </summary>
     public bool GoToMatch(int direction)
     {
         // The order on screen is known only of what has been judged: a step
-        // taken while the filter is still being judged judges the rest first.
-        if (_filterJudging is not null)
+        // taken while the filter is still being judged judges the rest first
+        // - unless it is a step on to a match already found.  The judging
+        // lists the matches in the order on screen as it finds them, so the
+        // next one listed is the next one there is, and the rest is left to
+        // the slices.  Enter pressed straight after typing goes to the first
+        // match at once rather than waiting for the whole tree.
+        if (_filterJudging is { } judging && !CanStepWhileJudging(judging, direction))
         {
             var budget = FrameBudget.Unlimited;
             JudgeFilterOn(ref budget);
@@ -441,24 +483,54 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        if (_tree is not null && _filterOrderGeneration != _tree.SortGeneration)
+        if (_tree is not null && _filterJudging is null && _filterOrderGeneration != _tree.SortGeneration)
         {
             ReorderFilterMatches();
         }
 
-        _filterCursor = ((_filterCursor < 0 && direction < 0 ? 0 : _filterCursor) + direction + _filterMatches.Count) % _filterMatches.Count;
-        var path = _filterMatches[_filterCursor];
-        if (Resolve(path) is not { } target)
+        var dropped = false;
+        while (_filterMatches.Count > 0)
         {
-            return false;
+            _filterCursor = ((_filterCursor < 0 && direction < 0 ? 0 : _filterCursor) + direction + _filterMatches.Count) % _filterMatches.Count;
+            var path = _filterMatches[_filterCursor];
+            if (Resolve(path) is { } target)
+            {
+                MarkSelected(path);
+                SelectRequested?.Invoke(path, false);
+                FlyToReadable(target.Folder, target.FileIndex);
+                RaiseFilterChanged();
+                return true;
+            }
+
+            // Not there any more: let go of it, and step on from where it
+            // was - to the match after it, or before it going back.
+            _filterMatchSet.Remove(path);
+            _filterMatches.RemoveAt(_filterCursor);
+            _filterCursor = direction > 0 ? _filterCursor - 1 : _filterCursor;
+            dropped = true;
         }
 
-        MarkSelected(path);
-        SelectRequested?.Invoke(path, false);
-        FlyToReadable(target.Folder, target.FileIndex);
-        RaiseFilterChanged();
-        return true;
+        _filterCursor = -1;
+        if (dropped)
+        {
+            RaiseFilterChanged();
+        }
+
+        return false;
     }
+
+    /// <summary>
+    /// Whether a step can be taken while <paramref name="judging"/> is still
+    /// under way: a step forward to a match already listed, with the list
+    /// still in the order on screen - the judging's own, the tree placed for
+    /// it, and no read since having listed a match out of it.
+    /// </summary>
+    private bool CanStepWhileJudging(FilterJudging judging, int direction) =>
+        direction > 0
+        && _filterCursor + 1 < _filterMatches.Count
+        && !judging.Tree.IsSorting
+        && judging.OrderGeneration == judging.Tree.SortGeneration
+        && _filterOrderGeneration == judging.OrderGeneration;
 
     private static Func<string, bool>? CompileFilter(string? text)
     {
@@ -778,10 +850,16 @@ public sealed partial class NestedCanvas
         }
 
         var lost = false;
+        var added = _filterMatches.Count - before;
         if (gone is { Count: > 0 })
         {
             RemoveMatches(gone);
             lost = true;
+        }
+
+        if (added > 0)
+        {
+            PlaceReadMatches(folder, added);
         }
 
         if (matched)
@@ -817,6 +895,228 @@ public sealed partial class NestedCanvas
         {
             RaiseFilterChangedWithFrame();
         }
+    }
+
+    /// <summary>
+    /// The matches a read added - the last <paramref name="added"/> listed,
+    /// in and under <paramref name="folder"/> - put in their places in the
+    /// order on screen.  Added at the end, a new file in the first folder
+    /// was stepped to after everything else, and past the window's limit of
+    /// marks got none.  The folder's matches are listed again together, in
+    /// its walking order: its own name, its files as they are placed, then
+    /// each sub-folder's, which keep the order they were listed in - in the
+    /// place where the folder's were, or where the folder comes among the
+    /// rest when none were listed.  While the list is not in the order on
+    /// screen anyway - a filter still being judged, a tree still placing
+    /// folders for a new order - it is only marked out of order, and put in
+    /// order with the rest (<see cref="FilterJudged"/>, <see cref="GoToMatch"/>).
+    /// </summary>
+    private void PlaceReadMatches(NestedFolder folder, int added)
+    {
+        if (_tree is not { } tree || folder.IsComputer || _filterJudging is not null || tree.IsSorting || _filterOrderGeneration != tree.SortGeneration)
+        {
+            _filterOrderGeneration = -1;
+            return;
+        }
+
+        // Which sub-folder each listed match at or under the folder is in;
+        // the folder's own name and files are listed again from the folder.
+        var root = folder.FullPath;
+        var start = root.Length + (root[^1] == Path.DirectorySeparatorChar ? 0 : 1);
+        var children = new Dictionary<string, NestedFolder>(folder.Children.Count, StringComparer.OrdinalIgnoreCase);
+        foreach (var child in folder.Children)
+        {
+            children[child.FullPath] = child;
+        }
+
+        var lookup = children.GetAlternateLookup<ReadOnlySpan<char>>();
+        var count = _filterMatches.Count;
+        var listedBefore = count - added;
+        var first = -1;
+        var inside = 0;
+        Dictionary<NestedFolder, List<string>>? blocks = null;
+        List<string>? stray = null;
+        for (var index = 0; index < count; index++)
+        {
+            var path = _filterMatches[index];
+            if (!IsAtOrUnder(path, root))
+            {
+                continue;
+            }
+
+            inside++;
+            if (first < 0 && index < listedBefore)
+            {
+                first = index;
+            }
+
+            if (path.Length <= start)
+            {
+                continue;
+            }
+
+            var end = path.IndexOf(Path.DirectorySeparatorChar, start);
+            if (lookup.TryGetValue(end < 0 ? path.AsSpan() : path.AsSpan(0, end), out var holder))
+            {
+                blocks ??= [];
+                if (!blocks.TryGetValue(holder, out var block))
+                {
+                    blocks[holder] = block = [];
+                }
+
+                block.Add(path);
+            }
+            else if (end >= 0)
+            {
+                (stray ??= []).Add(path);
+            }
+        }
+
+        var matcher = _filter!;
+        var placed = new List<string>(inside);
+        if (_filterMatchSet.Contains(root))
+        {
+            placed.Add(root);
+        }
+
+        foreach (var file in folder.Files)
+        {
+            if (matcher(file.Name))
+            {
+                placed.Add(folder.PathOf(file));
+            }
+        }
+
+        if (blocks is not null)
+        {
+            foreach (var child in folder.Children)
+            {
+                if (blocks.TryGetValue(child, out var block))
+                {
+                    placed.AddRange(block);
+                }
+            }
+        }
+
+        if (stray is not null)
+        {
+            placed.AddRange(stray);
+        }
+
+        if (placed.Count != inside)
+        {
+            // Not what was listed - a file of the folder not listed as a
+            // match, say: put in order with everything instead.
+            _filterOrderGeneration = -1;
+            return;
+        }
+
+        // Where the folder's matches go: where the first of them was, or
+        // where the folder comes among the matches listed before the read.
+        var at = first >= 0 ? first : FilterInsertionPoint(folder, listedBefore);
+        var cursor = _filterCursor >= 0 && _filterCursor < count ? _filterMatches[_filterCursor] : null;
+        var kept = 0;
+        var cursorAt = -1;
+        for (var index = 0; index < count; index++)
+        {
+            var path = _filterMatches[index];
+            if (IsAtOrUnder(path, root))
+            {
+                continue;
+            }
+
+            if (index == _filterCursor)
+            {
+                cursorAt = kept < at ? kept : kept + placed.Count;
+            }
+
+            _filterMatches[kept++] = path;
+        }
+
+        _filterMatches.RemoveRange(kept, count - kept);
+        _filterMatches.InsertRange(at, placed);
+        if (cursor is not null)
+        {
+            _filterCursor = IsAtOrUnder(cursor, root)
+                ? at + placed.FindIndex(path => string.Equals(path, cursor, StringComparison.OrdinalIgnoreCase))
+                : cursorAt;
+        }
+    }
+
+    /// <summary>
+    /// Where the matches in and under <paramref name="folder"/> go among the
+    /// first <paramref name="count"/> listed, which are in the order on
+    /// screen and hold none of them: after every match that comes before the
+    /// folder there - a folder it is in, a file of one, anything in a
+    /// sub-folder placed before the one on its way.
+    /// </summary>
+    private int FilterInsertionPoint(NestedFolder folder, int count)
+    {
+        var low = 0;
+        var high = count;
+        while (low < high)
+        {
+            var middle = (low + high) >>> 1;
+            if (ComesBefore(_filterMatches[middle], folder))
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        return low;
+    }
+
+    /// <summary>
+    /// Whether the match at <paramref name="path"/> comes before everything
+    /// in and under <paramref name="folder"/> in the order on screen, as the
+    /// folders are placed now.  One that is not there any more is listed at
+    /// the end (see <see cref="ReorderFilterMatches"/>).
+    /// </summary>
+    private bool ComesBefore(string path, NestedFolder folder)
+    {
+        if (ResolveAsPlaced(path) is not { } found)
+        {
+            return false;
+        }
+
+        // Up both folders' chains to the folder they are both in, noting
+        // the sub-folder of it each came from.
+        var match = found.Folder;
+        var other = folder;
+        NestedFolder? matchFrom = null;
+        NestedFolder? otherFrom = null;
+        while (match.Depth > other.Depth && match.Parent is { } up)
+        {
+            matchFrom = match;
+            match = up;
+        }
+
+        while (other.Depth > match.Depth && other.Parent is { } otherUp)
+        {
+            otherFrom = other;
+            other = otherUp;
+        }
+
+        while (!ReferenceEquals(match, other) && match.Parent is { } matchUp && other.Parent is { } otherUp)
+        {
+            matchFrom = match;
+            match = matchUp;
+            otherFrom = other;
+            other = otherUp;
+        }
+
+        if (!ReferenceEquals(match, other) || otherFrom is null)
+        {
+            return false;
+        }
+
+        // A folder the folder is in - or a file of one - comes before its
+        // sub-folders; otherwise the sub-folder placed first comes first.
+        return matchFrom is null || matchFrom.Index >= 0 && matchFrom.Index < otherFrom.Index;
     }
 
     /// <summary>
