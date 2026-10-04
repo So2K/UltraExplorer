@@ -405,7 +405,7 @@ internal static class DialogNative
         var style = GetWindowLongPtr(edit, -16).ToInt64();
         if ((style & (0x20 | 0x4)) != 0) throw new NotSupportedException("A password or multiline field needs its original dialog.");
         var text = new StringBuilder(2049);
-        if (SendTextMessage(edit, 0xd, text.Capacity, text, 2, 250, out var length) == 0)
+        if (SendTextMessage(edit, 0xd, text.Capacity, text, 2, FieldAnswerMilliseconds, out var length) == 0)
             throw new IOException("The application's text option cannot be read.");
         if (length >= 2048)
         {
@@ -416,7 +416,7 @@ internal static class DialogNative
             if (!TryMessage(edit, 0xe, 0, 0, out var longer) || longer is < 0 or > LongestEditText)
                 throw new IOException("The application's text option cannot be read.");
             text = new StringBuilder((int)longer + 2);
-            if (SendTextMessage(edit, 0xd, text.Capacity, text, 2, 250, out length) == 0 || length >= text.Capacity - 1)
+            if (SendTextMessage(edit, 0xd, text.Capacity, text, 2, FieldAnswerMilliseconds, out length) == 0 || length >= text.Capacity - 1)
                 throw new IOException("The application's text option cannot be read.");
         }
         return text.ToString();
@@ -427,9 +427,16 @@ internal static class DialogNative
     /// whatever length an application's field claims.</summary>
     private const int LongestEditText = 1 << 20;
 
+    /// <summary>How long a text field of the application's is waited for, to
+    /// be read or written: an application busy for a moment - a collection, a
+    /// slow handler - answers within it, so the picker is not withdrawn, nor
+    /// an accepted name lost, for that moment. One that does not answer at all
+    /// is still given up on within a second, and a hung one at once.</summary>
+    private const uint FieldAnswerMilliseconds = 1000;
+
     internal static void SetEdit(nint edit, string text)
     {
-        if (SendInputMessage(edit, 0xc, 0, text, 2, 250, out var accepted) == 0 || accepted == 0 || ReadEdit(edit) != text)
+        if (SendInputMessage(edit, 0xc, 0, text, 2, FieldAnswerMilliseconds, out var accepted) == 0 || accepted == 0 || ReadEdit(edit) != text)
             throw new IOException("The application's text option did not accept its new value.");
     }
 
@@ -437,7 +444,7 @@ internal static class DialogNative
     {
         var parent = GetParent(edit);
         if (ClassName(parent) != "ComboBox") { SetEdit(edit, text); return; }
-        if (SendInputMessage(parent, 0xc, 0, text, 2, 250, out var accepted) == 0 || accepted == 0 || ReadEdit(edit) != text)
+        if (SendInputMessage(parent, 0xc, 0, text, 2, FieldAnswerMilliseconds, out var accepted) == 0 || accepted == 0 || ReadEdit(edit) != text)
             throw new IOException("The application's filename control did not accept the selected name.");
         // Writing the inner edit does not necessarily invalidate the common
         // dialog's cached filename after a type change. Commit the combo edit
