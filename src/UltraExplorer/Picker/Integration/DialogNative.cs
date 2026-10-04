@@ -365,6 +365,10 @@ internal static class DialogNative
         return (labels, (int)selected);
     }
 
+    /// <summary>How many entries a native combo box holds; null when it is not one or does not answer.</summary>
+    internal static long? ComboCount(nint combo) =>
+        combo != 0 && ClassName(combo) == "ComboBox" && TryMessage(combo, 0x146, 0, 0, out var count) ? count : null;
+
     internal static bool SelectCombo(nint combo, int index)
     {
         if (combo == 0 || ClassName(combo) != "ComboBox") return false;

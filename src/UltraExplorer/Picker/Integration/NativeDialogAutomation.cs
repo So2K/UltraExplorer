@@ -26,6 +26,9 @@ internal sealed class NativeDialogAutomation : IDisposable
     private bool _folderConfirmed;
     private Func<bool>? _mayMutate;
 
+    /// <summary>The most file types a replaced dialog may offer; one with more stays with Windows.</summary>
+    private const int MostFileTypes = 64;
+
     public NativeDialogSnapshot Capture(nint handle, DialogLease? lease = null, Func<bool>? requestActive = null)
     {
         bool Owned() => requestActive?.Invoke() != false && lease is not null && lease.IsProtected
@@ -74,9 +77,15 @@ internal sealed class NativeDialogAutomation : IDisposable
             var emptyReads = 0;
             for (var attempt = 0; attempt < 5; attempt++)
             {
-                var native = DialogNative.ReadCombo(_types.Properties.NativeWindowHandle.ValueOrDefault, 64);
+                var typeList = _types.Properties.NativeWindowHandle.ValueOrDefault;
+                var native = DialogNative.ReadCombo(typeList, MostFileTypes);
                 if (native is { Selected: >= 0 } selected)
                 { labels = selected.Labels; filterIndex = selected.Selected + 1; break; }
+                // More types than the picker mirrors (Notepad++, LibreOffice):
+                // the dialog stays with Windows now, rather than after reading
+                // the list again and again and then dropping it down to count.
+                if (native is null && DialogNative.ComboCount(typeList) > MostFileTypes)
+                    throw new NotSupportedException("The file types cannot be read.");
                 // A Save dialog shows its type list even when the caller gave it
                 // no types: present, and empty. Empty twice in a row, 150 ms
                 // apart, is that list - not one still being filled.
@@ -106,7 +115,7 @@ internal sealed class NativeDialogAutomation : IDisposable
                 filters.Add(NativeDialogRules.AllFiles);
                 filterIndex = 1;
             }
-            else if (_typeCount is 0 or > 64 || filterIndex < 1) throw new NotSupportedException("The file types cannot be read.");
+            else if (_typeCount is 0 or > MostFileTypes || filterIndex < 1) throw new NotSupportedException("The file types cannot be read.");
             for (var i = 0; i < labels.Length; i++)
             {
                 filters.Add(NativeDialogRules.ReadFilter(labels[i])
