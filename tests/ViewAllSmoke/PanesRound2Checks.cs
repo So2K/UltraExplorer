@@ -26,7 +26,8 @@ namespace ViewAllSmoke;
 /// (J131).  Shift+F5 or Shift+F6 pressed again while a copy or a move to the
 /// other pane is on its way sends nothing more (J065).  Zoomed out of a
 /// folder opened by name, the folder stays where it is when its parent is
-/// listed, rather than jumping to a speck elsewhere (J026).
+/// listed, rather than jumping to a speck elsewhere (J026).  A drag of fifty
+/// thousand items goes from folder to folder without a stall at each (J103).
 ///
 /// <para>The windows need the app, of which a process can only ever have the
 /// one, on the thread that made it: these checks always run in a process of
@@ -139,6 +140,7 @@ internal static partial class Program
                 await PanesTreeSwitchChecksAsync(root);
                 await PanesSendTwiceChecksAsync(root);
                 await PanesSparseParentChecksAsync(root);
+                await PanesBigDragChecksAsync(root);
             }
         }
         finally
@@ -564,6 +566,108 @@ internal static partial class Program
         }
         finally
         {
+            shell.Dispose();
+        }
+    }
+
+    // ---- a drag of fifty thousand photos over the folders (J103) ------------------------
+
+    /// <summary>
+    /// Ctrl+A over fifty thousand photos, dragged across the canvas: each
+    /// folder the pointer came to compared every one of them with it, by
+    /// their full names worked out afresh - a tenth of a second for each
+    /// folder, a stutter at every one - and every DragOver while it stayed
+    /// there asked again whether all of them were on its drive.  What the
+    /// drag carries is looked up by name instead, gathered once for the
+    /// drag; what is refused is refused as before.
+    /// </summary>
+    private static async Task PanesBigDragChecksAsync(string root)
+    {
+        Section("panes round 2: a drag of fifty thousand items goes over folder after folder without a stall (J103)");
+        var drive = Path.Combine(root, "drag-drive");
+        var photos = Path.Combine(drive, "photos");
+        var carriedFolder = Path.Combine(drive, "carried");
+        var insideCarried = Path.Combine(carriedFolder, "inside");
+        var targets = Enumerable.Range(0, 8).Select(index => Path.Combine(drive, $"target{index}")).ToArray();
+        foreach (var folder in targets.Append(photos).Append(insideCarried))
+        {
+            Directory.CreateDirectory(folder);
+        }
+
+        string[] carried = [.. Enumerable.Range(0, 50_000).Select(index => Path.Combine(photos, $"IMG_{index:D5}.jpg")), carriedFolder];
+        var main = ProxyWindow(out var shell);
+        var host = (INestedPaneHost)main;
+        try
+        {
+            await main.StartNestedForChecksAsync();
+            main.UseNestedDrivesForChecks([new NestedRoot(drive, "D", NestedFolderKind.Drive)]);
+            var pane = main.FirstPane;
+            var tree = pane.Tree;
+            await tree.LoadAsync(tree.Find(drive)!);
+            await tree.LoadAsync(tree.Find(carriedFolder)!);
+            pane.Canvas.FlyTo(tree.Find(drive)!, 0.92, animated: false);
+            pane.Canvas.RenderNow();
+            var surface = SettingsHosts[main];
+            Point? Centre(string path) =>
+                tree.Find(path) is { } folder && pane.Canvas.ScreenRectOf(folder) is { } cell
+                    ? pane.Canvas.TranslatePoint(new Point(cell.X + cell.Width / 2, cell.Y + cell.Height / 2), surface)
+                    : null;
+            var points = targets.Select(Centre).ToArray();
+            if (points.Any(point => point is null) || Centre(photos) is not { } overPhotos || Centre(insideCarried) is not { } overInside)
+            {
+                Check("every folder is on the canvas", false);
+                return;
+            }
+
+            var data = new DataObject(DataFormats.FileDrop, carried);
+            DragEventArgs Over(Point at)
+            {
+                var args = SplitDragArgs(DragDrop.DragOverEvent, data, DragDropKeyStates.None, surface, at);
+                pane.Canvas.RaiseEvent(args);
+                return args;
+            }
+
+            // The pointer comes onto the canvas, then goes from folder to
+            // folder, and stays a while on the last.
+            var watch = Stopwatch.StartNew();
+            var first = Over(points[0]!.Value);
+            var entered = watch.Elapsed.TotalMilliseconds;
+            var lit = first.Effects == DragDropEffects.Move && pane.Canvas.DropTarget?.FullPath == targets[0];
+            watch.Restart();
+            for (var index = 1; index < targets.Length; index++)
+            {
+                var over = Over(points[index]!.Value);
+                lit &= over.Effects == DragDropEffects.Move && pane.Canvas.DropTarget?.FullPath == targets[index];
+            }
+
+            var perFolder = watch.Elapsed.TotalMilliseconds / (targets.Length - 1);
+            watch.Restart();
+            for (var repeat = 0; repeat < 20; repeat++)
+            {
+                lit &= Over(points[^1]!.Value).Effects == DragDropEffects.Move;
+            }
+
+            var perStay = watch.Elapsed.TotalMilliseconds / 20;
+            Check($"each folder the pointer comes to is lit at once ({entered:0.0} ms coming onto the canvas, then {perFolder:0.00} ms for each new folder and {perStay:0.000} ms for each DragOver on the same one)",
+                lit && perFolder < 40 && perStay < 1);
+
+            // Refused as ever: inside a folder it carries, and - from this
+            // window - the folder its items come out of.
+            var intoCarried = Over(overInside);
+            var backAccepted = Over(overPhotos).Effects == DragDropEffects.Move;
+            host.NestedDragPaths = carried;
+            var elsewhere = Over(points[1]!.Value);
+            var outOfItsFolder = Over(overPhotos);
+            host.NestedDragPaths = null;
+            Check("still refused inside a folder it carries, and on the folder a drag from this window carries its items out of; taken anywhere else",
+                intoCarried.Effects == DragDropEffects.None && backAccepted && outOfItsFolder.Effects == DragDropEffects.None
+                && elsewhere.Effects == DragDropEffects.Move);
+            host.ForgetDropPaths();
+            host.ClearDropTargets();
+        }
+        finally
+        {
+            host.NestedDragPaths = null;
             shell.Dispose();
         }
     }

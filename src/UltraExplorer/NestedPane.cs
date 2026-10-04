@@ -1795,7 +1795,7 @@ internal sealed class NestedPane
         }
 
         // The keys and what the source allows, as the tree canvas has them (see DropEffectFor).
-        var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
+        var effect = DropEffectOver(e, paths, target.FullPath);
         canvas.DropTarget = effect == DragDropEffects.None ? null : target;
         e.Effects = effect;
     }
@@ -1857,12 +1857,153 @@ internal sealed class NestedPane
         }
 
         var target = hit.Folder;
-        return _host.IsDropRefused(target.FullPath, () => paths.Any(path =>
-            ViewAllPath.Equals(path, target.FullPath)
-            || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)
-            || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _host.NestedDragPaths is not null))
+        return _host.IsDropRefused(target.FullPath, () =>
+            _dropCarried.GetValue(paths, DropCarried.Gather).Refuses(target.FullPath, fromThisWindow: _host.NestedDragPaths is not null) is { } refused
+                ? refused
+                : paths.Any(path =>
+                    ViewAllPath.Equals(path, target.FullPath)
+                    || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)
+                    || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _host.NestedDragPaths is not null))
             ? null
             : target;
+    }
+
+    /// <summary>What each drag's items are, by name (<see cref="DropCarried"/>): gathered once for the list the window keeps for the drag, and let go with it.</summary>
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<IReadOnlyList<string>, DropCarried> _dropCarried = new();
+
+    /// <summary>
+    /// What a drag carries, by name, for <see cref="ResolveDropTarget"/>: the
+    /// items, the folders they are in, and the items as folders a target may
+    /// be inside, each in the full form the item-by-item comparison works out.
+    /// That worked every one out again for each folder the pointer came to -
+    /// a tenth of a second and more for fifty thousand photos, a stall at
+    /// every folder; gathered once for the drag, a folder is answered by a
+    /// few lookups, the same answer.  A drag with an item whose full form
+    /// cannot be worked out, or a folder whose own cannot, is compared item
+    /// by item, as ever.  The drop effect last worked out for it is kept here
+    /// too (<see cref="DropEffectOver"/>).
+    /// </summary>
+    private sealed class DropCarried
+    {
+        private readonly HashSet<string> _items = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _parents = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Each item as a folder something may be inside, ending in a separator, as NativeShellService.IsInvalidMoveTarget has it: the item, by it.</summary>
+        private readonly Dictionary<string, string> _containers = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Any item that comes to the same folder as one before it, named another way.</summary>
+        private List<KeyValuePair<string, string>>? _moreContainers;
+
+        private bool _usable = true;
+
+        /// <summary>The drop effect last worked out for the drag, over a folder with the keys held and the effects allowed then.</summary>
+        public (string Folder, DragDropKeyStates Keys, DragDropEffects Allowed, DragDropEffects Effect)? LastEffect { get; set; }
+
+        public static DropCarried Gather(IReadOnlyList<string> paths)
+        {
+            var carried = new DropCarried();
+            var parents = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                foreach (var path in paths)
+                {
+                    carried._items.Add(ViewAllPath.Normalize(path));
+
+                    // An item with no folder of its own - a drive - is
+                    // compared by an empty name, which no folder has.
+                    if (Path.GetDirectoryName(path) is { Length: > 0 } parent && parents.Add(parent))
+                    {
+                        carried._parents.Add(ViewAllPath.Normalize(parent));
+                    }
+
+                    if (path.Length > 0)
+                    {
+                        var container = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                        if (!carried._containers.TryAdd(container, path))
+                        {
+                            (carried._moreContainers ??= []).Add(new(container, path));
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Whatever working out a full form throws, the item-by-item
+                // comparison meets it as it always has.
+                carried._usable = false;
+            }
+
+            return carried;
+        }
+
+        /// <summary>
+        /// Whether a drop into <paramref name="folder"/> is refused: it is one
+        /// of the items, or inside one that is a folder, or - for a drag from
+        /// this window - the folder an item is in.  Null where the items are
+        /// to be compared one by one instead.
+        /// </summary>
+        public bool? Refuses(string folder, bool fromThisWindow)
+        {
+            if (!_usable || folder.Length == 0)
+            {
+                return null;
+            }
+
+            string normal;
+            string inside;
+            try
+            {
+                normal = ViewAllPath.Normalize(folder);
+                inside = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            }
+            catch
+            {
+                return null;
+            }
+
+            if (_items.Contains(normal) || fromThisWindow && _parents.Contains(normal))
+            {
+                return true;
+            }
+
+            // Inside an item if the item is the folder or one of the folders
+            // it is in - and that item is a folder on disk.
+            for (var end = inside.IndexOf(Path.DirectorySeparatorChar); end >= 0; end = inside.IndexOf(Path.DirectorySeparatorChar, end + 1))
+            {
+                var container = inside[..(end + 1)];
+                if (_containers.TryGetValue(container, out var item)
+                    && (Directory.Exists(item)
+                        || _moreContainers?.Any(more => string.Equals(more.Key, container, StringComparison.OrdinalIgnoreCase) && Directory.Exists(more.Value)) == true))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The drop effect over <paramref name="folder"/>, as
+    /// <see cref="MainWindow.DropEffectFor"/> works it out, kept until the
+    /// pointer comes to another folder or the keys or the effects allowed
+    /// change: it asks whether every item is on the folder's drive -
+    /// milliseconds for fifty thousand - and DragOver comes many times a
+    /// second while the pointer stays.
+    /// </summary>
+    private DragDropEffects DropEffectOver(DragEventArgs e, IReadOnlyList<string> paths, string folder)
+    {
+        var carried = _dropCarried.GetValue(paths, DropCarried.Gather);
+        var keys = e.KeyStates & (DragDropKeyStates.ShiftKey | DragDropKeyStates.ControlKey | DragDropKeyStates.AltKey);
+        if (carried.LastEffect is { } last && last.Keys == keys && last.Allowed == e.AllowedEffects
+            && string.Equals(last.Folder, folder, StringComparison.Ordinal))
+        {
+            return last.Effect;
+        }
+
+        var effect = MainWindow.DropEffectFor(e, paths, folder);
+        carried.LastEffect = (folder, keys, e.AllowedEffects, effect);
+        return effect;
     }
 
     // ---- the name filter ---------------------------------------------------------
