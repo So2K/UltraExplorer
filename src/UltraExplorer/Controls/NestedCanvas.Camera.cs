@@ -22,12 +22,36 @@ public sealed partial class NestedCanvas
     // destination. Only the latest request may apply its result.
     private long _cameraRequest;
 
+    /// <summary>
+    /// What the camera being put back reads, on its way and once it is back
+    /// (<see cref="RestoreCameraAsync"/>); null when nothing is.  Let go of by
+    /// any newer request for the camera.
+    /// </summary>
+    private CancellationTokenSource? _cameraReads;
+
+    /// <summary>
+    /// A new request for the camera - a move of the user's, a flight, a
+    /// camera put back, another tree: only the newest may move the camera once
+    /// its reads are done, and whatever a camera being put back still had to
+    /// read for it is let go.
+    /// </summary>
+    private long NextCameraRequest()
+    {
+        if (_cameraReads is { } reads)
+        {
+            _cameraReads = null;
+            reads.Cancel();
+        }
+
+        return ++_cameraRequest;
+    }
+
     // ---- camera --------------------------------------------------------------
 
     /// <summary>Shows all of This PC.</summary>
     public void FitAll(bool animated = true)
     {
-        _cameraRequest++;
+        NextCameraRequest();
         if (_tree is null)
         {
             return;
@@ -89,7 +113,7 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        _cameraRequest++;
+        NextCameraRequest();
         if (!animated)
         {
             StopFlight();
@@ -157,7 +181,7 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        var request = ++_cameraRequest;
+        var request = NextCameraRequest();
         var folder = await tree.RevealAsync(path);
         if (folder is null || !ReferenceEquals(tree, _tree) || request != _cameraRequest)
         {
@@ -180,7 +204,7 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        _cameraRequest++;
+        NextCameraRequest();
         StopFlight();
         ZoomAround(at, factor);
         Normalize();
@@ -206,7 +230,7 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        _cameraRequest++;
+        NextCameraRequest();
         StopFlight();
         _ax += delta.X;
         _ay += delta.Y;
@@ -239,7 +263,17 @@ public sealed partial class NestedCanvas
 
     /// <summary>
     /// Puts the camera back where a previous session left it, once the folders
-    /// on the way there have been read - unless the user has moved it since.
+    /// on the way there have been found - unless the user has moved it since.
+    ///
+    /// <para>They are found by name, as a folder opened by name is: described,
+    /// not listed - one look at the disk for the whole way, rather than a full
+    /// listing of every folder on it, each applied a frame or more after the
+    /// last while the window showed This PC and then jumped.  Once the camera
+    /// is back they are listed, nearest first, so what is around it fills in
+    /// as it always did (<see cref="ListFoldersOnTheWayAsync"/>).  A way that
+    /// cannot be found by name - a folder gone since, a tree not on a disk -
+    /// is read the whole way down as before.  The user moving the camera, or
+    /// anything else asking for it, lets go of all of these reads.</para>
     /// </summary>
     public async Task RestoreCameraAsync(NestedCameraState state)
     {
@@ -249,10 +283,22 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        var request = ++_cameraRequest;
+        var request = NextCameraRequest();
         _cameraTouched = false;
         var isRoot = string.IsNullOrWhiteSpace(state.AnchorPath);
-        var folder = isRoot ? tree.Root : await tree.RevealAsync(state.AnchorPath);
+        var reads = new CancellationTokenSource();
+        _cameraReads = reads;
+        NestedFolder? folder;
+        try
+        {
+            folder = isRoot
+                ? tree.Root
+                : await tree.MaterializeContainerAsync(state.AnchorPath, reads.Token) ?? await tree.RevealAsync(state.AnchorPath, reads.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
 
         // The canvas may have been handed another tree while the folders were
         // read: a folder of the old one is no camera for it.
@@ -263,13 +309,22 @@ public sealed partial class NestedCanvas
             || !isRoot && !ViewAllPath.Equals(folder.FullPath, state.AnchorPath)
             || _viewWidth <= 0)
         {
+            if (ReferenceEquals(_cameraReads, reads))
+            {
+                _cameraReads = null;
+            }
+
             return;
         }
 
         var width = state.Width * _viewWidth;
         var x = _viewWidth / 2 + state.X * _viewWidth;
         var y = _viewHeight / 2 + state.Y * _viewWidth;
-        if (!double.IsFinite(width) || !double.IsFinite(x) || !double.IsFinite(y)) return;
+        if (!double.IsFinite(width) || !double.IsFinite(x) || !double.IsFinite(y))
+        {
+            _cameraReads = null;
+            return;
+        }
 
         StopFlight();
         _anchor = folder;
@@ -286,6 +341,38 @@ public sealed partial class NestedCanvas
         // resize keeps it rather than framing everything afresh - which an
         // overview, anchored on This PC, would otherwise lose at once.
         _cameraTouched = true;
+        await ListFoldersOnTheWayAsync(tree, folder, reads);
+    }
+
+    /// <summary>
+    /// The camera is back on <paramref name="folder"/>, reached by name: the
+    /// folders on the way to it, found without being listed, are listed now -
+    /// the nearest first, which is most of what is around the view - so the
+    /// view ends with what it always had around it.  Anything asking for the
+    /// camera meanwhile lets go of the rest: a folder the view is inside is
+    /// then listed when the camera goes into it, as after any folder opened
+    /// by name.
+    /// </summary>
+    private async Task ListFoldersOnTheWayAsync(NestedTree tree, NestedFolder folder, CancellationTokenSource reads)
+    {
+        try
+        {
+            for (var parent = folder.Parent; parent is { IsComputer: false }; parent = parent.Parent)
+            {
+                await tree.LoadAsync(parent, reads.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Let go of by a newer request for the camera.
+        }
+        finally
+        {
+            if (ReferenceEquals(_cameraReads, reads))
+            {
+                _cameraReads = null;
+            }
+        }
     }
 
     /// <summary>The cell of <paramref name="folder"/> on screen, or null when it is not one of the cells.</summary>

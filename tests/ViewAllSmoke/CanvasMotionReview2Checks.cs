@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using System.Windows;
 using System.Windows.Input;
@@ -29,6 +30,7 @@ internal static partial class Program
         RunOnSta("canvas motion: a middle click that does not move", CanvasMotionStillMiddleClickAsync);
         RunOnSta("canvas motion: the hover after the wheel", CanvasMotionHoverAfterWheelAsync);
         RunOnSta("canvas motion: the folder in view after a move", CanvasMotionFolderInViewAsync);
+        RunOnSta("canvas motion: a camera put back from the last session", CanvasMotionRestoreAsync);
         return Task.CompletedTask;
     }
 
@@ -313,6 +315,116 @@ internal static partial class Program
         finally
         {
             canvas.Tree = null;
+        }
+    }
+
+    // ---- a camera put back from the last session (J023) ----------------------------------------
+
+    /// <summary>
+    /// A camera saved fifteen folders deep, each folder on the way holding
+    /// forty others, put back on a tree that has read nothing yet.  It is
+    /// back as soon as the folders on the way are found by name - none of
+    /// them listed first, a frame or more each - and the folders around it
+    /// are listed afterwards, so the view ends as it always did.  Moved by
+    /// the user before it is back, it lets go of the reads it was waiting
+    /// for rather than reading the whole way down regardless.
+    /// </summary>
+    private static async Task CanvasMotionRestoreAsync()
+    {
+        Section("canvas motion: a camera put back from the last session is back at once");
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerCameraRestore", Guid.NewGuid().ToString("N"));
+        var levels = new List<string>();
+        var current = root;
+        for (var level = 0; level < 15; level++)
+        {
+            for (var sibling = 0; sibling < 40; sibling++)
+            {
+                Directory.CreateDirectory(Path.Combine(current, $"s{sibling:D2}"));
+            }
+
+            current = Path.Combine(current, $"L{level:D2}");
+            Directory.CreateDirectory(current);
+            levels.Add(current);
+        }
+
+        var target = levels[^1];
+        var listed = 0;
+        NestedListing Read(string path, CancellationToken token)
+        {
+            Interlocked.Increment(ref listed);
+            return NestedDirectoryReader.Read(path, token);
+        }
+
+        // Every folder on the way: the root, and each level above the one saved.
+        var onTheWay = levels.Take(levels.Count - 1).Prepend(root).ToList();
+        var canvas = new NestedCanvas { FramesByHandForTests = true, DpiOverride = new DpiScale(1, 1) };
+        canvas.Measure(new Size(1000, 700));
+        canvas.Arrange(new Rect(0, 0, 1000, 700));
+        canvas.UpdateLayout();
+        var state = new NestedCameraState(target, -0.3, -0.25, 0.6);
+        try
+        {
+            // Left alone: back before anything is listed, and the folders
+            // around it listed after.
+            using (var tree = new NestedTree(Read) { IsReadingOnDemand = false })
+            {
+                tree.SetRoots([new NestedRoot(root, "N", NestedFolderKind.Drive)]);
+                canvas.Tree = tree;
+                canvas.FitAll(animated: false);
+                var listedWhenBack = -1;
+                var watch = Stopwatch.StartNew();
+                var backAfter = 0.0;
+                void OnCamera()
+                {
+                    if (listedWhenBack < 0 && canvas.CaptureCamera() is { } camera && camera.AnchorPath == target)
+                    {
+                        listedWhenBack = Volatile.Read(ref listed);
+                        backAfter = watch.Elapsed.TotalMilliseconds;
+                    }
+                }
+
+                canvas.CameraChanged += OnCamera;
+                await canvas.RestoreCameraAsync(state);
+                canvas.CameraChanged -= OnCamera;
+                var back = canvas.CaptureCamera();
+                await WaitUntil(() => onTheWay.All(path => tree.Find(path) is { IsLoaded: true }), 10_000);
+                var around = onTheWay.Count(path => tree.Find(path) is { IsLoaded: true });
+                Console.WriteLine($"        15 deep: back after {backAfter:0} ms with {listedWhenBack} folders listed first; then {around} of the {onTheWay.Count} folders on the way listed");
+                Check($"the camera is back before any folder on the way is listed ({listedWhenBack} listed first)", listedWhenBack == 0);
+                Check($"where it was saved ({back?.AnchorPath})",
+                    back is { } kept && kept.AnchorPath == target && Math.Abs(kept.Width - state.Width) < 1e-9 && Math.Abs(kept.X - state.X) < 1e-9 && Math.Abs(kept.Y - state.Y) < 1e-9);
+                Check($"and the folders on the way are listed afterwards, as they always were ({around} of {onTheWay.Count})", around == onTheWay.Count);
+                Check("without moving it", canvas.CaptureCamera() == back);
+            }
+
+            // Moved before it is back: nothing more is read for it.
+            using (var tree = new NestedTree(Read) { IsReadingOnDemand = false })
+            {
+                tree.SetRoots([new NestedRoot(root, "N", NestedFolderKind.Drive)]);
+                canvas.Tree = tree;
+                canvas.FitAll(animated: false);
+                Volatile.Write(ref listed, 0);
+                var restore = canvas.RestoreCameraAsync(state);
+                canvas.Pan(new Vector(30, 0));
+                await restore;
+                await Task.Delay(1_500);
+                var afterMove = Volatile.Read(ref listed);
+                Console.WriteLine($"        moved at once: {afterMove} folders listed for it afterwards");
+                Check($"moved before it is back, the folders on the way are not read for it ({afterMove} listed)", afterMove == 0);
+                Check($"and the camera stays where the user put it ({canvas.CaptureCamera()?.AnchorPath ?? "This PC"})", canvas.CaptureCamera()?.AnchorPath != target);
+            }
+        }
+        finally
+        {
+            canvas.Tree = null;
+            try
+            {
+                Directory.Delete(root, recursive: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Left in the temp folder.
+            }
         }
     }
 

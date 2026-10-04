@@ -466,7 +466,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             // over or went down on.  Any of them would take the camera, or a
             // frame's walk, into a tree it is no longer drawing, whose This
             // PC is not the one the walk starts from.
-            _cameraRequest++;
+            NextCameraRequest();
             StopFlight();
             CancelMarquee();
             _anchor = null;
