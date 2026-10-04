@@ -1,4 +1,10 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using UltraExplorer.Services;
 using UltraExplorer.Services.Search;
+using UltraExplorer.ViewModels;
 
 namespace ViewAllSmoke;
 
@@ -13,6 +19,7 @@ internal static partial class Program
     {
         SearchOpenQuoteExclusionChecks();
         SearchSpacedOrChecks();
+        RunOnSta("search: a walk's first report", SearchWalkFirstReportAsync);
         return Task.CompletedTask;
     }
 
@@ -61,5 +68,67 @@ internal static partial class Program
             words.Matches("foo bar.txt", folder, false) && !words.Matches("foo.txt", folder, false));
         Check($"and both sides of the OR are lit in a name ({string.Join(",", spaced.Words)})",
             spaced.Words.Contains(".mp3") && spaced.Words.Contains(".wav"));
+    }
+
+    /// <summary>
+    /// J030: a walk told the panel nothing until it found something.  Made
+    /// after another search - "reportx" after "report" - the panel went on
+    /// showing that one's rows, count and status, and Enter opened one of
+    /// them, for as long as the walk found nothing, which can be all of it.
+    /// Walked here from a drive's root, far more than a walk gets through in
+    /// the second and a half given it, for a name nothing has.
+    /// </summary>
+    private static async Task SearchWalkFirstReportAsync()
+    {
+        Section("search: a walk that has found nothing yet says so at once (J030)");
+        var method = typeof(SearchEngine).GetMethod("WalkAsync", BindingFlags.NonPublic | BindingFlags.Instance);
+        if (method is null || !method.GetParameters().Any(parameter => parameter.Name == "drives"))
+        {
+            Check("the drives a walk goes over can be given it", false);
+            return;
+        }
+
+        var here = Path.GetPathRoot(Environment.SystemDirectory)!;
+        var query = SearchQuery.Parse("uxnothing" + Guid.NewGuid().ToString("N")[..12]);
+        using var stop = new CancellationTokenSource();
+        var reports = new ConcurrentQueue<(SearchSnapshot Snapshot, long At)>();
+        var clock = Stopwatch.StartNew();
+        Action<SearchSnapshot> publish = snapshot =>
+        {
+            reports.Enqueue((snapshot, clock.ElapsedMilliseconds));
+            stop.Cancel();
+        };
+        var arguments = method.GetParameters().Select(parameter => parameter.Name switch
+        {
+            "query" => query,
+            "here" => here,
+            "drives" => Array.Empty<string>(),
+            "reason" => "checked",
+            "everythingFailed" => false,
+            "publish" => publish,
+            "cancellationToken" => stop.Token,
+            _ => (object?)null,
+        }).ToArray();
+        stop.CancelAfter(1_500);
+        await (Task)method.Invoke(new SearchEngine(), arguments)!;
+        var (first, at) = reports.TryPeek(out var report) ? report : default;
+        Check($"the first report comes while the walk goes on, not at its end ({(first is null ? "none in 1.5 s" : $"after {at} ms, {first.Hits.Count} found, final: {first.IsFinal}")})",
+            first is { IsFinal: false, Hits.Count: 0 });
+
+        // That report on screen: the search before is gone, and Enter has nothing to open.
+        using var icons = new ShellIconService();
+        var opened = new List<string>();
+        using var search = new SearchViewModel(icons, _ => Task.CompletedTask, (path, _) => opened.Add(path));
+        SearchOpenForTest(search, @"C:\UxFirstReport");
+        var before = SearchQuery.Parse("report");
+        var old = new SearchHit("report.docx", @"C:\UxFirstReport", false, 1, null, null);
+        SearchRanking.Rank([old], before, @"C:\UxFirstReport");
+        SearchApplyForTest(search, new SearchSnapshot([old], 1, 0, SearchSource.Walk, true, "1 found", 1), before);
+        SearchApplyForTest(search, first ?? new SearchSnapshot([], 0, 0, SearchSource.Walk, false, "Searching…", 1), SearchQuery.Parse("reportx"));
+        search.OpenSelected();
+        Check($"with it on screen the rows of the search before are gone ({search.Results.Count}) and it says so ({search.EmptyText})",
+            search.Results.Count == 0 && search.Selected is null && search.EmptyText == "Searching…");
+        Check("and Enter opens nothing", opened.Count == 0);
+        search.Close();
     }
 }

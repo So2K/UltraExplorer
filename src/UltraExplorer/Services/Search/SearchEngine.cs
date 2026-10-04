@@ -137,7 +137,10 @@ internal sealed class SearchEngine
             reason = "Walking folders. Install Everything (voidtools.com) for instant results.";
         }
 
-        await WalkAsync(query, here, reason, failed, publish, cancellationToken).ConfigureAwait(false);
+        var drives = DriveInfo.GetDrives()
+            .Where(drive => drive.DriveType == DriveType.Fixed && drive.IsReady)
+            .Select(drive => drive.RootDirectory.FullName);
+        await WalkAsync(query, here, drives, reason, failed, publish, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<bool> AskEverythingAsync(SearchQuery query, string? here, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
@@ -211,21 +214,18 @@ internal sealed class SearchEngine
         return true;
     }
 
-    private async Task WalkAsync(SearchQuery query, string? here, string reason, bool everythingFailed, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
+    /// <param name="drives">The roots of the drives walked after the folder searched from.</param>
+    private async Task WalkAsync(SearchQuery query, string? here, IEnumerable<string> drives, string reason, bool everythingFailed, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
     {
         var clock = Stopwatch.StartNew();
         var substs = Substs();
-        var (roots, skip) = WalkPlan(
-            here,
-            DriveInfo.GetDrives()
-                .Where(drive => drive.DriveType == DriveType.Fixed && drive.IsReady)
-                .Select(drive => drive.RootDirectory.FullName),
-            substs);
+        var (roots, skip) = WalkPlan(here, drives, substs);
 
         var walk = new FolderWalk(query, WalkLimit);
         var running = walk.RunAsync(here, roots, skip, cancellationToken);
         var hits = new List<SearchHit>();
         var folder = SearchRanking.Normalize(here);
+        var reported = false;
         while (true)
         {
             var finished = await Task.WhenAny(running, Task.Delay(WalkReportMilliseconds, CancellationToken.None)).ConfigureAwait(false) == running;
@@ -235,8 +235,14 @@ internal sealed class SearchEngine
             }
 
             var fresh = walk.Drain();
-            if (fresh.Count > 0 || finished)
+
+            // The first report goes out even when nothing has been found yet:
+            // until it does, the panel still shows the search before - its
+            // results, its count, its first result for Enter to open - for as
+            // long as the walk finds nothing, which can be all of it.
+            if (fresh.Count > 0 || finished || !reported)
             {
+                reported = true;
                 foreach (var hit in fresh)
                 {
                     SearchRanking.Measure(hit, query, folder);
