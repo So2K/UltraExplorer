@@ -17,8 +17,10 @@ namespace ViewAllSmoke;
 /// graph has never read does not have what was brought into it by name checked
 /// against the disk; a slow listing lets go only of what was selected when it
 /// began; an item found gone is said to be gone once, and only once the disk
-/// says so, and the focus goes to its folder; and a navigation on the tree
-/// canvas that has been given way to stops opening the folders on its way.
+/// says so, and the focus goes to its folder; a navigation on the tree canvas
+/// that has been given way to stops opening the folders on its way; and a
+/// reveal racing a refresh of the folder above starts again instead of
+/// selecting a folder the graph let go of.
 /// </summary>
 internal static partial class Program
 {
@@ -34,6 +36,7 @@ internal static partial class Program
             await OnDispatcher(() => VmRound2SlowPruneAsync(root));
             await OnDispatcher(() => VmRound2GoneFocusAsync(root));
             await OnDispatcher(() => VmRound2SupersededRevealAsync(root));
+            await OnDispatcher(() => VmRound2RevealRefreshRaceAsync(root));
         }
         finally
         {
@@ -395,5 +398,53 @@ internal static partial class Program
         await Task.WhenAll(opening, away);
         Check($"a row given way to while it was found says nothing ({string.Join(" | ", messages)})", messages.Count == 0);
         Check("and the later navigation has the selection", ViewAllPath.Equals(tree.ActivePath, elsewhere));
+    }
+
+    // ---- J134: a reveal racing a refresh of the folder above ------------------------------
+
+    private static async Task VmRound2RevealRefreshRaceAsync(string root)
+    {
+        Section("view model round 2: a folder asked for by name while the folder above is read again");
+        var folder = Path.Combine(root, "race-hidden");
+        var scratch = Path.Combine(root, "race-hidden-state");
+        var parent = Path.Combine(folder, "parent");
+        var hidden = Path.Combine(parent, "hidden");
+        Directory.CreateDirectory(hidden);
+        Directory.CreateDirectory(scratch);
+        File.WriteAllText(Path.Combine(parent, "shown.txt"), "shown");
+        File.SetAttributes(hidden, FileAttributes.Directory | FileAttributes.Hidden);
+
+        using var icons = new ShellIconService();
+        using var tree = NewTree(scratch, icons);
+        tree.RestoreShowHiddenItems(false);
+        await tree.InitializeAsync(folder);
+        if (!tree.TryGetNode(folder, out var top))
+        {
+            Check("the folder is on the tree", false);
+            return;
+        }
+
+        await tree.ExpandAsync(top);
+        if (!tree.TryGetNode(parent, out var parentNode))
+        {
+            Check("the parent is on the tree", false);
+            return;
+        }
+
+        await tree.ExpandAsync(parentNode);
+        Check("the hidden folder is left out of its parent's listing", !tree.TryGetNode(hidden, out _));
+        var messages = new List<string>();
+        tree.MessageRequested += (message, _) => messages.Add(message);
+        bool Live(ViewAllNodeViewModel? node) => node is not null && tree.TryGetNode(node.FullPath, out var live) && ReferenceEquals(live, node);
+
+        // Asked for by name - the address bar - while a change reads the folder above again.
+        var reveal = tree.RevealAsync(hidden, focus: false);
+        var refresh = tree.RefreshAsync(top);
+        var outcome = await reveal;
+        await refresh;
+        Check($"a folder asked for by name while the folder above it is read again is found (exact: {outcome.IsExact}, live: {Live(outcome.Node)})",
+            outcome.IsExact && Live(outcome.Node));
+        Check($"nothing says it is gone ({string.Join(" | ", messages)})", !messages.Any(message => message.Contains("no longer inside", StringComparison.Ordinal)));
+        Check("and what is selected is a node the graph has", Live(tree.ActiveNode) && ViewAllPath.Equals(tree.ActivePath, hidden));
     }
 }

@@ -1764,6 +1764,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                         var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
                         if (adopted is null)
                         {
+                            // Not given because the folder was read again while
+                            // the disk was asked, and is another node now: lost,
+                            // like a folder read again while it was opened.
+                            if (attempt < 2 && node is not null && !IsLive(node))
+                            {
+                                lost = true;
+                                break;
+                            }
+
                             ReportMissing(step, node, holdGone);
                             break;
                         }
