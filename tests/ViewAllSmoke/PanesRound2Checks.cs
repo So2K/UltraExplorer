@@ -17,7 +17,8 @@ namespace ViewAllSmoke;
 /// nested canvas's side of the window, the split view and each pane - and
 /// what was done about it.  A camera the last session left on a share that
 /// answers after the start is put back once it does, and kept meanwhile
-/// rather than the overview shown while it waits (J041, J124).
+/// rather than the overview shown while it waits (J041, J124).  A colour or
+/// a note on a drive or share that answers late is drawn once it does (J126).
 ///
 /// <para>The windows need the app, of which a process can only ever have the
 /// one, on the thread that made it: these checks always run in a process of
@@ -125,6 +126,7 @@ internal static partial class Program
             using (ActivationGuard.GuardWindowsCreated())
             {
                 await PanesLateShareCameraChecksAsync(root);
+                await PanesLateRootMarksChecksAsync(root);
             }
         }
         finally
@@ -204,7 +206,60 @@ internal static partial class Program
         }
     }
 
+    // ---- colours and notes on a drive or share that answers late (J126) --------------
+
+    /// <summary>
+    /// A colour on a folder of a share and a note on a folder of a drive,
+    /// neither of which had answered as the window started: the pane looked
+    /// for both among its cells, found neither and set them aside as nowhere
+    /// to be found.  Once each answers and joins the canvas, its mark is
+    /// looked for again, and found; they stayed undrawn for the session.
+    /// </summary>
+    private static async Task PanesLateRootMarksChecksAsync(string root)
+    {
+        Section("panes round 2: colours and notes on a drive or share that answers late are drawn once it does (J126)");
+        var share = Path.Combine(root, "marks-share");
+        var drive = Path.Combine(root, "marks-drive");
+        var onShare = Path.Combine(share, "coloured");
+        var onDrive = Path.Combine(drive, "noted");
+        Directory.CreateDirectory(onShare);
+        Directory.CreateDirectory(onDrive);
+        var main = ProxyWindow(out var shell);
+        try
+        {
+            shell.Marks.Seed(onShare, "#FF8800", string.Empty);
+            shell.Marks.Seed(onDrive, string.Empty, "a note");
+            await main.StartNestedForChecksAsync();
+            var pane = main.FirstPane;
+            Check("at the start, neither mark is on a drive or share among the cells: both are set aside as nowhere",
+                await LiveWait(() => PanesUnresolvable(pane.Canvas).Contains(onShare) && PanesUnresolvable(pane.Canvas).Contains(onDrive), 5_000) >= 0);
+
+            // The share answers, as a root of the tree and so of the canvas.
+            main.UseNestedDrivesForChecks([new NestedRoot(share, "marks-share", NestedFolderKind.Drive)]);
+            PanesExtraRootAdded(main, share);
+            Check("once the share answers, the colour on it is looked for again and found",
+                await LiveWait(() => pane.Tree.Find(onShare) is not null && !PanesUnresolvable(pane.Canvas).Contains(onShare), 3_000) >= 0);
+
+            // The drive answers, as the tree hears of a drive start-up went on without.
+            PanesDriveAdded(main, drive);
+            Check("and once the drive answers, so is the note on it",
+                await LiveWait(() => pane.Tree.Find(onDrive) is not null && !PanesUnresolvable(pane.Canvas).Contains(onDrive), 3_000) >= 0);
+        }
+        finally
+        {
+            shell.Dispose();
+        }
+    }
+
     // ---- helpers -----------------------------------------------------------------------
+
+    /// <summary>The beacons <paramref name="canvas"/> looked for and found nowhere, not to be looked for again until it is told to.</summary>
+    private static IReadOnlySet<string> PanesUnresolvable(NestedCanvas canvas) =>
+        (HashSet<string>)typeof(NestedCanvas).GetField("_unresolvable", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(canvas)!;
+
+    /// <summary>A drive the window started without answered, as the window hears of it from its tree.</summary>
+    private static void PanesDriveAdded(MainWindow main, string drive) =>
+        typeof(MainWindow).GetMethod("OnDriveAddedForNested", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(main, [PanesRootNode(drive, ViewAllEntryKind.Drive)]);
 
     /// <summary>The camera <paramref name="pane"/> is waiting to put back once its drive or share answers, if any.</summary>
     private static NestedCameraState? PanesLateCamera(NestedPane pane) =>

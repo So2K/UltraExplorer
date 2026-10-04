@@ -352,15 +352,21 @@ public partial class MainWindow : INestedPaneHost
             {
                 pane.DriveArrived(root.FullPath);
             }
+
+            // The colours, notes and pins in it were looked for before it
+            // answered, found nowhere, and set aside until the beacons are
+            // gathered again.
+            ScheduleBeacons();
         }
     }
 
     /// <summary>
     /// A drive that had not answered as the window started has, and the tree
     /// has it now: it joins the canvas's drives where a start that waited for
-    /// it would have put it, named as the tree names it, and a camera the
-    /// last session left on it is put back.  Before the canvas copied the
-    /// tree's drives, the copy takes it in.  Once the drives have been listed
+    /// it would have put it, named as the tree names it, a camera the last
+    /// session left on it is put back, and the marks on it are drawn.
+    /// Before the canvas copied the tree's drives, the copy takes it in.
+    /// Once the drives have been listed
     /// again for a volume arriving or leaving, that listing is newer than this
     /// answer, and stands.
     /// </summary>
@@ -388,6 +394,10 @@ public partial class MainWindow : INestedPaneHost
             {
                 pane.DriveArrived(drive.FullPath);
             }
+
+            // Its colours, notes and pins, looked for before it answered and
+            // set aside as nowhere, are looked for again.
+            ScheduleBeacons();
         }
     }
 
