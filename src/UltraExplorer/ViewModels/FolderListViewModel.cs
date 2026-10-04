@@ -181,13 +181,19 @@ public sealed class FolderListViewModel : ObservableObject
         _icons = icons;
         _iconWhenShown = IconWhenShown;
 
-        ActivateCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: true));
-        RevealCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: false));
-        OpenFirstMatchCommand = new AsyncRelayCommand(() => Activate(Items.FirstOrDefault(), open: true));
+        // Going somewhere, each of them: a row clicked while another row's
+        // reveal is still under way - a share taking its time - is a newer
+        // pick, not a second go at the first, and Up or Back pressed again
+        // while the folder the last press went to is read is one more step.
+        // Run one at a time, they dropped every press but the first.  The
+        // canvas and the list see to it that the last one asked for wins.
+        ActivateCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: true), allowConcurrent: true);
+        RevealCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: false), allowConcurrent: true);
+        OpenFirstMatchCommand = new AsyncRelayCommand(() => Activate(Items.FirstOrDefault(), open: true), allowConcurrent: true);
         ClearFilterCommand = new RelayCommand(() => Filter = string.Empty);
         HideCommand = new RelayCommand(() => IsVisible = false);
-        UpCommand = new AsyncRelayCommand(GoUpAsync, () => CanGoUp);
-        BackCommand = new AsyncRelayCommand(GoBackAsync, () => CanGoBack);
+        UpCommand = new AsyncRelayCommand(GoUpAsync, () => CanGoUp, allowConcurrent: true);
+        BackCommand = new AsyncRelayCommand(GoBackAsync, () => CanGoBack, allowConcurrent: true);
     }
 
     /// <summary>Rows that survive the current filter, best match first.</summary>

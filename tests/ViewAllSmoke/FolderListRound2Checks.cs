@@ -37,6 +37,7 @@ internal static partial class Program
         RunOnSta("list while the next folder is read", ListLoadingAsync);
         RunOnSta("list refill cost", ListRefillCostAsync);
         RunOnSta("list filter in a folder that could not be read", ListFilterKeepsFailureAsync);
+        RunOnSta("list rows clicked during a reveal", ListClicksDuringRevealAsync);
         return Task.CompletedTask;
     }
 
@@ -393,5 +394,98 @@ internal static partial class Program
         list.Filter = string.Empty;
         Check($"a folder that could not be read keeps saying so ({said} | {filtered} | {list.EmptyText})",
             said == "This folder could not be read." && filtered == said && list.EmptyText == said);
+    }
+
+    /// <summary>
+    /// J115: a row clicked while another row's reveal was still under way -
+    /// a share taking its time - was dropped: the command was busy with the
+    /// first, and said so by ignoring the second; so were Up and Back pressed
+    /// again while the folder the last one went to was read.  Every click
+    /// reaches the canvas, which sees to it that the last one asked for wins,
+    /// and every step up or back is taken, the last one's folder the list's.
+    /// </summary>
+    private static async Task ListClicksDuringRevealAsync()
+    {
+        Section("folder list round 2: rows clicked while a reveal is under way");
+        var folder = Path.Combine(Path.GetTempPath(), "UltraExplorerListClicks");
+        using var icons = new ShellIconService();
+        var asked = new List<(string Path, bool Open)>();
+        var pending = new List<TaskCompletionSource>();
+        var list = new FolderListViewModel(
+            (path, _, _) => Task.FromResult(ReviewSnapshot(path, false, "r1.txt", "r2.txt", "r3.txt", "r4.txt")),
+            (path, open) =>
+            {
+                if (ViewAllPath.Equals(path, folder))
+                {
+                    return Task.CompletedTask;
+                }
+
+                asked.Add((path, open));
+                var reveal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                pending.Add(reveal);
+                return reveal.Task;
+            },
+            _ => false,
+            icons) { IsVisible = true };
+
+        await list.NavigateAsync(folder);
+        var rows = list.Items.ToList();
+        list.RevealCommand.Execute(rows[0]);
+        list.RevealCommand.Execute(rows[1]);
+        list.ActivateCommand.Execute(rows[2]);
+        list.ActivateCommand.Execute(rows[3]);
+        list.OpenFirstMatchCommand.Execute(null);
+        list.OpenFirstMatchCommand.Execute(null);
+        Check($"every click reaches the canvas, slow reveals under way or not ({asked.Count} of 6: {string.Join(", ", asked.Select(item => Path.GetFileName(item.Path) + (item.Open ? " open" : string.Empty)))})",
+            asked.Count == 6
+            && asked.Select(item => Path.GetFileName(item.Path)).SequenceEqual(["r1.txt", "r2.txt", "r3.txt", "r4.txt", "r1.txt", "r1.txt"])
+            && asked.Select(item => item.Open).SequenceEqual([false, false, true, true, true, true]));
+
+        foreach (var reveal in pending)
+        {
+            reveal.SetResult();
+        }
+
+        await Task.Delay(20);
+
+        // Up, then Back, pressed twice while the folder the first press went to is read.
+        var middle = Path.Combine(folder, "middle");
+        var bottom = Path.Combine(middle, "bottom");
+        TaskCompletionSource<ViewAllDirectorySnapshot>? slow = null;
+        var went = new List<string>();
+        var walker = new FolderListViewModel(
+            (path, _, _) => slow?.Task ?? Task.FromResult(ReviewSnapshot(path, false, "x.txt")),
+            (path, _) => { went.Add(path); return Task.CompletedTask; },
+            _ => false,
+            icons) { IsVisible = true };
+        await walker.NavigateAsync(bottom);
+        went.Clear();
+
+        slow = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        walker.UpCommand.Execute(null);
+        walker.UpCommand.Execute(null);
+        var upTo = walker.FolderPath;
+        var reading = slow;
+        slow = null;
+        reading.SetResult(ReviewSnapshot(folder, false, "x.txt"));
+        await LiveWait(() => went.Count > 0, 1_000);
+        Check($"Up pressed twice while the folder above is read goes up twice ({Path.GetFileName(upTo)}, the canvas taken to {string.Join(", ", went.Select(Path.GetFileName))})",
+            ViewAllPath.Equals(upTo, folder) && went.Count == 1 && ViewAllPath.Equals(went[0], folder));
+
+        // Down again step by step, so Back has the same two steps to take whatever Up did.
+        await walker.NavigateAsync(folder);
+        await walker.NavigateAsync(middle);
+        await walker.NavigateAsync(bottom);
+        went.Clear();
+        slow = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        walker.BackCommand.Execute(null);
+        walker.BackCommand.Execute(null);
+        var backTo = walker.FolderPath;
+        reading = slow;
+        slow = null;
+        reading.SetResult(ReviewSnapshot(folder, false, "x.txt"));
+        await LiveWait(() => went.Count > 0, 1_000);
+        Check($"Back pressed twice while the folder before is read goes back twice ({Path.GetFileName(backTo)}, the canvas taken to {string.Join(", ", went.Select(Path.GetFileName))})",
+            ViewAllPath.Equals(backTo, folder) && went.Count == 1 && ViewAllPath.Equals(went[0], folder));
     }
 }
