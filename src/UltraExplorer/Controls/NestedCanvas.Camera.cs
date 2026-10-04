@@ -717,6 +717,34 @@ public sealed partial class NestedCanvas
     private void StopFlight() => _flight = null;
 
     /// <summary>
+    /// Puts the camera where the flight under way was taking it, at once, as
+    /// the flight's last frame would have; nothing without one.  A flight to
+    /// a folder that has gone since just stops, as it would on its next frame.
+    /// </summary>
+    private void LandFlight()
+    {
+        if (_flight is not { } flight)
+        {
+            return;
+        }
+
+        StopFlight();
+        if (NestedTree.IsDetached(flight.Target) || !NestedTree.IsOnCanvas(flight.Target))
+        {
+            return;
+        }
+
+        flight.End(_viewWidth, _viewHeight, out var x, out var y, out var w);
+        _anchor = flight.Target;
+        _ax = x;
+        _ay = y;
+        _aw = w;
+        _hasCamera = true;
+        Normalize();
+        AfterCameraMove();
+    }
+
+    /// <summary>
     /// A smooth zoom-and-pan in the sense of van Wijk and Nuij: the path
     /// through (centre, width) space along which the apparent motion is
     /// least.  Expressed in the target's own frame, where the target is one
@@ -833,6 +861,14 @@ public sealed partial class NestedCanvas
             x = viewWidth / 2 - centreX * w;
             y = viewHeight / 2 - centreY * w;
             return done;
+        }
+
+        /// <summary>The target's rectangle once the flight has arrived: where <see cref="Sample"/> puts it at the end.</summary>
+        public void End(double viewWidth, double viewHeight, out double x, out double y, out double w)
+        {
+            w = viewWidth / _w1;
+            x = viewWidth / 2 - _c1x * w;
+            y = viewHeight / 2 - _c1y * w;
         }
     }
 

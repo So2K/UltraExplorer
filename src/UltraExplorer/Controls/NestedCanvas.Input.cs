@@ -1058,9 +1058,17 @@ public sealed partial class NestedCanvas
     /// Brings what an arrow key moved to into view.  Readable but off screen,
     /// the view only slides - the zoom the user chose stays; too small to read,
     /// it flies to where it can be read.
+    ///
+    /// <para>A flight still under way - a key held down repeats faster than
+    /// one lands - lands at once first, so the move is measured from where
+    /// the view was going.  Started from the middle of the last flight
+    /// instead, every repeat began from a standstill and from the zoom that
+    /// flight's arc had dipped to: a held key left the item further behind
+    /// with each repeat, and the view shrank a little more each time.</para>
     /// </summary>
     private void EnsureVisible(NestedFolder folder, int fileIndex = -1)
     {
+        LandFlight();
         var rect = TargetRect(folder, fileIndex);
         var readable = rect is { } r && (fileIndex >= 0 ? r.Height >= FileLabelPixels : r.Width >= 48);
         if (!readable)
