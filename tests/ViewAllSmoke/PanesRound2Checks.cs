@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Reflection;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Threading;
 using UltraExplorer;
 using UltraExplorer.Controls;
@@ -22,7 +23,8 @@ namespace ViewAllSmoke;
 /// A new window gathers its beacons once, when its panes have their drives,
 /// not first for nothing as it reads its workspace (J079).  Switching to the
 /// tree keeps a selection of several items, and a navigation under way
-/// (J131).
+/// (J131).  Shift+F5 or Shift+F6 pressed again while a copy or a move to the
+/// other pane is on its way sends nothing more (J065).
 ///
 /// <para>The windows need the app, of which a process can only ever have the
 /// one, on the thread that made it: these checks always run in a process of
@@ -133,6 +135,7 @@ internal static partial class Program
                 await PanesLateRootMarksChecksAsync(root);
                 await PanesStartBeaconChecksAsync(root);
                 await PanesTreeSwitchChecksAsync(root);
+                await PanesSendTwiceChecksAsync(root);
             }
         }
         finally
@@ -354,6 +357,85 @@ internal static partial class Program
         finally
         {
             shell.Layout = CanvasLayout.Nested;
+            shell.Dispose();
+        }
+    }
+
+    // ---- Shift+F5 pressed again while a copy to the other pane is on its way (J065) ----
+
+    /// <summary>
+    /// Shift+F5 on a file of a share that takes its time to say it is there:
+    /// nothing shows while the copy asks, and Shift+F5 pressed again - or
+    /// Shift+F6, or the key held down - started a second copy beside it, or
+    /// a move racing it.  Pressed again before the first is done, nothing
+    /// more is sent; once it is done, the keys send again.  The file is
+    /// found not there in the end, so nothing is copied for real.
+    /// </summary>
+    private static async Task PanesSendTwiceChecksAsync(string root)
+    {
+        Section("panes round 2: Shift+F5 pressed again while a copy to the other pane is on its way sends nothing more (J065)");
+        var drive = Path.Combine(root, "send-drive");
+        var left = Path.Combine(drive, "left");
+        var right = Path.Combine(drive, "right");
+        var file = Path.Combine(left, "slow.txt");
+        Directory.CreateDirectory(left);
+        Directory.CreateDirectory(right);
+        File.WriteAllText(file, "on a share that takes its time");
+        var existsBefore = MainViewModel.ItemExists;
+        using var held = new ManualResetEventSlim(false);
+        var asked = 0;
+        var main = ProxyWindow(out var shell);
+        try
+        {
+            await main.StartNestedForChecksAsync();
+            main.UseNestedDrivesForChecks([new NestedRoot(drive, "T", NestedFolderKind.Drive)]);
+            shell.Tree.SecondPane = new NestedPaneState(null, null);
+            shell.IsSplit = true;
+            var second = main.SecondPane;
+            second?.KeptSelection.ReplaceSingle(right, true, 0, SelectionSource.Navigation);
+            shell.Tree.Selection.ReplaceSingle(file, false, 1, SelectionSource.Navigation);
+            Check("split, with the file selected in the first pane and the other pane's folder to send it to",
+                second is not null && ViewAllPath.Equals(main.OtherPaneFolder() ?? string.Empty, right)
+                && await LiveWait(() => shell.Tree.SelectedPaths.SequenceEqual([file]), 5_000) >= 0);
+
+            // Each copy or move asks whether the file is there as it starts:
+            // counted, held as a share that takes its time holds it, and
+            // answered no.
+            MainViewModel.ItemExists = path =>
+            {
+                if (!ViewAllPath.Equals(path, file))
+                {
+                    return existsBefore(path);
+                }
+
+                Interlocked.Increment(ref asked);
+                held.Wait(TimeSpan.FromSeconds(20));
+                return false;
+            };
+
+            main.TryHandlePaneTransferKey(Key.F5, ModifierKeys.Shift);
+            Check("Shift+F5 starts a copy, which asks whether the file is there", await LiveWait(() => Volatile.Read(ref asked) == 1, 5_000) >= 0);
+            main.TryHandlePaneTransferKey(Key.F5, ModifierKeys.Shift);
+            main.TryHandlePaneTransferKey(Key.F5, ModifierKeys.Shift);
+            main.TryHandlePaneTransferKey(Key.F6, ModifierKeys.Shift);
+            await LiveWait(() => Volatile.Read(ref asked) > 1, 1_000);
+            var sent = Volatile.Read(ref asked);
+            held.Set();
+            Check($"pressed again, held down or Shift+F6, while it is on its way: nothing more is sent ({sent} copies and moves started)", sent == 1);
+
+            var done = await LiveWait(() => shell.Toast.Message.StartsWith("This drop target", StringComparison.Ordinal), 5_000) >= 0;
+            await SettingsSettle();
+            Interlocked.Exchange(ref asked, 0);
+            main.TryHandlePaneTransferKey(Key.F6, ModifierKeys.Shift);
+            Check("once it is done, Shift+F6 sends again", done && await LiveWait(() => Volatile.Read(ref asked) == 1, 5_000) >= 0);
+            await LiveWait(() => shell.Toast.Message.StartsWith("This drop target", StringComparison.Ordinal), 5_000);
+            await SettingsSettle();
+        }
+        finally
+        {
+            MainViewModel.ItemExists = existsBefore;
+            held.Set();
+            shell.IsSplit = false;
             shell.Dispose();
         }
     }
