@@ -192,6 +192,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         set => _main.ShowFavoriteLinks = value;
     }
 
+    public bool ShowHoverPreviews
+    {
+        get => _main.ShowHoverPreviews;
+        set => _main.ShowHoverPreviews = value;
+    }
+
     public bool IsTreeLayout
     {
         get => _main.IsTreeLayout;
@@ -682,6 +688,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 break;
             case nameof(MainViewModel.ShowFavoriteLinks):
                 OnPropertyChanged(nameof(ShowFavoriteLinks));
+                break;
+            case nameof(MainViewModel.ShowHoverPreviews):
+                OnPropertyChanged(nameof(ShowHoverPreviews));
                 break;
             case nameof(MainViewModel.Layers):
                 Raise(LayerProperties);

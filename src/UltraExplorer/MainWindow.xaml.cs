@@ -136,6 +136,7 @@ public partial class MainWindow : Window
         Harness.Index = _viewModel.Tree.SpatialIndex;
         AttachNested();
         AttachSelection();
+        AttachHoverPreviews();
 
         StateChanged += (_, _) =>
         {
@@ -709,6 +710,7 @@ public partial class MainWindow : Window
 
     private void PushViewport()
     {
+        if (_hoverPreview is not null) ClearHoverPreview();
         using var frame = PerfLog.Measure("viewport");
 
         using (PerfLog.Measure("viewport.model"))

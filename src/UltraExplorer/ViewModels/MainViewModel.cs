@@ -81,6 +81,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CanvasLayer _layers = CanvasLayer.All;
     private bool _showFavoriteLinks;
     private bool _favoriteLinksChanged;
+    private bool _showHoverPreviews = true;
+    private bool _hoverPreviewsChanged;
     private bool _favoritesChanged;
 
     /// <summary>
@@ -470,6 +472,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>Whether hovering a file shows its content thumbnail, in the canvases and folder list.</summary>
+    public bool ShowHoverPreviews
+    {
+        get => _showHoverPreviews;
+        set
+        {
+            if (SetProperty(ref _showHoverPreviews, value))
+            {
+                _hoverPreviewsChanged = true;
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
     /// <summary>The visible nested canvas layers, remembered with the workspace.</summary>
     public CanvasLayer Layers
     {
@@ -798,6 +814,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _layers = NormalizePickerLayers(CanvasLayers.Parse(state.CanvasLayersOff));
             _showFavoriteLinks = state.ShowFavoriteLinks;
             OnPropertyChanged(nameof(ShowFavoriteLinks));
+            // Settings are usable while the workspace is still loading.
+            // Keep a deliberate click made during that read.
+            if (!_hoverPreviewsChanged)
+            {
+                _showHoverPreviews = state.ShowHoverPreviews;
+                OnPropertyChanged(nameof(ShowHoverPreviews));
+            }
 
             // A file dialog shows the tree and never splits, and writes back
             // whatever the file says (see SaveNowAsync).
@@ -926,6 +949,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (_isDisposed) return;
         Address.SetPath(Tree.ActivePath);
         UpdateSidebarSelection();
+
+        // An early Settings click could not save before the user's workspace
+        // was loaded. Flush that preference now, with the same save gate,
+        // without writing the canvas's newly initialized view.
+        if (_hoverPreviewsChanged)
+        {
+            await _stateSaving.WaitAsync();
+            try { await SaveNavigationPreferencesCoreAsync(); }
+            finally { _stateSaving.Release(); }
+        }
     }
 
     public void ShowContextMenuFor(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
@@ -1168,6 +1201,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _showFavoriteLinks = state.ShowFavoriteLinks;
             OnPropertyChanged(nameof(ShowFavoriteLinks));
         }
+        if (!_hoverPreviewsChanged && _showHoverPreviews != state.ShowHoverPreviews)
+        {
+            _showHoverPreviews = state.ShowHoverPreviews;
+            OnPropertyChanged(nameof(ShowHoverPreviews));
+        }
         if (_favoritesChanged) return;
         foreach (var item in QuickAccess.Where(item => item.IsCustom).ToArray()) QuickAccess.Remove(item);
         foreach (var favorite in state.Favorites ?? [])
@@ -1233,6 +1271,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var before = _savedWorkspace!;
         var favoritesBefore = _savedFavorites;
         var ownLinks = _favoriteLinksChanged;
+        var ownHoverPreviews = _hoverPreviewsChanged;
         var ownFavorites = _favoritesChanged;
         try
         {
@@ -1251,7 +1290,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 // Nothing of this window's to write - a window closed after
                 // another saved its change must not write that file back as
                 // it read it a moment before.
-                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownFavorites);
+                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownHoverPreviews, ownFavorites);
                 return JsonSerializer.SerializeToUtf8Bytes(state).AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(current))
                     ? null
                     : state;
@@ -1264,6 +1303,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
 
             if (_showFavoriteLinks == here.ShowFavoriteLinks) _favoriteLinksChanged = false;
+            if (_showHoverPreviews == here.ShowHoverPreviews) _hoverPreviewsChanged = false;
             if (FavoriteSnapshot().SequenceEqual(here.Favorites)) _favoritesChanged = false;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1292,6 +1332,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         NestedLeftDragHintShown = _leftDragHintShown,
         CanvasLayersOff = CanvasLayers.OffSetting(_layers),
         ShowFavoriteLinks = _showFavoriteLinks,
+        ShowHoverPreviews = _showHoverPreviews,
         IsSplit = _isSplit,
         SplitOrientation = SplitLayout.OrientationSetting(_splitOrientation),
         SplitRatio = _splitRatio,
@@ -1318,6 +1359,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         WorkspaceState there,
         List<FavoriteState> favoritesBefore,
         bool ownLinks,
+        bool ownHoverPreviews,
         bool ownFavorites)
     {
         var settings = !_isPickerSession;
@@ -1342,6 +1384,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 ? here.CanvasLayersOff
                 : there.CanvasLayersOff,
             ShowFavoriteLinks = ownLinks ? here.ShowFavoriteLinks : there.ShowFavoriteLinks,
+            ShowHoverPreviews = ownHoverPreviews ? here.ShowHoverPreviews : there.ShowHoverPreviews,
             IsSplit = view ? Own(here.IsSplit, before.IsSplit, there.IsSplit) : there.IsSplit,
             SplitOrientation = view ? Own(here.SplitOrientation, before.SplitOrientation, there.SplitOrientation) : there.SplitOrientation,
             SplitRatio = view ? Own(here.SplitRatio, before.SplitRatio, there.SplitRatio) : there.SplitRatio,
@@ -1430,11 +1473,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task SaveNavigationPreferencesCoreAsync()
     {
-        if (_isDisposed || !_favoriteLinksChanged && !_favoritesChanged) return;
+        if (_isDisposed || !_favoriteLinksChanged && !_hoverPreviewsChanged && !_favoritesChanged) return;
         var links = _showFavoriteLinks;
+        var hoverPreviews = _showHoverPreviews;
         var favorites = FavoriteSnapshot();
         var favoritesBefore = _savedFavorites;
         var saveLinks = _favoriteLinksChanged;
+        var saveHoverPreviews = _hoverPreviewsChanged;
         var saveFavorites = _favoritesChanged;
         try
         {
@@ -1443,10 +1488,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 if (_isDisposed) return null;
                 current ??= new WorkspaceState();
                 if (saveLinks) current.ShowFavoriteLinks = links;
+                if (saveHoverPreviews) current.ShowHoverPreviews = hoverPreviews;
                 if (saveFavorites) current.Favorites = MergeFavorites(favorites, favoritesBefore, current.Favorites);
                 return current;
             });
             if (saveLinks && _showFavoriteLinks == links) _favoriteLinksChanged = false;
+            if (saveHoverPreviews && _showHoverPreviews == hoverPreviews) _hoverPreviewsChanged = false;
             if (saveFavorites)
             {
                 _savedFavorites = favorites;

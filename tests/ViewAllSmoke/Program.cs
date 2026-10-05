@@ -214,6 +214,9 @@ internal static partial class Program
         await Group(CrossClusterReviewChecks);
         await Group(TopReviewFixChecks);
         await Group(DriveGateChecks);
+        await Group(ThumbnailServiceChecks);
+        await Group(HoverPreviewChecks);
+        await Group(HoverPreviewPreferenceChecks);
     }
 
     /// <summary>

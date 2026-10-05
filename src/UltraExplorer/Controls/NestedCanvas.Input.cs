@@ -911,6 +911,10 @@ public sealed partial class NestedCanvas
         return HitTest(point);
     }
 
+    /// <summary>Content previews use exactly the same hit and motion rules as canvas hover.</summary>
+    internal NestedHit? HoverPreviewHit(Point point) =>
+        _press == PressKind.None && !IsCameraMoving && HotspotAt(point) is null ? PointerHit(point) : null;
+
     private Hotspot? HotspotAt(Point point)
     {
         for (var index = _hotspots.Count - 1; index >= 0; index--)

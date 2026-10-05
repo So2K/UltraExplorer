@@ -381,6 +381,17 @@
                 <!-- Layers: the switches of the layers menu in the canvas's corner. -->
                 <TextBlock Text="Layers" Style="{StaticResource SectionHeading}" />
 
+                <controls:SettingCard Glyph="&#xEB9F;"
+                                      Header="Hover previews"
+                                      Description="Rest the pointer on a file to see a thumbnail without opening it. Also works with selected files, in either canvas and the folder list.">
+                    <CheckBox x:Name="HoverPreviewsSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowHoverPreviews, Mode=TwoWay}"
+                              ToolTip="Show a content thumbnail when hovering a file"
+                              AutomationProperties.Name="Hover previews"
+                              AutomationProperties.HelpText="Show a content thumbnail when hovering a file" />
+                </controls:SettingCard>
+
                 <controls:SettingCard Glyph="&#xE8A5;"
                                       Header="Files"
                                       Description="File tiles. Off, each folder shows only its sub-folders, which then fill it; its title still counts its files.">

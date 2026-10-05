@@ -73,6 +73,9 @@ public sealed class WorkspaceState
     /// <summary>Optional round favorite links above This PC; missing settings keep the existing view.</summary>
     public bool ShowFavoriteLinks { get; set; }
 
+    /// <summary>Show a content thumbnail when hovering a file; older workspaces enable it by default.</summary>
+    public bool ShowHoverPreviews { get; set; } = true;
+
     /// <summary>
     /// The canvas layers switched off, by name - "Files", "Icons", "Details",
     /// "FolderCounts", "Marks" (see <see cref="CanvasLayers"/>).  Missing or

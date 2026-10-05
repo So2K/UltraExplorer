@@ -1,6 +1,8 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
+using System.Windows.Data;
+using UltraExplorer.ViewModels;
 using UltraExplorer.Models;
 
 namespace UltraExplorer;
@@ -34,6 +36,23 @@ public partial class MainWindow
     /// </summary>
     private void AddLayerItems(ItemsControl menu, bool includeMinimap)
     {
+        var hoverPreviews = new MenuItem
+        {
+            Header = "Hover previews",
+            IsCheckable = true,
+            StaysOpenOnClick = true,
+            ToolTip = "Show a content thumbnail when hovering a file, including selected files"
+        };
+        hoverPreviews.SetBinding(MenuItem.IsCheckedProperty, new Binding(nameof(MainViewModel.ShowHoverPreviews))
+        {
+            Source = _viewModel,
+            Mode = BindingMode.TwoWay
+        });
+        System.Windows.Automation.AutomationProperties.SetName(hoverPreviews, "Hover previews");
+        System.Windows.Automation.AutomationProperties.SetHelpText(hoverPreviews, (string)hoverPreviews.ToolTip);
+        menu.Items.Add(hoverPreviews);
+        menu.Items.Add(new Separator());
+
         var switches = new List<(MenuItem Item, CanvasLayer Layer)>();
         var showAll = new MenuItem
         {
