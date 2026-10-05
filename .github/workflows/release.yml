@@ -183,8 +183,8 @@ jobs:
           path: packages
 
       - name: Check planned release notes
-        if: github.ref_name == 'v1.1.0-beta.1'
-        run: test -s docs/RELEASE_NOTES_v1.1.0-beta.1.md
+        if: github.ref_name == 'v1.2.0-beta.1'
+        run: test -s docs/RELEASE_NOTES_v1.2.0-beta.1.md
 
       - name: Create the release
         uses: softprops/action-gh-release@v2
@@ -194,7 +194,7 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
           make_latest: ${{ needs.build.outputs.prerelease == 'false' }}
-          body_path: ${{ github.ref_name == 'v1.1.0-beta.1' && 'docs/RELEASE_NOTES_v1.1.0-beta.1.md' || '' }}
+          body_path: ${{ github.ref_name == 'v1.2.0-beta.1' && 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' || '' }}
           body: |
             ## Download
 

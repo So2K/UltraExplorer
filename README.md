@@ -12,7 +12,7 @@ See the structure, fly into a folder, and keep your bearings.
 [![C# · .NET 10](https://img.shields.io/badge/C%23-.NET%2010-512BD4)](src/UltraExplorer/UltraExplorer.csproj)
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[Download for Windows](https://github.com/So2K/UltraExplorer/releases/tag/v1.1.0-beta.1) ·
+[Download for Windows](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0-beta.1) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -31,7 +31,7 @@ inside their parents. Opening a folder moves the camera into it.
 The address bar, navigation pane, file operations and Windows Shell menus
 remain familiar. The canvas gives you another way to find and move your files.
 
-## Explorer vs UltraExplorer
+## Same folder, two views
 
 | Navigation | Windows Explorer | UltraExplorer |
 | --- | --- | --- |
@@ -39,19 +39,22 @@ remain familiar. The canvas gives you another way to find and move your files.
 | Keep your bearings | Breadcrumbs, Back/Forward and the navigation pane. | The same path navigation, plus the surrounding folder structure. |
 | Return to a project | Pinned locations in the navigation pane. | Favorites, color Tags and visual marks on the canvas. |
 
-![Explorer and UltraExplorer navigating the same generated folder hierarchy](docs/media/explorer-comparison.png)
+![Native Explorer Details view on the left and UltraExplorer's animated canvas on the right, showing the same folder](docs/media/explorer-comparison.png)
 
 [GIF version](docs/media/explorer-comparison.gif)
 
-The comparison uses the same generated folder tree, destination and depth.
-Explorer can also jump directly to a pasted path. No artificial disk delay is
-added; this demonstrates navigation styles rather than a timed benchmark.
+Left: native Windows Explorer's Details view, already in the destination
+folder. Right: UltraExplorer flying from the overview to that same folder,
+then to Library and back. The destination is 12 directory levels below the
+generated workspace. Both apps can open a pasted path. This compares the
+views, with no artificial disk delay or timing race.
 
 ## See it in action
 
-These recordings use the CPU fallback and a preloaded, generated workspace.
-Playback follows captured frame timing. Animated PNGs are shown below, with
-GIF alternatives linked under each clip.
+These 30 fps animated PNG demos were captured from the running app with
+Windows Graphics Capture, using the CPU fallback and a preloaded, generated
+workspace. Playback follows elapsed frame timestamps. GIF alternatives are
+linked under each clip.
 
 ### Go deep without losing the bigger picture
 
@@ -127,10 +130,10 @@ which folder occupies the most bytes.
 ## Download
 
 The current release is a **Windows x64 prerelease**. Get the assets from
-[v1.1.0-beta.1](https://github.com/So2K/UltraExplorer/releases/tag/v1.1.0-beta.1):
+[v1.2.0-beta.1](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0-beta.1):
 
-- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.1.0-beta.1/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
-- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.1.0-beta.1/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
+- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0-beta.1/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
+- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0-beta.1/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
 
 Both include the .NET runtime. Settings, favorites, colors and notes are stored
 in `%LOCALAPPDATA%\UltraExplorer`.

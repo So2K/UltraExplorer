@@ -1,4 +1,4 @@
-# UltraExplorer v1.1.0-beta.1
+# UltraExplorer v1.2.0-beta.1
 
 **Your files. One zoomable map.**
 
@@ -29,10 +29,14 @@ with a CPU fallback. Split view lets two independent cameras work side by
 side or top to bottom.
 
 See the [project page](https://github.com/So2K/UltraExplorer#see-it-in-action)
-for animated PNG navigation, search, Tags and split-view demos, with GIF
-alternatives. The [Explorer comparison](https://github.com/So2K/UltraExplorer#explorer-vs-ultraexplorer)
-uses the same generated folder tree, destination and depth. No artificial disk
-delay is added; the comparison demonstrates navigation rather than measuring time.
+for 30 fps animated PNG navigation, search, Tags and split-view demos, with GIF
+alternatives. They use Windows Graphics Capture, the CPU fallback and a
+preloaded, generated workspace, with elapsed frame timestamps.
+
+[Same folder, two views](https://github.com/So2K/UltraExplorer#same-folder-two-views)
+shows native Explorer's static Details view on the left and UltraExplorer's
+animated canvas on the right. Both show the same generated destination, 12
+directory levels deep. No artificial disk delay or timing race is introduced.
 
 ## Download
 
