@@ -24,6 +24,7 @@ internal static partial class Program
             await TildeLookupChecks();
             await FileLookupChecks();
             await FirstDrawRegistrationChecks();
+            await PickChecks();
         });
 
         return Task.CompletedTask;
@@ -187,6 +188,129 @@ internal static partial class Program
         var registered = hub.Registry.NestedTargets - before;
         Check($"and once they left the screen, only the folders read are registered ({read} read, {registered} registered with the hub, {tree.LiveRegisteredCount - 1} by the tree)",
             read is > 0 and < Count && registered == read && tree.LiveRegisteredCount - 1 == read);
+    }
+
+    // ---- picking the next read (J007) ----------------------------------------------------
+
+    /// <summary>
+    /// A freed slot finds its next folder among thousands waiting without a
+    /// look at every one of them, and still in the order the queue always
+    /// read them: something waited for first, then the widest on screen -
+    /// one queued later among them included, and past the first few hundred.
+    /// </summary>
+    private static async Task PickChecks()
+    {
+        const int Waiting = 10_000;
+        using (var disk = new GatedDisk())
+        {
+            var (tree, folders) = await QueueTreeAsync(disk, [.. Enumerable.Range(0, Waiting).Select(index => $"w{index:D5}")]);
+            using var owned = tree;
+            var random = new Random(5);
+            disk.Gating = true;
+            tree.BeginFrame();
+            foreach (var folder in folders)
+            {
+                tree.Request(folder, 20 + random.NextDouble() * 400);
+            }
+
+            // Every one of them waiting, the reads go.
+            var started = Stopwatch.GetTimestamp();
+            disk.Open();
+            await WaitUntil(() => folders.All(folder => folder.IsLoaded), 60_000);
+            var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            var (picks, total, worst) = tree.PickCost;
+            var mean = total * 1000 / Math.Max(1, picks);
+            Console.WriteLine($"        {Waiting:N0} folders waiting: read in {elapsed:N0} ms, {picks:N0} picks of {mean:0.0} us on average ({total:0.0} ms in all, the worst {worst * 1000:0} us)");
+            Check($"{Waiting:N0} folders waiting are all read, each pick a few microseconds rather than a pass over the queue ({mean:0.0} us on average)",
+                folders.All(folder => folder.IsLoaded) && mean < 20);
+        }
+
+        // All but one of the local slots held for the whole check, so the
+        // reads go one at a time and the order they begin in is the order
+        // they were picked in.
+        using var held = new ManualResetEventSlim();
+        using var gate = new SemaphoreSlim(0);
+        var order = new List<string>();
+        var disk = new FakeDisk();
+        disk.Hook = (path, token) =>
+        {
+            if (path.Length <= 3)
+            {
+                return null;
+            }
+
+            if (Path.GetFileName(path).StartsWith("held", StringComparison.Ordinal))
+            {
+                held.Wait(token);
+                return null;
+            }
+
+            lock (order)
+            {
+                order.Add(path);
+            }
+
+            gate.Wait(token);
+            return null;
+        };
+
+        var heldNames = Numbered("held", NestedTree.LocalReadSlots - 1);
+        var waitingNames = Enumerable.Range(0, 600).Select(index => $"v{index:D3}").ToArray();
+        foreach (var name in (string[])[.. heldNames, "opener", .. waitingNames, "late"])
+        {
+            disk.Folder($@"Q:\{name}");
+        }
+
+        using var ordered = new NestedTree(disk.Read);
+        ordered.SetRoots([new NestedRoot(@"Q:\", "Q:", NestedFolderKind.Drive)]);
+        await ordered.LoadAsync(ordered.Find(@"Q:\")!);
+        var waiting = waitingNames.Select(name => ordered.Find($@"Q:\{name}")!).ToArray();
+        var late = ordered.Find(@"Q:\late")!;
+        var widths = Enumerable.Range(1, waiting.Length).Select(width => (double)width).ToArray();
+        new Random(9).Shuffle(widths);
+        ordered.BeginFrame();
+        foreach (var name in (string[])[.. heldNames, "opener"])
+        {
+            ordered.Request(ordered.Find($@"Q:\{name}")!, 100_000);
+        }
+
+        for (var index = 0; index < waiting.Length; index++)
+        {
+            ordered.Request(waiting[index], widths[index]);
+        }
+
+        int Begun()
+        {
+            lock (order)
+            {
+                return order.Count;
+            }
+        }
+
+        // The opener and 100 of them read; the 101st begins, and waits.
+        await WaitUntil(() => Begun() >= 1, 3_000);
+        gate.Release(101);
+        await WaitUntil(() => Begun() >= 102, 3_000);
+        ordered.Request(late, 1_000);
+        gate.Release(10_000);
+        await WaitUntil(() => waiting.All(folder => folder.IsLoaded) && late.IsLoaded, 10_000);
+        held.Set();
+
+        string[] begun;
+        lock (order)
+        {
+            begun = [.. order.Skip(1)];
+        }
+
+        var widthOf = waiting.Select((folder, index) => (folder.FullPath, Width: widths[index]))
+            .ToDictionary(pair => pair.FullPath, pair => pair.Width, StringComparer.OrdinalIgnoreCase);
+        var actual = begun.Where(widthOf.ContainsKey).ToList();
+        var inOrder = actual.Count == waiting.Length
+            && actual.Zip(actual.Skip(1), (first, second) => widthOf[first] > widthOf[second]).All(isWider => isWider);
+        var lateAt = Array.IndexOf(begun, late.FullPath);
+        Check($"and {waiting.Length} folders waiting, more than a ranking holds, are read widest first ({actual.Count} read, {(inOrder ? "in order" : "out of order")})",
+            inOrder);
+        Check($"a wider one queued after 101 of them began is read next ({lateAt} began before it)", lateAt == 101);
     }
 
     /// <summary>The short form of a path, or null when the volume gives none.</summary>
