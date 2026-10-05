@@ -806,11 +806,18 @@ internal static partial class Program
             Check("an item deleted or moved away leaves the other pane's selection too", second.KeptSelection.Count == 0);
 
             // ---- F6, and closing with the second pane worked with ----
-            PressKey(main, Key.F6);
-            Check("F6 goes to the other pane", ReferenceEquals(main.ActivePane, second) && Lit(second));
-            PressKey(main, Key.F6);
-            Check("and back", ReferenceEquals(main.ActivePane, first) && Lit(first));
-            PressKey(main, Key.F6);
+            // Pressed while something else holds Shift on the desktop, as
+            // another program's input can at any moment of a run: the
+            // checks' own F6 is still F6.
+            WithShiftHeld(() =>
+            {
+                Check("with Shift held elsewhere on the desktop meanwhile", Keyboard.Modifiers == ModifierKeys.Shift);
+                PressKey(main, Key.F6);
+                Check("F6 goes to the other pane", ReferenceEquals(main.ActivePane, second) && Lit(second));
+                PressKey(main, Key.F6);
+                Check("and back", ReferenceEquals(main.ActivePane, first) && Lit(first));
+                PressKey(main, Key.F6);
+            });
             var closedSecond = second;
             Check("Ctrl+\\ closes the split", main.TryHandleSplitKey(Key.Oem5, ModifierKeys.Control) && !shell.IsSplit);
             Check("the first pane is the one left, worked with again, with its selection back",
@@ -1420,10 +1427,52 @@ internal static partial class Program
         return args;
     }
 
-    /// <summary>A key pressed in the window, as the keyboard sends it: down from the window first.</summary>
+    /// <summary>
+    /// A key pressed in the window, as the keyboard sends it: down from the
+    /// window first, and on its own.  The window reads Shift, Ctrl, Alt and
+    /// the Windows key from this thread's keyboard state, which follows the
+    /// desktop's: one held there by anything else - another program's
+    /// SendInput, a person at the keyboard - turned F6 into Shift+F6 and the
+    /// pane stayed where it was.  They are let go of for the press, and the
+    /// state is put back as it was after it.
+    /// </summary>
     private static void PressKey(Window window, Key key)
     {
+        //FIXSTART
         using var source = new System.Windows.Interop.HwndSource(new System.Windows.Interop.HwndSourceParameters("UltraExplorer split key check") { ParentWindow = new IntPtr(-3), WindowStyle = 0 });
         window.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, key) { RoutedEvent = Keyboard.PreviewKeyDownEvent });
+        //FIXEND
     }
+
+    /// <summary>
+    /// Shift held down, as far as this thread's keyboard state says, while
+    /// <paramref name="body"/> runs: what another program holding Shift on
+    /// the desktop looks like to the window.  Nothing outside this thread
+    /// sees it, and the state is put back after.
+    /// </summary>
+    private static void WithShiftHeld(Action body)
+    {
+        var before = new byte[256];
+        GetKeyboardState(before);
+        var shifted = (byte[])before.Clone();
+        shifted[0x10] = shifted[0xA0] = 0x80;
+        SetKeyboardState(shifted);
+        try
+        {
+            body();
+        }
+        finally
+        {
+            SetKeyboardState(before);
+        }
+    }
+
+    /// <summary>Shift, Ctrl and Alt, each side of each, and both Windows keys: the keys <see cref="Keyboard.Modifiers"/> is read from.</summary>
+    private static readonly byte[] ModifierVirtualKeys = [0x10, 0x11, 0x12, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C];
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool GetKeyboardState(byte[] keys);
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern bool SetKeyboardState(byte[] keys);
 }

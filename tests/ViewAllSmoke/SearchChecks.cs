@@ -29,6 +29,7 @@ internal static partial class Program
         await LiveEverythingChecks();
         RunOnSta("search panel", SearchPanelOnStaAsync);
         RunOnSta("search result content hit-testing", SearchResultContentChecksAsync);
+        await SilentEverythingChecks();
     }
 
     private static void SearchQueryChecks()
@@ -380,6 +381,67 @@ internal static partial class Program
             TryDelete(root);
         }
     }
+
+    /// <summary>
+    /// Everything running here but not answering - hung, or held up by a
+    /// drive it is reading - says nothing about UltraExplorer: the live
+    /// checks above call that inconclusive and name what they skip, where
+    /// they failed and then waited minutes for the walk of every drive that
+    /// stands in for Everything.  A hidden window of this process plays that
+    /// Everything: its index loaded, every query taken, none answered.  Its
+    /// class is one only this process asks for, so no other program finds it.
+    /// </summary>
+    private static async Task SilentEverythingChecks()
+    {
+        Section("search: an Everything that does not answer");
+        var classes = (string[])typeof(EverythingClient).GetField("WindowClasses", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!.GetValue(null)!;
+        var kept = (string[])classes.Clone();
+        var ready = new TaskCompletionSource<(Dispatcher Dispatcher, System.Windows.Interop.HwndSource Window, string ClassName)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            var silent = new System.Windows.Interop.HwndSource(new System.Windows.Interop.HwndSourceParameters("Everything that does not answer") { WindowStyle = 0 });
+            silent.AddHook((nint window, int message, nint wParam, nint lParam, ref bool handled) =>
+            {
+                // WM_USER, which asks whether the index is loaded, and WM_COPYDATA, a query: both taken.
+                handled = message is 0x0400 or 0x004A;
+                return handled ? 1 : 0;
+            });
+            var name = new StringBuilder(256);
+            SilentEverythingClassName(silent.Handle, name, name.Capacity);
+            ready.SetResult((Dispatcher.CurrentDispatcher, silent, name.ToString()));
+            Dispatcher.Run();
+        })
+        {
+            IsBackground = true,
+            Name = "Everything that does not answer"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        var (dispatcher, silent, className) = await ready.Task;
+
+        var failures = _failures;
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            Array.Fill(classes, className);
+            Check("Everything is there, with its index loaded, as far as UltraExplorer can tell", EverythingClient.IsDatabaseLoaded);
+            await LiveEverythingChecks();
+            RunOnSta("search panel, Everything not answering", SearchPanelOnStaAsync);
+        }
+        finally
+        {
+            kept.CopyTo(classes, 0);
+            dispatcher.Invoke(silent.Dispose);
+            dispatcher.InvokeShutdown();
+            thread.Join();
+        }
+
+        Check($"the live checks fail none of theirs for it, and wait for no walk of every drive ({_failures - failures} failed, {clock.ElapsedMilliseconds:N0} ms)",
+            _failures == failures && clock.ElapsedMilliseconds < 30_000);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int SilentEverythingClassName(nint window, StringBuilder name, int capacity);
 
     private static async Task<bool> SearchUntil(Func<bool> condition, int milliseconds)
     {

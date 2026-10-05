@@ -186,6 +186,7 @@ internal static partial class Program
         await Group(TrailParentChecks);
         await Group(GpuArrivalChecks);
         await Group(ExplorerReview2Checks);
+        await Group(ReleasePackagingChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.
