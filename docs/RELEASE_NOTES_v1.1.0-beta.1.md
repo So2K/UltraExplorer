@@ -29,7 +29,10 @@ with a CPU fallback. Split view lets two independent cameras work side by
 side or top to bottom.
 
 See the [project page](https://github.com/So2K/UltraExplorer#see-it-in-action)
-for navigation, search, Tags and split-view demos.
+for animated PNG navigation, search, Tags and split-view demos, with GIF
+alternatives. The [Explorer comparison](https://github.com/So2K/UltraExplorer#explorer-vs-ultraexplorer)
+uses the same generated folder tree, destination and depth. No artificial disk
+delay is added; the comparison demonstrates navigation rather than measuring time.
 
 ## Download
 

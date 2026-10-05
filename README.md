@@ -17,7 +17,9 @@ See the structure, fly into a folder, and keep your bearings.
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
 
-![UltraExplorer: a generated workspace and its nested folders](docs/media/overview.gif)
+![UltraExplorer: a generated workspace and its nested folders](docs/media/overview.png)
+
+[GIF version](docs/media/overview.gif)
 
 </div>
 
@@ -29,10 +31,27 @@ inside their parents. Opening a folder moves the camera into it.
 The address bar, navigation pane, file operations and Windows Shell menus
 remain familiar. The canvas gives you another way to find and move your files.
 
+## Explorer vs UltraExplorer
+
+| Navigation | Windows Explorer | UltraExplorer |
+| --- | --- | --- |
+| Move through a hierarchy | Enter directories as the current folder view changes. | Fly into nested folders on one map. |
+| Keep your bearings | Breadcrumbs, Back/Forward and the navigation pane. | The same path navigation, plus the surrounding folder structure. |
+| Return to a project | Pinned locations in the navigation pane. | Favorites, color Tags and visual marks on the canvas. |
+
+![Explorer and UltraExplorer navigating the same generated folder hierarchy](docs/media/explorer-comparison.png)
+
+[GIF version](docs/media/explorer-comparison.gif)
+
+The comparison uses the same generated folder tree, destination and depth.
+Explorer can also jump directly to a pasted path. No artificial disk delay is
+added; this demonstrates navigation styles rather than a timed benchmark.
+
 ## See it in action
 
 These recordings use the CPU fallback and a preloaded, generated workspace.
-Playback follows captured frame timing.
+Playback follows captured frame timing. Animated PNGs are shown below, with
+GIF alternatives linked under each clip.
 
 ### Go deep without losing the bigger picture
 
@@ -41,7 +60,9 @@ parents, or paste a path to jump straight there. Directory contents load as
 they become visible. Cold directories and network paths depend on filesystem
 response time.
 
-![Flying from the overview into a deeply nested folder and back](docs/media/deep-zoom.gif)
+![Flying from the overview into a deeply nested folder and back](docs/media/deep-zoom.png)
+
+[GIF version](docs/media/deep-zoom.gif)
 
 ### Search, then land on the result
 
@@ -55,7 +76,9 @@ DLL to install. Without Everything it walks directories in the background,
 and results arrive as that walk progresses. Index coverage and disk access
 determine what can be found.
 
-![Searching for a file and revealing its folder on the canvas](docs/media/search.gif)
+![Searching for a file and revealing its folder on the canvas](docs/media/search.png)
+
+[GIF version](docs/media/search.gif)
 
 The search recording uses a background directory walk scoped to the demo
 workspace.
@@ -70,7 +93,9 @@ Right-click a tag for **Change color** or **Unpin**. Unpin removes its color
 and sidebar entry while keeping its note. `Shift+F10` and the Menu key work
 too. Colors and notes belong to paths and are shared between app windows.
 
-![Navigating between already colored folders through the Tags sidebar](docs/media/tags.gif)
+![Navigating between already colored folders through the Tags sidebar](docs/media/tags.png)
+
+[GIF version](docs/media/tags.gif)
 
 ### Work in two places at once
 
@@ -78,7 +103,9 @@ Split the canvas side by side or top to bottom. Each pane keeps its own
 camera, selection, filter and history. Drag a file onto a folder in the other
 pane, or use `Shift+F5` to copy and `Shift+F6` to move the selection there.
 
-![Two independent canvas panes for moving between project folders](docs/media/split-view.gif)
+![Two independent canvas panes for moving between project folders](docs/media/split-view.png)
+
+[GIF version](docs/media/split-view.gif)
 
 ## What you can do
 

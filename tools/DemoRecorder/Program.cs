@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.IO;
 using System.Reflection;
 using System.Text.Json;
@@ -8,6 +9,7 @@ using System.Windows.Data;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using System.Windows.Threading;
+using System.Windows.Interop;
 using UltraExplorer;
 using UltraExplorer.Controls;
 using UltraExplorer.Models;
@@ -31,6 +33,9 @@ internal static class Program
     private static int _frame;
     private static Stopwatch _clock = new();
     private static readonly List<(string File, double Seconds)> _frames = [];
+    private static BlockingCollection<(BitmapSource Bitmap, string Path)>? _pendingFrames;
+    private static int _droppedFrames;
+    private static double _nextCaptureSeconds;
 
     [STAThread]
     private static void Main(string[] args)
@@ -57,7 +62,23 @@ internal static class Program
         app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
         app.Dispatcher.InvokeAsync(async () =>
         {
-            try { await RunAsync(); }
+            try
+            {
+                if (args.Contains("--open-native-explorer"))
+                {
+                    MakeFixture();
+                    // The installed observer must recognize this expressly
+                    // native Explorer frame. This reads its enabled flag; it
+                    // changes no preference or personal workspace.
+                    Environment.SetEnvironmentVariable("ULTRAEXPLORER_STATE_DIR", null);
+                    NativeShellService.ShowInWindowsExplorer(_fixture);
+                    await Task.Delay(4500);
+                }
+                else
+                {
+                    await RunAsync();
+                }
+            }
             catch (Exception ex) { File.WriteAllText(Path.Combine(_output, "error.txt"), ex.ToString()); }
             finally { app.Shutdown(); }
         });
@@ -197,11 +218,31 @@ internal static class Program
     {
         var folder = Path.Combine(_output, name);
         Directory.CreateDirectory(folder);
+        if (Environment.GetEnvironmentVariable("ULTRAEXPLORER_DEMO_CAPTURE") is { Length: > 0 } captureTool)
+        {
+            await RecordNativeAsync(folder, captureTool, scenario);
+            return;
+        }
+
         _frame = 0;
+        _nextCaptureSeconds = 0;
         _frames.Clear();
         _clock = Stopwatch.StartNew();
         _recording = true;
-        var timer = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(66.6667) };
+        _droppedFrames = 0;
+        _pendingFrames = new BlockingCollection<(BitmapSource, string)>(4);
+        var frameQueue = _pendingFrames;
+        var encoding = Task.Run(() =>
+        {
+            foreach (var frame in frameQueue.GetConsumingEnumerable())
+            {
+                var encoder = new BmpBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(frame.Bitmap));
+                using var stream = File.Create(frame.Path);
+                encoder.Save(stream);
+            }
+        });
+        var timer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(1) };
         timer.Tick += (_, _) => Capture(folder);
         timer.Start();
         Capture(folder);
@@ -209,6 +250,10 @@ internal static class Program
         _recording = false;
         timer.Stop();
         var end = _clock.Elapsed.TotalSeconds;
+        frameQueue.CompleteAdding();
+        await encoding;
+        frameQueue.Dispose();
+        _pendingFrames = null;
         var lines = new List<string>();
         for (var i = 0; i < _frames.Count; i++)
         {
@@ -218,31 +263,90 @@ internal static class Program
         }
         if (_frames.Count > 0) lines.Add($"file '{_frames[^1].File}'");
         File.WriteAllLines(Path.Combine(folder, "frames.txt"), lines);
-        File.WriteAllText(Path.Combine(folder, "timing.json"), JsonSerializer.Serialize(new { frames = _frames.Count, seconds = end, renderer = "CPU", dataset = "synthetic", speed = "real time" }));
+        File.WriteAllText(Path.Combine(folder, "timing.json"), JsonSerializer.Serialize(new
+        {
+            frames = _frames.Count, seconds = end, capturedFps = _frames.Count / end,
+            targetFps = 30, droppedFrames = _droppedFrames,
+            renderer = "CPU", dataset = "synthetic", speed = "real time"
+        }));
+    }
+
+    private static async Task RecordNativeAsync(string folder, string captureTool, Func<Task> scenario)
+    {
+        var start = new ProcessStartInfo(captureTool)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var argument in new[]
+        {
+            "--window", new WindowInteropHelper(_window).Handle.ToString(),
+            "--out", folder, "--seconds", "90", "--fps", "30", "--app-window"
+        }) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new IOException("The window recorder did not start.");
+        var errors = process.StandardError.ReadToEndAsync();
+        string? line;
+        do
+        {
+            line = await process.StandardOutput.ReadLineAsync().WaitAsync(TimeSpan.FromSeconds(20));
+            if (line is null) throw new IOException("Recorder ended before READY: " + await errors);
+        } while (!line.StartsWith("READY:", StringComparison.Ordinal));
+        var scopeGuard = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(20) };
+        scopeGuard.Tick += (_, _) => KeepSearchScoped();
+        scopeGuard.Start();
+        try
+        {
+            await Task.Delay(300);
+            await scenario();
+        }
+        finally
+        {
+            scopeGuard.Stop();
+            await process.StandardInput.WriteLineAsync("stop");
+            process.StandardInput.Close();
+            await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(30));
+            File.WriteAllText(Path.Combine(folder, "recorder.log"), await process.StandardOutput.ReadToEndAsync() + await errors);
+        }
+        if (process.ExitCode != 0) throw new IOException($"Window recorder exited {process.ExitCode}; see {folder}.");
+    }
+
+    private static void KeepSearchScoped()
+    {
+        foreach (var timerName in new[] { "_typing", "_folderSettling", "_waitingForEverything" })
+            ((DispatcherTimer)typeof(SearchViewModel).GetField(timerName, Private)!.GetValue(_model.Search)!).Stop();
+        (typeof(SearchViewModel).GetField("_run", Private)!.GetValue(_model.Search) as CancellationTokenSource)?.Cancel();
     }
 
     private static void Capture(string folder)
     {
         if (!_recording) return;
+        var seconds = _clock.Elapsed.TotalSeconds;
+        if (seconds < _nextCaptureSeconds) return;
+        _nextCaptureSeconds = seconds + 1.0 / 30;
         // The demo search is deliberately scoped to generated files. Camera
         // changes must not schedule the normal all-drive background query.
-        foreach (var timerName in new[] { "_typing", "_folderSettling", "_waitingForEverything" })
-            ((DispatcherTimer)typeof(SearchViewModel).GetField(timerName, Private)!.GetValue(_model.Search)!).Stop();
-        (typeof(SearchViewModel).GetField("_run", Private)!.GetValue(_model.Search) as CancellationTokenSource)?.Cancel();
-        var seconds = _clock.Elapsed.TotalSeconds;
-        var bitmap = new RenderTargetBitmap(
-            (int)Math.Ceiling(_window.ActualWidth),
-            (int)Math.Ceiling(_window.ActualHeight),
-            96,
-            96,
-            PixelFormats.Pbgra32);
-        bitmap.Render(_window);
-        var encoder = new PngBitmapEncoder();
-        encoder.Frames.Add(BitmapFrame.Create(bitmap));
-        var name = $"frame-{_frame++:D5}.png";
-        using var stream = File.Create(Path.Combine(folder, name));
-        encoder.Save(stream);
-        _frames.Add((name, seconds));
+        KeepSearchScoped();
+        const int width = 1100;
+        var height = (int)Math.Ceiling(width * _window.ActualHeight / _window.ActualWidth);
+        var bitmap = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
+        var visual = new DrawingVisual();
+        using (var drawing = visual.RenderOpen())
+            drawing.DrawRectangle(new VisualBrush(_window) { Stretch = Stretch.Fill }, null, new Rect(0, 0, width, height));
+        bitmap.Render(visual);
+        bitmap.Freeze();
+        var name = $"frame-{_frame:D5}.bmp";
+        if (_pendingFrames?.TryAdd((bitmap, Path.Combine(folder, name))) == true)
+        {
+            _frame++;
+            _frames.Add((name, seconds));
+        }
+        else
+        {
+            _droppedFrames++;
+        }
     }
 
     private static string P(params string[] parts) => Path.Combine([_fixture, .. parts]);
