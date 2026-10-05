@@ -1,7 +1,7 @@
 ; The UltraExplorer installer (Inno Setup 6.3 or later).
 ;
-; It installs the self-contained single-file UltraExplorer.exe that
-; `dotnet publish` makes, so no .NET needs to be on the machine.  By default
+; It installs the complete self-contained folder from `dotnet publish`,
+; including the .NET/WPF runtime, so no .NET needs to be on the machine. By default
 ; it installs for the current user only, without administrator rights, into
 ; the same folder scripts/install.ps1 uses (%LOCALAPPDATA%\Programs\UltraExplorer),
 ; so either one updates the other's copy; setup offers an all-users install in
@@ -11,10 +11,13 @@
 ; Built by .github/workflows/release.yml.  By hand, after a publish:
 ;
 ;   iscc /DAppVersion=1.2.3 /DPublishDir=..\publish installer\UltraExplorer.iss
+; The publish folder must also contain LICENSE, README.md, notices, and
+; UltraExplorer-package-files.txt (all publish-relative file paths, one per line,
+; including the manifest itself). The workflow creates these before compiling.
 ;
 ; AppVersion      shown to the user (the tag without its "v": 1.2.3, 1.2.3-beta.1)
 ; AppFileVersion  numeric version for the file properties (1.2.3); defaults to AppVersion
-; PublishDir      the folder holding UltraExplorer.exe, relative to this file
+; PublishDir      the complete publish folder, relative to this file
 ; OutputDir       where the setup goes, relative to this file
 
 #ifndef AppVersion
@@ -32,6 +35,7 @@
 
 #define AppName "UltraExplorer"
 #define AppExe "UltraExplorer.exe"
+#define PackageManifest "UltraExplorer-package-files.txt"
 ; The app's own taskbar identity (App.AppUserModelId): a shortcut carrying it
 ; and the running window are one taskbar button, as with scripts/install.ps1.
 #define AppUserModelId "UltraExplorer.App"
@@ -92,22 +96,11 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
-[InstallDelete]
-; What scripts/install.ps1 leaves in the same folder: a framework-dependent
-; build.  The single-file exe replaces all of it.
-Type: files; Name: "{app}\UltraExplorer.dll"
-Type: files; Name: "{app}\UltraExplorer.pdb"
-Type: files; Name: "{app}\UltraExplorer.deps.json"
-Type: files; Name: "{app}\UltraExplorer.runtimeconfig.json"
-Type: files; Name: "{app}\Nodify.dll"
-Type: files; Name: "{app}\Vortice.*.dll"
-Type: files; Name: "{app}\SharpGen.Runtime*.dll"
-
 [Files]
-Source: "{#PublishDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
-Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+; First in a solid archive so PrepareToInstall can read it cheaply. The second
+; entry installs it as well, alongside ALL runtime, native and locale files.
+Source: "{#PublishDir}\{#PackageManifest}"; Flags: dontcopy
+Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Comment: "A file manager on a zoomable canvas"; AppUserModelID: "{#AppUserModelId}"
@@ -123,6 +116,111 @@ Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgra
 Filename: "{app}\{#AppExe}"; Parameters: "--dialog-recover"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreWindowsDialogs"
 
 [Code]
+var
+  PreviousPackageFiles: TArrayOfString;
+  CurrentPackageFiles: TArrayOfString;
+
+function PackageFileAttributes(const FileName: String): LongWord;
+  external 'GetFileAttributesW@kernel32.dll stdcall';
+
+function PackageContains(const RelativeName: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 0 to GetArrayLength(CurrentPackageFiles) - 1 do
+    if CompareText(CurrentPackageFiles[I], RelativeName) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+end;
+
+(* Only manifest-owned relative files inside {app} may be removed. Reject path
+  traversal, wildcard/absolute paths, and any junction or symbolic link in the
+  path. Never delete a directory, the uninstall log, or profile settings. *)
+function SafeObsoletePackageFile(const RelativeName: String): Boolean;
+var
+  Remaining, Segment, Prefix: String;
+  Separator: Integer;
+  Attributes: LongWord;
+begin
+  Result := False;
+  if RelativeName = '' then Exit;
+  if (Pos(':', RelativeName) > 0) or
+     (Pos('/', RelativeName) > 0) or (Pos('*', RelativeName) > 0) or
+     (Pos('?', RelativeName) > 0) or (RelativeName[1] = '\') or
+     (Pos('unins', Lowercase(RelativeName)) = 1) then Exit;
+
+  Prefix := ExpandConstant('{app}');
+  Attributes := PackageFileAttributes(Prefix);
+  if (Attributes = $FFFFFFFF) or ((Attributes and $400) <> 0) then Exit;
+  Remaining := RelativeName;
+  repeat
+    Separator := Pos('\', Remaining);
+    if Separator > 0 then
+    begin
+      Segment := Copy(Remaining, 1, Separator - 1);
+      Delete(Remaining, 1, Separator);
+    end
+    else
+    begin
+      Segment := Remaining;
+      Remaining := '';
+    end;
+    if (Segment = '') or (Segment = '.') or (Segment = '..') then Exit;
+    Prefix := AddBackslash(Prefix) + Segment;
+    Attributes := PackageFileAttributes(Prefix);
+    if (Attributes = $FFFFFFFF) or ((Attributes and $400) <> 0) then Exit;
+  until Separator = 0;
+  Result := FileExists(Prefix) and not DirExists(Prefix);
+end;
+
+procedure RemoveObsoletePackageFile(const RelativeName: String);
+begin
+  if not PackageContains(RelativeName) and SafeObsoletePackageFile(RelativeName) then
+  begin
+    if DeleteFile(AddBackslash(ExpandConstant('{app}')) + RelativeName) then
+      Log('Removed obsolete package file: ' + RelativeName)
+    else
+      Log('Retained locked obsolete package file: ' + RelativeName);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := '';
+  ExtractTemporaryFile('{#PackageManifest}');
+  if not LoadStringsFromFile(ExpandConstant('{tmp}\{#PackageManifest}'), CurrentPackageFiles) then
+  begin
+    Result := 'The UltraExplorer package manifest could not be read.';
+    Exit;
+  end;
+  SetArrayLength(PreviousPackageFiles, 0);
+  LoadStringsFromFile(ExpandConstant('{app}\{#PackageManifest}'), PreviousPackageFiles);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  I: Integer;
+begin
+  (* Deletion happens only after the new payload has installed successfully.
+     Updates retain settings and any unlisted file the user put in {app}. *)
+  if CurStep = ssPostInstall then
+  begin
+    for I := 0 to GetArrayLength(PreviousPackageFiles) - 1 do
+      RemoveObsoletePackageFile(PreviousPackageFiles[I]);
+    { Exact filenames used by older packages before they carried a manifest.
+      Required current files are protected by PackageContains. }
+    RemoveObsoletePackageFile('LICENSE.txt');
+    RemoveObsoletePackageFile('UltraExplorer.pdb');
+    RemoveObsoletePackageFile('Vanara.Windows.Shell.dll');
+    RemoveObsoletePackageFile('Vanara.PInvoke.Shared.dll');
+    RemoveObsoletePackageFile('Vanara.PInvoke.Shell32.dll');
+    RemoveObsoletePackageFile('Vanara.PInvoke.User32.dll');
+  end;
+end;
+
 { The file-dialog classes (--register-picker) are removed with the copy they
   start, and only then: a registration that points at another build, a
   development copy say, is not this uninstaller's to touch. }
