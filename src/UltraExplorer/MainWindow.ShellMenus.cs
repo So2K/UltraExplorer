@@ -42,9 +42,40 @@ public partial class MainWindow
     /// </summary>
     private const int PreparedMenuMostItems = 100;
 
+    /// <summary>
+    /// The most items the Shell's menu is built for at all.  It grows with
+    /// the selection - 1.6 s for 5,000 files, measured, and on for as long as
+    /// the selection goes - on the thread every window shares; a bigger
+    /// selection gets the app's own menu.
+    /// </summary>
+    private const int ShellMenuMostItems = 2000;
+
+    /// <summary>
+    /// How long a press must stay still before its menu is built: a press
+    /// that moves sooner is the start of a right-drag, which only pans, and
+    /// building the menu it never shows held the pan's start.
+    /// </summary>
+    private static readonly TimeSpan PreparedMenuStillTime = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// How long an item on a share is waited for before its menu is built:
+    /// the Shell asks the server while it parses the item, and a server that
+    /// has gone away held every window for the network's timeout - over a
+    /// minute, measured.  An item that does not answer in time gets the app's
+    /// own menu.
+    /// </summary>
+    private static readonly TimeSpan ShareAnswerTime = TimeSpan.FromMilliseconds(1500);
+
+    /// <summary>
+    /// The question last put to each share, by its \\server\share: one still
+    /// unanswered is not asked again, nor waited for, until it is answered.
+    /// </summary>
+    private static readonly Dictionary<string, Task<bool>> ShareQuestions = new(StringComparer.OrdinalIgnoreCase);
+
     private ShellContextMenu? _preparedMenu;
     private string? _preparedKey;
     private DispatcherOperation? _preparing;
+    private DispatcherTimer? _preparedStill;
     private DispatcherTimer? _preparedExpiry;
 
     /// <summary>For tests: the menus built for a press, and the ones built only when shown.</summary>
