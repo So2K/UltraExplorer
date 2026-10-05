@@ -2086,6 +2086,13 @@ internal sealed class NestedPane
         View.CanvasFilterPrevious.Visibility = navigation;
         View.CanvasFilterNext.Visibility = navigation;
         View.CanvasFilterClear.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
-        ScheduleBeacons();
+
+        // While folders are read the matches change frame after frame, each
+        // frame saying so: the beacons are gathered as the timer comes round,
+        // not put off again by every frame for as long as the reading goes on.
+        if (_beaconTimer is not { IsEnabled: true })
+        {
+            ScheduleBeacons();
+        }
     }
 }

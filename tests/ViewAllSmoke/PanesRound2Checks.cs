@@ -141,6 +141,7 @@ internal static partial class Program
                 await PanesSendTwiceChecksAsync(root);
                 await PanesSparseParentChecksAsync(root);
                 await PanesBigDragChecksAsync(root);
+                await PanesFilterBeaconChecksAsync(root);
             }
         }
         finally
@@ -668,6 +669,67 @@ internal static partial class Program
         finally
         {
             host.NestedDragPaths = null;
+            shell.Dispose();
+        }
+    }
+
+    // ---- the filter's matches changing frame after frame while folders are read (J140) --
+
+    /// <summary>
+    /// With a filter on, flying into folders not read yet: each frame that
+    /// takes in read folders says the matches changed, and each time the
+    /// pane put off gathering its beacons - the matches among them, the
+    /// marks - another 120 ms, so none was gathered for as long as the
+    /// reading went on, seconds of it.  They are gathered again as the timer
+    /// comes round, and once more after the last change.
+    /// </summary>
+    private static async Task PanesFilterBeaconChecksAsync(string root)
+    {
+        Section("panes round 2: matches changing frame after frame while folders are read still have their beacons gathered (J140)");
+        var drive = Path.Combine(root, "filter-drive");
+        Directory.CreateDirectory(Path.Combine(drive, "read-later"));
+        var main = ProxyWindow(out var shell);
+        try
+        {
+            await main.StartNestedForChecksAsync();
+            main.UseNestedDrivesForChecks([new NestedRoot(drive, "F", NestedFolderKind.Drive)]);
+            var pane = main.FirstPane;
+            var canvas = pane.Canvas;
+            await Task.Delay(400);
+            var raise = typeof(NestedCanvas).GetMethod("RaiseFilterChanged", BindingFlags.Instance | BindingFlags.NonPublic)!;
+
+            // A frame each 16 ms takes in folders read and says so, for
+            // 1.2 seconds.
+            var gathered = 0;
+            var firstGathered = -1.0;
+            var last = PanesBeacons(canvas);
+            var watch = Stopwatch.StartNew();
+            while (watch.ElapsedMilliseconds < 1_200)
+            {
+                raise.Invoke(canvas, null);
+                await Task.Delay(16);
+                if (!ReferenceEquals(PanesBeacons(canvas), last))
+                {
+                    last = PanesBeacons(canvas);
+                    gathered++;
+                    if (firstGathered < 0)
+                    {
+                        firstGathered = watch.Elapsed.TotalMilliseconds;
+                    }
+                }
+            }
+
+            Check($"while the matches change frame after frame, the beacons are gathered as the timer comes round ({gathered} times in 1.2 s, first at {firstGathered:0} ms)",
+                pane.IsReady && gathered >= 4 && firstGathered is >= 0 and < 400);
+
+            // The last frame that takes any in.
+            var stopped = PanesBeacons(canvas);
+            raise.Invoke(canvas, null);
+            Check("and once more after the last change",
+                await LiveWait(() => !ReferenceEquals(PanesBeacons(canvas), stopped), 2_000) >= 0);
+        }
+        finally
+        {
             shell.Dispose();
         }
     }
