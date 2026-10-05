@@ -31,7 +31,8 @@ remain familiar. The canvas gives you another way to find and move your files.
 
 ## See it in action
 
-These recordings use generated folders and files in the running app.
+These recordings use the CPU fallback and a preloaded, generated workspace.
+Playback follows captured frame timing.
 
 ### Go deep without losing the bigger picture
 
@@ -56,8 +57,8 @@ determine what can be found.
 
 ![Searching for a file and revealing its folder on the canvas](docs/media/search.gif)
 
-This search recording uses a background directory walk scoped to the demo
-workspace and the CPU renderer. Playback follows the captured timestamps.
+The search recording uses a background directory walk scoped to the demo
+workspace.
 
 ### Remember folders by color
 
@@ -107,7 +108,7 @@ The current release is a **Windows x64 prerelease**. Get the assets from
 Both include the .NET runtime. Settings, favorites, colors and notes are stored
 in `%LOCALAPPDATA%\UltraExplorer`.
 
-Windows 10 1903+ / Windows 11, x64. For earlier and newer builds, see
+Windows 11, x64. For earlier and newer builds, see
 [all releases](https://github.com/So2K/UltraExplorer/releases).
 
 ## A few keys to get started

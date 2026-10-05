@@ -36,7 +36,7 @@ for navigation, search, Tags and split-view demos.
 - **UltraExplorer-Setup-x64.exe**: installer with Start menu entry and uninstaller.
 - **UltraExplorer-win-x64.zip**: portable build; extract and run `UltraExplorer.exe`.
 
-Both include the .NET runtime. Requires Windows 10 1903+ / Windows 11, x64.
+Both include the .NET runtime. This release targets Windows 11, x64.
 Preferences, favorites, colors and notes live in `%LOCALAPPDATA%\UltraExplorer`.
 
 ## Before trying it
