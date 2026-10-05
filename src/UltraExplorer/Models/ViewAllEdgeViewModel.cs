@@ -19,6 +19,10 @@ public sealed class ViewAllEdgeViewModel : ObservableObject, IDisposable
     private static readonly ConditionalWeakTable<ViewAllNodeViewModel, Outgoing> OutgoingBySource = new();
 
     private bool _isTreeVisible = true;
+    private static long _nextPaintOrder;
+
+    /// <summary>The graph appends new edges in creation order; culling preserves that paint order.</summary>
+    internal long PaintOrder { get; } = Interlocked.Increment(ref _nextPaintOrder);
 
     public ViewAllEdgeViewModel(ViewAllNodeViewModel source, ViewAllNodeViewModel target)
     {

@@ -166,6 +166,9 @@ public sealed class ViewAllGraphService : IDisposable
 
     public IReadOnlyList<ViewAllEdgeViewModel> Edges => _edges;
 
+    /// <summary>Existing incoming-edge index, used to cull work as well as pixels.</summary>
+    internal IReadOnlyDictionary<Guid, ViewAllEdgeViewModel> IncomingEdges => _incomingEdges;
+
     public IReadOnlyList<ViewAllNodeViewModel> Roots => _roots;
 
     /// <summary>Grid over placed nodes; culling and layout both query it.</summary>

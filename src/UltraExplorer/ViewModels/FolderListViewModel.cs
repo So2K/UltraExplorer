@@ -472,7 +472,7 @@ public sealed class FolderListViewModel : ObservableObject
     /// </summary>
     public IReadOnlyList<FolderListItem> SelectedRows()
     {
-        if (SharedSelection is not { Count: > 0 } selection || _byPath.Count == 0 || selection.CountIn(FolderPath) == 0)
+        if (!HasCurrentRows || SharedSelection is not { Count: > 0 } selection || _byPath.Count == 0 || selection.CountIn(FolderPath) == 0)
         {
             return [];
         }
@@ -1079,8 +1079,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// or a double-click on it is not meant for what it would act on.  An
     /// item handed in from elsewhere, not one of the rows shown, is not one.
     /// </summary>
+    internal bool HasCurrentRows => _rowsVersion == _folderVersion;
+
+    internal bool IsCurrentRow(FolderListItem item) =>
+        HasCurrentRows && ReferenceEquals(RowFor(item.FullPath), item);
+
     private bool IsLeftOver(FolderListItem item) =>
-        _rowsVersion != _folderVersion && ReferenceEquals(RowFor(item.FullPath), item);
+        !HasCurrentRows && ReferenceEquals(RowFor(item.FullPath), item);
 
     // ---- changes on disk ---------------------------------------------------------
 

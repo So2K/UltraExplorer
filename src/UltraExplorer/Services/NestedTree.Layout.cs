@@ -20,7 +20,8 @@ public sealed partial class NestedTree
     /// the address bar, a program opening a folder, a dialog's start folder.
     /// Kept on the canvas even when the user hid one of them - going there
     /// is the user's word too, and the later one - until the user next hides
-    /// or shows a folder.  A beacon's chain or a mark is no such word.
+    /// that path or an ancestor. An unrelated visibility change keeps it.
+    /// A beacon's chain or a mark is no such word.
     /// </summary>
     private readonly HashSet<string> _openedByName = new(StringComparer.OrdinalIgnoreCase);
 
@@ -30,6 +31,9 @@ public sealed partial class NestedTree
     /// filtered by their attributes alone, without hashing a single path.
     /// </summary>
     private readonly HashSet<string> _filterParents = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Visibility rules changed, independently of read/sort versions.</summary>
+    public int VisibilityVersion { get; private set; }
 
     /// <summary>
     /// Budget for one background slice of re-placing folders after a change of
@@ -113,15 +117,74 @@ public sealed partial class NestedTree
     /// </summary>
     public void SetUserHidden(IEnumerable<string> paths)
     {
+        var next = new HashSet<string>(paths.Select(Key), StringComparer.OrdinalIgnoreCase);
+        if (_userHidden.SetEquals(next)) return;
+        var newlyHidden = next.Where(path => !_userHidden.Contains(path)).ToHashSet(StringComparer.OrdinalIgnoreCase);
         _userHidden.Clear();
-        foreach (var path in paths)
-        {
-            _userHidden.Add(Key(path));
-        }
+        _userHidden.UnionWith(next);
 
-        _openedByName.Clear();
+        OpenedHiddenAncestorProbes = 0;
+        if (newlyHidden.Count > 0)
+            _openedByName.RemoveWhere(path => NewlyHiddenAncestor(path, newlyHidden));
         RebuildFilterParents();
         RefilterAll();
+    }
+
+    /// <summary>
+    /// An explicit Hide from canvas command is newer than named navigation,
+    /// even if these paths were already in the synchronized hidden set.
+    /// Unrelated named paths remain open; passive SetUserHidden does not rehide.
+    /// </summary>
+    public void HideFromCanvas(IEnumerable<string> paths)
+    {
+        if (_disposed) return;
+        var hidden = new HashSet<string>(paths.Select(Key), StringComparer.OrdinalIgnoreCase);
+        if (hidden.Count == 0) return;
+        var before = _userHidden.Count;
+        _userHidden.UnionWith(hidden);
+        OpenedHiddenAncestorProbes = 0;
+        var removed = _openedByName.RemoveWhere(path => NewlyHiddenAncestor(path, hidden));
+        if (before == _userHidden.Count && removed == 0) return;
+        RebuildFilterParents();
+        RefilterAll();
+    }
+
+    /// <summary>For checks: hash probes in the last named-override invalidation.</summary>
+    internal int OpenedHiddenAncestorProbes { get; private set; }
+
+    private bool NewlyHiddenAncestor(string path, HashSet<string> roots)
+    {
+        var lookup = roots.GetAlternateLookup<ReadOnlySpan<char>>();
+        for (var at = path.AsSpan(); !at.IsEmpty; at = ItemSelection.ParentOf(at))
+        {
+            OpenedHiddenAncestorProbes++;
+            if (lookup.Contains(at)) return true;
+        }
+        return false;
+    }
+
+    private static bool PathUnderVisibilityRoot(string path, string root) =>
+        root.Length > 0 && path.StartsWith(root, StringComparison.OrdinalIgnoreCase)
+        && (path.Length == root.Length || root[^1] == Path.DirectorySeparatorChar
+            || path[root.Length] == Path.DirectorySeparatorChar);
+
+    // Tree-local visibility intent follows an identity rename. This does not
+    // clone or edit the shared marks store, whose own Move remains authoritative.
+    private void MoveVisibilityForRename(string previous, string successor)
+    {
+        var changed = false;
+        foreach (var set in new[] { _userHidden, _forcedVisible, _openedByName })
+        {
+            foreach (var path in set.Where(path => PathUnderVisibilityRoot(path, previous)).ToArray())
+            {
+                set.Remove(path);
+                set.Add(successor + path[previous.Length..]);
+                changed = true;
+            }
+        }
+        if (!changed) return;
+        RebuildFilterParents();
+        VisibilityVersion++;
     }
 
     public bool IsUserHidden(string path) => _userHidden.Contains(Key(path));
@@ -157,6 +220,7 @@ public sealed partial class NestedTree
 
         if (parents.Count > 0)
         {
+            VisibilityVersion++;
             RaiseChanged();
         }
     }
@@ -209,6 +273,7 @@ public sealed partial class NestedTree
 
         if (parents.Count > 0)
         {
+            VisibilityVersion++;
             RaiseChanged();
         }
     }
@@ -443,6 +508,7 @@ public sealed partial class NestedTree
 
     private void RefilterAll()
     {
+        VisibilityVersion++;
         var stack = new Stack<NestedFolder>();
         stack.Push(Root);
         while (stack.Count > 0)

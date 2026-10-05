@@ -242,6 +242,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Raised when a message belongs on the shell toast.</summary>
     public event Action<string, bool>? MessageRequested;
 
+    /// <summary>Exact successfully resolved folder paths explicitly hidden by a user command, including an already-hidden path reopened by name.</summary>
+    public event Action<IReadOnlyList<string>>? FoldersHiddenByUser;
+
     /// <summary>Raised when the graph structure changed and cached drawing is stale.</summary>
     public event Action? GraphInvalidated;
 
@@ -252,6 +255,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// like any change on disk; this is for whoever wants to know as well.
     /// </summary>
     public event Action<string>? PathRefreshed;
+
+    /// <summary>Explicit filesystem rename, independent of which item is selected.</summary>
+    public event Action<string, string>? RenameFollowed;
 
     /// <summary>
     /// F5 on a folder: everything read in and below it is to be taken as out
@@ -1247,6 +1253,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         });
         OnPropertyChanged(nameof(HiddenPaths));
         OnPropertyChanged(nameof(HiddenCount));
+        FoldersHiddenByUser?.Invoke([.. targets.Select(node => node.FullPath)]);
         MessageRequested?.Invoke(
             targets.Count == 1
                 ? $"{targets[0].DisplayName} hidden — bring it back from the canvas menu"
@@ -1534,7 +1541,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         HashSet<string> present;
         try
         {
-            present = await Task.Run(() => new HashSet<string>(Directory.EnumerateFileSystemEntries(folder), StringComparer.OrdinalIgnoreCase));
+            var normalized = ViewAllPath.Normalize(folder);
+            present = await Task.Run(() => new HashSet<string>(
+                new DirectoryInfo(ViewAllFileSystemService.ForWindows(normalized)).EnumerateFileSystemInfos()
+                    .Select(entry => Path.Combine(normalized, entry.Name)), StringComparer.OrdinalIgnoreCase));
         }
         catch (DirectoryNotFoundException)
         {
@@ -1835,6 +1845,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         RebuildRenderSet();
         if (focus && acts)
         {
+            // A light by-name node can be replaced while its ancestors are
+            // expanded for the tree canvas. Keep the focus on the live node
+            // without turning a focus-only reveal into a single selection or
+            // a new navigation (especially when several files are selected).
+            if (!select && Selection.Focus is { } currentFocus && ViewAllPath.Equals(currentFocus, node.FullPath))
+                SetActive(node, records: false);
             FocusNodeRequested?.Invoke(node, true);
         }
 
@@ -1988,7 +2004,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             {
                 if (!_isDisposed)
                 {
-                    NativeShellService.Open(path);
+                    NativeShellService.Open(path, isDirectory: true);
                 }
 
                 return;
@@ -2594,7 +2610,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     }
 
     /// <summary>What <paramref name="path"/> is called once <paramref name="oldPath"/> is <paramref name="newPath"/>: null when it is not that or inside it.</summary>
-    private static string? Renamed(string path, string oldPath, string newPath) =>
+    internal static string? Renamed(string path, string oldPath, string newPath) =>
         string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase)
             ? newPath
             : path.Length > oldPath.Length
@@ -2665,6 +2681,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         {
             EndMarkBatch();
         }
+
+        RenameFollowed?.Invoke(oldPath, newPath);
+    }
+
+    /// <summary>Queues the app's known rename pair before an immediate reread can overtake the watcher.</summary>
+    internal void NoteOwnRename(string oldPath, string newPath)
+    {
+        _changes?.TouchRename(oldPath, newPath);
+        FollowRename(oldPath, newPath);
     }
 
     /// <summary>Renames the selection followed, for tests.</summary>
@@ -3214,7 +3239,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             // not there: a share that has stopped answering would hold the
             // window up for as long as the network takes to say so, and what
             // is selected in it is not to be let go of meanwhile.
-            if (await IsGoneAsync(path) && !_isDisposed)
+            if (await IsGoneAsync(path) && ticket == _selectTicket && !_isDisposed)
             {
                 var parent = Path.GetDirectoryName(path);
                 var focused = ViewAllPath.Equals(Selection.Focus ?? string.Empty, path);
@@ -3252,7 +3277,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     {
         try
         {
-            _ = File.GetAttributes(path);
+            _ = File.GetAttributes(ViewAllFileSystemService.ForWindows(path));
             return false;
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
@@ -3393,7 +3418,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             AlwaysRealized(viewport),
             viewport,
             _viewportZoom,
-            _visibleNodeCount);
+            _visibleNodeCount,
+            _graph.IncomingEdges);
         PerfLog.Value("renderset.nodes", set.Nodes.Count);
         int pending;
         using (PerfLog.Measure("renderset.sync"))

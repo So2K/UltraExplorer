@@ -518,6 +518,11 @@ internal static class TestScreen
 
     public static Box WindowRect(nint window) { GetWindowRect(window, out var box); return box; }
 
+    /// <summary>CenterScreen follows the pointer; never test it on the user's primary monitor.</summary>
+    public static bool PointerOnTarget()
+        => Target() is { } target && GetCursorPos(out var point)
+            && MonitorFromPoint(point, 2) == target.Handle;
+
     /// <summary>True when the window is wholly off the primary monitor and on a secondary one.</summary>
     public static bool OnSecondary(nint window)
     {
@@ -542,6 +547,9 @@ internal static class TestScreen
 
     [StructLayout(LayoutKind.Sequential)] private struct MonitorInfo { public int Size; public Box Bounds, Work; public uint Flags; }
     private delegate bool MonitorProc(nint monitor, nint context, nint rect, nint data);
+    [StructLayout(LayoutKind.Sequential)] private struct ScreenPoint { public int X, Y; }
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out ScreenPoint point);
+    [DllImport("user32.dll")] private static extern nint MonitorFromPoint(ScreenPoint point, uint flags);
     [DllImport("user32.dll")] private static extern bool EnumDisplayMonitors(nint context, nint clip, MonitorProc callback, nint data);
     [DllImport("user32.dll")] private static extern bool GetMonitorInfo(nint monitor, ref MonitorInfo info);
     [DllImport("user32.dll")] private static extern nint MonitorFromWindow(nint window, uint flags);

@@ -201,12 +201,12 @@ internal static partial class Program
     private static async Task PickChecks()
     {
         const int Waiting = 10_000;
-        using (var disk = new GatedDisk())
+        using (var waitingDisk = new GatedDisk())
         {
-            var (tree, folders) = await QueueTreeAsync(disk, [.. Enumerable.Range(0, Waiting).Select(index => $"w{index:D5}")]);
+            var (tree, folders) = await QueueTreeAsync(waitingDisk, [.. Enumerable.Range(0, Waiting).Select(index => $"w{index:D5}")]);
             using var owned = tree;
             var random = new Random(5);
-            disk.Gating = true;
+            waitingDisk.Gating = true;
             tree.BeginFrame();
             foreach (var folder in folders)
             {
@@ -215,7 +215,7 @@ internal static partial class Program
 
             // Every one of them waiting, the reads go.
             var started = Stopwatch.GetTimestamp();
-            disk.Open();
+            waitingDisk.Open();
             await WaitUntil(() => folders.All(folder => folder.IsLoaded), 60_000);
             var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             var (picks, total, worst) = tree.PickCost;

@@ -192,6 +192,15 @@ internal static partial class Program
         await Group(SlowPlacesChecks);
         await Group(SharedMarksChecks);
         await Group(CarriedMarksChecks);
+        await Group(Review2IntegrationChecks);
+        await Group(ShellMenuReview2IntegrationChecks);
+        await Group(FastEntryPointChecks);
+        await Group(BeaconIntegrationChecks);
+        await Group(ReadLaneIntegrationChecks);
+        await Group(LongPathShellOperationChecks);
+        await Group(ExplorerIntegrationFollowupChecks);
+        await Group(FileCommandReview2Checks);
+        await Group(NestedVisibilityRenameIntegrationChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

@@ -84,6 +84,7 @@ public partial class App : Application
         // frame.  The other roles show no canvas, and make no device.
         if (e.Args.Contains("--dialog-worker") || e.Args.Contains("--dialog-proxy"))
         {
+            Rendering.Gpu.GpuBootstrap.WarmOtherAdapters = false;
             StartGpu();
         }
 
@@ -116,34 +117,45 @@ public partial class App : Application
             return;
         }
 
+        var hasPreparedFolder = FastEntryPoint.TryTakePreparedFolder(e.Args, out var preparedFolder);
         FolderInvocation? folderInvocation = null;
         Mutex? folderStartup = null;
-        if (!FileDialogCommandLine.IsPickerInvocation(e.Args) && FolderCommandLine.IsInvocation(e.Args))
+        if (!FileDialogCommandLine.IsPickerInvocation(e.Args)
+            && (hasPreparedFolder || FolderCommandLine.IsInvocation(e.Args)))
         {
-            if (ExplorerLaunchRouter.TryHandleShellFallback(e.Args))
+            FolderInvocation invocation;
+            if (hasPreparedFolder)
             {
-                Shutdown(FileDialogCommandLine.ExitAccepted);
-                return;
+                invocation = preparedFolder;
+            }
+            else
+            {
+                if (ExplorerLaunchRouter.TryHandleShellFallback(e.Args))
+                {
+                    Shutdown(FileDialogCommandLine.ExitAccepted);
+                    return;
+                }
+
+                if (!FolderCommandLine.TryParse(e.Args, out invocation, out var error))
+                {
+                    FileDialogHost.WriteConsole(error);
+                    Shutdown(FileDialogCommandLine.ExitError);
+                    return;
+                }
             }
 
-            if (!FolderCommandLine.TryParse(e.Args, out folderInvocation, out var error))
-            {
-                FileDialogHost.WriteConsole(error);
-                Shutdown(FileDialogCommandLine.ExitError);
-                return;
-            }
-
+            folderInvocation = invocation;
             // Several folders opened together start a launch each: with no
             // window listening, the first builds one and the others wait to
             // hand it their folders, rather than each building its own.
             folderStartup = ExplorerLaunchRouter.EnterFolderStartup();
-            if (ExplorerLaunchRouter.TryForward(folderInvocation))
+            if (ExplorerLaunchRouter.TryForward(invocation))
             {
                 ExplorerLaunchRouter.LeaveFolderStartup(folderStartup, whenListening: false);
                 Shutdown(FileDialogCommandLine.ExitAccepted);
                 return;
             }
-            if (folderInvocation.OriginIsShell && ExplorerLaunchRouter.TryHandleShellFallback(e.Args))
+            if (invocation.OriginIsShell && ExplorerLaunchRouter.TryHandleShellFallback(e.Args))
             {
                 ExplorerLaunchRouter.LeaveFolderStartup(folderStartup, whenListening: false);
                 Shutdown(FileDialogCommandLine.ExitAccepted);

@@ -509,6 +509,8 @@ internal static partial class Program
         }
 
         main.PrepareShellMenu(background: false, [file]);
+        // The saved review2 policy waits 50 ms so the press can become a pan.
+        await Task.Delay(80);
         await main.Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ContextIdle);
         Check("a right press on a local item still builds its menu while the button is down", prepared.GetValue(main) is not null);
         drop.Invoke(main, null);

@@ -39,6 +39,10 @@ public sealed partial class NestedTree : IChangeSink
     /// <summary>Renames seen in a folder whose new listing has not been applied yet, by folder.</summary>
     private readonly Dictionary<NestedFolder, List<RenamePair>> _renames = [];
 
+    // Only a camera/other consumer retaining an old node keeps this bridge
+    // alive. Neither the table nor a successor retains the detached subtree.
+    private readonly ConditionalWeakTable<NestedFolder, NestedFolder> _renameSuccessors = new();
+
     /// <summary>Named checks for disappeared descendants whose parents have never been listed.</summary>
     private readonly HashSet<NestedFolder> _sparseGoneChecks = [];
 
@@ -1141,6 +1145,12 @@ public sealed partial class NestedTree : IChangeSink
 
             renames.RemoveAt(index);
             var renamed = FindChild(parent, pair.NewName);
+            if (renamed is not null && renamed.IsReparsePoint == old.IsReparsePoint)
+            {
+                MoveVisibilityForRename(old.FullPath, renamed.FullPath);
+                ApplyVisibleChildren(parent);
+                RememberRenameSuccessor(old, renamed);
+            }
             if (renamed is { LoadState: NestedLoadState.Loaded or NestedLoadState.Failed })
             {
                 // The new name was a folder's that went first - an updater's
@@ -1157,23 +1167,7 @@ public sealed partial class NestedTree : IChangeSink
                 continue;
             }
 
-            var children = new NestedFolder[old.AllChildren.Length];
-            for (var child = 0; child < children.Length; child++)
-            {
-                var previous = old.AllChildren[child];
-                children[child] = NestedFolder.ChildOf(renamed, previous.Name, previous.IsHidden, previous.IsReparsePoint, previous.ModifiedTicks);
-            }
-
-            renamed.AllChildren = children;
-            renamed.AllFiles = old.AllFiles;
-            renamed.FileCount = old.FileCount;
-            renamed.HiddenFileCount = old.HiddenFileCount;
-            renamed.IsTruncated = old.IsTruncated;
-            renamed.ErrorMessage = string.Empty;
-            renamed.LoadState = NestedLoadState.Loaded;
-            renamed.IsStale = true;
-            _knownCount += children.Length;
-            ApplyVisibleChildren(renamed);
+            CarryRenamedListing(old, renamed);
             Register(renamed);
             LiveCarriedOver++;
             FolderLoaded?.Invoke(renamed);
@@ -1184,6 +1178,100 @@ public sealed partial class NestedTree : IChangeSink
         {
             _renames.Remove(parent);
         }
+    }
+
+    private void RememberRenameSuccessor(NestedFolder previous, NestedFolder successor)
+    {
+        if (ReferenceEquals(previous, successor)) return;
+        _renameSuccessors.Remove(previous);
+        _renameSuccessors.Add(previous, successor);
+    }
+
+    private void CarryRenamedListing(NestedFolder previous, NestedFolder successor)
+    {
+        var children = new NestedFolder[previous.AllChildren.Length];
+        for (var index = 0; index < children.Length; index++)
+        {
+            var oldChild = previous.AllChildren[index];
+            var child = NestedFolder.ChildOf(successor, oldChild.Name, oldChild.IsHidden,
+                oldChild.IsReparsePoint, oldChild.ModifiedTicks);
+            children[index] = child;
+            RememberRenameSuccessor(oldChild, child);
+        }
+        successor.AllChildren = children;
+        successor.AllFiles = previous.AllFiles;
+        successor.FileCount = previous.FileCount;
+        successor.HiddenFileCount = previous.HiddenFileCount;
+        successor.IsTruncated = previous.IsTruncated;
+        successor.HasPartialListing = false;
+        successor.ErrorMessage = string.Empty;
+        successor.LoadState = NestedLoadState.Loaded;
+        successor.IsStale = true;
+        _knownCount += children.Length;
+        ApplyVisibleChildren(successor);
+    }
+
+    /// <summary>
+    /// Follows an identity rename for a detached camera node. Only its known
+    /// path is reified below the carried listing, never the whole old subtree
+    /// and never a disk probe. A definitive newer listing outranks that path.
+    /// </summary>
+    internal NestedFolder? RenameSuccessor(NestedFolder previous)
+    {
+        if (_disposed || !IsDetached(previous)) return null;
+        Stack<NestedFolder>? below = null;
+        for (NestedFolder? old = previous; old is not null; old = old.Parent)
+        {
+            if (!_renameSuccessors.TryGetValue(old, out var successor))
+            {
+                (below ??= new()).Push(old);
+                continue;
+            }
+            for (var guard = 0; IsDetached(successor) && guard < 128; guard++)
+            {
+                if (!_renameSuccessors.TryGetValue(successor, out var next)) break;
+                successor = next;
+            }
+            var top = successor;
+            while (top.Parent is not null) top = top.Parent;
+            if (IsDetached(successor) || !ReferenceEquals(top, Root)) return null;
+
+            var changed = false;
+            while (below is { Count: > 0 })
+            {
+                var oldChild = below.Pop();
+                var child = FindChild(successor, oldChild.Name);
+                if (child is null)
+                {
+                    // A child removed by an actual new listing must stay gone.
+                    if (successor.IsLoaded && !successor.HasPartialListing) return null;
+                    child = NestedFolder.ChildOf(successor, oldChild.Name, oldChild.IsHidden,
+                        oldChild.IsReparsePoint, oldChild.ModifiedTicks);
+                    successor.AllChildren = WithChildInOrder(successor.AllChildren, child);
+                    successor.HasPartialListing = true;
+                    ApplyVisibleChildren(successor);
+                    _knownCount++;
+                    changed = true;
+                }
+                if (child.IsReparsePoint != oldChild.IsReparsePoint) return null;
+                RememberRenameSuccessor(oldChild, child);
+                successor = child;
+            }
+
+            // Keep the picture at the anchor while its normal refresh catches
+            // up. Intermediate ancestors remain sparse, as named navigation.
+            if (previous.IsLoaded && successor.LoadState == NestedLoadState.NotLoaded
+                && successor.QueuedRead == ReadKind.None)
+            {
+                CarryRenamedListing(previous, successor);
+                Register(successor);
+                FolderLoaded?.Invoke(successor);
+                changed = true;
+            }
+            if (changed) RaiseChanged();
+            return successor;
+        }
+        return null;
     }
 
     private static NestedFolder? FindByName(NestedFolder[] folders, string name)

@@ -914,6 +914,7 @@ public partial class MainWindow : Window
     private void FolderListItems_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
         _folderListMouseDown = false;
+        if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
 
         // With Ctrl or Shift the click was about the selection - the list box
         // has made it, and the canvas shows it - not about going anywhere.
@@ -951,6 +952,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void FolderListItems_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
+        if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
         if (RowUnder(e) is not { } item)
         {
             return;
@@ -1023,6 +1025,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void FolderListPanel_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
+        if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
         if (RowUnder(e) is { } item)
         {
             var selection = _viewModel.Tree.Selection;
@@ -1058,6 +1061,7 @@ public partial class MainWindow : Window
         if (FolderListItems.SelectedItems.Count == 1
             && FolderListItems.SelectedItem is FolderListItem row
             && clicked is not null
+            && _viewModel.Tree.FolderList.IsCurrentRow(row)
             && ViewAllPath.Equals(row.FullPath, clicked.FullPath))
         {
             _viewModel.RenameCommand.Execute(null);
@@ -1198,9 +1202,9 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// Runs a drop's transfer: true when the drop is to be reported as done.
-    /// A drop of files from the temporary folder holds its source until they
-    /// are copied; any other lets its source go at once (see
-    /// <see cref="ExternalFileDrop"/>).  A drop that would have to be held
+    /// An affirmatively async source retains its bytes after Drop returns;
+    /// every other source is held only until its files are copied (see
+    /// <see cref="ExternalFileDrop"/>). A drop that would have to be held
     /// while another is held is refused: its frame inside the first one's
     /// would keep the first source blocked until the second ended.  Close
     /// waits for every transfer still running.
@@ -1208,9 +1212,9 @@ public partial class MainWindow : Window
     private bool CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
     {
         if (_closeRequested) return false;
-        if (!ExternalFileDrop.MustHold(paths))
+        if (ExternalFileDrop.TryContinue(data, beginTransfer, reported, out var asyncTransfer))
         {
-            TrackExternalDrop(ExternalFileDrop.Continue(data, beginTransfer, reported));
+            TrackExternalDrop(asyncTransfer);
             return true;
         }
 
@@ -2193,7 +2197,8 @@ public partial class MainWindow : Window
         // take the keyboard, so a click on one leaves these keys working.)
         // Going places, zooming and refreshing work from anywhere, as they
         // always have.
-        var onSelection = IsSelectionSurfaceFocused();
+        var onSelection = IsSelectionSurfaceFocused()
+            && (!FolderListItems.IsKeyboardFocusWithin || _viewModel.Tree.FolderList.HasCurrentRows);
 
         // Shift+F5 and Shift+F6: what is selected, to the other pane.
         if (onSelection && TryHandlePaneTransferKey(key, modifiers))
@@ -2426,13 +2431,13 @@ public partial class MainWindow : Window
     private string? ShowInputDialog(string title, string prompt, string initialValue, bool selectStem)
     {
         var dialog = new InputDialog(title, prompt, initialValue, selectStem) { Owner = this };
-        return dialog.ShowDialog() == true ? dialog.Value : null;
+        return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 
     private bool ShowConfirmDialog(string title, string message, string confirmLabel)
     {
         var dialog = new ConfirmDialog(title, message, confirmLabel, danger: confirmLabel == "Delete") { Owner = this };
-        return dialog.ShowDialog() == true;
+        return dialog.ShowOwnerModal();
     }
 
     // ---- Win32 -------------------------------------------------------------

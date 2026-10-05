@@ -53,7 +53,8 @@ public sealed class ViewAllViewportService(ViewAllViewportOptions? options = nul
         IReadOnlyCollection<ViewAllNodeViewModel> alwaysRealized,
         Rect viewportInGraphCoordinates,
         double zoom,
-        int logicalNodeCount)
+        int logicalNodeCount,
+        IReadOnlyDictionary<Guid, ViewAllEdgeViewModel>? incomingEdges = null)
     {
         zoom = Math.Clamp(zoom, 0.01, 8);
         var detail = GetDetailLevel(zoom);
@@ -111,11 +112,28 @@ public sealed class ViewAllViewportService(ViewAllViewportOptions? options = nul
         var realizedNodes = _candidates.ToArray();
         var realizedSet = new HashSet<ViewAllNodeViewModel>(realizedNodes);
         var realizedEdges = new List<ViewAllEdgeViewModel>(Math.Min(edges.Count, realizedNodes.Length));
-        foreach (var edge in edges)
+        if (incomingEdges is not null)
         {
-            if (edge.IsTreeVisible && realizedSet.Contains(edge.Source) && realizedSet.Contains(edge.Target))
+            foreach (var node in realizedNodes)
             {
-                realizedEdges.Add(edge);
+                if (incomingEdges.TryGetValue(node.Id, out var edge)
+                    && edge.IsTreeVisible && realizedSet.Contains(edge.Source))
+                {
+                    realizedEdges.Add(edge);
+                }
+            }
+
+            realizedEdges.Sort(static (left, right) => left.PaintOrder.CompareTo(right.PaintOrder));
+        }
+        else
+        {
+            // Compatibility for callers supplying a standalone edge list.
+            foreach (var edge in edges)
+            {
+                if (edge.IsTreeVisible && realizedSet.Contains(edge.Source) && realizedSet.Contains(edge.Target))
+                {
+                    realizedEdges.Add(edge);
+                }
             }
         }
 

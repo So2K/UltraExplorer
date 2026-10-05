@@ -1279,6 +1279,9 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void OnTreeChanged(object? sender, EventArgs e)
     {
+        if (sender is NestedTree visibility && ReferenceEquals(visibility, _tree))
+            RejudgeFilterVisibility(visibility);
+
         if (sender is NestedTree tree && ReferenceEquals(tree, _batchTree) && tree.Version == _batchVersion)
         {
             _batchVersion = -1;
@@ -1506,7 +1509,7 @@ public sealed partial class NestedCanvas
 
             DrawSelection(dc);
             DrawDropTarget(dc);
-            DrawBeacons(dc);
+            DrawBeacons(dc, _tree?.Version ?? -1, _tree?.SortGeneration ?? -1);
             DrawTrail(dc);
             DrawFavoriteLinks(dc);
         }

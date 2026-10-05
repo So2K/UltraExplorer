@@ -57,6 +57,13 @@ internal static class ExplorerLaunchRouter
     internal static bool TryHandleShellFallback(string[] arguments)
     {
         if (!arguments.Contains(FolderCommandLine.ShellRequestSwitch, StringComparer.OrdinalIgnoreCase)) return false;
+        // A destination request belongs to an Explorer frame already open.
+        // If replacement was switched off meanwhile, that frame remains its
+        // fallback; starting Explorer here would create a duplicate window.
+        var destinationAt = Array.FindIndex(arguments, value => value.Equals(FolderCommandLine.DestinationSwitch, StringComparison.OrdinalIgnoreCase));
+        if (destinationAt >= 0 && destinationAt + 1 < arguments.Length
+            && Guid.TryParse(arguments[destinationAt + 1], out var destination) && destination != Guid.Empty
+            && !DialogIntegrationStore.Read().Enabled) return true;
         if (DialogIntegrationStore.Read().Enabled && FolderCommandLine.TryParse(arguments, out var invocation, out _))
             return NativeExplorerNavigation.TryHandle(invocation, arguments);
         // Best effort: while Settings is still switching the mode off it holds
@@ -137,6 +144,7 @@ internal static class ExplorerLaunchRouter
     internal static bool TryForward(FolderInvocation invocation)
     {
         if (!Allowed(invocation)) return false;
+        if (!BrokerPipeExists()) return false;
         try
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500));
@@ -159,6 +167,7 @@ internal static class ExplorerLaunchRouter
     /// </summary>
     internal static bool TryForwardSettings()
     {
+        if (!BrokerPipeExists()) return false;
         try
         {
             using var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(1500));
@@ -278,7 +287,20 @@ internal static class ExplorerLaunchRouter
         while (elapsed.Elapsed < TimeSpan.FromSeconds(18) && Allowed(invocation))
         {
             cancellation.ThrowIfCancellationRequested();
-            try { return await SendAsync(request, cancellation); }
+            // Only FILE_NOT_FOUND proves absence. Busy or inaccessible pipes
+            // still go through SendAsync's identity/commit checks.
+            if (!BrokerPipeExists())
+            {
+                if (started is null) started = StartBroker(invocation);
+                if (StartFailed(started)) return null;
+                await Task.Delay(50, cancellation);
+                continue;
+            }
+            try
+            {
+                var receipt = await SendAsync(request, cancellation);
+                return receipt.Accepted && receipt.Ready ? receipt : null;
+            }
             catch (Exception ex) when (Failure(ex) && !cancellation.IsCancellationRequested)
             {
                 // Retrying the same id retrieves its result rather than navigating again.
@@ -318,11 +340,12 @@ internal static class ExplorerLaunchRouter
         }
     }
 
-    /// <summary>A started copy that ended with an error will not answer. One
-    /// that ended accepted handed its folder to a broker that is there now.</summary>
+    /// <summary>A terminated copy cannot answer when no broker remains, even
+    /// if it exited successfully. An accepted forward to a live broker can.</summary>
     private static bool StartFailed(Process started)
     {
-        lock (StartGate) return started.HasExited && started.ExitCode != UltraExplorer.Picker.FileDialogCommandLine.ExitAccepted;
+        lock (StartGate) return started.HasExited
+            && (started.ExitCode != UltraExplorer.Picker.FileDialogCommandLine.ExitAccepted || !BrokerPipeExists());
     }
 
     /// <summary>Whether a broker has its pipe, answering or busy. Only the
@@ -574,7 +597,7 @@ internal static class ExplorerLaunchRouter
                     bool Free(MainWindow window) => request.VerifyOnly || !window.IsFolderInvocationPending && !window.IsFolderWindowClosing;
                     destination = invocation.DestinationId == Guid.Empty
                         ? Windows.FirstOrDefault(window => window.IsFolderWindowReady && Free(window)) ?? Windows.FirstOrDefault(Free)
-                        : Windows.FirstOrDefault(window => window.FolderDestinationId == invocation.DestinationId);
+                        : Windows.FirstOrDefault(window => window.FolderDestinationId == invocation.DestinationId && !window.IsFolderWindowClosing);
                     if (destination is null && !request.VerifyOnly && Allowed(invocation) && !_stop.IsCancellationRequested)
                     {
                         var id = invocation.DestinationId == Guid.Empty ? Guid.NewGuid() : invocation.DestinationId;
@@ -591,7 +614,7 @@ internal static class ExplorerLaunchRouter
                 if (destination is null) return Receipt(request.Id, false, false);
                 if (navigation is not null && (!await navigation.WaitAsync(navigationDeadline.Token) || !Allowed(invocation)))
                 {
-                    if (created) await _dispatcher.InvokeAsync(destination.Close);
+                    if (created) await _dispatcher.InvokeAsync(() => { if (destination.IsUnusedFolderRequest) destination.Close(); });
                     return Receipt(request.Id, true, false);
                 }
                 return await _dispatcher.InvokeAsync(() => Receipt(request.Id, true, Allowed(invocation) && destination.MatchesFolderInvocation(invocation), destination));
@@ -599,7 +622,8 @@ internal static class ExplorerLaunchRouter
             catch (Exception ex) when (Failure(ex) || ex is ArgumentException or NotSupportedException)
             {
                 DialogIntegrationStore.Log("A destination folder was not ready", ex);
-                if (created && destination is not null) await _dispatcher.InvokeAsync(destination.Close);
+                if (created && destination is not null)
+                    await _dispatcher.InvokeAsync(() => { if (destination.IsUnusedFolderRequest) destination.Close(); });
                 return Receipt(request.Id, true, false);
             }
         }

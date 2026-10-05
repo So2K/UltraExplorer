@@ -104,7 +104,20 @@ internal static partial class Program
     /// <summary>The copy's side: its own WPF application, folder broker and state folder.</summary>
     private static async Task ExplorerReview2OnStaAsync()
     {
-        new App().InitializeComponent();
+        // Application's constructor posts OnStartup to the dispatcher, even
+        // without Run(). App.OnStartup would make its default window/broker
+        // on the first await, invalidating the later "no broker" scenario.
+        // Keep the old setup only for an explicit isolated diagnostic replay.
+        if (Environment.GetEnvironmentVariable("ULTRAEXPLORER_EXPLORER_STARTUP_DIAGNOSTIC") == "1")
+            new App().InitializeComponent();
+        else
+        {
+            var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            // Exact App.xaml merged dictionaries, with relative theme URIs
+            // qualified to their owning assembly rather than this harness.
+            foreach (var source in new[] { "/Nodify;component/Themes/Dark.xaml", "/UltraExplorer;component/Themes/UltraTheme.xaml", "/UltraExplorer;component/Themes/PickerControls.xaml" })
+                application.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri(source, UriKind.Relative) });
+        }
         Application.Current.ShutdownMode = ShutdownMode.OnExplicitShutdown;
         Dispatcher.CurrentDispatcher.UnhandledException += (_, e) =>
         {
@@ -123,6 +136,12 @@ internal static partial class Program
         {
             using (ActivationGuard.GuardWindowsCreated())
             {
+                if (Environment.GetEnvironmentVariable(ExplorerFollowupOnlyVariable) == "1")
+                {
+                    await ExplorerIntegrationFollowupOnStaAsync(root);
+                    Check($"nothing here opened Windows Explorer ({explorer.Count})", explorer.IsEmpty);
+                    return;
+                }
                 ExplorerReview2TrailingNameChecks(root);
 
                 // First, while no window of this copy has started its broker.
@@ -277,6 +296,10 @@ internal static partial class Program
         Directory.CreateDirectory(folder);
         FolderCommandLine.TryOpenFolder(folder, out var open, out _);
         ExplorerReview2ForgetStarted();
+        var hasBroker = typeof(ExplorerLaunchRouter).GetMethod("BrokerPipeExists", BindingFlags.Static | BindingFlags.NonPublic)?.Invoke(null, null);
+        Console.WriteLine($"  note: zero-exit precondition: application={Application.Current.GetType().Name}, "
+            + $"PID={Environment.ProcessId}, owned Windows={Application.Current.Windows.Count}, "
+            + $"broker={hasBroker}");
         // Ends at once with exit code 0 and leaves no broker, as a copy does whose only window was closed.
         ExplorerLaunchRouter.StartSelf = _ => Process.Start(new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/d /c exit 0")
         {
@@ -291,7 +314,8 @@ internal static partial class Program
             var canceled = false;
             try { receipt = await ExplorerLaunchRouter.OpenAndWaitAsync(open with { DestinationId = Guid.NewGuid() }, patience.Token); }
             catch (Exception) when (patience.IsCancellationRequested) { canceled = true; }
-            Check($"the handoff is given up once that copy has ended, not after 18 s ({clock.ElapsedMilliseconds} ms)",
+            Check($"the handoff is given up once that copy has ended, not after 18 s ({clock.ElapsedMilliseconds} ms; receipt: {receipt?.Accepted}/{receipt?.Ready}; "
+                + $"server PID/HWND: {receipt?.Process}/{receipt?.Window}; caller: {Environment.ProcessPath})",
                 receipt is null && !canceled && clock.ElapsedMilliseconds < 3000);
         }
         finally

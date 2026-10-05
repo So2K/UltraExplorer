@@ -65,14 +65,16 @@ internal static partial class Program
         Thread.Sleep(150);
         watch.Stop();
         Check("the picker comes over the dialog, which goes from the screen", shown);
-        Console.WriteLine($"  neither on screen for at most {watch.LongestMilliseconds:F2} ms; screen refreshes meanwhile: {watch.FramesPassed} ({watch.Samples})");
+        Console.WriteLine($"  sampled both-hidden gap {watch.LongestMilliseconds:F2} ms; DWM vblank timestamp changes during it: {watch.FramesPassed} ({watch.Samples})");
         Check("the screen's refreshes are counted", watch.Counting);
-        Check("no refresh passes with neither the dialog nor its picker on screen", shown && watch.FramesPassed == 0);
+        Check("no sampled interval leaves both the dialog and picker hidden, and no DWM vblank update witnesses such a gap",
+            shown && watch.LongestMilliseconds == 0 && watch.FramesPassed == 0);
         var log = run.Finish();
         foreach (var line in log.Split('\n').Where(line => line.Contains("timing path=", StringComparison.Ordinal)))
             Console.WriteLine("  log: " + line.Trim()[..Math.Min(line.Trim().Length, 300)]);
-        Check("the picker came on screen early, under the dialog's protection, as a prepared worker shows one",
-            log.Contains("timing path=prepared-early", StringComparison.Ordinal) && log.Contains(" early-leased=", StringComparison.Ordinal));
+        Check("the prepared picker comes on screen under its early lease, including a budgeted full-read fallback",
+            (log.Contains("timing path=prepared-early", StringComparison.Ordinal) || log.Contains("timing path=prepared ", StringComparison.Ordinal))
+            && log.Contains(" early-leased=", StringComparison.Ordinal));
     }
 
     // ---- J066: the user goes on in the Windows dialog ------------------------------------
@@ -88,7 +90,7 @@ internal static partial class Program
     private static void PickerAgentTypedOnChecks()
     {
         Section("picker review: the user goes on in the Windows dialog while the picker is on its way (J066)");
-        using var run = new AgentDialogRun("save-nofilter", 0);
+        using var run = new AgentDialogRun("save-nofilter", SlowFolderFiles, handoffDelay: 1500);
         Check($"a prepared worker waits for the fixture's dialog ({run.Problem})", run.Picker != 0);
         if (run.Picker == 0) return;
 
@@ -118,7 +120,7 @@ internal static partial class Program
         }
 
         Console.WriteLine($"  typed {typed.Length - "export".Length} keys over {clock.ElapsedMilliseconds} ms; the picker {(cameAt >= 0 ? $"came over the dialog after {cameAt} ms" : "never came")}");
-        Check("the picker is slower to draw this folder than the moment it is given (700 ms)", cameAt is < 0 or > 800);
+        Check("the owned slow-folder fixture keeps a deterministic handoff delay while typing continues", cameAt is < 0 or > 1500);
         Check("the picker does not come over the dialog the user is typing in", cameAt < 0);
         Check("the dialog stays on screen, with what the user typed",
             DialogNative.IsWindow(run.Dialog) && !DialogNative.IsHidden(run.Dialog) && DialogNative.ReadEdit(name) == typed);
@@ -152,7 +154,7 @@ internal static partial class Program
         public string Problem { get; private set; } = "ready";
         public uint FixtureProcess => (uint)(_fixture?.Id ?? 0);
 
-        public AgentDialogRun(string mode, int files)
+        public AgentDialogRun(string mode, int files, int handoffDelay = 0)
         {
             var id = Guid.NewGuid().ToString("N");
             _state = Path.Combine(AppPaths.StateDirectory, "review-agent-dialog-" + id);
@@ -181,6 +183,7 @@ internal static partial class Program
 
             _agent = StartTestCopy(_state, ["--dialog-agent"],
                 ("ULTRAEXPLORER_DIALOG_TEST_ONLY_PROCESS", _fixture.Id.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                ("ULTRAEXPLORER_DIALOG_TEST_HANDOFF_DELAY_MS", handoffDelay.ToString(System.Globalization.CultureInfo.InvariantCulture)),
                 ("ULTRAEXPLORER_DIALOG_TEST_WAIT_FOR_WARM", "1"));
             _agentStarted = _agent.StartTime;
             var log = Path.Combine(_state, "dialog-integration", "integration.log");
@@ -304,6 +307,7 @@ internal static partial class Program
     private sealed class NeitherShownWatch : IDisposable
     {
         private readonly Thread _thread;
+        private readonly byte[] _timing = new byte[292];
         private readonly AgentDialogRun _run;
         private volatile bool _stop;
         private long _longest;
@@ -313,7 +317,7 @@ internal static partial class Program
         public NeitherShownWatch(AgentDialogRun run)
         {
             _run = run;
-            _thread = new Thread(Run) { IsBackground = true, Name = "neither shown watch", Priority = ThreadPriority.AboveNormal };
+            _thread = new Thread(Run) { IsBackground = true, Name = "neither shown watch", Priority = ThreadPriority.BelowNormal };
             _thread.Start();
         }
 
@@ -340,16 +344,20 @@ internal static partial class Program
                 }
 
                 var hidden = DialogNative.IsHidden(dialog);
-                var neither = hidden && DialogNative.IsCloaked(_run.Picker);
+                var cloaked = DialogNative.IsCloaked(_run.Picker);
                 Interlocked.Increment(ref _samples);
                 if (hidden) Interlocked.Increment(ref _hiddenSamples);
                 var now = Stopwatch.GetTimestamp();
                 var frame = RefreshCount();
+                // Bracket the timestamp with both states, avoiding a mixed
+                // observation from opposite sides of the transition.
+                var neither = hidden && cloaked && DialogNative.IsHidden(dialog) && DialogNative.IsCloaked(_run.Picker);
                 if (frame != 0 && frame != firstFrame) Interlocked.Exchange(ref _counting, 1);
                 if (neither && since == 0)
                 {
                     since = now;
                     frameAtStart = frame;
+                    Interlocked.CompareExchange(ref _longest, 1, 0);
                 }
                 else if (neither)
                 {
@@ -367,12 +375,17 @@ internal static partial class Program
             }
         }
 
-        /// <summary>The compositor's count of screen refreshes (DWM_TIMING_INFO.cRefresh), 0 when unknown.</summary>
-        private static ulong RefreshCount()
+        /// <summary>
+        /// Last compositor vblank QPC timestamp. On this Windows session
+        /// cRefresh advances on every API query, not every physical refresh;
+        /// it cannot be used as a frame counter. This timestamp is a timing
+        /// witness, not a recording or a count of all physical display frames.
+        /// </summary>
+        private ulong RefreshCount()
         {
-            var info = new byte[292];
+            var info = _timing;
             BitConverter.TryWriteBytes(info.AsSpan(0, 4), info.Length);
-            return DwmGetCompositionTimingInfo(0, info) == 0 ? BitConverter.ToUInt64(info, 36) : 0;
+            return DwmGetCompositionTimingInfo(0, info) == 0 ? BitConverter.ToUInt64(info, 28) : 0;
         }
 
         public void Stop()

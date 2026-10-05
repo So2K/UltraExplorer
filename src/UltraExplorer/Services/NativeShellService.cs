@@ -3,7 +3,6 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
-using Microsoft.VisualBasic.FileIO;
 
 namespace UltraExplorer.Services;
 
@@ -18,10 +17,17 @@ public sealed class NativeShellService
     [DllImport("user32.dll")]
     private static extern uint GetDoubleClickTime();
 
-    public static void Open(string path)
+    /// <summary>
+    /// Opens an item in its default program.  A caller that already knows
+    /// whether the item is a folder passes that answer so this method does not
+    /// ask a sleeping disk or share again on the caller's thread.  The null
+    /// default keeps the public API's previous behaviour for callers without
+    /// a trustworthy item kind.
+    /// </summary>
+    public static void Open(string path, bool? isDirectory = null)
     {
-        if (Directory.Exists(path) && ExplorerLaunchRouter.TryOpenFolder(path)) return;
-        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+        if ((isDirectory ?? Directory.Exists(path)) && ExplorerLaunchRouter.TryOpenFolder(path)) return;
+        using var process = Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
     }
 
     /// <summary>
@@ -123,6 +129,9 @@ public sealed class NativeShellService
     public static void OpenWith(string path)
         => ExecuteShellVerb(path, "openas");
 
+    /// <summary>The Open with Shell dialog on its own STA, away from the shared WPF dispatcher.</summary>
+    public static Task OpenWithAsync(string path) => RunStaAsync(() => OpenWith(path));
+
     /// <summary>
     /// Windows Explorer itself on <paramref name="path"/> - a folder opened,
     /// anything else selected in its folder - for the commands that name it:
@@ -152,11 +161,19 @@ public sealed class NativeShellService
     /// </summary>
     public static bool CopyPathsToClipboard(IEnumerable<string> paths, bool cut)
     {
-        var pathArray = paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var pathArray = paths
+            .Where(path => !string.IsNullOrWhiteSpace(path))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
         if (pathArray.Length == 0)
         {
             return false;
         }
+
+        // This check is only string arithmetic.  Besides being cheap, it is
+        // essential for a path from WSL/git whose last dot or space Windows
+        // would silently drop when another program later consumes CF_HDROP.
+        ThrowIfAnyNameEndDropped(pathArray, "copied");
 
         var collection = new StringCollection();
         collection.AddRange(pathArray);
@@ -164,6 +181,22 @@ public sealed class NativeShellService
         data.SetFileDropList(collection);
         data.SetData(PreferredDropEffectFormat, new MemoryStream([(byte)(cut ? DropEffectMove : DropEffectCopy), 0, 0, 0]));
 
+        if (ClipboardPublisherForTests is { } publisher)
+        {
+            return publisher(data);
+        }
+
+        return PublishClipboard(data);
+    }
+
+    /// <summary>
+    /// Test seam at the last boundary: validation and data construction remain
+    /// production code, while checks never replace the user's real clipboard.
+    /// </summary>
+    internal static Func<IDataObject, bool>? ClipboardPublisherForTests { get; set; }
+
+    private static bool PublishClipboard(IDataObject data)
+    {
         // The clipboard is a shared, contended resource; another process can own
         // it for a moment right when the user presses Ctrl+C.
         for (var attempt = 0; attempt < 3; attempt++)
@@ -273,7 +306,7 @@ public sealed class NativeShellService
 
         ThrowIfAnyRoot([.. sourceArray, .. beside], move ? "moved" : "copied");
         var owner = OwnerWindowHandle();
-        const FileOperationFlags flags = FileOperationFlags.AllowUndo | FileOperationFlags.NoConnectedElements;
+        var flags = ShellFileOperation.TransferFlags(renameOnCollision: false);
 
         // What asks the disk - each item still there, the target made - on
         // the operation's own thread (see OperationItemExists).
@@ -289,12 +322,13 @@ public sealed class NativeShellService
             Directory.CreateDirectory(targetDirectory);
             if (present.Length > 0)
             {
-                RunShellOperation(owner, move ? FileOperation.Move : FileOperation.Copy, present, targetDirectory, flags);
+                RunShellOperation(owner, move ? ShellFileOperationKind.Move : ShellFileOperationKind.Copy, present, targetDirectory, flags);
             }
 
             if (presentBeside.Length > 0)
             {
-                RunShellOperation(owner, FileOperation.Copy, presentBeside, targetDirectory, flags | FileOperationFlags.RenameOnCollision);
+                RunShellOperation(owner, ShellFileOperationKind.Copy, presentBeside, targetDirectory,
+                    ShellFileOperation.TransferFlags(renameOnCollision: true));
             }
         }));
     }
@@ -330,10 +364,7 @@ public sealed class NativeShellService
         }
 
         ThrowIfAnyRoot(pathArray, "deleted");
-        var flags = FileOperationFlags.NoConnectedElements
-            | (permanently
-                ? FileOperationFlags.NoConfirmation
-                : FileOperationFlags.AllowUndo | FileOperationFlags.WantNukeWarning);
+        var flags = ShellFileOperation.DeleteFlags(permanently);
         var owner = OwnerWindowHandle();
 
         // Whether each item is still there is asked on the operation's own
@@ -343,7 +374,7 @@ public sealed class NativeShellService
             var present = pathArray.Where(OperationItemExists).ToArray();
             if (present.Length > 0)
             {
-                RunShellOperation(owner, FileOperation.Delete, present, null, flags);
+                RunShellOperation(owner, ShellFileOperationKind.Delete, present, null, flags);
             }
         });
     }
@@ -351,18 +382,19 @@ public sealed class NativeShellService
     public Task<string> DuplicateAsync(string path)
     {
         ThrowIfAnyNameEndDropped([path], "duplicated");
+        var owner = OwnerWindowHandle();
         return RunStaAsync(() =>
         {
             var target = GetDuplicatePath(path);
-            if (Directory.Exists(path))
-            {
-                FileSystem.CopyDirectory(path, target, UIOption.AllDialogs, UICancelOption.ThrowException);
-            }
-            else
-            {
-                FileSystem.CopyFile(path, target, UIOption.AllDialogs, UICancelOption.ThrowException);
-            }
-
+            var destination = Path.GetDirectoryName(target)
+                ?? throw new InvalidOperationException("The parent folder is unavailable.");
+            ShellFileOperation.Run(
+                owner,
+                ShellFileOperationKind.Copy,
+                [path],
+                destination,
+                ShellFileOperation.TransferFlags(renameOnCollision: false),
+                [Path.GetFileName(target)]);
             return target;
         });
     }
@@ -606,44 +638,20 @@ public sealed class NativeShellService
     }
 
     /// <summary>
-    /// One SHFileOperation over every item.  The Shell takes its items as one
-    /// string, each full path ended by a null and the list by another, and a
-    /// path that is not full it would read from the current directory - so
-    /// every path is made full here.  Stopped by the user - Cancel, or No to
-    /// one of its questions - it is an <see cref="OperationCanceledException"/>,
-    /// which the callers have always taken as "cancelled"; any other failure
-    /// is an <see cref="IOException"/>, once Windows has shown its own error.
+    /// One modern IFileOperation over every item. Stopped by the user - Cancel,
+    /// or No to one of its questions - it is an
+    /// <see cref="OperationCanceledException"/>, which callers have always
+    /// taken as "cancelled"; any other failure is an <see cref="IOException"/>.
+    /// Shell items, rather than SHFileOperation's legacy double-null path
+    /// buffer, keep long paths out of the crashing MAX_PATH implementation.
     /// </summary>
     private static void RunShellOperation(
         IntPtr owner,
-        FileOperation operation,
+        ShellFileOperationKind operation,
         IReadOnlyList<string> sources,
         string? targetDirectory,
-        FileOperationFlags flags)
-    {
-        var request = new ShellFileOperation
-        {
-            Window = owner,
-            Function = operation,
-            From = DoubleNullTerminated(sources),
-            To = targetDirectory is null ? null : DoubleNullTerminated([targetDirectory]),
-            Flags = flags
-        };
-
-        var result = SHFileOperation(ref request);
-        if (request.AnyOperationsAborted || result is ErrorCancelled or LegacyErrorCancelled)
-        {
-            throw new OperationCanceledException();
-        }
-
-        if (result != 0)
-        {
-            throw new IOException($"Windows could not finish the operation (error 0x{result:X}).");
-        }
-    }
-
-    private static string DoubleNullTerminated(IEnumerable<string> paths)
-        => string.Concat(paths.Select(path => Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)) + '\0')) + '\0';
+        ShellFileOperationFlags flags)
+        => ShellFileOperation.Run(owner, operation, sources, targetDirectory, flags);
 
     private static Task RunStaAsync(Action action)
     {
@@ -736,44 +744,4 @@ public sealed class NativeShellService
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool ShellExecuteEx(ref ShellExecuteInfo executeInfo);
 
-    private const int ErrorCancelled = 1223;
-    private const int LegacyErrorCancelled = 0x75;
-
-    private enum FileOperation : uint
-    {
-        Move = 0x0001,
-        Copy = 0x0002,
-        Delete = 0x0003
-    }
-
-    [Flags]
-    private enum FileOperationFlags : ushort
-    {
-        RenameOnCollision = 0x0008,
-        NoConfirmation = 0x0010,
-        AllowUndo = 0x0040,
-        NoConnectedElements = 0x2000,
-        WantNukeWarning = 0x4000
-    }
-
-    /// <summary>
-    /// SHFILEOPSTRUCTW.  shellapi.h packs it to single bytes only on 32-bit
-    /// Windows; the app is built for x64 alone (the project's
-    /// RuntimeIdentifier), where it has the natural layout declared here.
-    /// </summary>
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct ShellFileOperation
-    {
-        public IntPtr Window;
-        public FileOperation Function;
-        [MarshalAs(UnmanagedType.LPWStr)] public string From;
-        [MarshalAs(UnmanagedType.LPWStr)] public string? To;
-        public FileOperationFlags Flags;
-        [MarshalAs(UnmanagedType.Bool)] public bool AnyOperationsAborted;
-        public IntPtr NameMappings;
-        [MarshalAs(UnmanagedType.LPWStr)] public string? ProgressTitle;
-    }
-
-    [DllImport("shell32.dll", EntryPoint = "SHFileOperationW", CharSet = CharSet.Unicode, ExactSpelling = true)]
-    private static extern int SHFileOperation(ref ShellFileOperation fileOperation);
 }

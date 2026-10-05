@@ -69,6 +69,8 @@ internal static partial class Program
                         loading = model.InitializeAsync(folder);
                     }
                     var propertiesAtClose = propertyChanges;
+                    var collectionsAtClose = collectionChanges;
+                    var countsAtClose = (model.HomeItems.Count, model.QuickAccess.Count, model.Drives.Count, model.NetworkLocations.Count);
                     Exception? error = null;
                     try { await loading.WaitAsync(TimeSpan.FromSeconds(20)); }
                     catch (Exception ex) { error = ex; }
@@ -76,8 +78,9 @@ internal static partial class Program
                     if (error is not null) Console.WriteLine($"        {error}");
                     Console.WriteLine($"        disposed model: Home={model.HomeItems.Count}, QuickAccess={model.QuickAccess.Count}, Drives={model.Drives.Count}, Network={model.NetworkLocations.Count}, Roots={model.Tree.Roots.Count}, CollectionChanges={collectionChanges}, LateProperties={propertyChanges - propertiesAtClose}");
                     Check("closed model receives no late sidebar entries or collection mutations",
-                        model.HomeItems.Count == 0 && model.QuickAccess.Count == 0 && model.Drives.Count == 0
-                        && model.NetworkLocations.Count == 0 && collectionChanges == 0);
+                        collectionChanges == collectionsAtClose
+                        && countsAtClose == (model.HomeItems.Count, model.QuickAccess.Count, model.Drives.Count, model.NetworkLocations.Count)
+                        && (disposeDuringLoad || countsAtClose == (0, 0, 0, 0)));
                     Check("closed model receives no late graph roots or property notifications",
                         model.Tree.Roots.Count == 0 && propertyChanges == propertiesAtClose);
                     Check("early closure preserves the owned existing workspace bytes",

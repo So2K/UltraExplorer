@@ -662,17 +662,13 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         var ticket = ++_menuTicket;
         var path = segment.FullPath;
         var includeHidden = _includeHidden?.Invoke();
-        var children = await Task.Run(() => ChildFolders(path, includeHidden));
+        var children = await Task.Run(() => new System.Collections.ObjectModel.ObservableCollection<AddressSuggestion>(ChildFolders(path, includeHidden)));
         if (_isDisposed || ticket != _menuTicket)
         {
             return;
         }
 
-        segment.Children.Clear();
-        foreach (var child in children)
-        {
-            segment.Children.Add(child);
-        }
+        segment.ReplaceChildren(children);
 
         // Opened even when empty: a chevron that does nothing reads as broken,
         // one that says "no sub-folders" has answered the question.

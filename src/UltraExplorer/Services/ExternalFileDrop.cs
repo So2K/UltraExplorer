@@ -1,6 +1,5 @@
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Windows;
 using System.Windows.Threading;
 
@@ -10,51 +9,15 @@ namespace UltraExplorer.Services;
 /// source's temporary files. Archive managers may delete them as soon as
 /// Drop returns; retaining filenames or the data object does not retain bytes.
 ///
-/// <para>Only a drop whose files lie in the temporary folder, where archive
-/// managers extract, is held that way, and only until the Shell is done with
-/// its files - not while the folders are read again afterwards.  Any other
-/// drop returns at once and its copy goes on after: holding Drop for the
-/// whole copy froze the source's window - the desktop, an Explorer window or
-/// a browser - for as long as the copy ran.  A source that can wait - one
-/// that offers <see cref="IDataObjectAsyncCapability"/> and has turned it on -
-/// is told that the copy goes on after Drop, and later that it has
-/// ended.</para></summary>
+/// <para>A source that has enabled async extraction and accepts
+/// <see cref="IDataObjectAsyncCapability.StartOperation"/> keeps its bytes
+/// until EndOperation, so Drop can return immediately, regardless of where
+/// those bytes are staged. Without that agreement Drop holds the source only
+/// until the Shell operation finishes, not through the folder reads after it.
+/// A filename outside our temporary directory is not an ownership agreement.</para></summary>
 internal static class ExternalFileDrop
 {
     private const int EFail = unchecked((int)0x80004005);
-
-    /// <summary>
-    /// Whether Drop has to hold the source until its files are copied: when
-    /// any of <paramref name="paths"/> lies in the temporary folder, where
-    /// archive managers extract and from where they delete once Drop returns.
-    /// </summary>
-    internal static bool MustHold(IReadOnlyList<string> paths)
-    {
-        var roots = TemporaryRoots();
-        return paths.Any(path => roots.Any(root => path.StartsWith(root, StringComparison.OrdinalIgnoreCase)));
-    }
-
-    /// <summary>
-    /// The temporary folder by its long and by its short (8.3) name: a source
-    /// may name its files under either.
-    /// </summary>
-    private static string[] TemporaryRoots()
-    {
-        var temp = Path.GetTempPath();
-        var name = new StringBuilder(1024);
-        string Named(uint length) => length is > 0 and < 1024
-            ? Path.TrimEndingDirectorySeparator(name.ToString(0, (int)length)) + Path.DirectorySeparatorChar
-            : temp;
-        return new[] { temp, Named(GetLongPathNameW(temp, name, (uint)name.Capacity)), Named(GetShortPathNameW(temp, name, (uint)name.Capacity)) }
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-    }
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern uint GetLongPathNameW(string path, StringBuilder longPath, uint length);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-    private static extern uint GetShortPathNameW(string path, StringBuilder shortPath, uint length);
 
     /// <summary>
     /// Starts the transfer and holds Drop - pumping the dispatcher - until the
@@ -72,15 +35,65 @@ internal static class ExternalFileDrop
         // progress/cancel UI instead of blocking it with Task.Wait().
         var frame = new DispatcherFrame(exitWhenRequested: false);
 
-        // The copy tells the hold it has ended before the transfer itself
-        // hears of it, so Drop returns before the transfer goes on to read
-        // the folders again (see NativeShellService.CopyStarted).
         var copied = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var transfer = BeginTransfer(beginTransfer, copied, () => frame.Continue = false);
+        started?.Invoke(transfer);
+        if (!copied.Task.IsCompleted)
+        {
+            Dispatcher.PushFrame(frame);
+        }
+
+        return copied.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>
+    /// Starts a transfer only after the source agrees to retain its data for
+    /// async extraction. False means no transfer was started and the caller
+    /// must keep Drop active while completing it. EndOperation follows the
+    /// actual Shell copy, before any later directory refreshes.
+    /// </summary>
+    internal static bool TryContinue(System.Windows.IDataObject data, Func<Task<bool>> beginTransfer,
+        DragDropEffects reported, out Task<bool> transfer)
+    {
+        var source = StartOperation(data);
+        if (source is null)
+        {
+            transfer = Task.FromResult(false);
+            return false;
+        }
+
+        var copied = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        try
+        {
+            transfer = BeginTransfer(beginTransfer, copied);
+        }
+        catch (Exception)
+        {
+            End(source, done: false, reported);
+            throw;
+        }
+
+        _ = EndWhenOverAsync(source, copied.Task, reported);
+        return true;
+    }
+
+    /// <summary>
+    /// Observes the Shell operation inside this transfer. Its completion owns
+    /// the source lifetime; the whole transfer also includes refreshes and is
+    /// separately retained by Close. If validation ends before a Shell copy
+    /// starts, that transfer outcome releases the source instead.
+    /// </summary>
+    private static Task<bool> BeginTransfer(Func<Task<bool>> beginTransfer, TaskCompletionSource<bool> copied,
+        Action? releaseHold = null)
+    {
         var outer = NativeShellService.CopyStarted.Value;
         NativeShellService.CopyStarted.Value = copy => copy.ContinueWith(ended =>
         {
             copied.TrySetResult(ended.Status == TaskStatus.RanToCompletion);
-            frame.Continue = false;
+            // Request the frame exit before Unwrap can resume the transfer's
+            // UI continuation. A second asynchronous continuation could let
+            // that continuation enter a slow refresh while Drop still held.
+            releaseHold?.Invoke();
             return ended;
         }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default).Unwrap();
         Task<bool> transfer;
@@ -93,39 +106,17 @@ internal static class ExternalFileDrop
             NativeShellService.CopyStarted.Value = outer;
         }
 
-        started?.Invoke(transfer);
-        if (!transfer.IsCompleted && !copied.Task.IsCompleted)
-        {
-            _ = transfer.ContinueWith(_ => frame.Continue = false,
-                CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            Dispatcher.PushFrame(frame);
-        }
-
-        return copied.Task.IsCompleted ? copied.Task.Result : transfer.GetAwaiter().GetResult();
+        _ = CompleteWithoutCopyAsync(transfer, copied, releaseHold);
+        return transfer;
     }
 
-    /// <summary>
-    /// Starts the transfer of a drop that is not held (see
-    /// <see cref="MustHold"/>).  A source that can wait is told that the
-    /// transfer goes on after Drop returns, and - with what was done - once it
-    /// has ended, whichever way.
-    /// </summary>
-    internal static Task<bool> Continue(System.Windows.IDataObject data, Func<Task<bool>> beginTransfer, DragDropEffects reported)
+    private static async Task CompleteWithoutCopyAsync(Task<bool> transfer, TaskCompletionSource<bool> copied,
+        Action? releaseHold)
     {
-        var source = StartOperation(data);
-        Task<bool> transfer;
-        try
-        {
-            transfer = beginTransfer();
-        }
-        catch (Exception)
-        {
-            if (source is not null) End(source, done: false, reported);
-            throw;
-        }
-
-        if (source is not null) _ = EndWhenOverAsync(source, transfer, reported);
-        return transfer;
+        var done = false;
+        try { done = await transfer; }
+        catch (Exception) { /* The transfer reports its own error. */ }
+        if (copied.TrySetResult(done)) releaseHold?.Invoke();
     }
 
     /// <summary>
@@ -186,6 +177,11 @@ internal static class ExternalFileDrop
     /// </summary>
     private static object? SourceOf(System.Windows.IDataObject data)
     {
+        if (data is IDataObjectAsyncCapability source)
+        {
+            return source;
+        }
+
         if (data is not DataObject wrapper || InnerData?.GetValue(wrapper) is not { } inner)
         {
             return null;

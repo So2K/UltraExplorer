@@ -457,16 +457,22 @@ internal sealed class VolumeNotifications : IDisposable
     /// <summary>Notifications registered since this was made, for tests.</summary>
     internal int Registrations { get; private set; }
 
+    /// <summary>Armed roots waiting for the window handle, for startup-order checks.</summary>
+    internal int WaitingForWindowCount => _waitingForWindow.Count;
+
     /// <summary>The window the notifications are sent to; watches armed before it had one are registered now.</summary>
     public void SetWindow(IntPtr window)
     {
         _window = window;
-        foreach (var root in _waitingForWindow)
+        // Register calls Unregister first, which removes the root from the
+        // waiting list. Take ownership of the whole batch before iterating so
+        // a root armed during a slow startup cannot mutate this enumeration.
+        var waiting = _waitingForWindow.ToArray();
+        _waitingForWindow.Clear();
+        foreach (var root in waiting)
         {
             Register(root);
         }
-
-        _waitingForWindow.Clear();
     }
 
     /// <summary>

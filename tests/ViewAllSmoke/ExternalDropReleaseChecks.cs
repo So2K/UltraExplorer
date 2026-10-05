@@ -22,10 +22,11 @@ namespace ViewAllSmoke;
 /// the folder re-reads after it had finished.  The real tree and nested Drop
 /// handlers are given the Shell's own data object for a file, and one that
 /// lives in another apartment and can wait (IDataObjectAsyncCapability), while
-/// the copy is slowed on its own thread.  A drop from outside the temporary
-/// folder must return before the copy ends; one from the temporary folder,
-/// where archive managers extract, is still held, but only until the copy
-/// ends.  Everything runs in an owned child on an inactive desktop.
+/// the copy is slowed on its own thread. Affirmatively async sources return
+/// early, including temporary ones; unsupported or rejected negotiation holds
+/// Drop only through copying, even for files staged outside our temporary
+/// directory. Sources then expire their owned staging files. Everything runs
+/// in an owned child on an inactive desktop.
 /// </summary>
 internal static partial class Program
 {
@@ -43,8 +44,8 @@ internal static partial class Program
         }
 
         Section("external drops: the source is let go of (J001)");
-        // Beside the temporary folder, not in it: these stand for files a
-        // source keeps, as the desktop's or an Explorer window's are.
+        // Beside the temporary folder: covers both persistent files and a
+        // provider's custom staging location, with exactly the same pathname.
         var temp = Path.TrimEndingDirectorySeparator(Path.GetFullPath(Path.GetTempPath()));
         var root = Path.Combine(Path.GetDirectoryName(temp)!, "UltraExplorerExternalDrop-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
@@ -108,8 +109,15 @@ internal static partial class Program
         try
         {
             foreach (var nested in new[] { true, false })
-                foreach (var scenario in new[] { "kept", "kept-async", "temporary", "temporary-async" })
+                foreach (var scenario in new[]
+                {
+                    "kept", "kept-async", "temporary", "temporary-async",
+                    "custom-temp", "custom-temp-async", "async-disabled",
+                    "async-query-failed", "async-start-failed", "async-copy-error",
+                    "async-copy-cancel", "kept-move", "temporary-async-move"
+                })
                     await ExternalDropRouteAsync(scenario.StartsWith("temporary", StringComparison.Ordinal) ? temporaryRoot : root, nested, scenario);
+            await ExternalCompletionBoundariesAsync(root);
         }
         finally
         {
@@ -133,19 +141,31 @@ internal static partial class Program
         await new WorkspaceStore(workspace).SaveAsync(new WorkspaceState { CanvasRenderer = "Cpu", CanvasLayout = nested ? "Nested" : "Tree" });
         File.WriteAllText(workspace + ".marks.json", "{}");
 
-        var async = scenario.EndsWith("-async", StringComparison.Ordinal);
-        var held = scenario.StartsWith("temporary", StringComparison.Ordinal);
+        var offersAsync = scenario.Contains("async", StringComparison.Ordinal);
+        var rejectedAsync = scenario is "async-disabled" or "async-query-failed" or "async-start-failed";
+        var async = offersAsync && !rejectedAsync;
+        var held = !async;
+        var move = scenario.EndsWith("-move", StringComparison.Ordinal);
+        var copyFailed = scenario is "async-copy-error" or "async-copy-cancel";
+        var expireOnReturn = scenario == "custom-temp" || rejectedAsync;
+        var expireOnEnd = async && (scenario.StartsWith("temporary", StringComparison.Ordinal)
+            || scenario.StartsWith("custom-temp", StringComparison.Ordinal));
         ExternalAsyncSource? asyncSource = null;
         Thread? sourceThread = null;
         object offered;
-        if (async)
+        if (offersAsync)
         {
-            (asyncSource, sourceThread, offered) = await ExternalAsyncSourceAsync(sourceFile, destination);
+            (asyncSource, sourceThread, offered) = await ExternalAsyncSourceAsync(sourceFile, destination, scenario);
+            if (expireOnEnd) asyncSource.ExpiringPath = sourceFile;
             Check(label + ": the source that can wait reaches the window as another apartment's COM object", Marshal.IsComObject(offered));
         }
         else
         {
             offered = ExternalShellDataObject(sourceFile);
+            // The fixture's source owns this choice. A target must not turn
+            // asynchronous mode on for a provider that has not offered it.
+            if (offered is IExternalDropAsyncCapability capability)
+                Marshal.ThrowExceptionForHR(capability.SetAsyncMode(0));
         }
         var data = new DataObject(offered);
 
@@ -206,12 +226,15 @@ internal static partial class Program
             }
             DragEventArgs Raise(RoutedEvent routed)
             {
-                var args = ArchiveDragArgs(routed, data, host, point);
+                var args = ArchiveDragArgs(routed, data, host, point,
+                    move ? DragDropKeyStates.ShiftKey : DragDropKeyStates.None,
+                    move ? DragDropEffects.Copy | DragDropEffects.Move : DragDropEffects.Copy);
                 dropView.RaiseEvent(args);
                 return args;
             }
             var over = Raise(nested ? DragDrop.DragOverEvent : DragDrop.PreviewDragOverEvent);
-            Check(label + ": the source's file is offered Copy", over.Handled && over.Effects == DragDropEffects.Copy);
+            Check(label + ": the preview offers the requested operation",
+                over.Handled && over.Effects == (move ? DragDropEffects.Move : DragDropEffects.Copy));
 
             // The copy itself is slow: the Shell's operation waits on its own
             // thread before it starts, as a big file or a slow disk makes it.
@@ -222,6 +245,8 @@ internal static partial class Program
                 {
                     Thread.Sleep(ExternalDropCopyDelayMs);
                     Volatile.Write(ref copyEnded, true);
+                    if (scenario == "async-copy-error") throw new IOException("owned copy failure");
+                    if (scenario == "async-copy-cancel") throw new OperationCanceledException("owned copy cancellation");
                 }
                 return operationExistsBefore(path);
             };
@@ -237,21 +262,28 @@ internal static partial class Program
             var startsAtReturn = asyncSource?.Starts ?? 0;
             var endsAtReturn = asyncSource?.Ends ?? 0;
             Console.WriteLine($"        {label}: Drop returned after {dropMs:F0} ms (copy delay {ExternalDropCopyDelayMs} ms), copyEnded={endedAtReturn}, copied={copiedAtReturn}, toastBusy={busyAtReturn}, effect={dropped.Effects}, starts={startsAtReturn}, ends={endsAtReturn}");
-            Check(label + ": the drop is reported as a copy", dropped.Handled && dropped.Effects == DragDropEffects.Copy);
+            var reported = move ? DragDropEffects.None : DragDropEffects.Copy;
+            Check(label + ": Copy is reported as Copy; a target-performed Move leaves no source-side delete",
+                dropped.Handled && dropped.Effects == reported);
             if (held)
             {
-                Check(label + ": a source whose files lie in the temporary folder is held until they are copied",
+                Check(label + ": without affirmative async agreement the source is held until copying ends",
                     endedAtReturn && copiedAtReturn && dropMs >= ExternalDropCopyDelayMs);
                 Check(label + ": ... and let go of before the folders are read again", busyAtReturn);
-                Check(label + ": ... without being told the copy goes on after Drop", startsAtReturn == 0);
+                Check(label + ": ... without a successful StartOperation or any EndOperation",
+                    (asyncSource?.SuccessfulStarts ?? 0) == 0 && endsAtReturn == 0);
+                if (asyncSource is not null)
+                    Check(label + ": rejected mode/query never starts; rejected Start is tried only once",
+                        asyncSource.ModeQueries == 1 && startsAtReturn == (scenario == "async-start-failed" ? 1 : 0));
+
+                if (expireOnReturn) File.Delete(sourceFile);
             }
             else
             {
-                Check(label + ": a source whose files are kept is let go of before the copy ends",
+                Check(label + ": an agreed async source is released before copying ends, at any path",
                     !endedAtReturn && !copiedAtReturn && dropMs < ExternalDropCopyDelayMs);
-                if (async)
-                    Check(label + ": ... and a source that can wait is told the copy goes on, and not yet that it has ended",
-                        startsAtReturn == 1 && endsAtReturn == 0);
+                Check(label + ": ... after exactly one successful Start, before EndOperation",
+                    startsAtReturn == 1 && asyncSource?.SuccessfulStarts == 1 && endsAtReturn == 0);
 
                 // Close waits for the copy that goes on after Drop.
                 main.Close();
@@ -259,18 +291,24 @@ internal static partial class Program
             }
 
             await ArchiveWaitAsync(() => !shell.Toast.IsBusy && shell.Toast.Message.Length > 0
-                && (asyncSource is null || asyncSource.Ends > 0) && (held || closed), 15000);
+                && (!async || asyncSource!.Ends > 0) && (held || closed), 15000);
             Console.WriteLine($"        {label}: final toast={shell.Toast.Message}");
-            Check(label + ": the file arrives whole", ArchiveBytesEqual(destination, payload));
-            Check(label + ": the copy is reported done", shell.Toast.Message.StartsWith("Copied 1 item", StringComparison.Ordinal));
+            Check(label + ": success arrives whole; cancel/error does not invent a destination",
+                copyFailed ? !File.Exists(destination) : ArchiveBytesEqual(destination, payload));
+            Check(label + ": the final status reflects success, cancellation or failure",
+                scenario == "async-copy-error" ? shell.Toast.Message.Contains("owned copy failure", StringComparison.Ordinal)
+                : scenario == "async-copy-cancel" ? shell.Toast.Message.Contains("cancelled", StringComparison.Ordinal)
+                : shell.Toast.Message.StartsWith(move ? "Moved 1 item" : "Copied 1 item", StringComparison.Ordinal));
             if (!held) Check(label + ": the window closes once the copy has ended", closed);
             if (asyncSource is not null && !held)
-                Check(label + ": the source that can wait is told once, after the file arrived, that the copy succeeded as a copy",
-                    asyncSource.Starts == 1 && asyncSource.Ends == 1 && asyncSource.EndResult == 0
-                    && asyncSource.EndEffects == (uint)DragDropEffects.Copy && asyncSource.DestinationAtEnd);
+                Check(label + ": exactly one EndOperation reports the actual copy outcome and effect",
+                    asyncSource.Starts == 1 && asyncSource.Ends == 1
+                    && asyncSource.EndEffects == (copyFailed ? 0u : (uint)reported) && asyncSource.DestinationAtEnd == !copyFailed
+                    && (copyFailed ? asyncSource.EndResult < 0 : asyncSource.EndResult == 0));
             if (asyncSource is not null && held)
-                Check(label + ": a held source that can wait is never told the copy goes on", asyncSource.Starts == 0 && asyncSource.Ends == 0);
-            Check(label + ": the source file is unchanged", ArchiveBytesEqual(sourceFile, payload));
+                Check(label + ": a rejected async source receives no spurious EndOperation", asyncSource.SuccessfulStarts == 0 && asyncSource.Ends == 0);
+            Check(label + ": source ownership and Move are honored",
+                expireOnReturn || expireOnEnd || move ? !File.Exists(sourceFile) : ArchiveBytesEqual(sourceFile, payload));
             Check(label + ": the owned window was never shown", !main.IsVisible);
         }
         finally
@@ -280,6 +318,98 @@ internal static partial class Program
             main.CloseFromCaller();
             await SettingsSettle();
             if (sourceThread is not null) Dispatcher.FromThread(sourceThread)?.InvokeShutdown();
+        }
+    }
+
+    /// <summary>
+    /// Source cleanup belongs to copy completion, not to directory refresh.
+    /// Failures before an operation exists must still close one accepted lease.
+    /// </summary>
+    private static async Task ExternalCompletionBoundariesAsync(string root)
+    {
+        Section("external drop: accepted lease completion boundaries");
+        foreach (var outcome in new[] { "after-copy", "held-after-copy", "sync-throw", "task-fault", "task-cancel", "validation-rejected" })
+        {
+            var owned = Path.Combine(root, "completion-boundaries", outcome);
+            var sourceFile = Path.Combine(owned, "source.bin");
+            var target = Path.Combine(owned, "destination");
+            var destination = Path.Combine(target, "source.bin");
+            Directory.CreateDirectory(target);
+            var payload = Encoding.UTF8.GetBytes("owned completion boundary " + outcome);
+            File.WriteAllBytes(sourceFile, payload);
+            var (source, thread, proxy) = await ExternalAsyncSourceAsync(sourceFile, destination, "kept-async");
+            var data = new DataObject(proxy);
+            var refresh = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Task<bool>? transfer = null;
+            try
+            {
+                async Task<bool> CopyBeforeRefresh()
+                {
+                    await new NativeShellService().CopyOrMoveAsync([sourceFile], target, move: false);
+                    await refresh.Task;
+                    return true;
+                }
+
+                Func<Task<bool>> begin = outcome switch
+                {
+                    "after-copy" or "held-after-copy" => CopyBeforeRefresh,
+                    "sync-throw" => () => throw new IOException("owned synchronous transfer failure"),
+                    "task-fault" => () => Task.FromException<bool>(new IOException("owned failed transfer")),
+                    "task-cancel" => () => Task.FromCanceled<bool>(new CancellationToken(canceled: true)),
+                    _ => () => Task.FromResult(false)
+                };
+                var threw = false;
+                var accepted = false;
+                try
+                {
+                    if (outcome == "held-after-copy")
+                    {
+                        accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, begin, pending => transfer = pending);
+                    }
+                    else
+                    {
+                        accepted = ExternalFileDrop.TryContinue(data, begin, DragDropEffects.Copy, out var pending);
+                        transfer = pending;
+                    }
+                }
+                catch (IOException) when (outcome == "sync-throw") { threw = true; }
+
+                if (outcome != "held-after-copy") await ArchiveWaitAsync(() => source.Ends == 1, 5_000);
+                if (outcome == "after-copy")
+                {
+                    Check("an async source hears copy success before the blocked refresh finishes",
+                        accepted && source.SuccessfulStarts == 1 && source.Ends == 1 && source.EndResult == 0
+                        && source.EndEffects == (uint)DragDropEffects.Copy && ArchiveBytesEqual(destination, payload)
+                        && transfer is { IsCompleted: false });
+                }
+                else if (outcome == "held-after-copy")
+                {
+                    Check("a held source is released with exact bytes while post-copy refresh is still blocked",
+                        accepted && ArchiveBytesEqual(destination, payload) && transfer is { IsCompleted: false }
+                        && source.Starts == 0 && source.Ends == 0);
+                }
+                else
+                {
+                    Check(outcome + ": an accepted Start has exactly one unsuccessful End even before Shell copy",
+                        (accepted || threw) && source.SuccessfulStarts == 1 && source.Ends == 1
+                        && source.EndResult < 0 && source.EndEffects == 0 && !File.Exists(destination));
+                }
+
+                refresh.TrySetResult();
+                if (transfer is not null)
+                {
+                    try { await transfer; }
+                    catch (Exception error) when (error is IOException or OperationCanceledException) { }
+                }
+                await Task.Delay(50);
+                Check(outcome + ": transfer completion never invents or duplicates EndOperation",
+                    outcome == "held-after-copy" ? source.Starts == 0 && source.Ends == 0 : source.Starts == 1 && source.Ends == 1);
+            }
+            finally
+            {
+                refresh.TrySetResult();
+                Dispatcher.FromThread(thread)?.InvokeShutdown();
+            }
         }
     }
 
@@ -298,14 +428,15 @@ internal static partial class Program
     /// A source that can wait, living on a thread of its own as another
     /// program's would, and the proxy the window is handed for it.
     /// </summary>
-    private static async Task<(ExternalAsyncSource Source, Thread Thread, object Proxy)> ExternalAsyncSourceAsync(string file, string destination)
+    private static async Task<(ExternalAsyncSource Source, Thread Thread, object Proxy)> ExternalAsyncSourceAsync(
+        string file, string destination, string scenario)
     {
         var ready = new TaskCompletionSource<(ExternalAsyncSource, nint)>(TaskCreationOptions.RunContinuationsAsynchronously);
         var thread = new Thread(() =>
         {
             try
             {
-                var source = new ExternalAsyncSource((System.Runtime.InteropServices.ComTypes.IDataObject)ExternalShellDataObject(file), destination);
+                var source = new ExternalAsyncSource((System.Runtime.InteropServices.ComTypes.IDataObject)ExternalShellDataObject(file), destination, scenario);
                 var dataId = typeof(System.Runtime.InteropServices.ComTypes.IDataObject).GUID;
                 Marshal.ThrowExceptionForHR(CoMarshalInterThreadInterfaceInStream(ref dataId, source, out var stream));
                 ready.SetResult((source, stream));
@@ -364,17 +495,20 @@ public interface IExternalDropAsyncCapability
 /// a real COM proxy, as a drop target in another process does.
 /// </summary>
 [ComVisible(true)]
-public sealed class ExternalAsyncSource(System.Runtime.InteropServices.ComTypes.IDataObject inner, string destination)
+public sealed class ExternalAsyncSource(System.Runtime.InteropServices.ComTypes.IDataObject inner, string destination, string scenario)
     : System.Runtime.InteropServices.ComTypes.IDataObject, IExternalDropAsyncCapability, ICustomQueryInterface
 {
     private static readonly Guid MarshalId = new("00000003-0000-0000-C000-000000000046");
     private static readonly Guid AgileId = new("94ea2b94-e9cc-49e0-c0ff-ee64ca8f5b90");
 
     public int Starts;
+    public int SuccessfulStarts;
+    public int ModeQueries;
     public int Ends;
     public int EndResult = 1;
     public uint EndEffects;
     public bool DestinationAtEnd;
+    public string? ExpiringPath;
 
     public CustomQueryInterfaceResult GetInterface(ref Guid iid, out nint ppv)
     {
@@ -383,14 +517,26 @@ public sealed class ExternalAsyncSource(System.Runtime.InteropServices.ComTypes.
     }
 
     public int SetAsyncMode(int doAsync) => 0;
-    public int GetAsyncMode(out int isAsync) { isAsync = 1; return 0; }
-    public int StartOperation(nint bindContext) { Interlocked.Increment(ref Starts); return 0; }
-    public int InOperation(out int inOperation) { inOperation = Starts > Ends ? 1 : 0; return 0; }
+    public int GetAsyncMode(out int isAsync)
+    {
+        Interlocked.Increment(ref ModeQueries);
+        isAsync = scenario == "async-disabled" ? 0 : 1;
+        return scenario == "async-query-failed" ? unchecked((int)0x80004005) : 0;
+    }
+    public int StartOperation(nint bindContext)
+    {
+        Interlocked.Increment(ref Starts);
+        if (scenario == "async-start-failed") return unchecked((int)0x80004005);
+        Interlocked.Increment(ref SuccessfulStarts);
+        return 0;
+    }
+    public int InOperation(out int inOperation) { inOperation = SuccessfulStarts > Ends ? 1 : 0; return 0; }
     public int EndOperation(int result, nint bindContext, uint effects)
     {
         EndResult = result;
         EndEffects = effects;
         DestinationAtEnd = File.Exists(destination);
+        if (ExpiringPath is { } path) File.Delete(path);
         Interlocked.Increment(ref Ends);
         return 0;
     }

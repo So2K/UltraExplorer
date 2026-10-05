@@ -259,7 +259,8 @@ internal static partial class Program
             using var window = new MainViewModel();
             var initializing = window.InitializeAsync(folder);
             var held = await Until(() => asked.IsSet, 10_000);
-            Check("the window is still asking its drives whether they are ready", held && !initializing.IsCompleted);
+            Check("the slow drive question is still pending while the usable window's settings are changed",
+                held && !released.IsSet);
             window.LeftDrag = NestedLeftDrag.Pan;
             window.SetLayer(CanvasLayer.Details, false);
             window.Orders.SetFolder(sorted, new ItemSort(SortColumn.Size, true));

@@ -338,7 +338,7 @@ public sealed class ViewAllFileSystemService
     /// - "backup." would be asked about as its neighbour "backup", or as
     /// nothing - and the extended-length form leaves them as they are.
     /// </summary>
-    private static string ForWindows(string path) =>
+    internal static string ForWindows(string path) =>
         ViewAllPath.EndsANameInDotOrSpace(path) && Path.IsPathFullyQualified(path)
             && !path.StartsWith(@"\\?\", StringComparison.Ordinal) && !path.StartsWith(@"\\.\", StringComparison.Ordinal)
             ? ExtendedLength(path)

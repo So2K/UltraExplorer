@@ -310,6 +310,8 @@ internal static class Program
                 Check("cleared tags do not leave an ever-growing revision history", revisionCount == 0);
             }
 
+            await CombinedKindCompatibilityChecksAsync(scratch);
+
             var root = Directory.GetCurrentDirectory();
             var xaml = File.ReadAllText(Path.Combine(root, "src", "UltraExplorer", "MainWindow.xaml"));
             var tagsCode = File.ReadAllText(Path.Combine(root, "src", "UltraExplorer", "MainWindow.Tags.cs"));
@@ -343,6 +345,187 @@ internal static class Program
             {
             }
         }
+    }
+
+    private static async Task CombinedKindCompatibilityChecksAsync(string scratch)
+    {
+        var combined = Path.Combine(scratch, "combined-kind");
+        Directory.CreateDirectory(combined);
+
+        var noteMoveState = Path.Combine(combined, "note-move.json");
+        var noteOld = Path.Combine(combined, "Note old");
+        var noteMoved = Path.Combine(combined, "Note moved");
+        var noteMove = new FolderMarkService(noteMoveState);
+        noteMove.SetNote(noteOld, "note without a colour");
+        noteMove.SetItemKind(noteOld, isDirectory: true);
+        noteMove.Move(noteOld, noteMoved);
+        var noteMovedInMemory = noteMove.Get(noteMoved);
+        await noteMove.SaveAsync();
+        var noteMoveDisk = new FolderMarkService(noteMoveState);
+        await noteMoveDisk.LoadAsync();
+        Check("a note-only mark keeps folder kind through an atomic move and reload",
+            noteMove.Get(noteOld).IsEmpty
+            && noteMovedInMemory is { Note: "note without a colour", IsDirectory: true }
+            && noteMoveDisk.Get(noteMoved) is { Note: "note without a colour", IsDirectory: true });
+
+        var caseMoveState = Path.Combine(combined, "case-move.json");
+        var oldRoot = Path.Combine(combined, "Case project");
+        var newRoot = Path.Combine(combined, "case project");
+        var oldChild = Path.Combine(oldRoot, "inside.txt");
+        var newChild = Path.Combine(newRoot, "inside.txt");
+        var caseMove = new FolderMarkService(caseMoveState);
+        caseMove.SetAccent(oldRoot, "#EF5A68", isDirectory: true);
+        caseMove.SetNote(oldChild, "inside");
+        caseMove.SetItemKind(oldChild, isDirectory: false);
+        caseMove.Move(oldRoot, newRoot);
+        var movedKeys = caseMove.Snapshot().Select(pair => pair.Key).ToArray();
+        await caseMove.SaveAsync();
+        var caseMoveDisk = new FolderMarkService(caseMoveState);
+        await caseMoveDisk.LoadAsync();
+        Check("a case-only folder rename carries descendant kinds and their new spelling",
+            movedKeys.Contains(newRoot, StringComparer.Ordinal)
+            && movedKeys.Contains(newChild, StringComparer.Ordinal)
+            && caseMoveDisk.Get(newRoot).IsDirectory == true
+            && caseMoveDisk.Get(newChild) is { Note: "inside", IsDirectory: false });
+
+        var seedState = Path.Combine(combined, "seed.json");
+        var seededPath = Path.Combine(combined, "Seeded");
+        var seedInitial = new FolderMarkService(seedState);
+        seedInitial.SetAccent(seededPath, "#60CDFF", isDirectory: true);
+        await seedInitial.SaveAsync();
+        var seeder = new FolderMarkService(seedState);
+        await seeder.LoadAsync();
+        seeder.Seed(seededPath, "#E3B341", "from legacy workspace");
+        var seedKeptKindInMemory = seeder.Get(seededPath).IsDirectory == true;
+        var seedConcurrent = new FolderMarkService(seedState);
+        await seedConcurrent.LoadAsync();
+        seedConcurrent.SetItemKind(seededPath, isDirectory: false);
+        await seedConcurrent.SaveAsync();
+        await seeder.SaveAsync();
+        var seedDisk = new FolderMarkService(seedState);
+        await seedDisk.LoadAsync();
+        Check("legacy Seed keeps in-memory kind but its Accent/Note mask preserves a newer disk kind",
+            seedKeptKindInMemory
+            && seedDisk.Get(seededPath) is
+            {
+                AccentHex: "#E3B341",
+                Note: "from legacy workspace",
+                IsDirectory: false
+            });
+
+        var pendingSeedState = Path.Combine(combined, "pending-seed.json");
+        var pendingSeedPath = Path.Combine(combined, "Pending seed");
+        var pendingSeed = new FolderMarkService(pendingSeedState);
+        pendingSeed.SetNote(pendingSeedPath, "before seed");
+        pendingSeed.SetItemKind(pendingSeedPath, isDirectory: true);
+        pendingSeed.Seed(pendingSeedPath, "#F28A4B", "seeded before first save");
+        await pendingSeed.SaveAsync();
+        var pendingSeedDisk = new FolderMarkService(pendingSeedState);
+        await pendingSeedDisk.LoadAsync();
+        Check("Seed keeps an unsaved prior Kind change in its accumulated save mask",
+            pendingSeedDisk.Get(pendingSeedPath) is
+            {
+                AccentHex: "#F28A4B",
+                Note: "seeded before first save",
+                IsDirectory: true
+            });
+
+        var saveOrders = new[]
+        {
+            new[] { 0, 1, 2 }, new[] { 0, 2, 1 }, new[] { 1, 0, 2 },
+            new[] { 1, 2, 0 }, new[] { 2, 0, 1 }, new[] { 2, 1, 0 }
+        };
+        var everySaveOrderKeptAllHalves = true;
+        for (var orderIndex = 0; orderIndex < saveOrders.Length; orderIndex++)
+        {
+            var state = Path.Combine(combined, $"halves-{orderIndex}.json");
+            var path = Path.Combine(combined, $"Three halves {orderIndex}");
+            var initial = new FolderMarkService(state);
+            initial.SetAccent(path, "#60CDFF", isDirectory: true);
+            initial.SetNote(path, "before");
+            await initial.SaveAsync();
+
+            var accent = new FolderMarkService(state);
+            var note = new FolderMarkService(state);
+            var kind = new FolderMarkService(state);
+            await accent.LoadAsync();
+            await note.LoadAsync();
+            await kind.LoadAsync();
+            accent.SetAccent(path, "#A979FF");
+            note.SetNote(path, "after");
+            kind.SetItemKind(path, isDirectory: false);
+            var writers = new[] { accent, note, kind };
+            foreach (var writer in saveOrders[orderIndex])
+            {
+                await writers[writer].SaveAsync();
+            }
+
+            var disk = new FolderMarkService(state);
+            await disk.LoadAsync();
+            everySaveOrderKeptAllHalves &= disk.Get(path) is
+            {
+                AccentHex: "#A979FF",
+                Note: "after",
+                IsDirectory: false
+            };
+        }
+
+        Check("interleaved Accent, Note and Kind saves retain all three halves in every order",
+            everySaveOrderKeptAllHalves);
+
+        var reloadState = Path.Combine(combined, "kind-reload.json");
+        var reloadPath = Path.Combine(combined, "Reloaded tag");
+        var reloadWriter = new FolderMarkService(reloadState);
+        reloadWriter.SetAccent(reloadPath, "#4ED6A0");
+        await reloadWriter.SaveAsync();
+        var reloadReader = new FolderMarkService(reloadState);
+        var classifyCalls = 0;
+        using (var reloadProjection = new FolderTagProjection(
+                   reloadReader,
+                   Dispatcher.CurrentDispatcher,
+                   (_, _) =>
+                   {
+                       classifyCalls++;
+                       return ValueTask.FromResult(FolderTagPathKind.Unknown);
+                   }))
+        {
+            await reloadProjection.InitializeAsync();
+            await EventuallyAsync(() => reloadProjection.Items.Any(item => item.FullPath == reloadPath));
+            reloadWriter.SetItemKind(reloadPath, isDirectory: false);
+            await reloadWriter.SaveAsync();
+            await reloadReader.LoadAsync();
+            await EventuallyAsync(() => reloadProjection.Items.All(item => item.FullPath != reloadPath));
+            var removedAsFile = reloadProjection.Items.All(item => item.FullPath != reloadPath);
+
+            reloadWriter.SetItemKind(reloadPath, isDirectory: true);
+            await reloadWriter.SaveAsync();
+            await reloadReader.LoadAsync();
+            await EventuallyAsync(() => reloadProjection.Items.Any(item => item.FullPath == reloadPath));
+            Check("kind-only shared reload events remove a file and restore a folder without another probe",
+                removedAsFile
+                && reloadProjection.Items.Any(item => item.FullPath == reloadPath)
+                && classifyCalls == 1);
+        }
+
+        var listenersState = Path.Combine(combined, "listeners.json");
+        var listeners = new FolderMarkService(listenersState);
+        var firstPath = Path.Combine(combined, "First listener tag");
+        var survivorPath = Path.Combine(combined, "Survivor tag");
+        var firstProjection = new FolderTagProjection(listeners, Dispatcher.CurrentDispatcher);
+        using var survivingProjection = new FolderTagProjection(listeners, Dispatcher.CurrentDispatcher);
+        await firstProjection.InitializeAsync();
+        await survivingProjection.InitializeAsync();
+        listeners.SetAccent(firstPath, "#60CDFF", isDirectory: true);
+        await EventuallyAsync(() => firstProjection.Items.Count == 1 && survivingProjection.Items.Count == 1);
+        var disposedCount = firstProjection.Items.Count;
+        firstProjection.Dispose();
+        listeners.SetAccent(survivorPath, "#EF5A68", isDirectory: true);
+        await EventuallyAsync(() => survivingProjection.Items.Any(item => item.FullPath == survivorPath));
+        await Dispatcher.Yield(DispatcherPriority.DataBind);
+        Check("disposing one Tags subscriber leaves it still while the surviving subscriber keeps receiving changes",
+            firstProjection.Items.Count == disposedCount
+            && firstProjection.Items.All(item => item.FullPath != survivorPath)
+            && survivingProjection.Items.Any(item => item.FullPath == survivorPath));
     }
 
     private static async Task EventuallyAsync(Func<bool> condition, TimeSpan? timeout = null)

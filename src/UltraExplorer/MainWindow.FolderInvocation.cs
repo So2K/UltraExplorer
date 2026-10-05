@@ -20,6 +20,7 @@ public partial class MainWindow
         _folderInitialPath = invocation.FolderPath;
         _folderPaneRoots[ActivePane] = invocation.FolderPath;
         _handoffUntouched = invocation.OriginIsShell && invocation.DestinationId != Guid.Empty;
+        _folderRequestUsed = false;
     }
 
     /// <summary>
@@ -31,6 +32,8 @@ public partial class MainWindow
     /// </summary>
     internal bool IsUntouchedHandoff => _handoffUntouched && !_closeRequested;
     private bool _handoffUntouched;
+    private bool _folderRequestUsed;
+    internal bool IsUnusedFolderRequest => !_folderRequestUsed && !_closeRequested;
 
     public string CurrentFolderPath => _viewModel.Tree.FolderList.FolderPath;
     public IReadOnlyList<string> CurrentFolderSelection => _viewModel.Tree.Selection.Paths.ToArray();
@@ -82,11 +85,12 @@ public partial class MainWindow
         _viewModel.Tree.PropertyChanged += OnFolderInvocationStateChanged;
 
         // Any use of the window makes it the user's (see IsUntouchedHandoff).
-        PreviewMouseDown += (_, _) => _handoffUntouched = false;
-        PreviewMouseWheel += (_, _) => _handoffUntouched = false;
-        PreviewKeyDown += (_, _) => _handoffUntouched = false;
-        PreviewTouchDown += (_, _) => _handoffUntouched = false;
-        PreviewStylusDown += (_, _) => _handoffUntouched = false;
+        void Used() { _handoffUntouched = false; _folderRequestUsed = true; }
+        PreviewMouseDown += (_, _) => Used();
+        PreviewMouseWheel += (_, _) => Used();
+        PreviewKeyDown += (_, _) => Used();
+        PreviewTouchDown += (_, _) => Used();
+        PreviewStylusDown += (_, _) => Used();
         Closed += (_, _) =>
         {
             _viewModel.Tree.FolderList.PropertyChanged -= OnFolderInvocationStateChanged;
@@ -137,12 +141,31 @@ public partial class MainWindow
             return await Dispatcher.InvokeAsync(() => ApplyFolderInvocationAsync(invocation, cancellation)).Task.Unwrap();
         }
 
-        bool Allowed() => !invocation.OriginIsShell || DialogIntegrationStore.Read().Enabled;
+        var checkedAt = long.MinValue;
+        var enabled = false;
+        // Selection materialization calls Current for every item. Read mode
+        // once per short interval, then recheck freshly before committing the
+        // final ready view. OFF still wins at that boundary and after waits.
+        bool Allowed(bool fresh = false)
+        {
+            if (!invocation.OriginIsShell) return true;
+            var now = Environment.TickCount64;
+            if (fresh || checkedAt == long.MinValue || now - checkedAt >= 100)
+            {
+                enabled = DialogIntegrationStore.Read().Enabled;
+                checkedAt = now;
+            }
+            return enabled;
+        }
         if (IsPickerMode || _closeRequested || cancellation.IsCancellationRequested || !Allowed()) return false;
 
         // Another folder sent here - not the handoff this window was opened
         // for - makes it a window in use.
-        if (invocation.DestinationId != FolderDestinationId) _handoffUntouched = false;
+        if (invocation.DestinationId != FolderDestinationId)
+        {
+            _handoffUntouched = false;
+            _folderRequestUsed = true;
+        }
         using var pending = new PendingFolderInvocation(this);
         try { await _folderLaunchReady.Task.WaitAsync(cancellation); }
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { return false; }
@@ -172,6 +195,9 @@ public partial class MainWindow
 
         try
         {
+            // Restore while the caller still owns foreground intent, before
+            // disk/network work. Tests never activate a physical window.
+            PresentFolderInvocationWindow(invocation);
             _viewModel.Layout = CanvasLayout.Nested;
             // Keep the normal drive hierarchy and focus the real folder;
             // describing its ancestors never enumerates their contents.
@@ -216,20 +242,14 @@ public partial class MainWindow
             }
             pane.SyncSelection();
             await Dispatcher.InvokeAsync(() => { if (Current()) pane.Canvas.UpdateLayout(); }, DispatcherPriority.ContextIdle);
-            if (!Current()) return false;
+            if (!Current() || !Allowed(fresh: true)) return false;
             var target = pane.Tree.Find(invocation.FolderPath);
             if (target is null || !pane.Canvas.FlyTo(target, 0.92, animated: false)) return false;
             _viewModel.Address.SetPath(invocation.FolderPath);
             _viewModel.DialogTitle = FolderName(invocation.FolderPath);
             pane.Canvas.RenderNow();
 
-            if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-            if (!IsVisible) Show();
-            if (!IsTestWindow && !IsDiagnosticsRun && (!invocation.OriginIsShell || invocation.DestinationId == Guid.Empty))
-            {
-                Activate();
-                FocusCanvas();
-            }
+            if (!Allowed(fresh: true)) return false;
             FolderLocationChanged?.Invoke(this, EventArgs.Empty);
             return MatchesFolderInvocation(invocation);
         }
@@ -244,6 +264,17 @@ public partial class MainWindow
             // too. An older request must not lift a newer request's gate, nor
             // leave its own inactive/detached pane permanently sparse.
             ReleaseLoadGate();
+        }
+    }
+
+    private void PresentFolderInvocationWindow(FolderInvocation invocation)
+    {
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        if (!IsVisible) Show();
+        if (!IsTestWindow && !IsDiagnosticsRun && (!invocation.OriginIsShell || invocation.DestinationId == Guid.Empty))
+        {
+            Activate();
+            FocusCanvas();
         }
     }
 }

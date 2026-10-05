@@ -686,7 +686,7 @@ public partial class MainWindow
         };
 
         var dialog = new ConfirmDialog(verdict.Caption, verdict.Message, label) { Owner = this };
-        return dialog.ShowDialog() == true;
+        return dialog.ShowOwnerModal();
     }
 
     private void CancelPicker()

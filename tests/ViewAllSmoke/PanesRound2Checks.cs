@@ -107,8 +107,9 @@ internal static partial class Program
 
     private static async Task PanesRound2OnStaAsync()
     {
-        new App().InitializeComponent();
-        Application.Current.ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+        foreach (var source in new[] { "/Nodify;component/Themes/Dark.xaml", "/UltraExplorer;component/Themes/UltraTheme.xaml", "/UltraExplorer;component/Themes/PickerControls.xaml" })
+            application.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri(source, UriKind.Relative) });
         var stateOverride = Environment.GetEnvironmentVariable("ULTRAEXPLORER_STATE_DIR");
         var isolated = !string.IsNullOrWhiteSpace(stateOverride)
             && Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1"
@@ -355,7 +356,7 @@ internal static partial class Program
             var navigation = shell.Tree.BeginNavigation();
             shell.Layout = CanvasLayout.Tree;
             await main.TreeEntryForChecks;
-            Check($"on the tree, its folders opened down to the focus, all four are still selected ({shell.Tree.Selection.Count} selected)",
+            Check($"on the tree, its folders opened down to the focus, all four are still selected ({shell.Tree.Selection.Count} selected; active={shell.Tree.ActivePath}; parent={shell.Tree.ActiveNode?.Parent?.FullPath}; expanded={shell.Tree.ActiveNode?.Parent?.IsExpanded})",
                 shell.Tree.Selection.Count == 4 && files.All(shell.Tree.Selection.Contains) && ViewAllPath.Equals(shell.Tree.ActivePath, files[0])
                 && shell.Tree.ActiveNode?.Parent is { IsExpanded: true });
             Check("and a navigation asked for just before is still the one that counts", shell.Tree.IsLatestNavigation(navigation));

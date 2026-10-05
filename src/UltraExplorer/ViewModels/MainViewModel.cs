@@ -179,8 +179,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         NewFolderCommand = new AsyncRelayCommand(CreateFolderAsync);
         NewTextFileCommand = new AsyncRelayCommand(CreateTextFileAsync);
-        CutCommand = new RelayCommand(() => CopySelection(true));
-        CopyCommand = new RelayCommand(() => CopySelection(false));
+        CutCommand = new AsyncRelayCommand(() => CopySelectionAsync(true));
+        CopyCommand = new AsyncRelayCommand(() => CopySelectionAsync(false));
         CopyPathCommand = new RelayCommand(CopySelectionPath);
         PasteCommand = new AsyncRelayCommand(PasteAsync);
         RenameCommand = new AsyncRelayCommand(RenameSelectionAsync);
@@ -188,8 +188,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         DeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(false));
         PermanentDeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(true));
         PropertiesCommand = new RelayCommand(ShowProperties);
-        OpenCommand = new RelayCommand(OpenSelection);
-        OpenWithCommand = new RelayCommand(OpenSelectionWith);
+        OpenCommand = new AsyncRelayCommand(OpenSelectionAsync);
+        OpenWithCommand = new AsyncRelayCommand(OpenSelectionWithAsync);
         ToggleHiddenItemsCommand = new AsyncRelayCommand(ToggleHiddenItemsAsync);
         ShowInExplorerCommand = new RelayCommand(ShowSelectionInExplorer);
         AddToFavoritesCommand = new RelayCommand(AddSelectionToFavorites);
@@ -1636,7 +1636,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             try
             {
-                NativeShellService.Open(item.Path);
+                // A Shell namespace link is not a filesystem folder.  The
+                // Shell launch can still wait on an extension, so it runs off
+                // the one dispatcher shared by every window.
+                await Task.Run(() => OpenKnownItem(item.Path, false));
             }
             catch (Exception ex)
             {
@@ -1671,7 +1674,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var path = NativeShellService.CreateFolder(target, name);
+            var path = await Task.Run(() => CreateFolderOnDisk(target, name));
+            if (_isDisposed)
+            {
+                return;
+            }
+
             await Tree.RefreshPathAsync(target);
             ShowDone($"Created {Path.GetFileName(path)}");
         }
@@ -1697,9 +1705,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var path = NativeShellService.CreateNoteFile(target, name);
+            // Creating the file and handing it to its default program are one
+            // user action.  Keep both off the dispatcher and in that order.
+            var path = await Task.Run(() =>
+            {
+                var created = CreateNoteFileOnDisk(target, name);
+                // Closing the window while a slow share creates the file must
+                // not launch a program afterwards.  The filesystem operation
+                // already asked for is allowed to finish; the follow-up is not.
+                if (!Volatile.Read(ref _isDisposed))
+                {
+                    OpenKnownItem(created, false);
+                }
+
+                return created;
+            });
+            if (_isDisposed)
+            {
+                return;
+            }
+
             await Tree.RefreshPathAsync(target);
-            NativeShellService.Open(path);
         }
         catch (Exception ex)
         {
@@ -1707,28 +1733,66 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void CopySelection(bool cut)
+    private async Task CopySelectionAsync(bool cut)
     {
-        var paths = Tree.SelectedPaths;
-        if (paths.Count == 0)
+        // Keep exactly what the user selected while the disk is being asked;
+        // a later click must not change what this invocation copies.
+        var paths = Tree.SelectedPaths.ToArray();
+        if (paths.Length == 0)
         {
             return;
         }
 
-        if (!NativeShellService.CopyPathsToClipboard(paths, cut))
+        string[] present;
+        try
         {
-            // Refused either because nothing selected is there any more -
-            // deleted from outside since it was selected - or because another
-            // program holds the clipboard.  Trying again only helps the second.
-            Toast.ShowError(paths.Any(ItemExists)
-                ? "Another application is holding the clipboard — try again."
-                : paths.Count == 1
-                    ? $"{(Path.GetFileName(Path.TrimEndingDirectorySeparator(paths[0])) is { Length: > 0 } name ? name : paths[0])} is no longer there."
-                    : "The selected items are no longer there.");
+            present = await Task.Run(() => paths
+                .Where(ItemExists)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray());
+        }
+        catch (Exception ex)
+        {
+            // A provider or a testable existence backend may fail rather than
+            // answer false.  This is an async command: never let that exception
+            // escape async void and take down the shared dispatcher.
+            if (!_isDisposed)
+            {
+                Toast.ShowError(ex.Message);
+            }
+
             return;
         }
 
-        _ = Toast.ShowSuccessAsync(cut ? $"Cut {paths.Count} item(s)" : $"Copied {paths.Count} item(s)");
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        if (present.Length == 0)
+        {
+            Toast.ShowError(paths.Length == 1
+                ? $"{(Path.GetFileName(Path.TrimEndingDirectorySeparator(paths[0])) is { Length: > 0 } name ? name : paths[0])} is no longer there."
+                : "The selected items are no longer there.");
+            return;
+        }
+
+        try
+        {
+            // Clipboard.SetDataObject must remain on this STA dispatcher.  All
+            // potentially blocking filesystem validation has already ended.
+            if (!NativeShellService.CopyPathsToClipboard(present, cut))
+            {
+                Toast.ShowError("Another application is holding the clipboard — try again.");
+                return;
+            }
+
+            _ = Toast.ShowSuccessAsync(cut ? $"Cut {present.Length} item(s)" : $"Copied {present.Length} item(s)");
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            Toast.ShowError(ex.Message);
+        }
     }
 
     private void CopySelectionPath()
@@ -1776,6 +1840,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// waits for it there.
     /// </summary>
     internal static Func<string, bool> ItemExists { get; set; } = path => File.Exists(path) || Directory.Exists(path);
+
+    /// <summary>Command boundaries replaced by responsiveness checks; production delegates to the native service.</summary>
+    internal static Func<string, string, string> CreateFolderOnDisk { get; set; } = NativeShellService.CreateFolder;
+    internal static Func<string, string, string> CreateNoteFileOnDisk { get; set; } = NativeShellService.CreateNoteFile;
+    internal static Action<string, bool?> OpenKnownItem { get; set; } = NativeShellService.Open;
 
     private async Task<bool> TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
     {
@@ -1922,7 +1991,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var renamed = NativeShellService.Rename(path, newName);
+            var renamed = await Task.Run(() => NativeShellService.Rename(path, newName));
+            Tree.NoteOwnRename(path, renamed);
 
             // In a folder no window has read, nothing tells the change hub of
             // the rename to follow, and the colour and note stayed behind on
@@ -2118,7 +2188,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// fifteen only once the user says so, as Explorer asks; with one, the
     /// focus, a folder going in on the tree and a file opening.
     /// </summary>
-    private void OpenSelection()
+    private async Task OpenSelectionAsync()
     {
         if (Tree.Selection.Count > 1)
         {
@@ -2131,16 +2201,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
-                foreach (var file in files)
+                try
                 {
-                    try
+                    await Task.Run(() =>
                     {
-                        NativeShellService.Open(file);
-                    }
-                    catch (Exception ex)
+                        foreach (var file in files)
+                        {
+                            OpenKnownItem(file, false);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    if (!_isDisposed)
                     {
-                        Toast.ShowError($"Could not open {Path.GetFileName(file)}: {ex.Message}");
-                        return;
+                        Toast.ShowError($"Could not open the selection: {ex.Message}");
                     }
                 }
 
@@ -2161,13 +2236,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void OpenSelectionWith()
+    private async Task OpenSelectionWithAsync()
     {
-        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path && File.Exists(path))
+        var path = Tree.SelectedOrActivePaths.FirstOrDefault();
+        if (path is not null && await Task.Run(() => File.Exists(path)))
         {
             try
             {
-                NativeShellService.OpenWith(path);
+                await NativeShellService.OpenWithAsync(path);
             }
             catch (Exception ex)
             {
@@ -2278,17 +2354,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// folder is shown on the canvas and gone into, as a double-click there
     /// would.
     /// </summary>
-    private void OpenSearchResult(string path, bool isDirectory)
+    private void OpenSearchResult(string path, bool isDirectory) => _ = OpenSearchResultAsync(path, isDirectory);
+
+    private async Task OpenSearchResultAsync(string path, bool isDirectory)
     {
         if (isDirectory)
         {
-            _ = Tree.RevealPathAsync(path);
+            await Tree.RevealPathAsync(path);
             return;
         }
 
         try
         {
-            NativeShellService.Open(path);
+            await Task.Run(() => OpenKnownItem(path, false));
         }
         catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException)
         {

@@ -104,6 +104,7 @@ public partial class MainWindow : INestedPaneHost
 
         _viewModel.PropertyChanged += OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
+        _viewModel.Tree.FoldersHiddenByUser += OnFoldersHiddenByUserForNested;
         _viewModel.Tree.DeepRefreshRequested += OnTreeDeepRefreshRequested;
         _viewModel.Tree.DriveAdded += OnDriveAddedForNested;
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
@@ -123,6 +124,7 @@ public partial class MainWindow : INestedPaneHost
         _viewModel.ShownSelectionCount = null;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
+        _viewModel.Tree.FoldersHiddenByUser -= OnFoldersHiddenByUserForNested;
         _viewModel.Tree.DeepRefreshRequested -= OnTreeDeepRefreshRequested;
         _viewModel.Tree.DriveAdded -= OnDriveAddedForNested;
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
@@ -475,6 +477,11 @@ public partial class MainWindow : INestedPaneHost
     // The canvas's gestures reach the shared selection as edits (NestedPane),
     // and every other change reaches the active pane's canvas, in
     // MainWindow.Selection.cs.
+
+    private void OnFoldersHiddenByUserForNested(IReadOnlyList<string> paths)
+    {
+        foreach (var pane in _panes) pane.Tree.HideFromCanvas(paths);
+    }
 
     private void OnTreePropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
     {

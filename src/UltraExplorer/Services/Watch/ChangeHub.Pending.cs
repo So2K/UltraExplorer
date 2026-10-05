@@ -180,6 +180,45 @@ public sealed partial class ChangeHub
         }
     }
 
+    /// <summary>An app rename and its immediate refresh are one pending change, before the OS echo.</summary>
+    public void TouchRename(string oldPath, string newPath)
+    {
+        ArgumentNullException.ThrowIfNull(oldPath);
+        ArgumentNullException.ThrowIfNull(newPath);
+        var oldParent = Path.GetDirectoryName(oldPath);
+        var newParent = Path.GetDirectoryName(newPath);
+        if (string.IsNullOrEmpty(oldParent) || string.IsNullOrEmpty(newParent)) return;
+        if (!WatchAlias.KeyOf(oldParent).Equals(WatchAlias.KeyOf(newParent), StringComparison.OrdinalIgnoreCase))
+        {
+            Touch(oldParent, immediate: true);
+            Touch(newParent, immediate: true);
+            return;
+        }
+        if (_disposed || !Registry.TryFind(WatchAlias.KeyOf(oldParent), out var key)) return;
+        var network = FindRoot(key, create: false, depth: 0)?.IsNetwork ?? false;
+        var now = _time.GetTimestamp();
+        lock (_gate)
+        {
+            var change = PendingFor(key, network);
+            Merge(change, ChangeKinds.Structural, now);
+            AddRename(change, Path.GetFileName(oldPath), Path.GetFileName(newPath));
+            change.ImmediateAt = Math.Min(change.ImmediateAt, now);
+            Settle(change);
+        }
+    }
+
+    private static void AddRename(PendingChange change, string oldName, string newName)
+    {
+        if (string.IsNullOrEmpty(oldName) || string.IsNullOrEmpty(newName)) return;
+        // Only consecutive duplicates can be coalesced: A→B, B→A, A→B
+        // is a real rename cycle, not a duplicate of its first operation.
+        if (change.RenameCount > 0 && change.Renames![change.RenameCount - 1] == new RenamePair(oldName, newName)) return;
+        if (change.RenameCount == MaximumRenames) return;
+        if (change.Renames is null || change.RenameCount == change.Renames.Length)
+            Array.Resize(ref change.Renames, change.Renames is null ? MaximumDetails : Math.Min(change.Renames.Length * 2, MaximumRenames));
+        change.Renames[change.RenameCount++] = new RenamePair(oldName, newName);
+    }
+
     /// <summary>
     /// Tells the hub a folder was just read again: how long the read took on
     /// its worker and the apply on the UI thread, and whether the listing
@@ -306,15 +345,7 @@ public sealed partial class ChangeHub
                 AddFolder(change, leaf, in record);
             }
 
-            if (!renamedFrom.IsEmpty && change.RenameCount < MaximumRenames)
-            {
-                if (change.Renames is null || change.RenameCount == change.Renames.Length)
-                {
-                    Array.Resize(ref change.Renames, change.Renames is null ? MaximumDetails : Math.Min(change.Renames.Length * 2, MaximumRenames));
-                }
-
-                change.Renames[change.RenameCount++] = new RenamePair(renamedFrom.ToString(), leaf.ToString());
-            }
+            if (!renamedFrom.IsEmpty) AddRename(change, renamedFrom.ToString(), leaf.ToString());
 
             Settle(change);
         }

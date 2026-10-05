@@ -1564,7 +1564,7 @@ internal sealed class NestedPane
         {
             foreach (var match in Canvas.FilterMatches.Take(FilterBeaconLimit))
             {
-                Add(match, NestedBeaconKind.Search, SearchBeaconColour, LeafName(match));
+                Add(match, NestedBeaconKind.Filter, SearchBeaconColour, LeafName(match));
             }
         }
 

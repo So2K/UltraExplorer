@@ -270,12 +270,13 @@ internal static partial class Program
         }
     }
 
-    private static DragEventArgs ArchiveDragArgs(RoutedEvent routed, IDataObject data, DependencyObject relativeTo, Point point)
+    private static DragEventArgs ArchiveDragArgs(RoutedEvent routed, IDataObject data, DependencyObject relativeTo, Point point,
+        DragDropKeyStates keyStates = DragDropKeyStates.None, DragDropEffects allowedEffects = DragDropEffects.Copy)
     {
         var constructor = typeof(DragEventArgs).GetConstructor(BindingFlags.Instance | BindingFlags.NonPublic, null,
             [typeof(IDataObject), typeof(DragDropKeyStates), typeof(DragDropEffects), typeof(DependencyObject), typeof(Point)], null)
             ?? throw new MissingMethodException(nameof(DragEventArgs), ".ctor");
-        var args = (DragEventArgs)constructor.Invoke([data, DragDropKeyStates.None, DragDropEffects.Copy, relativeTo, point]);
+        var args = (DragEventArgs)constructor.Invoke([data, keyStates, allowedEffects, relativeTo, point]);
         args.RoutedEvent = routed;
         return args;
     }

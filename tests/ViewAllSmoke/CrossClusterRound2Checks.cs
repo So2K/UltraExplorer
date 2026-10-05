@@ -269,11 +269,13 @@ internal static partial class Program
 
         Select(gone.Take(1));
         model.CopyCommand.Execute(null);
+        await Until(() => model.CopyCommand.CanExecute(null), 5_000);
         Check($"Copy of one file that is gone names it ({model.Toast.Message})",
             model.Toast.Message == "report.txt is no longer there.");
 
         Select(gone);
         model.CutCommand.Execute(null);
+        await Until(() => model.CutCommand.CanExecute(null), 5_000);
         Check($"Cut of several says they are gone ({model.Toast.Message})",
             model.Toast.Message == "The selected items are no longer there.");
     }
@@ -751,7 +753,9 @@ internal static partial class Program
                 });
             using var coordinator = new ExplorerReplacementCoordinator(actions);
             await coordinator.TransferForChecksAsync(source).WaitAsync(TimeSpan.FromSeconds(10));
-            await LiveWait(() => discarded.Count > 0, 500);
+            // Keep the assertion, but allow the coordinator's real 600 ms
+            // observer-debounce grace to elapse before checking retirement.
+            await LiveWait(() => discarded.Count > 0, 2000);
             return (opened, discarded, closed);
         }
 

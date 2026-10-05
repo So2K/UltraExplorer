@@ -51,6 +51,9 @@ internal static class NativeExplorerNavigation
     internal static bool IsEligible(FolderInvocation invocation, IReadOnlyList<string> arguments) =>
         invocation.OriginIsShell && invocation.Kind == FolderInvocationKind.OpenFolder
         && invocation.DestinationId == Guid.Empty && invocation.SelectedPaths is { Count: 0 }
+        // SHParseDisplayName trims literal name endings. Never navigate a
+        // kept-native Explorer frame to that different folder by accident.
+        && !Models.ViewAllPath.EndsANameInDotOrSpace(invocation.FolderPath)
         && !arguments.Any(argument => argument.Equals(FolderCommandLine.HomeSwitch, StringComparison.OrdinalIgnoreCase));
 
     internal static bool IsExplorerContext(uint parentProcess, DateTime callerStartedUtc, NativeExplorerNavigationIdentity context) =>

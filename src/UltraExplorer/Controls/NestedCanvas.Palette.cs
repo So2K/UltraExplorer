@@ -91,6 +91,7 @@ public sealed partial class NestedCanvas
         }
 
         _filter = matcher;
+        _filterVisibilityVersion = _tree?.VisibilityVersion ?? -1;
         _filterText = matcher is null ? string.Empty : text!.Trim();
         _filterStamp++;
         _filterCursor = -1;
@@ -155,6 +156,19 @@ public sealed partial class NestedCanvas
         RequestFrame(Layers.All);
         RaiseFilterChanged();
     }
+
+    private int _filterVisibilityVersion = -1;
+
+    /// <summary>Reuses the bounded judging pass only when visibility rules change.</summary>
+    private void RejudgeFilterVisibility(NestedTree tree)
+    {
+        if (_filter is not null && tree.VisibilityVersion != _filterVisibilityVersion)
+            SetFilter(_filterText);
+    }
+
+    private bool IsVisibleFilterTarget(string path) => Resolve(path) is { } target
+        && NestedTree.IsOnCanvas(target.Folder) && !NestedTree.IsDetached(target.Folder)
+        && (target.FileIndex >= 0 || _tree?.Find(path) is not null);
 
     /// <summary>At most how many names <see cref="SetFilter"/> judges before it leaves the rest to slices between the frames.</summary>
     private const int FilterNamesAtOnce = 250_000;
@@ -493,7 +507,8 @@ public sealed partial class NestedCanvas
         {
             _filterCursor = ((_filterCursor < 0 && direction < 0 ? 0 : _filterCursor) + direction + _filterMatches.Count) % _filterMatches.Count;
             var path = _filterMatches[_filterCursor];
-            if (Resolve(path) is { } target)
+            if (Resolve(path) is { } target && NestedTree.IsOnCanvas(target.Folder)
+                && !NestedTree.IsDetached(target.Folder))
             {
                 MarkSelected(path);
                 SelectRequested?.Invoke(path, false);
@@ -818,6 +833,17 @@ public sealed partial class NestedCanvas
     {
         if (_filter is null)
         {
+            return;
+        }
+
+        // A late read under a hidden ancestor must not put its matches back.
+        if (!NestedTree.IsOnCanvas(folder) || NestedTree.IsDetached(folder))
+        {
+            if (MatchesAtOrUnder(folder.FullPath) is { Count: > 0 } hidden)
+            {
+                RemoveMatches(hidden);
+                RaiseFilterChangedWithFrame();
+            }
             return;
         }
 

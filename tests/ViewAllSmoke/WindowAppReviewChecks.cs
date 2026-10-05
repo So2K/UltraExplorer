@@ -133,7 +133,7 @@ internal static partial class Program
         }, DispatcherPriority.Background);
 
         // The drop, as the canvas hands it to the window: held until its copy ends.
-        var dropped = ((INestedPaneHost)main).CompleteExternalDrop(() => transfer.Task);
+        var dropped = ((INestedPaneHost)main).CompleteExternalDrop(new DataObject(), [], DragDropEffects.Copy, () => transfer.Task);
         var clock = Stopwatch.StartNew();
         while (!closed && clock.ElapsedMilliseconds < 10_000)
         {
@@ -277,6 +277,12 @@ internal static partial class Program
         if (ReviewSecondMonitor() is not { } second)
         {
             Check("no second monitor: no window is opened on the main one", true);
+            return;
+        }
+
+        if (!TestScreen.PointerOnTarget())
+        {
+            Console.WriteLine("  note: CenterScreen placement checks skipped: pointer is not on the secondary test monitor");
             return;
         }
 
@@ -473,6 +479,8 @@ internal static partial class Program
                     Check($"{role} shows no canvas and makes no device", !GpuBootstrap.IsStarted && !GpuLabelAtlases.IsStarted);
                     return;
                 }
+
+                Check($"{role} does not warm unrelated display adapters", !GpuBootstrap.WarmOtherAdapters);
 
                 if (SystemParameters.IsRemoteSession || RenderCapability.Tier >> 16 < 2)
                 {

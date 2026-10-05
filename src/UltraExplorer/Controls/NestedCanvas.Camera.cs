@@ -317,6 +317,17 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // Materializing the path can outlast a split/collapse layout. Its
+        // ActualSize may already be current while the deferred SizeChanged
+        // notification still leaves our camera cache at the old pane width.
+        // A restored normalized camera belongs to the current view, not that
+        // earlier width (otherwise a late share returns at half its zoom).
+        UpdateLayout();
+        if (ActualWidth > 0 && ActualHeight > 0)
+        {
+            _viewWidth = ActualWidth;
+            _viewHeight = ActualHeight;
+        }
         var width = state.Width * _viewWidth;
         var x = _viewWidth / 2 + state.X * _viewWidth;
         var y = _viewHeight / 2 + state.Y * _viewWidth;
@@ -469,6 +480,15 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // A rename is an identity change, not a reason to occupy the sibling
+        // now in the old slot. Keep the anchor's screen rectangle unchanged.
+        if (_tree is { } tree && NestedTree.IsDetached(_anchor)
+            && tree.RenameSuccessor(_anchor) is { } successor)
+        {
+            _anchor = successor;
+            _chain.Clear();
+        }
+
         // Walking up divides by the anchor's own place in its parent, and
         // walking down reads its children's: all of them for the current order.
         EnsureAnchorPath();
@@ -478,6 +498,15 @@ public sealed partial class NestedCanvas
         // view is deep inside must take the view out of it.
         while (_anchor.Parent is not null && (!NestedTree.IsOnCanvas(_anchor) || NestedTree.IsDetached(_anchor)))
         {
+            // If a descendant really went away, its renamed surviving ancestor
+            // is still the right place to climb to, not an unrelated sibling.
+            if (_tree is { } renamedTree && renamedTree.RenameSuccessor(_anchor) is { } renamedAnchor)
+            {
+                _anchor = renamedAnchor;
+                _chain.Clear();
+                EnsureAnchorPath();
+                if (NestedTree.IsOnCanvas(_anchor) && !NestedTree.IsDetached(_anchor)) break;
+            }
             Up();
         }
 

@@ -104,6 +104,6 @@ public partial class MainWindow
     {
         Window owner = _settingsWindow is { IsVisible: true } settings ? settings : this;
         var dialog = new ConfirmDialog(title, message, confirmLabel) { Owner = owner };
-        return dialog.ShowDialog() == true;
+        return dialog.ShowOwnerModal();
     }
 }

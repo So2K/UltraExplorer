@@ -36,6 +36,7 @@ public partial class MainWindow
     private void AttachSelection()
     {
         _viewModel.Tree.Selection.Changed += OnSharedSelectionChanged;
+        _viewModel.Tree.RenameFollowed += OnPickerFolderRename;
         _viewModel.Tree.FolderList.SelectionRowsChanged += ApplySelectionToList;
         _viewModel.Tree.FolderList.RowsReplaced += ApplySelectionToList;
         _viewModel.PropertyChanged += OnShellPropertyChangedForSelection;
@@ -46,6 +47,7 @@ public partial class MainWindow
     private void DetachSelection()
     {
         _viewModel.Tree.Selection.Changed -= OnSharedSelectionChanged;
+        _viewModel.Tree.RenameFollowed -= OnPickerFolderRename;
         _viewModel.Tree.FolderList.SelectionRowsChanged -= ApplySelectionToList;
         _viewModel.Tree.FolderList.RowsReplaced -= ApplySelectionToList;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForSelection;
@@ -87,6 +89,16 @@ public partial class MainWindow
                 else if (selection.LastSource == SelectionSource.Navigation) session.CurrentFolder = item.Path;
             }
             session.ReportSelection(selection.Items);
+        }
+    }
+
+    private void OnPickerFolderRename(string oldPath, string newPath)
+    {
+        if (_picker is { } session
+            && ViewAllViewModel.Renamed(session.CurrentFolder, oldPath, newPath) is { } moved)
+        {
+            // The typed Save name is deliberately left intact.
+            session.CurrentFolder = moved;
         }
     }
 
@@ -148,7 +160,7 @@ public partial class MainWindow
 
         var list = _viewModel.Tree.FolderList;
         var folder = list.FolderPath;
-        if (folder.Length == 0 || e.AddedItems.Count == 0 && e.RemovedItems.Count == 0)
+        if (!list.HasCurrentRows || folder.Length == 0 || e.AddedItems.Count == 0 && e.RemovedItems.Count == 0)
         {
             return;
         }

@@ -136,8 +136,9 @@ internal static partial class Program
 
     /// <summary>
     /// J005 end to end: the canvas has a file selected in the list's folder,
-    /// and the folder is deleted by another program.  The list goes up, and
-    /// the folder above it must not end up selected.
+    /// and the folder is deleted by another program. The list goes up, and
+    /// the actual Delete command must never ask the Shell to delete its parent.
+    /// A native-operation spy prevents any deletion even on regressed code.
     /// </summary>
     private static async Task ListGoneEndToEndAsync()
     {
@@ -148,15 +149,16 @@ internal static partial class Program
         var inside = Path.Combine(doomed, "a.txt");
         Directory.CreateDirectory(doomed);
         File.WriteAllText(inside, "a");
-        File.WriteAllText(Path.Combine(parent, "keep.txt"), "k");
+        var canary = Path.Combine(parent, "keep.txt");
+        File.WriteAllText(canary, "owned sibling canary");
         try
         {
-            using var icons = new ShellIconService();
-            var marks = new FolderMarkService(Path.Combine(baseDirectory, "marks.json"));
-            using var hub = new ChangeHub(TimeProvider.System);
-            using var tree = new ViewAllViewModel(marks, icons, Path.Combine(baseDirectory, "tree.json")) { PreferLightReveal = true };
-            hub.Driver.Fallback = DispatcherFrameDriver.ForCurrentThread((ref FrameBudget budget) => hub.Drain(ref budget, tree), () => hub.HasWork);
-            tree.Changes = hub;
+            using var model = new MainViewModel(Path.Combine(baseDirectory, "tree.json"), nestedPicker: true)
+            {
+                SuppressShellWrites = true
+            };
+            var tree = model.Tree;
+            tree.PreferLightReveal = true;
             tree.IsCanvasShown = false;
             await tree.InitializeAsync(parent);
             tree.FolderList.IsVisible = true;
@@ -168,9 +170,50 @@ internal static partial class Program
             Directory.Delete(doomed, recursive: true);
             var up = await LiveWait(() => ViewAllPath.Equals(tree.FolderList.FolderPath, parent), 3_000);
             await Task.Delay(600);
-            Check($"the folder deleted elsewhere, the list goes up ({up} ms, in {Path.GetFileName(tree.FolderList.FolderPath)}, {tree.FolderList.EmptyText})", up >= 0);
+            Check($"the folder deleted elsewhere, the list stays up ({up} ms, in {Path.GetFileName(tree.FolderList.FolderPath)}, {tree.FolderList.EmptyText})",
+                up >= 0 && ViewAllPath.Equals(tree.FolderList.FolderPath, parent) && !tree.FolderList.IsLoading);
             Check($"and the folder above is not selected for the next Delete ({tree.Selection.Count} selected: {string.Join(", ", tree.Selection.Paths.Select(Path.GetFileName))})",
                 !tree.Selection.Contains(parent));
+
+            var operationExists = NativeShellService.OperationItemExists;
+            var requested = new List<string>();
+            model.ConfirmRequested += (_, _, _) => true;
+            try
+            {
+                NativeShellService.OperationItemExists = path =>
+                {
+                    lock (requested) requested.Add(path);
+                    // Deliberately no real Shell delete, even if a regression
+                    // sent the parent or another path to the command.
+                    return false;
+                };
+                model.DeleteCommand.Execute(null);
+                var ended = await LiveWait(() => model.DeleteCommand.CanExecute(null), 3_000);
+                lock (requested)
+                {
+                    Check("Delete after the outside removal never sends the parent or sibling to Shell",
+                        ended >= 0 && requested.Count == 0);
+                }
+                Check("the parent and its sibling bytes survive that actual Delete command",
+                    Directory.Exists(parent) && File.ReadAllText(canary) == "owned sibling canary");
+
+                // Prove the spy observes this real command rather than a
+                // disabled command that could make a no-call assertion pass.
+                tree.Selection.ReplaceSingle(parent, true, 0, SelectionSource.Command);
+                model.DeleteCommand.Execute(null);
+                ended = await LiveWait(() => model.DeleteCommand.CanExecute(null), 3_000);
+                lock (requested)
+                {
+                    Check("the Delete boundary spy sees an explicitly selected owned control folder",
+                        ended >= 0 && requested.Count == 1 && ViewAllPath.Equals(requested[0], parent));
+                }
+                Check("the control probe also preserves the parent's sibling canary",
+                    Directory.Exists(parent) && File.ReadAllText(canary) == "owned sibling canary");
+            }
+            finally
+            {
+                NativeShellService.OperationItemExists = operationExists;
+            }
         }
         finally
         {
