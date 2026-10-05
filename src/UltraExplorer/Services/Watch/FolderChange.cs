@@ -104,6 +104,16 @@ public readonly struct FolderChange(string key, ChangeKinds kinds, long firstTic
 
     /// <summary>Files whose size or date changed; see the type's remarks for when it is empty.</summary>
     public ReadOnlyMemory<FileDelta> Files { get; } = files;
+
+    /// <summary>
+    /// Sub-folders whose own entry changed (<see cref="ChangeKinds.DirDate"/>),
+    /// each with its attributes now: complete or empty, as <see cref="Files"/>
+    /// is.  Writing in a sub-folder moves its date and hiding it - attrib +h,
+    /// the Hidden box in Properties - changes its attributes, and the watch
+    /// tells both the same way: a consumer that shows hidden folders apart
+    /// compares the attributes with what it has.
+    /// </summary>
+    public ReadOnlyMemory<FileDelta> Folders { get; init; }
 }
 
 /// <summary>

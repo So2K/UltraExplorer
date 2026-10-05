@@ -21,7 +21,8 @@ namespace UltraExplorer.Infrastructure;
 /// nothing is on screen (a failure would otherwise leave an invisible process
 /// behind), the same thing keeps failing (an exception on every frame or
 /// every event is not something to click through), or this is a benchmark,
-/// snapshot or test copy, whose runs must fail where they fail.
+/// snapshot or test copy, whose runs must fail where they fail.  A dialog
+/// worker survives one without a word instead (<see cref="SurviveQuietly"/>).
 /// </summary>
 internal static class CrashReporter
 {
@@ -37,6 +38,7 @@ internal static class CrashReporter
     private static bool _showing;
     private static bool _survive;
     private static bool _started;
+    private static Action? _survivedQuietly;
 
     public static string LogPath => AppPaths.State("crash.log");
 
@@ -106,9 +108,35 @@ internal static class CrashReporter
     /// </summary>
     public static void MarkStarted() => _started = true;
 
+    /// <summary>
+    /// For a dialog worker, or a process serving one dialog: an exception on
+    /// the UI thread is written down and survived without a word - nobody is
+    /// there to read a message box from a background process - and
+    /// <paramref name="survived"/> runs next, to give the dialog being served
+    /// back to Windows and let the process make way for a fresh one.  Ended
+    /// on the spot, the worker took the user's dialog with it, and the
+    /// guardian then paused the whole replacement for one glitch in a
+    /// picker.  The same thing failing again and again still ends the
+    /// process.
+    /// </summary>
+    public static void SurviveQuietly(Action survived) => _survivedQuietly = survived;
+
     private static void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         Log("on the UI thread", e.Exception);
+
+        if (_survivedQuietly is { } survived)
+        {
+            if (IsStorm())
+            {
+                return;
+            }
+
+            // Run once the failing call has unwound, not inside it.
+            e.Handled = true;
+            e.Dispatcher.BeginInvoke(survived);
+            return;
+        }
 
         if (!_survive || !_started || !IsAnyWindowShown() || IsStorm())
         {

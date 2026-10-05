@@ -194,16 +194,20 @@ internal sealed class ShellContextMenu : IDisposable
     public static ShellContextMenu? ForItems(IReadOnlyList<string> paths, IntPtr owner, bool extended, bool offerNew)
     {
         var distinct = paths.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        if (distinct.Length == 0)
+        if (distinct.Length == 0 || distinct.Any(Models.ViewAllPath.EndsANameInDotOrSpace))
         {
+            // A name ending in a dot or a space the Shell parses without it -
+            // "dup." as "dup", another item or none - and its menu would act
+            // on that.  The app's own menu is shown instead, whose operations
+            // say why they cannot.
             return null;
         }
 
         // The Shell builds one menu from items of a single parent folder.
-        var parentDirectory = Path.GetDirectoryName(distinct[0]);
+        var parentDirectory = ShellParentOf(distinct[0]);
         for (var index = 1; index < distinct.Length; index++)
         {
-            if (!string.Equals(Path.GetDirectoryName(distinct[index]), parentDirectory, StringComparison.OrdinalIgnoreCase))
+            if (!string.Equals(ShellParentOf(distinct[index]), parentDirectory, StringComparison.OrdinalIgnoreCase))
             {
                 return null;
             }
@@ -317,6 +321,12 @@ internal sealed class ShellContextMenu : IDisposable
     /// </summary>
     public static ShellContextMenu? ForFolderBackground(string folderPath, IntPtr owner, bool extended)
     {
+        // As for items (see ForItems): the menu, and its New, would be for another folder.
+        if (Models.ViewAllPath.EndsANameInDotOrSpace(folderPath))
+        {
+            return null;
+        }
+
         var watch = Stopwatch.StartNew();
         var menu = new ShellContextMenu(owner, [folderPath], isBackground: true, extended) { NewTarget = folderPath };
         var handedBack = false;
@@ -737,6 +747,30 @@ internal sealed class ShellContextMenu : IDisposable
         return parent.GetAttributesOf(1, [child], ref attributes) == 0
             && (attributes & (SfgaoFolder | SfgaoFileSystem)) == (SfgaoFolder | SfgaoFileSystem)
             && (attributes & SfgaoStream) == 0;
+    }
+
+    /// <summary>
+    /// The folder the Shell finds an item in, by its path: its parent folder,
+    /// or for a root, which has none by name, This PC for a drive (an empty
+    /// string) and the server for a share's root.  A drive and a share had
+    /// no parent alike, and the share was handed to This PC as one of its
+    /// drives - a menu refused, or acting on what the Shell made of it.
+    /// </summary>
+    private static string ShellParentOf(string path)
+    {
+        if (Path.GetDirectoryName(path) is { } parent)
+        {
+            return parent;
+        }
+
+        if (!path.StartsWith(@"\\", StringComparison.Ordinal))
+        {
+            return string.Empty;
+        }
+
+        // \\server\share is in \\server; a server alone, in the network, which no drive is in either.
+        var server = path.IndexOfAny(['\\', '/'], 2);
+        return server < 0 ? @"\\" : path[..server];
     }
 
     /// <summary>One item's PIDL relative to its parent folder, parsed by name; null when the item is not there.</summary>

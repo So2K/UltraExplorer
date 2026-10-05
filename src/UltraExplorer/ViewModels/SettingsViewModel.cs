@@ -7,6 +7,7 @@ using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Rendering.Gpu;
 using UltraExplorer.Services;
+using UltraExplorer.Picker.Integration;
 
 namespace UltraExplorer.ViewModels;
 
@@ -52,6 +53,11 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private bool? _hiddenWanted;
     private bool _isApplyingHidden;
     private bool _isDisposed;
+    private bool? _dialogWanted;
+    private bool _applyingDialogs;
+    private bool? _winEWanted;
+    private bool _applyingWinE;
+    private readonly DialogIntegrationController _dialogIntegration = DialogIntegrationController.Shared;
 
     /// <param name="main">The window's view model, whose settings these are.</param>
     /// <param name="canChooseLayout">False in a file dialog, which keeps the tree canvas whatever is chosen.</param>
@@ -74,6 +80,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         _showAllLayersCommand = new RelayCommand(() => _main.Layers = CanvasLayer.All, () => CanShowAllLayers);
         OpenInstallFolderCommand = new RelayCommand(() => OpenFolder(InstallFolder));
         OpenStateFolderCommand = new RelayCommand(() => OpenFolder(StateFolder));
+        RecoverDialogIntegrationCommand = new AsyncRelayCommand(() => DialogActionAsync(_dialogIntegration.RecoverAsync));
+        ResetDialogExceptionsCommand = new AsyncRelayCommand(() => DialogActionAsync(_dialogIntegration.ResetExclusionsAsync));
+        _dialogIntegration.Changed += OnDialogIntegrationChanged;
         _rendererStatus = _rendererNow?.Invoke() ?? string.Empty;
 
         _main.PropertyChanged += OnMainPropertyChanged;
@@ -83,6 +92,73 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     }
 
     private FolderOrders Orders => _main.Orders;
+
+    public bool IsDialogReplacementEnabled
+    {
+        get => _dialogWanted ?? _dialogIntegration.Enabled;
+        set
+        {
+            if (value == IsDialogReplacementEnabled) return;
+            _dialogWanted = value;
+            OnPropertyChanged();
+            if (!_applyingDialogs) _ = ApplyDialogIntegrationAsync();
+        }
+    }
+    public string DialogIntegrationStatus => _dialogIntegration.Status;
+    public bool IsWinEShortcutEnabled
+    {
+        get => _winEWanted ?? _dialogIntegration.WinEEnabled;
+        set
+        {
+            if (value == IsWinEShortcutEnabled) return;
+            _winEWanted = value;
+            OnPropertyChanged();
+            if (!_applyingWinE) _ = ApplyWinEShortcutAsync();
+        }
+    }
+    public string WinEShortcutStatus => _dialogIntegration.WinEStatus;
+    public string DialogExceptionsDescription => _dialogIntegration.ExclusionCount == 0
+        ? "Every supported application can use UltraExplorer."
+        : $"{_dialogIntegration.ExclusionCount} application(s) keep their Windows dialogs. Reset to try them again.";
+    public ICommand RecoverDialogIntegrationCommand { get; }
+    public ICommand ResetDialogExceptionsCommand { get; }
+    private async Task ApplyDialogIntegrationAsync()
+    {
+        _applyingDialogs = true;
+        try
+        {
+            bool? applied = null;
+            while (_dialogWanted is { } wanted && wanted != applied)
+            { applied = wanted; await _dialogIntegration.SetEnabledAsync(wanted); }
+        }
+        catch (Exception ex) { _main.Toast.ShowError(ex.Message); }
+        finally { _dialogWanted = null; _applyingDialogs = false; OnDialogIntegrationChanged(); }
+    }
+    private async Task ApplyWinEShortcutAsync()
+    {
+        _applyingWinE = true;
+        try
+        {
+            bool? applied = null;
+            while (_winEWanted is { } wanted && wanted != applied)
+            { applied = wanted; await _dialogIntegration.SetWinEEnabledAsync(wanted); }
+        }
+        catch (Exception ex) { _main.Toast.ShowError(ex.Message); }
+        finally { _winEWanted = null; _applyingWinE = false; OnDialogIntegrationChanged(); }
+    }
+    private async Task DialogActionAsync(Func<Task> action)
+    {
+        try { await action(); }
+        catch (Exception ex) { _main.Toast.ShowError(ex.Message); }
+    }
+    private void OnDialogIntegrationChanged()
+    {
+        OnPropertyChanged(nameof(IsDialogReplacementEnabled));
+        OnPropertyChanged(nameof(DialogIntegrationStatus));
+        OnPropertyChanged(nameof(IsWinEShortcutEnabled));
+        OnPropertyChanged(nameof(WinEShortcutStatus));
+        OnPropertyChanged(nameof(DialogExceptionsDescription));
+    }
 
     // ---- Canvas ----------------------------------------------------------------
 
@@ -108,6 +184,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 _main.Layout = CanvasLayout.Nested;
             }
         }
+    }
+
+    public bool ShowFavoriteLinks
+    {
+        get => _main.ShowFavoriteLinks;
+        set => _main.ShowFavoriteLinks = value;
     }
 
     public bool IsTreeLayout
@@ -598,6 +680,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
             case nameof(MainViewModel.LeftDrag):
                 Raise(LeftDragProperties);
                 break;
+            case nameof(MainViewModel.ShowFavoriteLinks):
+                OnPropertyChanged(nameof(ShowFavoriteLinks));
+                break;
             case nameof(MainViewModel.Layers):
                 Raise(LayerProperties);
                 _showAllLayersCommand.RaiseCanExecuteChanged();
@@ -637,6 +722,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         }
 
         _isDisposed = true;
+        _dialogIntegration.Changed -= OnDialogIntegrationChanged;
         _main.PropertyChanged -= OnMainPropertyChanged;
         _main.Tree.PropertyChanged -= OnTreePropertyChanged;
         Orders.Changed -= OnOrdersChanged;

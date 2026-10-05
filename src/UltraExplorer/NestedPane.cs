@@ -23,6 +23,16 @@ internal interface INestedPaneHost
     bool IsPickerMode { get; }
 
     /// <summary>
+    /// The folder a file dialog's view has come to rest on.  <paramref name="movedByUser"/>:
+    /// the user brought it there by hand, which moves the dialog there even
+    /// from the folder it was opened at, still selected for having been gone to.
+    /// </summary>
+    void PickerFolderChanged(string? folder, bool movedByUser);
+    void PickerFileOpened(string path);
+    void PickerFolderOpened(string path);
+    void EnsureNestedLocation(NestedPane pane, string folder);
+
+    /// <summary>
     /// The paths a drag that started on one of the window's canvases is
     /// carrying, while it is carried: a drop on their own folder then moves
     /// nothing anywhere.  Null while no such drag is on.
@@ -83,6 +93,10 @@ internal interface INestedPaneHost
 
     /// <summary>The drag left or was dropped: what it carried is not kept for the next one.</summary>
     void ForgetDropPaths();
+
+    /// <summary>Keeps an OLE source's temporary files alive until transfer ends.</summary>
+    bool CompleteExternalDrop(Func<Task<bool>> beginTransfer)
+        => ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, beginTransfer());
 }
 
 /// <summary>
@@ -132,6 +146,30 @@ internal sealed class NestedPane
     private DispatcherTimer? _filterTimer;
     private DispatcherTimer? _headerTimer;
     private bool _cameraRestored;
+
+    /// <summary>
+    /// Set while a file dialog's camera was last moved by the user's hand,
+    /// until the header timer tells the dialog where it came to rest; a move
+    /// of the program's own - a flight, a camera put back - clears it.
+    /// </summary>
+    private bool _movedByUser;
+
+    /// <summary>
+    /// Set while the camera the last session left is on its way back - the
+    /// folders on the way still being read - and nothing has moved it since:
+    /// the canvas shows an overview meanwhile, which is no place to keep.
+    /// </summary>
+    private bool _cameraRestoring;
+
+    /// <summary>
+    /// The camera the last session left, when it was on a drive that had not
+    /// answered as the window started: put back once the drive is among the
+    /// cells (<see cref="DriveArrived"/>), as a start that waited for the drive
+    /// would have put it back - unless something has moved the camera since.
+    /// </summary>
+    private NestedCameraState? _cameraOnLateDrive;
+
+    private bool _detached;
 
     /// <summary>Set while a gesture on this pane's canvas is being applied to the shared selection, so its echo is not loaded back.</summary>
     private bool _applyingCanvasSelection;
@@ -247,15 +285,26 @@ internal sealed class NestedPane
         Canvas.AttachChanges(_viewModel.Changes, _viewModel.Tree);
 
         Canvas.Tree = Tree;
+
+        // A partial folder the view is inside was only needed on the way to
+        // a deeper one, and is listed once the camera goes into it.  Any
+        // other drawn - beside the folder in view, known by a beacon's
+        // chain - is listed as every folder drawn there is.
+        Tree.PartialListingReadAllowed = folder => !Canvas.IsCameraMoving && Canvas.Anchor is { } anchor
+            && (anchor.IsComputer ? !_host.IsPickerMode
+                : MainWindow.IsNestedPathInside(folder.FullPath, anchor.FullPath)
+                    || !MainWindow.IsNestedPathInside(anchor.FullPath, folder.FullPath));
         Canvas.MarkLookup = _viewModel.Marks.Get;
         Canvas.IconLookup = LookUpFileIcon;
         Canvas.IconArrivals = _iconInbox;
         Tree.FolderLoaded += OnFolderLoadedForIcons;
         Canvas.OpenRequested += OnOpenRequested;
+        Canvas.FavoriteLinkRequested += OnFavoriteLinkRequested;
         Canvas.ContextMenuRequested += OnContextMenuRequested;
         Canvas.ContextMenuPressed += OnContextMenuPressed;
         Canvas.DragRequested += OnDragRequested;
         Canvas.CameraChanged += OnCameraChanged;
+        Canvas.UserCameraMoved += OnUserCameraMoved;
         Canvas.FilterChanged += OnFilterChanged;
         Canvas.SelectionCommitted += OnSelectionCommitted;
         Canvas.MarqueePreview += OnMarqueePreview;
@@ -292,18 +341,33 @@ internal sealed class NestedPane
         _saveTimer.Tick += (_, _) =>
         {
             _saveTimer.Stop();
-            KeptCamera = Canvas.CaptureCamera() ?? KeptCamera;
+            CaptureCamera();
             _viewModel.Tree.ScheduleSave();
         };
 
         // The header names the folder in view as the last picture has it, so
         // it is brought up to date once the camera has come to rest and the
-        // picture has been drawn, not on the move.
+        // picture has been drawn, not on the move.  So is a file dialog's
+        // folder, once the user has moved the camera by hand.
         _headerTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(120) };
         _headerTimer.Tick += (_, _) =>
         {
             _headerTimer.Stop();
             UpdateHeader();
+            if (!_host.IsPickerMode)
+            {
+                return;
+            }
+
+            if (_movedByUser)
+            {
+                _movedByUser = false;
+                _host.PickerFolderChanged(FolderAtRest(), movedByUser: true);
+            }
+            else if (View.PaneHeader.Visibility == Visibility.Visible)
+            {
+                _host.PickerFolderChanged(Canvas.FolderInView?.FullPath, movedByUser: false);
+            }
         };
 
         _beaconTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(120) };
@@ -319,6 +383,10 @@ internal sealed class NestedPane
     /// <summary>Lets go of the hub, the icons and the tree: the window is going, or the pane is.</summary>
     public void Detach()
     {
+        if (_detached) return;
+        _detached = true;
+        IsReady = false;
+        _flightTicket++;
         _saveTimer?.Stop();
         _beaconTimer?.Stop();
         _filterTimer?.Stop();
@@ -328,6 +396,24 @@ internal sealed class NestedPane
         KeptSelection.Changed -= OnKeptSelectionChanged;
         _viewModel.Tree.RemoveKeptSelection(KeptSelection);
         Tree.FolderLoaded -= OnFolderLoadedForIcons;
+        Canvas.OpenRequested -= OnOpenRequested;
+        Canvas.FavoriteLinkRequested -= OnFavoriteLinkRequested;
+        Canvas.ContextMenuRequested -= OnContextMenuRequested;
+        Canvas.ContextMenuPressed -= OnContextMenuPressed;
+        Canvas.DragRequested -= OnDragRequested;
+        Canvas.CameraChanged -= OnCameraChanged;
+        Canvas.UserCameraMoved -= OnUserCameraMoved;
+        Canvas.FilterChanged -= OnFilterChanged;
+        Canvas.SelectionCommitted -= OnSelectionCommitted;
+        Canvas.MarqueePreview -= OnMarqueePreview;
+        Canvas.MarqueeStarted -= OnMarqueeStarted;
+        Canvas.DragOver -= OnCanvasDragOver;
+        Canvas.DragLeave -= OnCanvasDragLeave;
+        Canvas.Drop -= OnCanvasDrop;
+        View.CanvasFilterBox.TextChanged -= OnFilterTextChanged;
+        View.CanvasFilterBox.PreviewKeyDown -= OnFilterPreviewKeyDown;
+        foreach (var header in View.SortHeaders.Children.OfType<Button>()) header.Click -= OnSortHeaderClick;
+        Canvas.Tree = null;
         Canvas.IconArrivals = null;
         _viewModel.Icons.UnsubscribeCanvas(_iconInbox);
         Canvas.AttachChanges(null, null);
@@ -350,6 +436,23 @@ internal sealed class NestedPane
         Tree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
         Tree.SetUserHidden(_viewModel.Tree.HiddenPaths);
         IsReady = true;
+        Canvas.ShowFavoriteLinks = _viewModel.ShowFavoriteLinks;
+        RebuildBeacons();
+    }
+
+    private async void OnFavoriteLinkRequested(string path)
+    {
+        try
+        {
+            _host.ActivatePane(this);
+            await OpenAsync(path, animated: true);
+            if (_detached) return;
+            _host.FocusCanvas(this);
+        }
+        catch (Exception exception)
+        {
+            _viewModel.Toast.ShowError(exception.Message);
+        }
     }
 
     /// <summary>
@@ -366,18 +469,20 @@ internal sealed class NestedPane
     /// </param>
     public void Enter(bool fromStartup, bool focus = true, bool fly = true)
     {
+        if (_detached) return;
         SyncSelection();
         RebuildBeacons();
         UpdateHeader();
         Dispatcher.InvokeAsync(() =>
         {
+            if (_detached) return;
             Canvas.UpdateLayout();
             if (!_cameraRestored && RestoredCamera is { } camera)
             {
                 // Not awaited: the window is usable while the folders on the
                 // way are read, and the view jumps there once they have been.
                 _cameraRestored = true;
-                _ = Canvas.RestoreCameraAsync(camera);
+                _ = RestoreCameraAsync(camera);
             }
             else if (fly && FocusPath is { Length: > 0 } path)
             {
@@ -431,6 +536,11 @@ internal sealed class NestedPane
         {
             History.Record(focus);
         }
+
+        // The canvas shows it from the start: a pane made the one being
+        // worked with before it is first entered - a split put back with it
+        // worked with - tells its canvas it already does (see Activate).
+        SyncSelection();
     }
 
     // ---- the camera -------------------------------------------------------------
@@ -460,17 +570,63 @@ internal sealed class NestedPane
         }
     }
 
-    /// <summary>The camera as it is now, kept for the next session: the window is being closed.</summary>
+    /// <summary>
+    /// The camera as it is now, kept for the next session: it came to rest,
+    /// or the window or the pane is being closed.  One still on its way back
+    /// keeps where it was going.
+    /// </summary>
     public void CaptureCamera()
     {
-        if (Canvas.CaptureCamera() is { } camera)
+        if (!_cameraRestoring && Canvas.CaptureCamera() is { } camera)
         {
             KeptCamera = camera;
         }
     }
 
+    /// <summary>The camera the last session left put back, and noted as on its way meanwhile (see <see cref="_cameraRestoring"/>).</summary>
+    private async Task RestoreCameraAsync(NestedCameraState camera)
+    {
+        _cameraRestoring = true;
+        try
+        {
+            await Canvas.RestoreCameraAsync(camera);
+
+            // On no drive among the cells: one not answered yet, put back when it has.
+            if (!_detached && camera.AnchorPath is { Length: > 0 } anchor && Tree.Chain(anchor).Count == 0)
+            {
+                _cameraOnLateDrive = camera;
+            }
+        }
+        finally
+        {
+            _cameraRestoring = false;
+        }
+    }
+
+    /// <summary>
+    /// A drive that had not answered as the window started is among the cells
+    /// now: the camera the last session left on it is put back, unless
+    /// something has moved the camera since.
+    /// </summary>
+    public void DriveArrived(string drive)
+    {
+        if (!_detached && _cameraOnLateDrive is { } camera && MainWindow.IsNestedPathInside(camera.AnchorPath, drive))
+        {
+            _cameraOnLateDrive = null;
+            _ = RestoreCameraAsync(camera);
+        }
+    }
+
     private void OnCameraChanged()
     {
+        // Moved, the camera is where somebody wants it, back or not.
+        _cameraRestoring = false;
+        _cameraOnLateDrive = null;
+
+        // Whose move it was is told after it (OnUserCameraMoved): one of the
+        // program's own, a flight's frame, takes the dialog nowhere.
+        _movedByUser = false;
+
         if (_host.IsActivePane(this))
         {
             _viewModel.NestedZoomLabel = Canvas.ZoomText;
@@ -481,6 +637,57 @@ internal sealed class NestedPane
         ScheduleHeader();
         _saveTimer?.Stop();
         _saveTimer?.Start();
+    }
+
+    /// <summary>
+    /// The user moved the camera by hand - the wheel, a drag, a zoom key.  In
+    /// a file dialog the folder they bring it to is where the dialog is, as a
+    /// folder opened in Windows' own: Save writes there and Select Folder
+    /// answers it.  Told once the camera has come to rest, as the header is,
+    /// whether the header is shown or not.
+    /// </summary>
+    private void OnUserCameraMoved()
+    {
+        if (!_host.IsPickerMode)
+        {
+            return;
+        }
+
+        _movedByUser = true;
+        _headerTimer?.Stop();
+        _headerTimer?.Start();
+    }
+
+    /// <summary>How much of the view's width or height a folder takes up to be the one a file dialog's view rests on.</summary>
+    private const double FolderAtRestShare = 0.75;
+
+    /// <summary>
+    /// The folder a file dialog's view rests on once the user has moved it:
+    /// the innermost folder under the middle of the view that fills at least
+    /// three quarters of its width or of its height.  Either way round, so a
+    /// folder framed whole in a view far wider than it is tall counts, where
+    /// <see cref="NestedCanvas.FolderInView"/> - the folder covering all of
+    /// the view - would be its parent.  Null on This PC.
+    /// </summary>
+    private string? FolderAtRest()
+    {
+        var width = Canvas.ActualWidth;
+        var height = Canvas.ActualHeight;
+        if (!(width > 0) || !(height > 0) || Canvas.HitTest(new Point(width / 2, height / 2)) is not { } hit)
+        {
+            return null;
+        }
+
+        for (var folder = hit.Folder; folder is { IsComputer: false }; folder = folder.Parent)
+        {
+            if (Canvas.ScreenRectOf(folder) is { } cell
+                && (cell.Width >= width * FolderAtRestShare || cell.Height >= height * FolderAtRestShare))
+            {
+                return folder.FullPath;
+            }
+        }
+
+        return null;
     }
 
     // ---- the header ---------------------------------------------------------------
@@ -567,9 +774,9 @@ internal sealed class NestedPane
     /// finished later took the camera back to where nobody wanted it any
     /// more, and one that jumped there stopped the flight under way.</para>
     /// </summary>
-    public async Task FlyToAsync(string path, bool gentle, bool animated = true)
+    public async Task FlyToAsync(string path, bool gentle, bool animated = true, Func<bool>? requestCurrent = null, bool isDirectory = false)
     {
-        if (string.IsNullOrEmpty(path))
+        if (_detached || requestCurrent?.Invoke() == false || string.IsNullOrEmpty(path))
         {
             return;
         }
@@ -578,20 +785,39 @@ internal sealed class NestedPane
         FlightsUnderWay++;
         try
         {
-            var folderPath = Directory.Exists(path) ? path : Path.GetDirectoryName(path) ?? path;
-            var folder = await Tree.RevealAsync(folderPath);
-            if (folder is null && ticket == _flightTicket)
-            {
-                // A share or a WSL distribution the tree has only just added.
-                _host.SyncNestedRoots();
-                folder = await Tree.RevealAsync(folderPath);
-            }
+            // A folder invocation already validated this directory off the UI
+            // thread. Do not probe a network path synchronously a second time.
+            // A folder the tree already has is one too; anything else is asked
+            // about off the interface thread, where a share gone to sleep holds
+            // up this flight alone, not the window.
+            var folderPath = isDirectory || Tree.Find(path) is not null || await Task.Run(() => Directory.Exists(path))
+                ? path
+                : Path.GetDirectoryName(path) ?? path;
 
-            // Nowhere to go, or superseded: a flight asked for since is the one that counts.
-            if (folder is null || ticket != _flightTicket)
+            // Superseded while the disk was asked: nothing of this path is
+            // brought into the tree for a flight nobody wants any more.
+            if (_detached || ticket != _flightTicket || requestCurrent?.Invoke() == false)
             {
                 return;
             }
+
+            var folder = await Tree.MaterializePathAsync(folderPath);
+            if (folder is null && !_detached && ticket == _flightTicket && requestCurrent?.Invoke() != false)
+            {
+                // A share or a WSL distribution the tree has only just added.
+                _host.EnsureNestedLocation(this, folderPath);
+                folder = await Tree.MaterializePathAsync(folderPath);
+            }
+
+            // Nowhere to go, or superseded: a flight asked for since is the one that counts.
+            if (folder is null || _detached || ticket != _flightTicket || requestCurrent?.Invoke() == false)
+            {
+                return;
+            }
+
+            // A named destination may be a partial ancestor. Its own contents
+            // are requested explicitly while every other ancestor stays lazy.
+            _ = Tree.LoadAsync(folder);
 
             var view = new Rect(0, 0, Canvas.ActualWidth, Canvas.ActualHeight);
             if (Canvas.ScreenRectOf(folder) is { } rect)
@@ -615,6 +841,10 @@ internal sealed class NestedPane
             {
                 Canvas.FlyTo(folder, 0.8, animated);
             }
+            // Normal navigation defers other drive reads only until its
+            // destination is framed. Its later overview reads visible roots;
+            // a file picker continues to keep unvisited drive contents lazy.
+            if (!_host.IsPickerMode) Canvas.LoadUnfocusedRoots = true;
         }
         finally
         {
@@ -634,6 +864,7 @@ internal sealed class NestedPane
     /// <param name="animated">Whether the camera flies there or is simply there: a pane only just made has nothing to fly from.</param>
     public async Task OpenAsync(string folder, bool animated)
     {
+        if (_detached) return;
         if (IsActive)
         {
             await _viewModel.Tree.RevealPathAsync(folder);
@@ -655,6 +886,7 @@ internal sealed class NestedPane
         // After the pane's own entering, which a pane only just made has
         // waiting at this priority, and once it has its size.
         await Dispatcher.InvokeAsync(Canvas.UpdateLayout, DispatcherPriority.Loaded);
+        if (_detached) return;
         await FlyToAsync(folder, gentle: false, animated);
     }
 
@@ -672,7 +904,7 @@ internal sealed class NestedPane
     /// <param name="records">Whether going there is a step for Back and Forward.</param>
     public void Land(string path, bool isDirectory, long size, bool select, bool fly, bool records)
     {
-        if (IsActive)
+        if (_detached || IsActive)
         {
             return;
         }
@@ -689,7 +921,7 @@ internal sealed class NestedPane
         if (fly && IsNested && IsReady)
         {
             _cameraRestored = true;
-            _ = FlyToAsync(path, gentle: false);
+            _ = FlyToAsync(path, gentle: false, isDirectory: isDirectory);
         }
     }
 
@@ -726,7 +958,11 @@ internal sealed class NestedPane
             _applyingCanvasSelection = false;
         }
 
-        Canvas.AcknowledgeSelection(selection.Version);
+        // A single-file picker may clamp a range, marquee or Ctrl+A to one
+        // item. That normalized selection must also be what the tiles show.
+        if (Canvas.SelectedCount != selection.Count)
+            Canvas.LoadSelection(selection);
+        else Canvas.AcknowledgeSelection(selection.Version);
     }
 
     /// <summary>Any other change of the shared selection: the canvas takes it in, unless it is not the picture on show.</summary>
@@ -901,6 +1137,11 @@ internal sealed class NestedPane
     {
         if (hit.IsFile)
         {
+            if (_host.IsPickerMode)
+            {
+                _host.PickerFileOpened(hit.Path);
+                return;
+            }
             try
             {
                 if (await _viewModel.Tree.SelectPathAsync(hit.Path) is { } node)
@@ -917,6 +1158,7 @@ internal sealed class NestedPane
         }
 
         var folder = hit.Folder;
+        if (_host.IsPickerMode) _host.PickerFolderOpened(folder.FullPath);
         if (!folder.IsReparsePoint)
         {
             return;
@@ -1135,6 +1377,9 @@ internal sealed class NestedPane
     /// </summary>
     public void RebuildBeacons()
     {
+        Canvas.SetFavoriteLinks(_viewModel.QuickAccess.Where(item => !item.OpensInShell)
+            .Select(item => new NestedFavoriteLink(item.Path, item.Name,
+                TryParse(item.AccentHex, out var colour) ? colour : PinBeaconColour)).ToArray());
         var marks = _viewModel.IsLayerShown(CanvasLayer.Marks);
         var beacons = new Dictionary<string, (NestedBeaconKind Kind, Color Colour, string Label, string Note)>(StringComparer.OrdinalIgnoreCase);
 
@@ -1273,6 +1518,7 @@ internal sealed class NestedPane
                 }
 
                 var area = await tree.MaterializeAsync(folder);
+                if (_detached) return;
                 _host.ShowFolderAreaMenu(Canvas, area);
                 return;
             }
@@ -1393,6 +1639,7 @@ internal sealed class NestedPane
         foreach (var delay in new[] { 300, 1500 })
         {
             await Task.Delay(delay);
+            if (_detached) return;
             foreach (var parent in parents)
             {
                 await _viewModel.Tree.RefreshPathAsync(parent!);
@@ -1436,27 +1683,33 @@ internal sealed class NestedPane
         ((NestedCanvas)sender).DropTarget = null;
     }
 
-    private async void OnCanvasDrop(object sender, DragEventArgs e)
+    private void OnCanvasDrop(object sender, DragEventArgs e)
     {
         e.Handled = true;
+        e.Effects = DragDropEffects.None;
         var canvas = (NestedCanvas)sender;
         canvas.DropTarget = null;
-        var carriesPaths = _host.TryGetDropPaths(e.Data, out var paths);
-        _host.ForgetDropPaths();
-        if (!carriesPaths || ResolveDropTarget(canvas, e, paths) is not { } target)
+        try
         {
-            e.Effects = DragDropEffects.None;
-            return;
-        }
+            // Archive sources can replace their preview paths when extraction
+            // finishes on mouse release. Read the final list while Drop is active.
+            _host.ForgetDropPaths();
+            var carriesPaths = _host.TryGetDropPaths(e.Data, out var paths);
+            _host.ForgetDropPaths();
+            if (!carriesPaths || ResolveDropTarget(canvas, e, paths) is not { } target) return;
 
-        var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
-        e.Effects = MainWindow.ReportedDropEffect(effect);
-        if (effect == DragDropEffects.None)
+            var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
+            if (effect == DragDropEffects.None) return;
+
+            if (_host.CompleteExternalDrop(() => _viewModel.DropIntoPathWithResultAsync(
+                    paths, target.FullPath, move: effect == DragDropEffects.Move)))
+                e.Effects = MainWindow.ReportedDropEffect(effect);
+        }
+        catch (Exception error)
         {
-            return;
+            _host.ForgetDropPaths();
+            _viewModel.Toast.ShowError(error.Message);
         }
-
-        await _viewModel.DropIntoPathAsync(paths, target.FullPath, move: effect == DragDropEffects.Move);
     }
 
     /// <summary>

@@ -66,6 +66,9 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     private long _quietUntil;
     private bool _disposed;
 
+    /// <summary>Set while the wait for Everything is asking whether it is ready yet.</summary>
+    private bool _askingEverything;
+
     /// <param name="icons">Where the rows' icons come from.</param>
     /// <param name="reveal">Shows a path on the canvas: flies there and selects it.</param>
     /// <param name="open">Opens a path: a file in its program, a folder by going into it.  The second argument says whether it is a folder.</param>
@@ -90,7 +93,7 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         // While a walk stands in for an Everything that is starting or still
         // reading the drives, the search is made again once it can answer.
         _waitingForEverything = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(1.5) };
-        _waitingForEverything.Tick += (_, _) =>
+        _waitingForEverything.Tick += async (_, _) =>
         {
             if (!IsOpen || _source != SearchSource.Walk)
             {
@@ -98,7 +101,26 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
                 return;
             }
 
-            if (SearchEngine.EverythingReady)
+            // Asked off this thread, one look at a time: an Everything busy
+            // with a query takes up to a second to say whether it is ready,
+            // and the window would wait with it at every tick.
+            if (_askingEverything)
+            {
+                return;
+            }
+
+            bool ready;
+            _askingEverything = true;
+            try
+            {
+                ready = await Task.Run(() => SearchEngine.EverythingReady);
+            }
+            finally
+            {
+                _askingEverything = false;
+            }
+
+            if (ready && _waitingForEverything.IsEnabled && IsOpen && _source == SearchSource.Walk)
             {
                 _waitingForEverything.Stop();
                 _ = RunAsync();
@@ -408,20 +430,27 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         _folderSettling.Stop();
         IsBusy = true;
         var dispatcher = Dispatcher.CurrentDispatcher;
+        var from = _here;
         try
         {
-            await _engine.RunAsync(
-                query,
-                _here,
-                snapshot => dispatcher.InvokeAsync(
-                    () =>
-                    {
-                        if (!token.IsCancellationRequested && ReferenceEquals(_run, run))
+            // Started off this thread: before its first wait the engine asks
+            // Everything whether it is ready - up to a second when it is busy -
+            // and looks at the drives, and this is the window's thread, at
+            // every key.
+            await Task.Run(
+                () => _engine.RunAsync(
+                    query,
+                    from,
+                    snapshot => dispatcher.InvokeAsync(
+                        () =>
                         {
-                            Apply(snapshot, query);
-                        }
-                    },
-                    DispatcherPriority.Input),
+                            if (!token.IsCancellationRequested && ReferenceEquals(_run, run))
+                            {
+                                Apply(snapshot, query);
+                            }
+                        },
+                        DispatcherPriority.Input),
+                    token),
                 token);
         }
         catch (OperationCanceledException)
@@ -470,7 +499,18 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
                 elsewhereHeaderAdded = true;
             }
 
-            if (!_byPath.TryGetValue(hit.FullPath, out var result) || result.Place != hit.Place)
+            // The row of the search before is kept - its icon, its selection -
+            // only while it says what this one would: the same group, the
+            // parts this query matches, the same place from the folder
+            // searched now, the same size and date.
+            var segments = Segments(hit, query);
+            var location = LocationOf(hit, here, hereName);
+            if (!_byPath.TryGetValue(hit.FullPath, out var result)
+                || result.Place != hit.Place
+                || result.Location != location
+                || result.Size != hit.Size
+                || result.Modified != hit.Modified
+                || !result.NameSegments.SequenceEqual(segments))
             {
                 result = new SearchResultViewModel(
                     hit.Name,
@@ -480,8 +520,8 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
                     hit.Size,
                     hit.Modified,
                     hit.Place,
-                    Segments(hit, query),
-                    LocationOf(hit, here, hereName));
+                    segments,
+                    location);
                 if (_icons.GetCached(hit.FullPath, hit.IsFolder) is { } icon)
                 {
                     result.Icon = icon;
@@ -524,7 +564,7 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         OnPropertyChanged(nameof(IsWalking));
         OnPropertyChanged(nameof(OffersEverything));
 
-        if (snapshot.IsFinal && snapshot.Source == SearchSource.Walk)
+        if (snapshot.IsFinal && snapshot.Source == SearchSource.Walk && !snapshot.EverythingFailed)
         {
             _waitingForEverything.Start();
         }

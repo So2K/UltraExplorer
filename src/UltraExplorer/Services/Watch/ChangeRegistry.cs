@@ -183,6 +183,29 @@ internal sealed class ChangeRegistry
         }
     }
 
+    /// <summary>
+    /// Moves <paramref name="key"/>'s registrations to <paramref name="root"/>
+    /// when the root they are under was dropped - a volume taken out and put
+    /// back at its letter - and nobody has registered the path again since;
+    /// says how many went, none when the path was not under a dropped root.
+    /// </summary>
+    public RootMove Rehome(string key, WatchRoot root)
+    {
+        lock (_gate)
+        {
+            if (!_paths.TryGetValue(key, out var interest) || interest.Root is not { IsDropped: true } from || ReferenceEquals(from, root))
+            {
+                return default;
+            }
+
+            var moved = new RootMove(from, root, Items(interest.Nested).Count, Items(interest.List).Count + Items(interest.Graph).Count);
+            from.RemoveInterest(key);
+            interest.Root = root;
+            root.AddInterest(key);
+            return moved;
+        }
+    }
+
     /// <summary>Takes <paramref name="target"/>'s registration away; false when it had none.  Says which root the path was under.</summary>
     public bool Remove(ChangeConsumer consumer, string key, object target, out WatchRoot? root)
     {

@@ -73,6 +73,16 @@ public partial class MainWindow
             return;
         }
 
+        // Not for a share, a drive mapped to one or a WSL distribution: the
+        // Shell asks the server while it parses the items, which for one that
+        // has gone away holds the window for the network's timeout - forty
+        // seconds, measured - and a press that only meant to pan the canvas
+        // would wait it out.  Their menu is built on the release, as a click.
+        if (paths.Any(VolumeKinds.IsNetwork))
+        {
+            return;
+        }
+
         var extended = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
         var key = MenuKey(background, paths, extended);
         if (key == _preparedKey && (_preparedMenu is not null || _preparing is not null))
@@ -208,7 +218,15 @@ public partial class MainWindow
                 choice.Entry?.Execute();
                 return;
             case ShellMenuPick.Shell when !menu.IsBackground && string.Equals(choice.Verb, "rename", StringComparison.OrdinalIgnoreCase):
+                SelectMenuItem(menu);
                 _viewModel.RenameCommand.Execute(null);
+                return;
+            // Open on a folder goes into it here, as a double-click does.  The
+            // Shell's verb has no window of Explorer's here to open it in, and
+            // hands the folder to whatever opens folders - another window of
+            // the app's, or Explorer's.  Several folders are each the Shell's.
+            case ShellMenuPick.Shell when !menu.IsBackground && menu.Paths is [var opened] && IsFolderOpenVerb(choice.Verb) && IsMenuFolder(opened):
+                _ = _viewModel.Tree.RevealPathAsync(opened);
                 return;
             // New ▸ Shortcut starts Windows' own wizard, which names what it makes.
             case ShellMenuPick.Shell when choice.IsNew && menu.NewTarget is { } folder && !string.Equals(choice.Verb, "NewLink", StringComparison.OrdinalIgnoreCase):
@@ -220,6 +238,46 @@ public partial class MainWindow
                 menu.Invoke(choice, x, y);
                 return;
         }
+    }
+
+    /// <summary>The Shell's verbs that open a folder where it is shown: Open, and Explore with the folder tree beside it.</summary>
+    private static bool IsFolderOpenVerb(string verb) =>
+        string.Equals(verb, "open", StringComparison.OrdinalIgnoreCase) || string.Equals(verb, "explore", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Whether an item a menu is for is a folder: as the selection knows it, else as the disk says.</summary>
+    private bool IsMenuFolder(string path) =>
+        _viewModel.Tree.Selection.TryGetItem(path, out var item) ? item.IsDirectory : Directory.Exists(path);
+
+    /// <summary>
+    /// Makes the one item a menu is for the selection, unless it is all that
+    /// is selected already: the app's rename acts on the selection, and the
+    /// menu can be for something else - a search result, while the canvas
+    /// still has the result revealed before it - which picking Rename on
+    /// its menu would leave alone and rename the other.
+    /// </summary>
+    private void SelectMenuItem(ShellContextMenu menu)
+    {
+        var selection = _viewModel.Tree.Selection;
+        if (menu.Paths is not [var path] || (selection.Count == 1 && selection.Contains(path)))
+        {
+            return;
+        }
+
+        var isDirectory = Directory.Exists(path);
+        long size = 0;
+        if (!isDirectory)
+        {
+            try
+            {
+                size = new FileInfo(path).Length;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Gone or shut: the rename says so.
+            }
+        }
+
+        selection.ReplaceSingle(path, isDirectory, size, SelectionSource.Command);
     }
 
     /// <summary>What a folder holds, by full path; empty when it cannot be read.</summary>

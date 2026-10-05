@@ -1,4 +1,6 @@
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using UltraExplorer.Models;
 using UltraExplorer.Services.Watch;
 
@@ -21,17 +23,32 @@ public sealed partial class NestedTree : IChangeSink
     /// <summary>Folders the background walks after F5 or after a subtree was dropped take in one slice.</summary>
     private const int FoldersPerSweepSlice = 4096;
 
+    /// <summary>The renames each set of folder orders was last moved for (<see cref="FirstToMoveOrders"/>).</summary>
+    private static readonly ConditionalWeakTable<FolderOrders, RenamePair[]> OrdersMovedFor = new();
+
     private ChangeHub? _changes;
 
     /// <summary>
     /// Every folder registered with the hub, which is every folder read and
-    /// not dropped since: what a poll picks its folders from, and what is
-    /// taken off the hub again when the hub changes.
+    /// not dropped since, with the unlisted folders above one reached by
+    /// name: what a poll picks its folders from, and what is taken off the
+    /// hub again when the hub changes.
     /// </summary>
     private readonly HashSet<NestedFolder> _registered = [];
 
     /// <summary>Renames seen in a folder whose new listing has not been applied yet, by folder.</summary>
     private readonly Dictionary<NestedFolder, List<RenamePair>> _renames = [];
+
+    /// <summary>Named checks for disappeared descendants whose parents have never been listed.</summary>
+    private readonly HashSet<NestedFolder> _sparseGoneChecks = [];
+
+    /// <summary>
+    /// Folders whose own path went - removed, or renamed or moved away -
+    /// while their parent's listing still holds them: until a listing of the
+    /// parent drops them, or their name turns out to be another folder's now
+    /// (<see cref="CheckNameTakenAsync"/>).
+    /// </summary>
+    private readonly HashSet<NestedFolder> _goneByPath = [];
 
     /// <summary>Dropped folders whose read descendants are still to be taken off the hub, a slice at a time.</summary>
     private readonly Queue<NestedFolder> _droppedSweep = new();
@@ -305,12 +322,15 @@ public sealed partial class NestedTree : IChangeSink
     /// <item>the folder itself went: nothing, unless the view is on it or
     /// inside it, when its parent is read again at once so it leaves the
     /// screen - its parent's own change would be read only if the parent's
-    /// cell were drawn, and a cell bigger than the view never is.  Gone with
-    /// a folder above it, nothing at all: that folder's own change does it;</item>
+    /// cell were drawn, and a cell bigger than the view never is - and a
+    /// look at whether its name is a folder's again, which has it read
+    /// again if so.  Gone with a folder above it, nothing at all: that
+    /// folder's own change does it;</item>
     /// <item>files grew or were written to, and the hub knows their new sizes
     /// and times: those are put into the listing as they are, with no read;</item>
     /// <item>only a sub-folder's own date moved: nothing, unless the folders
-    /// are ordered by date, when that is a change like any other;</item>
+    /// are ordered by date, or the sub-folder was hidden or shown by its
+    /// attributes, when that is a change like any other;</item>
     /// <item>anything else: the folder is marked out of date, and if it was
     /// drawn in the last few frames it is queued to be read again at once, at
     /// the priority its size on screen gives it.  It is drawn as it was until
@@ -330,13 +350,37 @@ public sealed partial class NestedTree : IChangeSink
         var kinds = change.Kinds;
         if ((kinds & ChangeKinds.Gone) != 0)
         {
+            if (folder.Parent is { IsComputer: false, HasPartialListing: true, IsLoaded: false })
+            {
+                // A named navigation can have loaded the target without ever
+                // listing its parent. No later parent refresh can remove it.
+                // Verify only the known names rather than enumerate ancestors.
+                _ = CheckSparseGoneAsync(folder);
+                return;
+            }
+
             // Gone with a folder above it, the parent went too and cannot be
             // read: the folder that went is told by its own change, and its
             // parent - still there - is what is read again.
             if ((kinds & ChangeKinds.AncestorGone) == 0
-                && folder.Parent is { IsComputer: false } parent && parent.IsLoaded && IsInView(folder))
+                && folder.Parent is { IsComputer: false } parent && parent.IsLoaded)
             {
-                Refresh(parent);
+                if (IsInView(folder))
+                {
+                    Refresh(parent);
+                }
+
+                // The parent's listing matches its folders by name, so a name
+                // taken again - renamed away and made anew, two folders
+                // swapped - would keep this folder, with what was read of the
+                // one that went.  Asked about when the parent's next listing
+                // still holds it; at once only when nothing is on its way to
+                // the parent, whose listing may already be one taken since.
+                _goneByPath.Add(folder);
+                if (!parent.NeedsRefresh && parent.QueuedRead == ReadKind.None)
+                {
+                    _ = CheckNameTakenAsync(folder);
+                }
             }
 
             if ((kinds & ~(ChangeKinds.Gone | ChangeKinds.AncestorGone)) == 0)
@@ -347,13 +391,16 @@ public sealed partial class NestedTree : IChangeSink
 
         if (!change.Renames.IsEmpty && folder.IsLoaded)
         {
-            NoteRenames(folder, change.Renames.Span);
+            NoteRenames(folder, change.Renames);
         }
 
         // Files patched in place leave everything else as it was: not taken
         // when a sub-folder's own date moved in the same change and the
-        // folder is ordered by date, which only a read puts right.
-        var structural = (kinds & ChangeKinds.Structural) != 0;
+        // folder is ordered by date, which only a read puts right.  A
+        // sub-folder hidden or shown by its attributes comes as its date
+        // moving, and only a read puts it in or takes it out.
+        var structural = (kinds & ChangeKinds.Structural) != 0
+            || (kinds & ChangeKinds.DirDate) != 0 && HiddenChanged(folder, change.Folders.Span);
         var byDate = SortOf(folder).Column == SortColumn.Modified;
         if (!structural && (kinds & ChangeKinds.Content) != 0 && ((kinds & ChangeKinds.DirDate) == 0 || !byDate)
             && TryPatchFiles(folder, change.Files.Span))
@@ -367,7 +414,7 @@ public sealed partial class NestedTree : IChangeSink
         }
 
         folder.IsStale = true;
-        if (folder.IsLoaded && WasDrawnRecently(folder))
+        if ((folder.IsLoaded || folder.LoadState == NestedLoadState.Failed) && WasDrawnRecently(folder))
         {
             LiveRereadsAsked++;
             Request(folder, folder.LastDrawnWidth);
@@ -376,6 +423,107 @@ public sealed partial class NestedTree : IChangeSink
         {
             LiveMarkedOnly++;
         }
+    }
+
+    private async Task CheckSparseGoneAsync(NestedFolder folder)
+    {
+        if (!_sparseGoneChecks.Add(folder)) return;
+        try
+        {
+            var known = new List<NestedFolder> { folder };
+            for (var parent = folder.Parent; parent is { IsComputer: false, HasPartialListing: true };
+                 parent = parent.Parent)
+            {
+                // Drive roots are refreshed by the drive collection, not by
+                // a descendant disappearing from a removable or offline disk.
+                if (parent.Parent?.IsComputer == true) break;
+                known.Add(parent);
+            }
+
+            var stale = await _pathFileSystem.FindStaleAsync(known.Select(node => node.FullPath).ToArray(), _lifetimeToken);
+            if (_disposed || IsDetached(folder)) return;
+
+            for (var index = known.Count - 1; index >= 0; index--)
+            {
+                if (!stale[index]) continue;
+                var gone = known[index];
+                if (IsDetached(gone) || gone.Parent is not { IsComputer: false } parent) continue;
+                if (!parent.HasPartialListing || parent.IsLoaded)
+                {
+                    if (parent.IsLoaded && IsInView(gone)) Refresh(parent);
+                    return;
+                }
+
+                var at = Array.IndexOf(parent.AllChildren, gone);
+                if (at < 0) return;
+                var remaining = new NestedFolder[parent.AllChildren.Length - 1];
+                Array.Copy(parent.AllChildren, 0, remaining, 0, at);
+                Array.Copy(parent.AllChildren, at + 1, remaining, at, remaining.Length - at);
+                parent.AllChildren = remaining;
+                _knownCount--;
+                Forget(gone);
+                ApplyVisibleChildren(parent);
+                RaiseChanged();
+                return;
+            }
+
+            // A burst may remove and recreate the same path before the hub
+            // hands it over. Keep its identity, but reread its own listing.
+            folder.IsStale = true;
+            if (folder.IsLoaded && IsInView(folder)) Refresh(folder);
+        }
+        catch (OperationCanceledException) when (_disposed || _lifetimeToken.IsCancellationRequested)
+        {
+        }
+        finally
+        {
+            _sparseGoneChecks.Remove(folder);
+        }
+    }
+
+    /// <summary>
+    /// Whether the name of a folder whose own path went is a folder's again,
+    /// asked off this thread: if it is, the folder is read again as the one
+    /// now there (<see cref="TakeName"/>).  Asked whenever a listing of the
+    /// parent still holds the folder - a name taken seconds later, while
+    /// nothing drew the parent, is caught when the parent is next read.
+    /// </summary>
+    private async Task CheckNameTakenAsync(NestedFolder folder)
+    {
+        try
+        {
+            var stale = await _pathFileSystem.FindStaleAsync([folder.FullPath], _lifetimeToken);
+            if (!stale[0] && !_disposed && !IsDetached(folder) && _goneByPath.Contains(folder))
+            {
+                TakeName(folder);
+            }
+        }
+        catch (OperationCanceledException) when (_disposed || _lifetimeToken.IsCancellationRequested)
+        {
+        }
+    }
+
+    /// <summary>Asks again about the folders of <paramref name="parent"/> whose own path went and that its listing just applied still holds.</summary>
+    private void CheckNamesTaken(NestedFolder parent)
+    {
+        foreach (var gone in _goneByPath.ToArray())
+        {
+            if (ReferenceEquals(gone.Parent, parent))
+            {
+                _ = CheckNameTakenAsync(gone);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The folder's name is another folder's now: what was read in it and
+    /// below it belongs to the one that went, so it is read again at once,
+    /// and what was read below it as it is drawn, as F5 does.
+    /// </summary>
+    private void TakeName(NestedFolder folder)
+    {
+        _goneByPath.Remove(folder);
+        RefreshDeep(folder);
     }
 
     /// <summary>
@@ -446,6 +594,27 @@ public sealed partial class NestedTree : IChangeSink
         _batch.Applied.Add(folder);
         Driver.Wake();
         return true;
+    }
+
+    /// <summary>
+    /// Whether a sub-folder whose own entry changed is hidden now where the
+    /// listing has it shown, or shown where it has it hidden: hidden or shown
+    /// by its attributes - attrib +h, the Hidden box in Properties - which the
+    /// watch tells only as its date moving.  A binary search per sub-folder
+    /// the change names, eight at most.
+    /// </summary>
+    private static bool HiddenChanged(NestedFolder folder, ReadOnlySpan<FileDelta> folders)
+    {
+        foreach (var delta in folders)
+        {
+            if (FindChild(folder, delta.Name) is { } child
+                && child.IsHidden != ((delta.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     // ---- F5 -------------------------------------------------------------------------------
@@ -529,17 +698,24 @@ public sealed partial class NestedTree : IChangeSink
 
     /// <summary>
     /// A successful read was applied.  A folder renamed in it takes the listing
-    /// it had under its old name; the folder is registered with the hub, if it
-    /// was not already; and a refresh tells the hub what it cost and whether
-    /// anything changed, which sets how soon the folder may be read again and,
-    /// on a share, whether to look once more in case the share's cache was
-    /// behind.  Then the soft-update capture.
+    /// it had under its old name; one whose own path went and that it still
+    /// holds is asked about again, in case its name was taken; the folder is
+    /// registered with the hub, if it was not already; and a refresh tells
+    /// the hub what it cost and whether anything changed, which sets how soon
+    /// the folder may be read again and, on a share, whether to look once
+    /// more in case the share's cache was behind.  Then the soft-update
+    /// capture.
     /// </summary>
     partial void AfterApply(NestedFolder folder, ReadResult result)
     {
         if (_renames.Count > 0 && _renames.TryGetValue(folder, out var renames))
         {
             CarryOverRenames(folder, result, renames);
+        }
+
+        if (_goneByPath.Count > 0)
+        {
+            CheckNamesTaken(folder);
         }
 
         Register(folder);
@@ -555,6 +731,16 @@ public sealed partial class NestedTree : IChangeSink
         _filesBeforeApply = [];
         CaptureAfterApply(folder, result);
     }
+
+    /// <summary>
+    /// A folder's first read was queued: it is registered with the hub now,
+    /// not once the read is applied.  A file written after the listing was
+    /// taken and before it is applied - a download finishing, an archive
+    /// unpacking its last file - then marks the folder stale, and it is read
+    /// again, where before it was dropped as a change in a folder nobody
+    /// watched and never shown.
+    /// </summary>
+    partial void OnFirstReadQueued(NestedFolder folder) => Register(folder);
 
     /// <summary>
     /// The soft-update capture before a successful read is applied
@@ -580,6 +766,7 @@ public sealed partial class NestedTree : IChangeSink
     partial void OnForgotten(NestedFolder folder)
     {
         _renames.Remove(folder);
+        _goneByPath.Remove(folder);
         if (_registered.Remove(folder))
         {
             _changes?.Unregister(ChangeConsumer.Nested, folder.FullPath, folder);
@@ -608,6 +795,10 @@ public sealed partial class NestedTree : IChangeSink
                     _changes?.Unregister(ChangeConsumer.Nested, child.FullPath, child);
                 }
 
+                // A rename waiting for a listing that will never come would
+                // keep the folder, and the branch it is in, alive.
+                _renames.Remove(child);
+                _goneByPath.Remove(child);
                 if (child.AllChildren.Length > 0)
                 {
                     _droppedSweep.Enqueue(child);
@@ -637,9 +828,27 @@ public sealed partial class NestedTree : IChangeSink
 
     private void Register(NestedFolder folder)
     {
-        if (_changes is { } hub && _registered.Add(folder))
+        if (_changes is not { } hub)
+        {
+            return;
+        }
+
+        if (_registered.Add(folder))
         {
             hub.Register(ChangeConsumer.Nested, folder.FullPath, folder);
+        }
+
+        // A folder reached by name hangs below folders that were never
+        // listed, which nothing else registers: one of them renamed, moved
+        // or recycled would take the folder with it unheard.  Registered, its
+        // own path going is heard, and checked as for any folder named below
+        // an unlisted one (CheckSparseGoneAsync).  The drive or root at the
+        // top is the drive list's to keep.
+        for (var parent = folder.Parent;
+             parent is { IsComputer: false, HasPartialListing: true, IsLoaded: false, Parent.IsComputer: false } && _registered.Add(parent);
+             parent = parent.Parent)
+        {
+            hub.Register(ChangeConsumer.Nested, parent.FullPath, parent);
         }
     }
 
@@ -698,7 +907,7 @@ public sealed partial class NestedTree : IChangeSink
     /// a handful at most; a renamed sub-folder's own order, if it has one,
     /// goes to its new name at once (<see cref="FolderOrders.Move"/>).
     /// </summary>
-    private void NoteRenames(NestedFolder folder, ReadOnlySpan<RenamePair> pairs)
+    private void NoteRenames(NestedFolder folder, ReadOnlyMemory<RenamePair> pairs)
     {
         if (!_renames.TryGetValue(folder, out var noted))
         {
@@ -706,7 +915,8 @@ public sealed partial class NestedTree : IChangeSink
             _renames[folder] = noted;
         }
 
-        foreach (var pair in pairs)
+        var moveOrders = _orders.Count > 0 && FirstToMoveOrders(pairs);
+        foreach (var pair in pairs.Span)
         {
             if (noted.Count < 16)
             {
@@ -720,11 +930,34 @@ public sealed partial class NestedTree : IChangeSink
             // and a name no order has is nothing to move.  Only a name the
             // listing has as a file is left out: its rename is no business
             // of the orders, and a lookup by name says which it is.
-            if (_orders.Count > 0 && !HoldsFile(folder, pair.OldName))
+            if (moveOrders && !HoldsFile(folder, pair.OldName))
             {
                 _orders.Move(Path.Combine(folder.FullPath, pair.OldName), Path.Combine(folder.FullPath, pair.NewName));
             }
         }
+    }
+
+    /// <summary>
+    /// Whether the orders are still to be moved for <paramref name="pairs"/>.
+    /// The panes of a split view share one set of orders, and each pane's
+    /// tree is handed the very same change - the same renames - so the first
+    /// tree to hear it moves them and the others leave them be: a rotation of
+    /// names, B to C and A to B, moved twice would give C the order A had.
+    /// </summary>
+    private bool FirstToMoveOrders(ReadOnlyMemory<RenamePair> pairs)
+    {
+        if (!MemoryMarshal.TryGetArray(pairs, out var segment) || segment.Array is not { } array)
+        {
+            return true;
+        }
+
+        if (OrdersMovedFor.TryGetValue(_orders, out var moved) && ReferenceEquals(moved, array))
+        {
+            return false;
+        }
+
+        OrdersMovedFor.AddOrUpdate(_orders, array);
+        return true;
     }
 
     /// <summary>
@@ -735,7 +968,8 @@ public sealed partial class NestedTree : IChangeSink
     /// path, unread - and is marked out of date, so it is drawn as it was at
     /// once and read again when it is drawn.  Renames the listing just applied
     /// does not show yet - a read that began before the rename - wait for the
-    /// next one.
+    /// next one.  A new name the listing keeps a folder already read under -
+    /// the name was another's, which went first - has that folder read again.
     /// </summary>
     private void CarryOverRenames(NestedFolder parent, ReadResult result, List<RenamePair> renames)
     {
@@ -756,6 +990,15 @@ public sealed partial class NestedTree : IChangeSink
 
             renames.RemoveAt(index);
             var renamed = FindChild(parent, pair.NewName);
+            if (renamed is { LoadState: NestedLoadState.Loaded or NestedLoadState.Failed })
+            {
+                // The new name was a folder's that went first - an updater's
+                // swap, current to old and new to current - and what was
+                // read under it is that folder's.
+                TakeName(renamed);
+                continue;
+            }
+
             if (!old.IsLoaded
                 || renamed is not { LoadState: NestedLoadState.NotLoaded, QueuedRead: ReadKind.None }
                 || renamed.IsReparsePoint != old.IsReparsePoint)

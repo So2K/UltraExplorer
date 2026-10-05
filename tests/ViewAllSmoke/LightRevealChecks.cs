@@ -129,14 +129,18 @@ internal static partial class Program
                 middleNode!.AreChildrenLoaded && middleNode.Children.Count == 4
                 && middleNode.Children.Select(child => child.FullPath).Distinct(StringComparer.OrdinalIgnoreCase).Count() == 4);
 
+            // Compared under the check's own folder, from where that folder
+            // sits: the folders above it are the temp folder and its parents,
+            // which other programs fill and empty between the two reads, and
+            // every folder made there moves everything after it.
             using (var full = NewTree(scratch, icons))
             {
                 await full.InitializeAsync(drive);
                 await full.RevealPathAsync(inner, focus: false);
-                var expected = Placed(full.Roots);
-                var actual = Placed(light.Roots);
-                Check("and the tree it ends up with is the one the full reveal builds",
-                    expected.Count == actual.Count
+                var expected = PlacedUnder(full, root);
+                var actual = PlacedUnder(light, root);
+                Check($"and the tree it ends up with is the one the full reveal builds ({actual.Count} placed under the check's folder)",
+                    expected.Count > 0 && expected.Count == actual.Count
                     && expected.All(pair => actual.TryGetValue(pair.Key, out var at) && (at - pair.Value).Length < 1e-6));
             }
 
@@ -348,10 +352,23 @@ internal static partial class Program
     private static int CountNodes(IEnumerable<ViewAllNodeViewModel> roots, bool visibleOnly = false)
         => Everything(roots).Count(node => !visibleOnly || node.IsTreeVisible);
 
-    private static Dictionary<string, Point> Placed(IEnumerable<ViewAllNodeViewModel> roots)
-        => Everything(roots)
+    /// <summary>
+    /// Where each node on the tree at or under <paramref name="top"/> sits,
+    /// measured from <paramref name="top"/>'s own node: a folder's block is
+    /// laid out from its own corner, so this is the same whatever is beside
+    /// it or above it.
+    /// </summary>
+    private static Dictionary<string, Vector> PlacedUnder(ViewAllViewModel tree, string top)
+    {
+        if (!tree.TryGetNode(top, out var anchor) || !anchor.IsTreeVisible || !anchor.HasLayoutPosition)
+        {
+            return [];
+        }
+
+        return Everything([anchor])
             .Where(node => node.IsTreeVisible && node.HasLayoutPosition)
-            .ToDictionary(node => node.FullPath, node => node.Location, StringComparer.OrdinalIgnoreCase);
+            .ToDictionary(node => node.FullPath, node => node.Location - anchor.Location, StringComparer.OrdinalIgnoreCase);
+    }
 
     private static IEnumerable<ViewAllNodeViewModel> Ancestors(ViewAllNodeViewModel node)
     {

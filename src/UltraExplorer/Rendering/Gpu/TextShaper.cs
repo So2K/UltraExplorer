@@ -292,7 +292,10 @@ internal sealed class TextShaper
     /// True when the direct path cannot be right for this text whatever the
     /// font holds: right-to-left scripts and bidi controls need the bidi
     /// algorithm, and surrogate pairs are emoji and rare scripts that come
-    /// from fallback fonts.
+    /// from fallback fonts.  A soft hyphen too: GetGlyphs gives it the
+    /// hyphen's glyph and advance, where the layout - like WPF and Explorer -
+    /// shows nothing for one that does not end a line, which in a name it
+    /// never does.
     /// </summary>
     private static bool NeedsLayout(string text)
     {
@@ -300,6 +303,11 @@ internal sealed class TextShaper
         {
             if (character < 0x0590)
             {
+                if (character == '\u00AD')
+                {
+                    return true;
+                }
+
                 continue;
             }
 
@@ -469,7 +477,9 @@ internal sealed class TextShaper
     /// </summary>
     private static class ShapingWorker
     {
-        private static readonly BlockingCollection<ShapeJob> Jobs = new(new ConcurrentQueue<ShapeJob>());
+        /// <summary>The queue under <see cref="Jobs"/>, read by the worker alone to see whose job comes next.</summary>
+        private static readonly ConcurrentQueue<ShapeJob> Queue = new();
+        private static readonly BlockingCollection<ShapeJob> Jobs = new(Queue);
         private static readonly Lazy<Thread> Worker = new(Start, LazyThreadSafetyMode.ExecutionAndPublication);
 
         public static void Post(ShapeJob job)
@@ -519,7 +529,12 @@ internal sealed class TextShaper
                     owner.Deliver(new ShapeKey(text, job.Face), shaped);
                 }
 
-                if (Jobs.Count == 0 || job.Texts.Count > 1)
+                // A run of one shaper's single names wakes its canvas once, at
+                // its end; every shaper shares this queue, so the run ends when
+                // the next job is another shaper's too - a split view's other
+                // pane, another window - or that canvas would never be woken
+                // for the names it is waiting on.
+                if (job.Texts.Count > 1 || !Queue.TryPeek(out var next) || !ReferenceEquals(next.Owner, owner))
                 {
                     owner.RaiseArrived();
                 }

@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.IO.Enumeration;
+using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Services.Search;
 
@@ -30,6 +31,9 @@ internal sealed class FolderWalk
     private int _hits;
     private long _foldersRead;
     private int _outstanding;
+
+    /// <summary>Set once a folder's failure has been written to the log (see <see cref="Work"/>).</summary>
+    private int _failureLogged;
 
     public FolderWalk(SearchQuery query, int maximum)
     {
@@ -68,7 +72,7 @@ internal sealed class FolderWalk
         return Task.Factory.StartNew(
             () =>
             {
-                if (first is not null && Directory.Exists(first))
+                if (first is not null && Directory.Exists(ExtendedLength(first)))
                 {
                     Walk([first], excluded, cancellationToken);
                     excluded.Add(Trim(first));
@@ -140,6 +144,17 @@ internal sealed class FolderWalk
             {
                 List(folder, excluded, cancellationToken);
             }
+            catch (Exception exception)
+            {
+                // Whatever else one folder throws, it costs that folder only:
+                // on this thread an exception nobody catches ends the process,
+                // and every window with it.  Written down the first time, so a
+                // walk that meets many such folders does not fill the log.
+                if (Interlocked.Exchange(ref _failureLogged, 1) == 0)
+                {
+                    CrashReporter.Log($"search walk: a folder could not be read ({folder})", exception);
+                }
+            }
             finally
             {
                 Interlocked.Decrement(ref _outstanding);
@@ -152,19 +167,21 @@ internal sealed class FolderWalk
         Interlocked.Increment(ref _foldersRead);
         try
         {
+            // Listed by its extended-length name, and its hits put in the
+            // folder as it is spelled everywhere else.
             var entries = new FileSystemEnumerable<Entry>(
-                folder,
+                ExtendedLength(folder),
                 static (ref FileSystemEntry entry) => new Entry(
                     entry.FileName.ToString(),
                     entry.IsDirectory,
-                    (entry.Attributes & FileAttributes.ReparsePoint) != 0,
+                    entry.IsDirectory && (entry.Attributes & FileAttributes.ReparsePoint) != 0 && IsLink(ref entry),
                     entry.IsDirectory ? -1 : entry.Length,
-                    entry.LastWriteTimeUtc.LocalDateTime),
+                    Modified(ref entry)),
                 Options)
             {
                 // Strings only for what is needed: a match, or a folder to go into.
                 ShouldIncludePredicate = (ref FileSystemEntry entry) =>
-                    entry.IsDirectory || _query.Matches(entry.FileName, entry.Directory, isFolder: false),
+                    entry.IsDirectory || _query.Matches(entry.FileName, folder, isFolder: false),
             };
 
             foreach (var entry in entries)
@@ -204,6 +221,71 @@ internal sealed class FolderWalk
         }
     }
 
+    /// <summary>
+    /// Whether a folder with a reparse point is a link - a junction, a symbolic
+    /// link, a mount point - rather than a cloud placeholder (OneDrive files
+    /// on demand: Documents and Desktop, once moved there) or a projected
+    /// folder, which carry the same attribute but are ordinary folders to
+    /// walk.  Only links report a target; as <see cref="NestedDirectoryReader"/>
+    /// decides it for the canvas.
+    /// </summary>
+    private static bool IsLink(ref FileSystemEntry entry)
+    {
+        try
+        {
+            return entry.ToFileSystemInfo().LinkTarget is not null;
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// The path in its extended-length form for a local drive or a share
+    /// (<c>\\server\share\...</c> as <c>\\?\UNC\server\share\...</c>).
+    /// Without it the enumerator normalises the path, which strips a trailing
+    /// dot or space - and a folder named "dup." would be listed as its twin
+    /// "dup", one named "lone " as nothing.  A path in either form already,
+    /// or a device's, is left as it is.  As <see cref="NestedDirectoryReader"/>
+    /// reads its folders.
+    /// </summary>
+    private static string ExtendedLength(string path)
+    {
+        if (path.Length >= 3 && path[1] == ':' && path[2] == Path.DirectorySeparatorChar)
+        {
+            return @"\\?\" + path;
+        }
+
+        if (path.Length > 2 && path[0] == Path.DirectorySeparatorChar && path[1] == Path.DirectorySeparatorChar
+            && !(path.Length > 3 && path[2] is ('?' or '.') && path[3] == Path.DirectorySeparatorChar))
+        {
+            return @"\\?\UNC\" + path[2..];
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// An entry's last-write time, local, or null - no date, as Everything
+    /// gives for one it does not know - when it is past what a date can hold:
+    /// a tool or a damaged volume can leave such a time on a file, and reading
+    /// it throws, which would end the walk and the process every time a search
+    /// came to that folder.  As <see cref="NestedDirectoryReader"/>'s
+    /// WriteTicks does for the canvas.
+    /// </summary>
+    private static DateTime? Modified(ref FileSystemEntry entry)
+    {
+        try
+        {
+            return entry.LastWriteTimeUtc.LocalDateTime;
+        }
+        catch (ArgumentOutOfRangeException)
+        {
+            return null;
+        }
+    }
+
     private void Add(SearchHit hit)
     {
         if (Interlocked.Increment(ref _hits) <= _maximum)
@@ -212,5 +294,5 @@ internal sealed class FolderWalk
         }
     }
 
-    private readonly record struct Entry(string Name, bool IsFolder, bool IsLink, long Size, DateTime Modified);
+    private readonly record struct Entry(string Name, bool IsFolder, bool IsLink, long Size, DateTime? Modified);
 }

@@ -18,11 +18,16 @@ public sealed partial class NestedCanvas
     /// </summary>
     public bool SmoothMotion { get; set; }
 
+    // A named camera move may still be reading when the user chooses another
+    // destination. Only the latest request may apply its result.
+    private long _cameraRequest;
+
     // ---- camera --------------------------------------------------------------
 
     /// <summary>Shows all of This PC.</summary>
     public void FitAll(bool animated = true)
     {
+        _cameraRequest++;
         if (_tree is null)
         {
             return;
@@ -46,10 +51,7 @@ public sealed partial class NestedCanvas
         {
             StopFlight();
             _anchor = _tree.Root;
-            var width = FitWidth();
-            _aw = width;
-            _ax = (_viewWidth - width) / 2;
-            _ay = (_viewHeight - width * NestedLayout.CellHeight) / 2;
+            (_ax, _ay, _aw) = OverviewFitRect();
             _hasCamera = true;
             _cameraTouched = true;
             AfterCameraMove();
@@ -73,7 +75,7 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        return FlyToRect(target, FitRect(fill), animated);
+        return FlyToRect(target, target.IsComputer && fill >= 1 ? OverviewFitRect() : FitRect(fill), animated);
     }
 
     /// <summary>Moves the camera so <paramref name="target"/> ends up exactly at <paramref name="end"/> on screen.</summary>
@@ -81,11 +83,13 @@ public sealed partial class NestedCanvas
     {
         EnsureCamera();
         var current = ScreenRectOf(target);
-        if (current is null || _viewWidth <= 0 || !(end.W > 0) || double.IsInfinity(end.W))
+        if (current is null || _viewWidth <= 0 || !(end.W > 0)
+            || !double.IsFinite(end.X) || !double.IsFinite(end.Y) || !double.IsFinite(end.W))
         {
             return false;
         }
 
+        _cameraRequest++;
         if (!animated)
         {
             StopFlight();
@@ -148,13 +152,14 @@ public sealed partial class NestedCanvas
     /// <summary>Reads everything on the way to <paramref name="path"/>, then flies to it.</summary>
     public async Task<bool> FlyToPathAsync(string path, double fill = 0.72, bool animated = true)
     {
-        if (_tree is null)
+        if (_tree is not { } tree)
         {
             return false;
         }
 
-        var folder = await _tree.RevealAsync(path);
-        if (folder is null)
+        var request = ++_cameraRequest;
+        var folder = await tree.RevealAsync(path);
+        if (folder is null || !ReferenceEquals(tree, _tree) || request != _cameraRequest)
         {
             return false;
         }
@@ -165,12 +170,17 @@ public sealed partial class NestedCanvas
     /// <summary>Zooms by <paramref name="factor"/> keeping the point under <paramref name="at"/> still.</summary>
     public void ZoomAt(Point at, double factor)
     {
+        if (!(factor > 0) || !double.IsFinite(factor) || !double.IsFinite(at.X) || !double.IsFinite(at.Y))
+            return;
         EnsureCamera();
-        if (_anchor is null)
+        if (_anchor is null || !double.IsFinite(_aw * factor)
+            || !double.IsFinite(at.X + (_ax - at.X) * factor)
+            || !double.IsFinite(at.Y + (_ay - at.Y) * factor))
         {
             return;
         }
 
+        _cameraRequest++;
         StopFlight();
         ZoomAround(at, factor);
         Normalize();
@@ -184,12 +194,14 @@ public sealed partial class NestedCanvas
 
     public void Pan(Vector delta)
     {
+        if (!double.IsFinite(delta.X) || !double.IsFinite(delta.Y)) return;
         EnsureCamera();
-        if (_anchor is null)
+        if (_anchor is null || !double.IsFinite(_ax + delta.X) || !double.IsFinite(_ay + delta.Y))
         {
             return;
         }
 
+        _cameraRequest++;
         StopFlight();
         _ax += delta.X;
         _ay += delta.Y;
@@ -226,11 +238,13 @@ public sealed partial class NestedCanvas
     /// </summary>
     public async Task RestoreCameraAsync(NestedCameraState state)
     {
-        if (_tree is not { } tree || !(state.Width > 0) || double.IsInfinity(state.Width))
+        if (_tree is not { } tree || !(state.Width > 0)
+            || !double.IsFinite(state.Width) || !double.IsFinite(state.X) || !double.IsFinite(state.Y))
         {
             return;
         }
 
+        var request = ++_cameraRequest;
         _cameraTouched = false;
         var isRoot = string.IsNullOrWhiteSpace(state.AnchorPath);
         var folder = isRoot ? tree.Root : await tree.RevealAsync(state.AnchorPath);
@@ -239,6 +253,7 @@ public sealed partial class NestedCanvas
         // read: a folder of the old one is no camera for it.
         if (folder is null
             || !ReferenceEquals(tree, _tree)
+            || request != _cameraRequest
             || _cameraTouched
             || !isRoot && !ViewAllPath.Equals(folder.FullPath, state.AnchorPath)
             || _viewWidth <= 0)
@@ -246,11 +261,16 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        var width = state.Width * _viewWidth;
+        var x = _viewWidth / 2 + state.X * _viewWidth;
+        var y = _viewHeight / 2 + state.Y * _viewWidth;
+        if (!double.IsFinite(width) || !double.IsFinite(x) || !double.IsFinite(y)) return;
+
         StopFlight();
         _anchor = folder;
-        _aw = state.Width * _viewWidth;
-        _ax = _viewWidth / 2 + state.X * _viewWidth;
-        _ay = _viewHeight / 2 + state.Y * _viewWidth;
+        _aw = width;
+        _ax = x;
+        _ay = y;
         _hasCamera = true;
         Normalize();
         ClampZoom(new Point(_viewWidth / 2, _viewHeight / 2));
@@ -323,23 +343,21 @@ public sealed partial class NestedCanvas
         }
 
         _anchor = _tree.Root;
-        var width = FitWidth();
-        _aw = width;
-        _ax = (_viewWidth - width) / 2;
-        _ay = (_viewHeight - width * NestedLayout.CellHeight) / 2;
+        (_ax, _ay, _aw) = OverviewFitRect();
         _hasCamera = true;
     }
 
     private double FitWidth()
     {
         const double margin = 18;
-        return Math.Max(40, Math.Min(_viewWidth - 2 * margin, (_viewHeight - 2 * margin) * NestedLayout.Aspect));
+        return Math.Max(40, Math.Min(_viewWidth - 2 * margin,
+            (_viewHeight - 2 * margin) / (NestedLayout.CellHeight + FavoriteStripHeight)));
     }
 
     private (double X, double Y, double W) FitRect(double fill)
     {
         var width = fill >= 1
-            ? FitWidth()
+            ? Math.Max(40, Math.Min(_viewWidth - 36, (_viewHeight - 36) * NestedLayout.Aspect))
             : Math.Min(_viewWidth * fill, _viewHeight * fill * NestedLayout.Aspect);
         return ((_viewWidth - width) / 2, (_viewHeight - width * NestedLayout.CellHeight) / 2, width);
     }
@@ -471,7 +489,8 @@ public sealed partial class NestedCanvas
         var dy = 0.0;
         if (rect.X > _viewWidth - keep) dx = _viewWidth - keep - rect.X;
         if (rect.X + rect.W < keep) dx = keep - rect.X - rect.W;
-        if (rect.Y > _viewHeight - keep) dy = _viewHeight - keep - rect.Y;
+        var top = rect.Y - rect.W * FavoriteStripHeight;
+        if (top > _viewHeight - keep) dy = _viewHeight - keep - top;
         if (rect.Y + height < keep) dy = keep - rect.Y - height;
         if (dx != 0 || dy != 0)
         {

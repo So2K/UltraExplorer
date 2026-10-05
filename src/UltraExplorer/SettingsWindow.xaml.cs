@@ -88,6 +88,19 @@ public partial class SettingsWindow : Window
 
     private void CloseButton_Click(object sender, RoutedEventArgs e) => Close();
 
+    /// <summary>
+    /// A click on the way of splitting already chosen splits the view too, as
+    /// a click on the other one does: a radio button already checked tells its
+    /// binding nothing, so while the view was not split the click did nothing.
+    /// </summary>
+    private void SplitOrientation_Click(object sender, RoutedEventArgs e)
+    {
+        if (Settings.CanChooseLayout)
+        {
+            Settings.IsSplit = true;
+        }
+    }
+
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr windowHandle, int attribute, ref int value, int valueSize);
 }

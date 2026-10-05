@@ -1,3 +1,4 @@
+using System.Buffers;
 using SharpGen.Runtime;
 using Vortice.DCommon;
 using Vortice.DirectWrite;
@@ -46,7 +47,7 @@ internal sealed class TextLayoutCapture : TextRendererBase
         using (var format = _faces.Factory.CreateTextFormat(info.FamilyName, _faces.Collection, info.Weight, info.Style, info.Stretch, LayoutSize, locale))
         {
             format.WordWrapping = WordWrapping.NoWrap;
-            using var layout = _faces.Factory.CreateTextLayout(text, format, 1e7f, 1e7f);
+            using var layout = _faces.Factory.CreateTextLayout(OneLine(text), format, 1e7f, 1e7f);
             layout.Draw(IntPtr.Zero, this, 0, 0);
             if (_failed)
             {
@@ -55,6 +56,36 @@ internal sealed class TextLayoutCapture : TextRendererBase
 
             return Build(text, face, info, layout.Metrics.Width / LayoutSize);
         }
+    }
+
+    /// <summary>
+    /// The characters DirectWrite always breaks a line at, even with
+    /// wrapping off.  A file name may hold U+0085 or U+2028/2029; laid out as
+    /// they are, what follows starts a second line at the left, and only the
+    /// runs' left edges are kept - its glyphs would be drawn over the start
+    /// of the name, and the width would be the first line's alone.
+    /// </summary>
+    private static readonly SearchValues<char> LineBreaks = SearchValues.Create(['\n', '\v', '\f', '\r', (char)0x0085, (char)0x2028, (char)0x2029]);
+
+    /// <summary>
+    /// The text with every line break a space: one line, as a name is shown,
+    /// and of the same length, so the clusters still point at the name's own
+    /// characters.
+    /// </summary>
+    private static string OneLine(string text)
+    {
+        if (text.AsSpan().IndexOfAny(LineBreaks) < 0)
+        {
+            return text;
+        }
+
+        return string.Create(text.Length, text, static (line, source) =>
+        {
+            for (var index = 0; index < source.Length; index++)
+            {
+                line[index] = LineBreaks.Contains(source[index]) ? ' ' : source[index];
+            }
+        });
     }
 
     public override void DrawGlyphRun(nint clientDrawingContext, float baselineOriginX, float baselineOriginY, MeasuringMode measuringMode, GlyphRun glyphRun, GlyphRunDescription glyphRunDescription, IUnknown clientDrawingEffect)

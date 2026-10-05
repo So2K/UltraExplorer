@@ -496,6 +496,8 @@ public static class ViewAllPath
     /// Paste and Rename acted on <c>C:\data\john</c> for
     /// <c>C:\data\%USERNAME%</c>.  What a person types is expanded where it
     /// is typed: the address bar and the file dialog's name box.
+    ///
+    /// <para>A name ending in a dot or a space keeps it (see <see cref="KeepNameEnds"/>).</para>
     /// </summary>
     public static string Normalize(string path)
     {
@@ -509,7 +511,77 @@ public static class ViewAllPath
             return root;
         }
 
-        return fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return KeepNameEnds(path, fullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+    }
+
+    /// <summary>
+    /// <paramref name="normalized"/>, the full form of <paramref name="path"/>,
+    /// with each name spelt as <paramref name="path"/> spells it.  Normalising
+    /// drops a dot or a space at the end of a name - "backup." becomes
+    /// "backup", "notes " becomes "notes" - and a folder of either name, which
+    /// a WSL tree, git or a share can leave, would be taken for its neighbour,
+    /// or for none.  Only where that is all normalising changed: a path it had
+    /// more to do for - one that is relative, quoted, already in the
+    /// extended-length form, or names "." or ".." - keeps the normalised form.
+    /// </summary>
+    public static string KeepNameEnds(string path, string normalized)
+    {
+        if (!EndsANameInDotOrSpace(path) || !Path.IsPathFullyQualified(path) || path.Contains('"')
+            || path.StartsWith(@"\\?\", StringComparison.Ordinal) || path.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            return normalized;
+        }
+
+        char[] separators = [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar];
+        var spelt = path.Split(separators, StringSplitOptions.RemoveEmptyEntries);
+        var names = normalized.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        if (spelt.Length != names.Length)
+        {
+            return normalized;
+        }
+
+        var changed = false;
+        for (var index = 0; index < names.Length; index++)
+        {
+            var name = names[index];
+            var own = spelt[index];
+            if (string.Equals(own, name, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (own is "." or ".." || !own.StartsWith(name, StringComparison.Ordinal)
+                || own.AsSpan(name.Length).ContainsAnyExcept('.', ' '))
+            {
+                return normalized;
+            }
+
+            names[index] = own;
+            changed = true;
+        }
+
+        if (!changed)
+        {
+            return normalized;
+        }
+
+        var joined = string.Join(Path.DirectorySeparatorChar, names);
+        return normalized.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\" + joined : joined;
+    }
+
+    /// <summary>Whether any name in the path ends in a dot or a space - the ones normalising may cut off.</summary>
+    public static bool EndsANameInDotOrSpace(string path)
+    {
+        for (var index = 0; index < path.Length; index++)
+        {
+            if (path[index] is '.' or ' '
+                && (index == path.Length - 1 || path[index + 1] is '\\' or '/'))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     public static bool Equals(string left, string right)

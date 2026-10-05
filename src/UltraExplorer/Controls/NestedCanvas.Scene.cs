@@ -862,9 +862,16 @@ public sealed partial class NestedCanvas
         // A link is never read for being drawn, but one already read by name
         // is drawn from what it held then, and is kept up to date like any
         // other folder (NestedTree.Request).
-        if (w >= LoadPixels && (folder.CanLoad || folder.IsReparsePoint && folder.IsLoaded))
+        if (w >= LoadPixels && (folder.CanLoad || folder.IsReparsePoint && folder.IsLoaded)
+            && (LoadUnfocusedRoots || folder.Parent?.IsComputer != true || _chain.ContainsKey(folder)))
         {
+            var partialDuringMotion = folder.HasPartialListing && folder.LoadState == NestedLoadState.NotLoaded
+                && _tree!.IsReadingOnDemand && IsMoving();
             _tree!.Request(folder, w);
+            if (partialDuringMotion && folder.LoadState == NestedLoadState.NotLoaded)
+            {
+                _cameraReadDeferred = true;
+            }
         }
 
         var labelMode = LabelModeFor(w, labelsAllowed);

@@ -114,7 +114,8 @@ internal sealed class NestedSelection
     /// <summary>
     /// The folder Ctrl+A selects everything in: the one a rectangle was last
     /// drawn in, an item was last clicked in, a body was last clicked, or the
-    /// keys last moved in.
+    /// keys last moved in or went up to.  None after a selection made
+    /// anywhere else but a command taking items out (see <see cref="Load"/>).
     /// </summary>
     public NestedFolder? CurrentFolder { get; set; }
 
@@ -130,6 +131,21 @@ internal sealed class NestedSelection
 
     /// <summary>Whether anything waits for a folder the tree has not read.</summary>
     public bool HasPending => _pending.Count > 0;
+
+    /// <summary>How many paths wait in the folders <paramref name="folder"/> picks out by their paths.</summary>
+    public int CountWaiting(Func<string, bool> folder)
+    {
+        var count = 0;
+        foreach (var (path, names) in _pending)
+        {
+            if (folder(path))
+            {
+                count += names.Count;
+            }
+        }
+
+        return count;
+    }
 
     /// <summary>The paths of the folders something waits in (see <see cref="ResolvePending"/>).</summary>
     public IEnumerable<string> PendingFolders => _pending.Keys;
@@ -453,6 +469,19 @@ internal sealed class NestedSelection
         Anchor = null;
         Active = null;
         Version++;
+
+        // Ctrl+A goes by the folder of the last gesture made here.  A
+        // selection made anywhere else - going somewhere, the list, Back -
+        // leaves it to the folder on screen, which is where that took the
+        // view; the folder of a click before it may be a parent of it.  A
+        // command taking items out - a delete, a prune, the focus moving
+        // after one - leaves the view where it was, and Ctrl+A on the
+        // folder worked in.
+        if (selection.LastSource is not (SelectionSource.Canvas or SelectionSource.Command))
+        {
+            CurrentFolder = null;
+        }
+
         if (tree is null)
         {
             return true;

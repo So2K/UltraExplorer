@@ -285,6 +285,13 @@ public partial class MainWindow
         second.Detach();
         _panes.Remove(second);
 
+        // A folder launch it had holds on to it no more; one still under way
+        // lets go of it itself as it ends.
+        if (!_folderLoadOwners.ContainsKey(second))
+        {
+            _folderPaneRoots.Remove(second);
+        }
+
         // Its selection, let go of by the pane, is followed for the next split.
         _closedSecondSelection = second.KeptSelection;
         tree.AddKeptSelection(second.KeptSelection);
@@ -642,6 +649,9 @@ public partial class MainWindow
     /// </summary>
     internal string? OtherPaneFolder() => IsNested && !IsPickerMode && InactivePane is { } other ? other.SortFolder() : null;
 
+    /// <summary>The panes whose Copy or Move to other pane is still asking whether the other pane's folder is there.</summary>
+    private readonly HashSet<NestedPane> _paneSendsAsking = [];
+
     /// <summary>
     /// What of <paramref name="paths"/> can go into <paramref name="folder"/>:
     /// not the folder itself, not a folder it is inside, and not what is in
@@ -681,11 +691,23 @@ public partial class MainWindow
             return;
         }
 
+        // The window takes keys while the other pane's folder is asked about:
+        // the same key pressed again from this pane meanwhile is let go, or
+        // everything would be copied twice, or moved twice.
+        var from = ActivePane;
+        if (!_paneSendsAsking.Add(from))
+        {
+            return;
+        }
+
         var name = FolderName(folder);
         string[] going;
         try
         {
-            if (!Directory.Exists(folder))
+            // Asked off the interface thread: the other pane may be showing a
+            // share gone to sleep, which takes as long as the network allows
+            // to answer.
+            if (!await Task.Run(() => Directory.Exists(folder)))
             {
                 _viewModel.Toast.ShowError($"{name} is no longer there.");
                 return;
@@ -697,6 +719,10 @@ public partial class MainWindow
         {
             _viewModel.Toast.ShowError(ex.Message);
             return;
+        }
+        finally
+        {
+            _paneSendsAsking.Remove(from);
         }
 
         if (going.Length == 0)

@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using SharpGen.Runtime;
@@ -53,7 +54,8 @@ internal sealed class IconAtlasOptions
 /// <para><b>Keys.</b>  A file's lower-case extension, as <see cref="NestedFile.Extension"/>
 /// has it; the canvas asks per type, which is what makes one small atlas enough.
 /// Types whose icon differs from file to file - programs, shortcuts, icon and
-/// cursor files, Internet shortcuts, ClickOnce references - may also have one
+/// cursor files, Internet shortcuts, management consoles, ClickOnce
+/// references - may also have one
 /// slot per file, in a region of at most <see cref="IconAtlasOptions.PerFileCapacity"/>
 /// slots where the least recently drawn gives way; until a file's own icon is
 /// there its type's generic one shows.  <see cref="PerFileIcons"/> switches the
@@ -117,7 +119,12 @@ internal sealed class IconAtlas : IDisposable
     /// <summary>At most this many arrivals are looked at in one frame, however many of them cost no upload.</summary>
     private const int ArrivalsPerFrameLimit = 1024;
 
-    private static readonly string[] PerFileExtensions = ["exe", "lnk", "ico", "url", "cur", "ani", "appref-ms"];
+    /// <summary>
+    /// With more than one canvas drawing from the atlas, a file slot drawn
+    /// within this long (Stopwatch ticks, half a second) may still be on one
+    /// of their screens, however many frames ago that was (<see cref="RecentlyDrawnElsewhere"/>).
+    /// </summary>
+    private static readonly long RecentlyDrawnTicks = Stopwatch.Frequency / 2;
 
     /// <summary>
     /// Asked for at start-up, before any folder is read: the types most
@@ -158,6 +165,7 @@ internal sealed class IconAtlas : IDisposable
     private readonly int[] _slotReferences;
     private readonly List<string>?[] _slotFileKeys;
     private readonly long[] _lastUsedFrame;
+    private readonly long[] _lastUsedTicks;
     private readonly int[] _lruPrevious;
     private readonly int[] _lruNext;
     private readonly Stack<int> _freeSlots = new();
@@ -170,12 +178,20 @@ internal sealed class IconAtlas : IDisposable
     private int _typeSlotCount;
     private int _fileSlotCount;
     private long _frame;
+
+    /// <summary>When the current frame's <c>ProcessArrivals</c> began (Stopwatch ticks); what a slot drawn in it is stamped with.</summary>
+    private long _frameTicks;
+
     private bool _dirty;
     private bool _perFileIcons;
     private int _signalled;
     private int _disposed;
     private long _extractions;
     private IconAtlasTexture? _active;
+
+    /// <summary>Who <see cref="ArrivalsPending"/> wakes, and how many of them: one per canvas drawing from the atlas.  Changed under the gate.</summary>
+    private Action? _arrivalsPending;
+    private int _listeners;
 
     public IconAtlas(IconAtlasOptions? options = null)
     {
@@ -191,6 +207,7 @@ internal sealed class IconAtlas : IDisposable
         _slotReferences = new int[slices];
         _slotFileKeys = new List<string>?[slices];
         _lastUsedFrame = new long[slices];
+        _lastUsedTicks = new long[slices];
         _lruPrevious = new int[slices];
         _lruNext = new int[slices];
         Array.Fill(_lruPrevious, -1);
@@ -209,9 +226,29 @@ internal sealed class IconAtlas : IDisposable
     /// once until that next runs - the canvas wakes its frame loop, which
     /// takes them in with its next frame of labels: however many icons arrive
     /// between two frames, one wake and no dispatcher operation of their own.
-    /// Must not block.
+    /// Must not block.  Every canvas drawing from the atlas listens, so how
+    /// many listen is also how many canvases share its frames.
     /// </summary>
-    public event Action? ArrivalsPending;
+    public event Action? ArrivalsPending
+    {
+        add
+        {
+            lock (_gate)
+            {
+                _arrivalsPending += value;
+                _listeners = _arrivalsPending?.GetInvocationList().Length ?? 0;
+            }
+        }
+
+        remove
+        {
+            lock (_gate)
+            {
+                _arrivalsPending -= value;
+                _listeners = _arrivalsPending?.GetInvocationList().Length ?? 0;
+            }
+        }
+    }
 
     /// <summary>Whether finished icons are waiting; true after a <c>ProcessArrivals</c> that hit its limit.</summary>
     public bool HasPendingArrivals => !_arrivals.IsEmpty;
@@ -342,6 +379,15 @@ internal sealed class IconAtlas : IDisposable
     public int SlotFor(string folderPath, string fileName, string extension)
     {
         var trimmed = Trim(extension);
+        if (trimmed.IsEmpty && Path.GetExtension(fileName.AsSpan()) is { Length: > 1 } named)
+        {
+            // A name that starts with its only dot (.gitignore), or whose type
+            // is longer than the tree keeps: the tree gives it no extension,
+            // but the Shell reads its type from the name, and so do Explorer
+            // and the folder list (ShellIconService.KeyOf).
+            trimmed = named[1..];
+        }
+
         if (!PerFileIcons || !IsPerFileType(trimmed))
         {
             lock (_gate)
@@ -458,6 +504,7 @@ internal sealed class IconAtlas : IDisposable
         lock (_gate)
         {
             _frame++;
+            _frameTicks = Stopwatch.GetTimestamp();
             Activate(texture, context);
             while (uploads < maximumUploads && taken < ArrivalsPerFrameLimit && _arrivals.TryDequeue(out var arrival))
             {
@@ -922,10 +969,11 @@ internal sealed class IconAtlas : IDisposable
         if (slot < 0)
         {
             var victim = _lruTail;
-            if (victim < 0 || _lastUsedFrame[victim] >= _frame - 1)
+            if (victim < 0 || _lastUsedFrame[victim] >= _frame - 1 || RecentlyDrawnElsewhere(victim))
             {
-                // Every file slot was drawn in the last frame: taking one would
-                // only have it asked for again.  Its type's icon shows for now.
+                // Every file slot was drawn in the last frame, or may still be
+                // on another canvas's screen: taking one would only have it
+                // asked for again.  Its type's icon shows for now.
                 entry.State = KeyState.Denied;
                 entry.Frame = _frame;
                 _files[key] = entry;
@@ -1036,6 +1084,7 @@ internal sealed class IconAtlas : IDisposable
         _slotVersion[slot]++;
         _byHash.TryAdd(pixels.Hash, slot);
         _lastUsedFrame[slot] = _frame;
+        _lastUsedTicks[slot] = _frameTicks;
         _dirty = true;
 
         var texture = _active;
@@ -1128,12 +1177,27 @@ internal sealed class IconAtlas : IDisposable
     private void Touch(int slot)
     {
         _lastUsedFrame[slot] = _frame;
+        _lastUsedTicks[slot] = _frameTicks;
         if (_slotRegion[slot] == SlotRegion.File && _lruHead != slot)
         {
             Unlink(slot);
             LinkAtHead(slot);
         }
     }
+
+    /// <summary>
+    /// Whether a file slot not drawn in the frame just gone may still be on
+    /// screen in another canvas.  Frames are counted for every canvas
+    /// together - each one's <c>ProcessArrivals</c> is one - so with two
+    /// drawing, the panes of a split view or two windows, each one's icons are
+    /// two frames old by the time its next frame takes an arrival in; counting
+    /// frames alone, the two took each other's slots on screen in turn, for
+    /// good, and the Shell was never left alone.  With more than one canvas
+    /// listening, a slot drawn within the last half second is held too.  A
+    /// canvas alone keeps counting frames, as it always has.  Under the gate.
+    /// </summary>
+    private bool RecentlyDrawnElsewhere(int slot)
+        => _listeners > 1 && _frameTicks - _lastUsedTicks[slot] < RecentlyDrawnTicks;
 
     /// <summary>
     /// Forgets the files that hold no slot of their own - those shown with
@@ -1265,7 +1329,7 @@ internal sealed class IconAtlas : IDisposable
         {
             try
             {
-                ArrivalsPending?.Invoke();
+                Volatile.Read(ref _arrivalsPending)?.Invoke();
             }
             catch (Exception)
             {
@@ -1364,23 +1428,12 @@ internal sealed class IconAtlas : IDisposable
     private static ReadOnlySpan<char> Trim(string extension)
         => extension.Length > 0 && extension[0] == '.' ? extension.AsSpan(1) : extension.AsSpan();
 
-    private static bool IsPerFileType(ReadOnlySpan<char> extension)
-    {
-        if (extension.Length is < 3 or > 9)
-        {
-            return false;
-        }
-
-        foreach (var candidate in PerFileExtensions)
-        {
-            if (extension.Equals(candidate, StringComparison.OrdinalIgnoreCase))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+    /// <summary>
+    /// The one list the folder list's icons are keyed by as well
+    /// (<see cref="Services.ShellIconService.IsPathSpecificIcon"/>), so a file
+    /// shows its own icon in every view or in none.
+    /// </summary>
+    private static bool IsPerFileType(ReadOnlySpan<char> extension) => Services.ShellIconService.IsPathSpecificIcon(extension);
 
     private static string TypeKey(ReadOnlySpan<char> extension)
     {

@@ -79,6 +79,7 @@ internal static partial class Program
             foreach (var set in sets)
             {
                 GpuLabelPipelineChecks(set, shaders, faces, glyphs, icons);
+                GpuTextZoomPixels(set, shaders, faces, glyphs);
             }
 
             RunOnSta("gpu label parity", () => GpuLabelCanvasChecksAsync(sets, shaders, faces, glyphs));

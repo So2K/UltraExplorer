@@ -8,6 +8,7 @@ using UltraExplorer.Picker;
 using UltraExplorer.Picker.Com;
 
 using UltraExplorer.Services;
+using UltraExplorer.Picker.Integration;
 
 namespace UltraExplorer;
 
@@ -30,7 +31,10 @@ public partial class App : Application
 
     protected override void OnStartup(StartupEventArgs e)
     {
-        var isTestCopy = Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1"
+        SuppressDriveErrorBoxes();
+
+        var isTestCopy = DialogIntegrationRuntime.IsRole(e.Args)
+            || Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1"
             || e.Args.Any(argument => argument.Equals("--nested-bench", StringComparison.OrdinalIgnoreCase)
                 || argument.Equals("--nested-snapshots", StringComparison.OrdinalIgnoreCase));
 
@@ -72,6 +76,8 @@ public partial class App : Application
 
         base.OnStartup(e);
 
+        if (DialogIntegrationRuntime.TryRun(this, e.Args)) return;
+
         if (HasSwitch(e.Args, "register-picker"))
         {
             FileDialogHost.WriteConsole(ComServerRegistration.Register(ExecutablePath));
@@ -99,6 +105,50 @@ public partial class App : Application
             return;
         }
 
+        FolderInvocation? folderInvocation = null;
+        Mutex? folderStartup = null;
+        if (!FileDialogCommandLine.IsPickerInvocation(e.Args) && FolderCommandLine.IsInvocation(e.Args))
+        {
+            if (ExplorerLaunchRouter.TryHandleShellFallback(e.Args))
+            {
+                Shutdown(FileDialogCommandLine.ExitAccepted);
+                return;
+            }
+
+            if (!FolderCommandLine.TryParse(e.Args, out folderInvocation, out var error))
+            {
+                FileDialogHost.WriteConsole(error);
+                Shutdown(FileDialogCommandLine.ExitError);
+                return;
+            }
+
+            // Several folders opened together start a launch each: with no
+            // window listening, the first builds one and the others wait to
+            // hand it their folders, rather than each building its own.
+            folderStartup = ExplorerLaunchRouter.EnterFolderStartup();
+            if (ExplorerLaunchRouter.TryForward(folderInvocation))
+            {
+                ExplorerLaunchRouter.LeaveFolderStartup(folderStartup, whenListening: false);
+                Shutdown(FileDialogCommandLine.ExitAccepted);
+                return;
+            }
+            if (folderInvocation.OriginIsShell && ExplorerLaunchRouter.TryHandleShellFallback(e.Args))
+            {
+                ExplorerLaunchRouter.LeaveFolderStartup(folderStartup, whenListening: false);
+                Shutdown(FileDialogCommandLine.ExitAccepted);
+                return;
+            }
+        }
+
+        // The tray's "Open settings" while a window is open is shown by that
+        // window, not by a second UltraExplorer on the same workspace.
+        if (folderInvocation is null && !FileDialogCommandLine.IsPickerInvocation(e.Args)
+            && e.Args.Contains("--settings") && ExplorerLaunchRouter.TryForwardSettings())
+        {
+            Shutdown(FileDialogCommandLine.ExitAccepted);
+            return;
+        }
+
         StartJitProfile();
         StartGpu();
         if (FileDialogCommandLine.IsPickerInvocation(e.Args))
@@ -107,10 +157,40 @@ public partial class App : Application
             return;
         }
 
-        var window = new MainWindow();
+        var window = folderInvocation is { DestinationId: var destination } && destination != Guid.Empty
+            ? new MainWindow(null, ExplorerLaunchRouter.FolderWorkspacePath(destination)) : new MainWindow();
+        ShutdownMode = ShutdownMode.OnLastWindowClose;
         MainWindow = window;
+        if (folderInvocation is not null) window.FolderDestinationId = folderInvocation.DestinationId;
+        if (folderInvocation is not null) window.PrepareFolderInvocation(folderInvocation);
+        ExplorerLaunchRouter.Attach(window);
+        ExplorerLaunchRouter.LeaveFolderStartup(folderStartup, whenListening: true);
         window.Show();
+        if (folderInvocation is not null) _ = window.ApplyFolderInvocationAsync(folderInvocation);
+        DialogIntegrationController.OnApplicationStarted();
+        if (e.Args.Contains("--settings")) window.Loaded += (_, _) => window.OpenSettings();
     }
+
+    /// <summary>
+    /// A drive with no media in it - a card pulled out, an empty DVD drive -
+    /// answers this process with an error, never with Windows' "There is no
+    /// disk in the drive" box.  A process started at sign-in begins with those
+    /// boxes on, and passes that to every worker and window it starts; a box
+    /// would also hold the thread that touched the drive - a watch retrying,
+    /// a right-click, a folder described or an icon read - until someone
+    /// answers it.  Whatever else the process was started with is kept.
+    /// </summary>
+    internal static void SuppressDriveErrorBoxes()
+    {
+        const uint FailCriticalErrors = 0x0001, NoOpenFileErrorBox = 0x8000;
+        _ = SetErrorMode(GetErrorMode() | FailCriticalErrors | NoOpenFileErrorBox);
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern uint SetErrorMode(uint mode);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll")]
+    private static extern uint GetErrorMode();
 
     /// <summary>
     /// Gets the nested canvas's GPU ready while the window is still being
@@ -280,6 +360,10 @@ public partial class App : Application
         }
 
         FileDialogHost.Deliver(invocation, result);
+
+        // The caller has its answer; the window's close-time save is let
+        // finish before the process ends, a few seconds at most.
+        await UltraExplorer.MainWindow.WhenClosingWindowsClosedAsync(this, TimeSpan.FromSeconds(3));
         Shutdown(FileDialogHost.ExitCodeFor(result));
     }
 

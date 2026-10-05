@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Threading;
@@ -44,6 +45,7 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     private readonly Func<int, bool> _isLatestNavigation;
     private readonly Func<IReadOnlyList<string>> _recent;
     private readonly Action<string, bool> _report;
+    private readonly Func<bool>? _includeHidden;
     private readonly DispatcherTimer _debounce;
 
     private CancellationTokenSource? _query;
@@ -60,6 +62,9 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
     /// <summary>Which of the bar's own requests is the latest, when nothing else hands out tickets.</summary>
     private int _ownTicket;
+
+    /// <summary>Which chevron press is the latest (see <see cref="ToggleSegmentMenuAsync"/>).</summary>
+    private int _menuTicket;
 
     /// <param name="navigate">Takes the window to a path that has been checked to exist.</param>
     /// <param name="recent">Where the window has already been, newest first.</param>
@@ -82,18 +87,25 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// <param name="isLatestNavigation">Whether a ticket is still the newest; null with <paramref name="beginNavigation"/>.</param>
     /// <param name="recent">Where the window has already been, newest first.</param>
     /// <param name="report">Something to say to the user; the flag marks it an error.</param>
+    /// <param name="includeHidden">
+    /// Whether the window shows hidden and system folders, which a crumb's
+    /// chevron then shows or leaves out the same way.  Null leaves out system
+    /// folders only, as the line's own suggestions do.
+    /// </param>
     public AddressBarViewModel(
         Func<string, int, Task> navigate,
         Func<int>? beginNavigation,
         Func<int, bool>? isLatestNavigation,
         Func<IReadOnlyList<string>> recent,
-        Action<string, bool> report)
+        Action<string, bool> report,
+        Func<bool>? includeHidden = null)
     {
         _navigate = navigate;
         _beginNavigation = beginNavigation ?? (() => ++_ownTicket);
         _isLatestNavigation = isLatestNavigation ?? (ticket => ticket == _ownTicket);
         _recent = recent;
         _report = report;
+        _includeHidden = includeHidden;
 
         // Long enough that holding a key down does not start a listing per
         // keystroke, short enough that stopping to think shows the answer.
@@ -108,7 +120,12 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         // dead and Enter ignored until it did.  The window's navigation lets
         // the last place asked for win.
         OpenSegmentCommand = new AsyncRelayCommand<BreadcrumbSegment>(OpenSegmentAsync, allowConcurrent: true);
-        ToggleSegmentMenuCommand = new AsyncRelayCommand<BreadcrumbSegment>(ToggleSegmentMenuAsync);
+
+        // Every chevron shares this command, so one run at a time would grey
+        // them all out while one folder is read - for as long as a share that
+        // has gone offline takes to say so.  The last chevron pressed is the
+        // one that opens (see ToggleSegmentMenuAsync).
+        ToggleSegmentMenuCommand = new AsyncRelayCommand<BreadcrumbSegment>(ToggleSegmentMenuAsync, allowConcurrent: true);
         AcceptCommand = new AsyncRelayCommand<AddressSuggestion>(AcceptAsync, allowConcurrent: true);
         GoCommand = new AsyncRelayCommand(GoAsync, allowConcurrent: true);
         EditCommand = new RelayCommand(BeginEdit);
@@ -169,6 +186,11 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _text, value) && !_quiet)
             {
+                // The arrow keys put what they picked out into the line; typed
+                // over, it is no longer what the line says.  Kept, it would be
+                // where Enter went and what Tab finished - D:\Music, picked
+                // out and then typed back to "D:\", still went to D:\Music.
+                Highlighted = null;
                 ScheduleQuery();
             }
         }
@@ -405,14 +427,15 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
     private async Task GoToAsync(string target)
     {
+        var literal = target.Trim().Trim('"');
         string expanded;
         try
         {
-            expanded = Environment.ExpandEnvironmentVariables(target.Trim().Trim('"'));
+            expanded = Environment.ExpandEnvironmentVariables(literal);
         }
         catch (ArgumentException)
         {
-            expanded = target.Trim().Trim('"');
+            expanded = literal;
         }
 
         if (string.IsNullOrWhiteSpace(expanded))
@@ -431,7 +454,20 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         var typed = Text;
         var wasEditing = IsEditing;
         var current = CurrentPath;
-        var resolved = await Task.Run(() => Resolve(expanded, current));
+
+        // A real folder can be called %USERNAME% - an installer that forgot to
+        // fill a variable in leaves one behind - and a path from the list, a
+        // chevron or the clipboard names it as it stands; filled in, it named
+        // another folder or none.  So a path that is there as it stands is
+        // where it goes, and only otherwise are its variables filled in, as
+        // for "%TEMP%" typed by hand.  Only a full path is tried as it stands:
+        // those places always hand one over, while "%APPDATA%" typed by hand
+        // would otherwise be read against the folder being shown - opening a
+        // leftover folder of that name there instead of the real one, and
+        // asking a share that is offline before going anywhere.
+        var unchanged = string.Equals(literal, expanded, StringComparison.Ordinal);
+        var resolved = await Task.Run(() => (unchanged || System.IO.Path.IsPathFullyQualified(literal) ? Resolve(literal, current) : null)
+            ?? (unchanged ? null : Resolve(expanded, current)));
         if (_isDisposed
             || !_isLatestNavigation(ticket)
             || IsEditing != wasEditing
@@ -442,7 +478,10 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
         if (resolved is null)
         {
-            _report("That location does not exist.", true);
+            // The shell's names for places that are not folders on disk - the
+            // Recycle Bin, This PC - are not missing; they are simply not
+            // something this window can show.
+            _report(IsShellName(expanded) ? "That place is not a folder on disk." : "That location does not exist.", true);
             return;
         }
 
@@ -458,39 +497,142 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// "..", "Windows", "\Temp" - is read the way a shell reads it, against
     /// the folder the window is showing (<paramref name="currentPath"/>, or
     /// the folder of the file it is showing), never against the directory
-    /// the process happens to be in.  Touches the disk; off the interface
+    /// the process happens to be in.  A file:/// address and the shell's
+    /// names for places - "shell:startup", "::{CLSID}" - are read as the
+    /// folder on disk they stand for, as Explorer's line reads them, and a
+    /// device path as the plain path.  Touches the disk; off the interface
     /// thread.
     /// </summary>
     internal static string? Resolve(string expanded, string currentPath)
     {
         try
         {
+            if (expanded.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!Uri.TryCreate(expanded, UriKind.Absolute, out var address) || !address.IsFile)
+                {
+                    return null;
+                }
+
+                expanded = address.LocalPath;
+            }
+            else if (IsShellName(expanded))
+            {
+                if (ShellFolderPath(expanded) is not { } folder)
+                {
+                    return null;
+                }
+
+                expanded = folder;
+            }
+
             if (expanded.Length == 2 && expanded[1] == ':' && char.IsAsciiLetter(expanded[0]))
             {
                 expanded += System.IO.Path.DirectorySeparatorChar;
             }
 
-            if (!System.IO.Path.IsPathFullyQualified(expanded))
+            expanded = WithoutDevicePrefix(expanded);
+
+            if (Qualify(expanded, currentPath) is not { } path)
             {
-                if (string.IsNullOrWhiteSpace(currentPath) || !System.IO.Path.IsPathFullyQualified(currentPath))
-                {
-                    return null;
-                }
-
-                var folder = File.Exists(currentPath) ? System.IO.Path.GetDirectoryName(currentPath) : currentPath;
-                if (string.IsNullOrEmpty(folder))
-                {
-                    return null;
-                }
-
-                expanded = System.IO.Path.GetFullPath(expanded, folder);
+                return null;
             }
 
-            return Directory.Exists(expanded) || File.Exists(expanded) ? expanded : null;
+            return Directory.Exists(path) || File.Exists(path) ? path : null;
         }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
         {
             return null;
+        }
+    }
+
+    /// <summary>
+    /// A line read as a full path: as it stands when it is one, against the
+    /// folder <paramref name="currentPath"/> names (or the folder of the file
+    /// it names) when it is not, and null when there is nothing shown to read
+    /// it against.  Asks the disk whether the current path is a file; off the
+    /// interface thread.
+    /// </summary>
+    private static string? Qualify(string text, string currentPath)
+    {
+        try
+        {
+            if (System.IO.Path.IsPathFullyQualified(text))
+            {
+                return text;
+            }
+
+            if (string.IsNullOrWhiteSpace(currentPath) || !System.IO.Path.IsPathFullyQualified(currentPath))
+            {
+                return null;
+            }
+
+            var folder = File.Exists(currentPath) ? System.IO.Path.GetDirectoryName(currentPath) : currentPath;
+            return string.IsNullOrEmpty(folder) ? null : System.IO.Path.GetFullPath(text, folder);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// "\\?\C:\Windows" and "\\.\C:\Windows" spelled the plain way, and
+    /// "\\?\UNC\server\share" as "\\server\share".  The prefix only tells the
+    /// file system to take the path literally; kept, it made a drive of its
+    /// own - "\\?\C:\" became a second C: on the canvas, saved as a root of
+    /// its own.  A path the plain spelling would lose a dot or a space at the
+    /// end of a name from keeps its prefix, since only that spelling reaches
+    /// it, and so does a volume with no drive letter.
+    /// </summary>
+    private static string WithoutDevicePrefix(string path)
+    {
+        if (!path.StartsWith(@"\\?\", StringComparison.Ordinal) && !path.StartsWith(@"\\.\", StringComparison.Ordinal))
+        {
+            return path;
+        }
+
+        var rest = path[4..];
+        string plain;
+        if (rest.Length >= 2 && rest[1] == ':' && char.IsAsciiLetter(rest[0]) && (rest.Length == 2 || rest[2] == '\\'))
+        {
+            plain = rest.Length == 2 ? rest + '\\' : rest;
+        }
+        else if (rest.Length > 4 && rest.StartsWith(@"UNC\", StringComparison.OrdinalIgnoreCase))
+        {
+            plain = @"\\" + rest[4..];
+        }
+        else
+        {
+            return path;
+        }
+
+        return ViewAllPath.EndsANameInDotOrSpace(plain) ? path : plain;
+    }
+
+    /// <summary>One of the shell's names for a place rather than a path: "shell:startup", "::{CLSID}".</summary>
+    private static bool IsShellName(string text)
+        => text.StartsWith("shell:", StringComparison.OrdinalIgnoreCase) || text.StartsWith("::", StringComparison.Ordinal);
+
+    /// <summary>
+    /// The folder on disk one of the shell's names stands for, or null when
+    /// it stands for none - the Recycle Bin, This PC - or for nothing at all.
+    /// Asks the shell; off the interface thread.
+    /// </summary>
+    private static string? ShellFolderPath(string name)
+    {
+        if (FolderShellNative.SHParseDisplayName(name, 0, out var pidl, 0, out _) < 0 || pidl == 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return FolderShellNative.FileSystemPath(pidl);
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pidl);
         }
     }
 
@@ -514,9 +656,14 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
             other.IsMenuOpen = false;
         }
 
+        // A chevron pressed while an earlier one is still being read - a share
+        // taking its time - is the one that opens; the earlier answer, coming
+        // in after, would open a second menu nobody is waiting for.
+        var ticket = ++_menuTicket;
         var path = segment.FullPath;
-        var children = await Task.Run(() => ChildFolders(path));
-        if (_isDisposed)
+        var includeHidden = _includeHidden?.Invoke();
+        var children = await Task.Run(() => ChildFolders(path, includeHidden));
+        if (_isDisposed || ticket != _menuTicket)
         {
             return;
         }
@@ -592,7 +739,17 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
         try
         {
-            NativeShellService.Open(CurrentPath);
+            // Windows Explorer itself on a folder, as the command says, not
+            // this window again; what is not a folder opens as the Shell
+            // opens it.
+            if (Directory.Exists(CurrentPath))
+            {
+                NativeShellService.ShowInWindowsExplorer(CurrentPath);
+            }
+            else
+            {
+                NativeShellService.Open(CurrentPath);
+            }
         }
         catch (Exception ex)
         {
@@ -628,11 +785,13 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
         var typed = Text;
         var recent = _recent();
+        var current = CurrentPath;
 
         IReadOnlyList<AddressSuggestion> found;
+        var named = false;
         try
         {
-            found = await Task.Run(() => Collect(typed, recent), cancellation.Token);
+            found = await Task.Run(() => Collect(typed, recent, current, out named), cancellation.Token);
         }
         catch (OperationCanceledException)
         {
@@ -647,7 +806,11 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
             return;
         }
 
-        Show(found, typed);
+        // A line that already names a folder or a file is finished as it
+        // stands: Enter means that place.  Finished with the first folder in
+        // it, or with a longer neighbour - "D:\Music" with "D:\Music Backup" -
+        // Enter would go somewhere else after a pause of a tenth of a second.
+        Show(found, named ? string.Empty : typed);
     }
 
     private void Show(IReadOnlyList<AddressSuggestion> found, string typed)
@@ -676,7 +839,10 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// The path the line should be finished with, or null when nothing on offer
     /// carries on from what was typed.  Recents are left out: they are somewhere
     /// else in the tree, and pulling one into the line under the caret would
-    /// rewrite what is being typed rather than continue it.
+    /// rewrite what is being typed rather than continue it.  So is anything
+    /// that runs on past the name being typed into a folder below it: that is
+    /// a different place, not the rest of this one's name.  A drive's root
+    /// keeps the separator it is spelled with - "D" is finished as "D:\".
     /// </summary>
     internal static string? Completion(IReadOnlyList<AddressSuggestion> found, string typed)
     {
@@ -689,7 +855,8 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         {
             if (suggestion.Kind != AddressSuggestionKind.Recent
                 && suggestion.FullPath.Length > typed.Length
-                && suggestion.FullPath.StartsWith(typed, StringComparison.OrdinalIgnoreCase))
+                && suggestion.FullPath.StartsWith(typed, StringComparison.OrdinalIgnoreCase)
+                && suggestion.FullPath[typed.Length..].TrimEnd(Separators).IndexOfAny(Separators) < 0)
             {
                 return suggestion.FullPath;
             }
@@ -702,19 +869,48 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
     /// Everything the half-typed path could mean.  Pure and off the interface
     /// thread: given the same text and the same history it gives the same list.
     /// </summary>
-    internal static IReadOnlyList<AddressSuggestion> Collect(string typed, IReadOnlyList<string> recent)
+    /// <param name="currentPath">
+    /// The folder the window is showing (or the file it is showing), which a
+    /// name that is not a full path is read against, as Enter reads it (see
+    /// <see cref="Resolve"/>).
+    /// </param>
+    internal static IReadOnlyList<AddressSuggestion> Collect(string typed, IReadOnlyList<string> recent, string currentPath = "")
+        => Collect(typed, recent, currentPath, out _);
+
+    /// <inheritdoc cref="Collect(string, IReadOnlyList{string}, string)"/>
+    /// <param name="named">Whether the line already names a folder or a file that is there.</param>
+    internal static IReadOnlyList<AddressSuggestion> Collect(
+        string typed,
+        IReadOnlyList<string> recent,
+        string currentPath,
+        out bool named)
     {
         var found = new List<AddressSuggestion>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        named = false;
 
+        var literal = typed.Trim().Trim('"');
         string text;
         try
         {
-            text = Environment.ExpandEnvironmentVariables(typed.Trim().Trim('"'));
+            text = Environment.ExpandEnvironmentVariables(literal);
         }
         catch (ArgumentException)
         {
-            text = typed.Trim().Trim('"');
+            text = literal;
+        }
+
+        // A real folder can be called %USERNAME%, and the line opened on it, or
+        // on something in it, names it as it stands; filled in, it offered
+        // what is in another folder.  So, as Enter reads it, a full path that
+        // is there as it stands is read as it stands, and only otherwise are
+        // the variables filled in - "%APPDATA%" typed by hand offers the real
+        // folder, not a leftover one of that name in the folder being shown.
+        if (!string.Equals(text, literal, StringComparison.Ordinal)
+            && System.IO.Path.IsPathFullyQualified(literal)
+            && IsThereAsItStands(literal, currentPath))
+        {
+            text = literal;
         }
 
         // "E:" on its own does not mean the drive: to Windows it means whatever
@@ -725,30 +921,40 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
             text += System.IO.Path.DirectorySeparatorChar;
         }
 
+        // "drivers", "..\Music" or "\Temp" mean what they mean to Enter: a
+        // place under the folder the window is showing.  Read as they stand,
+        // they were read against the directory the process happens to be in -
+        // started from System32, "drivers" offered System32's own drivers
+        // folder, and Enter then found nothing, or another folder of that name.
+        // With nothing shown to read it against, such a name names nothing.
+        var path = text.Length == 0 ? null : Qualify(text, currentPath);
+
         if (text.Length == 0)
         {
             AddDrives(found, seen, string.Empty);
         }
-        else if (File.Exists(text))
+        else if (path is not null && File.Exists(path))
         {
             // The line was opened on a file - selecting one on the canvas points
             // the bar at it - and what is worth offering then is the rest of the
             // folder it is in, not the one file already named.
-            var (folder, _) = Split(text);
+            named = true;
+            var (folder, _) = Split(path);
             if (folder is not null)
             {
                 AddChildren(found, seen, folder, string.Empty);
             }
         }
-        else if (Exists(text))
+        else if (path is not null && Exists(path))
         {
             // The line already names a folder, so what is inside it is the useful
             // answer - but a sibling that carries on from the same letters is
             // still worth offering, because "Program Files" is also the start of
             // "Program Files (x86)".
-            AddChildren(found, seen, text, string.Empty);
+            named = true;
+            AddChildren(found, seen, path, string.Empty);
 
-            var (parent, leaf) = Split(text);
+            var (parent, leaf) = Split(path);
             if (parent is not null && leaf.Length > 0)
             {
                 AddChildren(found, seen, parent, leaf);
@@ -756,14 +962,16 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         }
         else
         {
+            // A name with no folder before it may also be the start of a drive.
             var (folder, leaf) = Split(text);
             if (folder is null)
             {
                 AddDrives(found, seen, leaf);
             }
-            else
+
+            if (path is not null && Split(path) is ({ } inside, var start))
             {
-                AddChildren(found, seen, folder, leaf);
+                AddChildren(found, seen, inside, start);
             }
         }
 
@@ -784,11 +992,15 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
             : (text[..(separator + 1)], text[(separator + 1)..]);
     }
 
+    /// <param name="folderLimit">How many folders to take; past it the rest are not read at all.</param>
+    /// <param name="skip">The folders and files left out, by attribute.</param>
     private static void AddChildren(
         List<AddressSuggestion> found,
         HashSet<string> seen,
         string folder,
-        string leaf)
+        string leaf,
+        int folderLimit = MaxFolders,
+        FileAttributes skip = FileAttributes.System)
     {
         if (leaf.IndexOfAny(Wildcards) >= 0 || !Directory.Exists(folder))
         {
@@ -799,13 +1011,13 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         var options = new EnumerationOptions
         {
             IgnoreInaccessible = true,
-            AttributesToSkip = FileAttributes.System,
+            AttributesToSkip = skip,
             MatchCasing = MatchCasing.CaseInsensitive
         };
 
         try
         {
-            Take(Directory.EnumerateDirectories(folder, pattern, options), MaxFolders, AddressSuggestionKind.Folder);
+            Take(Directory.EnumerateDirectories(folder, pattern, options), folderLimit, AddressSuggestionKind.Folder);
 
             // Every file in a folder is a listing, not a suggestion: files are
             // worth offering only once enough has been typed to mean one of them.
@@ -822,7 +1034,7 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
         void Take(IEnumerable<string> paths, int limit, AddressSuggestionKind kind)
         {
-            var batch = new List<AddressSuggestion>(limit);
+            var batch = new List<AddressSuggestion>(Math.Min(limit, MaxFolders));
             foreach (var path in paths)
             {
                 if (batch.Count == limit)
@@ -924,12 +1136,52 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>The sub-folders behind one crumb's chevron.</summary>
-    internal static IReadOnlyList<AddressSuggestion> ChildFolders(string folder)
+    /// <summary>
+    /// The sub-folders behind one crumb's chevron - every one of them, in
+    /// order.  Unlike the line's suggestions this is not a guess at what is
+    /// being typed but the answer to "what is in here", so a list cut short
+    /// would be wrong without saying so: "Windows" ended at Provisioning, with
+    /// System32 and WinSxS missing.  The list underneath only draws the rows
+    /// in sight, however many there are.
+    /// </summary>
+    /// <param name="includeHidden">
+    /// Whether the window shows hidden and system folders; it treats them as
+    /// one, and so does this.  Null leaves out system folders only, as the
+    /// line's suggestions do.
+    /// </param>
+    internal static IReadOnlyList<AddressSuggestion> ChildFolders(string folder, bool? includeHidden = null)
     {
+        var skip = includeHidden switch
+        {
+            true => (FileAttributes)0,
+            false => FileAttributes.Hidden | FileAttributes.System,
+            null => FileAttributes.System
+        };
+
         var found = new List<AddressSuggestion>();
-        AddChildren(found, new HashSet<string>(StringComparer.OrdinalIgnoreCase), folder, string.Empty);
+        AddChildren(found, new HashSet<string>(StringComparer.OrdinalIgnoreCase), folder, string.Empty, int.MaxValue, skip);
         return found;
+    }
+
+    /// <summary>
+    /// Whether a line holding a "%" names something that is there without its
+    /// variables filled in - the folder or file itself, or, while a name is
+    /// being typed under it, the folder that holds the "%".
+    /// </summary>
+    private static bool IsThereAsItStands(string literal, string currentPath)
+    {
+        if (Qualify(literal, currentPath) is not { } path)
+        {
+            return false;
+        }
+
+        if (File.Exists(path) || Exists(path))
+        {
+            return true;
+        }
+
+        var (folder, _) = Split(path);
+        return folder is not null && folder.Contains('%') && Exists(folder);
     }
 
     private static bool Exists(string path)

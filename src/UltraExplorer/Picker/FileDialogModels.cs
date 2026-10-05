@@ -108,6 +108,10 @@ public sealed record FileDialogPlace(string Path, bool Top);
 /// </summary>
 public sealed class FileDialogRequest
 {
+    // A native-dialog proxy reads the user's usual settings but writes none of
+    // the canvas session back. Its final acceptance belongs to the original app.
+    internal bool IsNativeProxy { get; set; }
+
     public FileDialogMode Mode { get; set; } = FileDialogMode.Open;
 
     public FileDialogOptions Options { get; set; } = FileDialogOptions.PathMustExist;

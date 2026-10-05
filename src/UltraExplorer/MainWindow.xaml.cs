@@ -44,6 +44,9 @@ public partial class MainWindow : Window
     private bool _maximizeHover;
     private bool _sidebarCollapsed;
     private double _restoredSidebarWidth = 240;
+
+    /// <summary>Set once the start has put the saved width on the sidebar (see <see cref="CaptureStateForSave"/>).</summary>
+    private bool _sidebarWidthRestored;
     private bool _isSpaceHeld;
     private bool _isSpacePanning;
     private Point _panPointerAnchor;
@@ -61,6 +64,9 @@ public partial class MainWindow : Window
         Interval = TimeSpan.FromMilliseconds(NativeShellService.DoubleClickMilliseconds + 60)
     };
 
+    /// <summary>The row a click on the selection asked to rename, once the double-click time has passed.</summary>
+    private FolderListItem? _folderListRenameRow;
+
     public MainWindow()
         : this(null)
     {
@@ -72,11 +78,22 @@ public partial class MainWindow : Window
     /// entry rules and what activating an item does differ.
     /// </param>
     public MainWindow(FileDialogSession? picker)
+        : this(picker, null)
     {
-        _viewModel = new MainViewModel(picker is null ? null : FileDialogHost.WorkspacePath);
+    }
+
+    public MainWindow(FileDialogSession? picker, string? normalWorkspacePath)
+    {
+        _viewModel = new MainViewModel(picker?.Request.IsNativeProxy == true
+            ? Infrastructure.AppPaths.State("dialog-integration/proxy-" + Guid.NewGuid().ToString("N") + ".workspace.json")
+            : picker is null ? normalWorkspacePath is null ? null : normalWorkspacePath + ".tree.json" : FileDialogHost.WorkspacePath,
+            nestedPicker: picker?.Request.IsNativeProxy == true,
+            normalWorkspacePath: picker is null ? normalWorkspacePath : null);
+        _viewModel.SuppressShellWrites = picker?.Request.IsNativeProxy == true;
 
         InitializeComponent();
         DataContext = _viewModel;
+        AttachFolderInvocationState();
 
         // A search puts first what is in the folder the headers would sort:
         // the one selected, the one the selected file is in, or the one in view.
@@ -108,6 +125,7 @@ public partial class MainWindow : Window
         _viewModel.Tree.ViewShiftRequested += OnViewShiftRequested;
 
         ConfigureNodeDrag();
+        ConfigureAutoPanning();
         _folderListRenameTimer.Tick += FolderListRename_Tick;
 
         _viewModel.Address.EditRequested += FocusAddressBox;
@@ -152,6 +170,9 @@ public partial class MainWindow : Window
             PlaceForDiagnostics(handle, neverActivate: true);
         }
 
+        PlaceOverCaller?.Invoke(handle);
+        FitIntoWorkArea(handle);
+
         var darkMode = 1;
         var cornerPreference = 2;
         _ = DwmSetWindowAttribute(handle, 20, ref darkMode, sizeof(int));
@@ -164,10 +185,13 @@ public partial class MainWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
+        if (_closeRequested) return;
         // The dialog's entry rules go in before the first read, so the folder
         // the caller asked for is already filtered when it appears.
         await ApplyPickerRulesAsync();
-        await _viewModel.InitializeAsync(_pickerStartFolder);
+        if (_closeRequested) return;
+        await _viewModel.InitializeAsync(_folderInitialPath ?? _pickerStartFolder);
+        if (_closeRequested) return;
         foreach (var pane in _panes)
         {
             pane.Canvas.LeftDrag = _viewModel.LeftDrag;
@@ -178,14 +202,23 @@ public partial class MainWindow : Window
         }
 
         await InitializeNestedAsync();
+        if (_closeRequested) return;
+        if (_picker is not null && IsNested) await ApplyPickerRulesAsync();
+        if (_closeRequested) return;
 
         _restoredSidebarWidth = _viewModel.SidebarWidth;
         SidebarColumn.Width = new GridLength(_restoredSidebarWidth);
+        _sidebarWidthRestored = true;
 
         await Dispatcher.InvokeAsync(() =>
         {
+            if (_closeRequested) return;
             PushViewport();
-            if (_viewModel.Tree.HasRestoredViewport)
+            if (IsPickerMode && IsNested && ActivePane.Tree.Find(_pickerStartFolder) is { } start)
+            {
+                ActivePane.Canvas.FlyTo(start, 0.92, animated: false);
+            }
+            else if (_viewModel.Tree.HasRestoredViewport)
             {
                 Editor.ViewportZoom = _viewModel.Tree.RestoredViewportZoom;
                 Editor.ViewportLocation = _viewModel.Tree.RestoredViewportLocation;
@@ -204,16 +237,23 @@ public partial class MainWindow : Window
         // layout restored.  A failure before this ends the process instead of
         // leaving a half-built window that would save its defaults on close.
         CrashReporter.MarkStarted();
+        _folderLaunchReady.TrySetResult();
 
         // The shares and WSL distributions the workspace lists are asked for
         // only now, all at once: one whose server is off takes as long as the
         // network allows to say so, and the window does not wait on it.  Each
         // that answers joins the canvases as it does.
         _viewModel.Tree.ExtraRootAdded += OnExtraRootAdded;
-        _ = _viewModel.Tree.ProbeExtraRootsAsync();
+        if (!IsPickerMode) _ = _viewModel.Tree.ProbeExtraRootsAsync();
 
         _capture = WindowCaptureService.TryCreate(this, Environment.GetCommandLineArgs());
-        _capture?.Start();
+
+        // A prepared picker is pictured once a dialog has it (CaptureForTests).
+        if (!_keyboardWithheld)
+        {
+            _capture?.Start();
+        }
+
         if (_picker is null && TryStartNestedDiagnostics())
         {
             return;
@@ -221,10 +261,16 @@ public partial class MainWindow : Window
 
         // Once the window is up and has nothing else to do, the Shell's menu
         // handlers are loaded on a thread of their own and kept loaded, so
-        // that no right-click waits for them.
-        _ = Dispatcher.InvokeAsync(
-            () => ShellMenuWarmUp.Start(Infrastructure.AppPaths.State("shell-menus")),
-            DispatcherPriority.ApplicationIdle);
+        // that no right-click waits for them.  Not in a replacement for
+        // another program's dialog: it lives in a resident worker, where the
+        // handlers would stay loaded for the whole session for the rare
+        // right-click in a picker, which builds its menu cold instead.
+        if (_picker?.Request.IsNativeProxy != true)
+        {
+            _ = Dispatcher.InvokeAsync(
+                () => ShellMenuWarmUp.Start(Infrastructure.AppPaths.State("shell-menus")),
+                DispatcherPriority.ApplicationIdle);
+        }
 
         if (PerfLog.IsEnabled)
         {
@@ -248,8 +294,22 @@ public partial class MainWindow : Window
 
         if (_picker is not null)
         {
-            await _viewModel.Tree.RevealPathAsync(_pickerStartFolder);
-            PickerNameBox.Focus();
+            if (IsNested)
+            {
+                _picker.CurrentFolder = _pickerStartFolder;
+            }
+            else if (await _viewModel.Tree.RevealPathAsync(_pickerStartFolder, focus: false) is { } requestedFolder)
+            {
+                // A fresh picker has no saved camera, so FitAll frames every
+                // drive. Put the requested folder and its files at a readable
+                // size before the user starts choosing.
+                await _viewModel.Tree.ExpandAsync(requestedFolder);
+                Editor.ViewportZoom = Math.Max(Editor.ViewportZoom, 1.25);
+                FocusNode(requestedFolder, false);
+            }
+            _pickerNestedReady = IsNested;
+            if (WithholdsKeyboard && !IsActive) FocusManager.SetFocusedElement(this, PickerNameBox);
+            else PickerNameBox.Focus();
             return;
         }
 
@@ -301,6 +361,14 @@ public partial class MainWindow : Window
         _closeRequested = true;
         try
         {
+            // A nested drop pumps UI messages while its transfer completes.
+            // A Close received there must not dispose the model/dispatcher
+            // before it has acquired and copied an archive source's bytes.
+            if (_pendingExternalDrop is { } transfer)
+            {
+                try { await transfer; }
+                catch (Exception) { /* The drop handler reports the transfer error; still save the window. */ }
+            }
             CaptureStateForSave();
             await _viewModel.SaveNowAsync();
         }
@@ -322,9 +390,21 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// What the window holds that the model does not, put into it before a
+    /// save.  The sidebar's width only once the start has put the saved width
+    /// on it: a window closed - or a session ended - while it was still
+    /// starting read the 240 the sidebar has until then, and saved that over
+    /// the width the user had dragged it to.  Until then the model still
+    /// holds the width it read.
+    /// </summary>
     private void CaptureStateForSave()
     {
-        _viewModel.SidebarWidth = SidebarColumn.ActualWidth > 0 ? SidebarColumn.ActualWidth : _restoredSidebarWidth;
+        if (_sidebarWidthRestored)
+        {
+            _viewModel.SidebarWidth = SidebarColumn.ActualWidth > 0 ? SidebarColumn.ActualWidth : _restoredSidebarWidth;
+        }
+
         CaptureNestedCamera();
     }
 
@@ -409,6 +489,20 @@ public partial class MainWindow : Window
                 ignoreModifierKeysOnRelease: true))
             .ToArray();
         editor.Pan.Value = new MultiGesture(MultiGesture.Match.Any, middleDrag);
+    }
+
+    /// <summary>
+    /// Nodify's editor pans by itself while something is dragged against its
+    /// edge, and it checks for that on a timer of a millisecond - which Windows
+    /// runs at every tick of its clock, 64 times a second - from the moment its
+    /// template is applied, dragged or not, shown or not.  It only ever pans
+    /// while the mouse is captured inside it, so the timer runs only then:
+    /// the same panning, and a window at rest that wakes nobody.
+    /// </summary>
+    private void ConfigureAutoPanning()
+    {
+        Editor.DisableAutoPanning = true;
+        Editor.IsMouseCaptureWithinChanged += (_, e) => Editor.DisableAutoPanning = e.NewValue is not true;
     }
 
     private void SetSpacePanArmed(bool armed)
@@ -777,10 +871,13 @@ public partial class MainWindow : Window
     /// button-up the answer is always yes.  A click with Ctrl or Shift is
     /// never the start of a rename.  From here until the button comes up,
     /// what the list box selects is the user's doing (see
-    /// <see cref="FolderListItems_SelectionChanged"/>).
+    /// <see cref="FolderListItems_SelectionChanged"/>).  Any press calls off
+    /// a rename still waiting: a click on another row is not a rename of
+    /// whichever row that one selects.
     /// </summary>
     private void FolderListItems_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
+        _folderListRenameTimer.Stop();
         _folderListMouseDown = true;
         NoteListInput();
         _folderListClickWasOnSelection =
@@ -815,6 +912,7 @@ public partial class MainWindow : Window
 
         if (_folderListClickWasOnSelection)
         {
+            _folderListRenameRow = item;
             _folderListRenameTimer.Stop();
             _folderListRenameTimer.Start();
             return;
@@ -935,12 +1033,20 @@ public partial class MainWindow : Window
 
     /// <summary>
     /// Starts the rename only once the double-click time has passed without a
-    /// second click, so opening something never opens a rename box first.
+    /// second click, so opening something never opens a rename box first -
+    /// and only of the row that was clicked, while it is still the one row
+    /// selected.  The selection moving on meanwhile, by a key or by the
+    /// canvas, made it a rename of whatever was selected by then.
     /// </summary>
     private void FolderListRename_Tick(object? sender, EventArgs e)
     {
         _folderListRenameTimer.Stop();
-        if (FolderListItems.SelectedItems.Count == 1 && FolderListItems.SelectedItem is FolderListItem)
+        var clicked = _folderListRenameRow;
+        _folderListRenameRow = null;
+        if (FolderListItems.SelectedItems.Count == 1
+            && FolderListItems.SelectedItem is FolderListItem row
+            && clicked is not null
+            && ViewAllPath.Equals(row.FullPath, clicked.FullPath))
         {
             _viewModel.RenameCommand.Execute(null);
         }
@@ -982,7 +1088,7 @@ public partial class MainWindow : Window
             }
             else
             {
-                ActivePane.Canvas.ZoomBy(factor > 1 ? 1.5 : 1 / 1.5);
+                ActivePane.Canvas.ZoomStep(factor > 1);
             }
 
             return;
@@ -1072,6 +1178,19 @@ public partial class MainWindow : Window
     /// <summary>The data object of the drag being read, and the paths it was found to carry (see <see cref="TryGetDropPaths"/>).</summary>
     private IDataObject? _dropData;
     private string[] _dropPaths = [];
+    private Task<bool>? _pendingExternalDrop;
+
+    bool INestedPaneHost.CompleteExternalDrop(Func<Task<bool>> beginTransfer)
+        => CompleteExternalDrop(beginTransfer);
+
+    private bool CompleteExternalDrop(Func<Task<bool>> beginTransfer)
+    {
+        if (_closeRequested || _pendingExternalDrop is not null) return false;
+        var transfer = beginTransfer();
+        _pendingExternalDrop = transfer;
+        try { return ExternalFileDrop.Complete(Dispatcher, transfer); }
+        finally { _pendingExternalDrop = null; }
+    }
 
     /// <summary>The last folder the drag was over, and whether its items may not go in (see <see cref="IsDropRefused"/>).</summary>
     private string? _dropCheckedFolder;
@@ -1103,33 +1222,36 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void Editor_PreviewDrop(object sender, DragEventArgs e)
+    private void Editor_PreviewDrop(object sender, DragEventArgs e)
     {
-        var carriesPaths = TryGetDropPaths(e.Data, out var paths);
-        ForgetDropPaths();
-        if (!carriesPaths)
-        {
-            e.Effects = DragDropEffects.None;
-            return;
-        }
-
-        var target = ResolveDropTarget(e, paths);
-        _viewModel.Tree.SetDropTarget(null);
-        if (target is null)
-        {
-            e.Effects = DragDropEffects.None;
-            return;
-        }
-
         e.Handled = true;
-        var effect = DropEffectFor(e, paths, target.FullPath);
-        e.Effects = ReportedDropEffect(effect);
-        if (effect == DragDropEffects.None)
+        e.Effects = DragDropEffects.None;
+        try
         {
-            return;
-        }
+            // Re-read the final paths: a source can have completed extraction
+            // since DragOver supplied its preview list.
+            ForgetDropPaths();
+            var carriesPaths = TryGetDropPaths(e.Data, out var paths);
+            ForgetDropPaths();
+            if (!carriesPaths) return;
 
-        await _viewModel.DropIntoPathAsync(paths, target.FullPath, move: effect == DragDropEffects.Move);
+            var target = ResolveDropTarget(e, paths);
+            _viewModel.Tree.SetDropTarget(null);
+            if (target is null) return;
+
+            var effect = DropEffectFor(e, paths, target.FullPath);
+            if (effect == DragDropEffects.None) return;
+
+            if (CompleteExternalDrop(() => _viewModel.DropIntoPathWithResultAsync(
+                    paths, target.FullPath, move: effect == DragDropEffects.Move)))
+                e.Effects = ReportedDropEffect(effect);
+        }
+        catch (Exception error)
+        {
+            ForgetDropPaths();
+            _viewModel.Tree.SetDropTarget(null);
+            _viewModel.Toast.ShowError(error.Message);
+        }
     }
 
     /// <summary>
@@ -1572,6 +1694,21 @@ public partial class MainWindow : Window
             return;
         }
 
+        // A press in the list of folders behind a crumb's chevron comes here
+        // too: the list is in a popup, and what is pressed in a popup goes on
+        // through it to the crumb it belongs to.  It is a press on that list,
+        // not on the bar, and it opened the line under the open list.
+        var pressed = e.OriginalSource as DependencyObject;
+        while (pressed is not null and not Visual)
+        {
+            pressed = ParentOf(pressed);
+        }
+
+        if (pressed is null || !AddressArea.IsAncestorOf(pressed))
+        {
+            return;
+        }
+
         if (FindAncestor<Button>(e.OriginalSource as DependencyObject) is not null)
         {
             return;
@@ -1597,6 +1734,25 @@ public partial class MainWindow : Window
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Open in Windows Explorer", "\uEC50", address.OpenInExplorerCommand);
         menu.IsOpen = true;
+    }
+
+    /// <summary>
+    /// A path longer than the bar has room for keeps its end in view - the
+    /// folder the window is in, and the ones just above it - as Explorer's
+    /// bar does.  The strip has no scroll bar and no wheel, and stayed at its
+    /// start, so the drive and the first folders showed and the folder the
+    /// user was in was cut off.  New crumbs, and a bar made narrower or
+    /// wider, go back to the end; a path that fits is shown from its start
+    /// as before.  The lists behind the chevrons scroll on their own, and
+    /// their scrolling comes up through here too: it is left alone.
+    /// </summary>
+    private void CrumbStrip_ScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        if (ReferenceEquals(e.OriginalSource, sender)
+            && (e.ExtentWidthChange != 0 || e.ViewportWidthChange != 0))
+        {
+            ((ScrollViewer)sender).ScrollToRightEnd();
+        }
     }
 
     private void BeginAddressEdit() => _viewModel.Address.BeginEdit();
@@ -1878,7 +2034,9 @@ public partial class MainWindow : Window
 
     private static SearchResultViewModel? SearchResultUnder(MouseEventArgs e)
     {
-        for (var element = e.OriginalSource as DependencyObject; element is not null; element = VisualTreeHelper.GetParent(element) ?? LogicalTreeHelper.GetParent(element))
+        // Highlighted text raises mouse events from Run/Span content elements,
+        // whose parents belong to the logical tree rather than the visual tree.
+        for (var element = e.OriginalSource as DependencyObject; element is not null; element = ParentOf(element))
         {
             if (element is ListBoxItem { DataContext: SearchResultViewModel result })
             {
@@ -1906,6 +2064,10 @@ public partial class MainWindow : Window
         // key in SystemKey, so reading e.Key alone silently drops Alt+Left,
         // Alt+Up, Alt+Enter and Shift+F10.
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
+
+        // A key calls off a rename the folder list is still waiting to start:
+        // it is not what was typed next that should go into its dialog.
+        _folderListRenameTimer.Stop();
 
         // Whatever the key, it is for the pane the keyboard is in.
         FollowKeyboardToPane();
@@ -2160,6 +2322,10 @@ public partial class MainWindow : Window
         _isSpacePanning = false;
         SetSpacePanArmed(false);
 
+        // Nor does a rename the folder list was about to start open its
+        // dialog over the program the user has gone to.
+        _folderListRenameTimer.Stop();
+
         // Going to another program puts the crumbs back, as Explorer does.
         _viewModel.Address.EndEdit();
     }
@@ -2207,15 +2373,15 @@ public partial class MainWindow : Window
 
     // ---- Dialogs -----------------------------------------------------------
 
-    private string? ShowInputDialog(string title, string prompt, string initialValue)
+    private string? ShowInputDialog(string title, string prompt, string initialValue, bool selectStem)
     {
-        var dialog = new InputDialog(title, prompt, initialValue) { Owner = this };
+        var dialog = new InputDialog(title, prompt, initialValue, selectStem) { Owner = this };
         return dialog.ShowDialog() == true ? dialog.Value : null;
     }
 
-    private bool ShowConfirmDialog(string title, string message)
+    private bool ShowConfirmDialog(string title, string message, string confirmLabel)
     {
-        var dialog = new ConfirmDialog(title, message) { Owner = this };
+        var dialog = new ConfirmDialog(title, message, confirmLabel, danger: confirmLabel == "Delete") { Owner = this };
         return dialog.ShowDialog() == true;
     }
 
@@ -2249,19 +2415,109 @@ public partial class MainWindow : Window
             return;
         }
 
+        // The point (0, 0) is on the primary monitor, by definition.
+        var primary = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+        if (!GetMonitorInfo(MonitorFromPoint(default, MonitorDefaultToPrimary), ref primary))
+        {
+            primary = info;
+        }
+
         var bounds = Marshal.PtrToStructure<MinMaxInfo>(lParam);
+        FitMaximizedBounds(ref bounds, info, primary.Work);
+        Marshal.StructureToPtr(bounds, lParam, false);
+    }
+
+    /// <summary>
+    /// What <see cref="ClampMaximizedBounds"/> writes for a window maximized on
+    /// the monitor <paramref name="target"/> describes, the primary monitor's
+    /// work area being <paramref name="primaryWork"/>.
+    ///
+    /// <para>Windows takes the maximized size as meant for the primary monitor,
+    /// and on any other one grows a size at least as large as the primary by
+    /// the difference between the two monitors.  So on a monitor larger than
+    /// the primary - a 4K screen beside a 1080p one - the work area written
+    /// here grew by that difference, and the caption buttons, the right end of
+    /// the toolbar and the status bar were laid out past the edges.  No size
+    /// written here can come out as the work area there, but a maximized
+    /// window is never made larger than its tracking size, so that is held to
+    /// the work area.  Only there: the work area is compared with the
+    /// primary's work area, the smaller of what Windows may compare it with,
+    /// and a window on the primary monitor, or on a smaller one, may still be
+    /// resized across monitors as before.</para>
+    /// </summary>
+    internal static void FitMaximizedBounds(ref MinMaxInfo bounds, MonitorInfo target, RectL primaryWork)
+    {
         bounds.MaxPosition = new PointL
         {
-            X = info.Work.Left - info.Monitor.Left,
-            Y = info.Work.Top - info.Monitor.Top
+            X = target.Work.Left - target.Monitor.Left,
+            Y = target.Work.Top - target.Monitor.Top
         };
         bounds.MaxSize = new PointL
         {
-            X = info.Work.Right - info.Work.Left,
-            Y = info.Work.Bottom - info.Work.Top
+            X = target.Work.Right - target.Work.Left,
+            Y = target.Work.Bottom - target.Work.Top
         };
 
-        Marshal.StructureToPtr(bounds, lParam, false);
+        if ((target.Flags & MonitorInfoPrimary) == 0
+            && bounds.MaxSize.X >= primaryWork.Right - primaryWork.Left
+            && bounds.MaxSize.Y >= primaryWork.Bottom - primaryWork.Top)
+        {
+            bounds.MaxTrackSize = new PointL
+            {
+                X = Math.Min(bounds.MaxTrackSize.X, bounds.MaxSize.X),
+                Y = Math.Min(bounds.MaxTrackSize.Y, bounds.MaxSize.Y)
+            };
+        }
+    }
+
+    /// <summary>
+    /// Keeps a window that is about to be shown for the first time wholly on
+    /// the monitor it opens on, wherever it was put.  It is 1520 by 900 and
+    /// centred on the work area whether or not that fits: on a 1080p screen
+    /// at 125 % the 900 is 1125 pixels, and the top went 46 pixels above the
+    /// screen, with the caption buttons and the strip the window is dragged
+    /// by.  On a small screen at 150 % even the minimum height, 620, is
+    /// taller than the screen, and a picker's OK and Cancel were below its
+    /// edge.  So the minimum is lowered to what the work area holds, the
+    /// window made no larger than the work area, and moved inside it by as
+    /// little as it takes; a window that fits is left where it was put.
+    /// </summary>
+    private void FitIntoWorkArea(IntPtr window)
+    {
+        if (WindowState != WindowState.Normal)
+        {
+            return;
+        }
+
+        var monitor = MonitorFromWindow(window, MonitorDefaultToNearest);
+        var info = new MonitorInfo { Size = Marshal.SizeOf<MonitorInfo>() };
+        if (monitor == IntPtr.Zero || !GetMonitorInfo(monitor, ref info) || !GetWindowRect(window, out var bounds))
+        {
+            return;
+        }
+
+        var work = info.Work;
+        var dpi = VisualTreeHelper.GetDpi(this);
+        var widest = Math.Floor((work.Right - work.Left) / dpi.DpiScaleX);
+        var tallest = Math.Floor((work.Bottom - work.Top) / dpi.DpiScaleY);
+        if (MinWidth > widest)
+        {
+            MinWidth = widest;
+        }
+
+        if (MinHeight > tallest)
+        {
+            MinHeight = tallest;
+        }
+
+        var width = Math.Min(bounds.Right - bounds.Left, work.Right - work.Left);
+        var height = Math.Min(bounds.Bottom - bounds.Top, work.Bottom - work.Top);
+        var left = Math.Clamp(bounds.Left, work.Left, work.Right - width);
+        var top = Math.Clamp(bounds.Top, work.Top, work.Bottom - height);
+        if (left != bounds.Left || top != bounds.Top || width != bounds.Right - bounds.Left || height != bounds.Bottom - bounds.Top)
+        {
+            SetWindowPos(window, IntPtr.Zero, left, top, width, height, SwpNoZOrder | SwpNoActivate);
+        }
     }
 
     private const int HtClient = 1;
@@ -2359,10 +2615,11 @@ public partial class MainWindow : Window
         MaximizeButton.Background = hover ? CaptionHoverBrush : Brushes.Transparent;
     }
 
+    private const int MonitorDefaultToPrimary = 0x00000001;
     private const int MonitorDefaultToNearest = 0x00000002;
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct RectL
+    internal struct RectL
     {
         public int Left;
         public int Top;
@@ -2371,14 +2628,14 @@ public partial class MainWindow : Window
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct PointL
+    internal struct PointL
     {
         public int X;
         public int Y;
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct MinMaxInfo
+    internal struct MinMaxInfo
     {
         public PointL Reserved;
         public PointL MaxSize;
@@ -2388,7 +2645,7 @@ public partial class MainWindow : Window
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    private struct MonitorInfo
+    internal struct MonitorInfo
     {
         public int Size;
         public RectL Monitor;

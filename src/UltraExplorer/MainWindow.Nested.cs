@@ -28,8 +28,12 @@ public partial class MainWindow : INestedPaneHost
 {
     private readonly List<NestedPane> _panes = [];
     private readonly List<NestedRoot> _nestedDrives = [];
+    private readonly List<NestedRoot> _pickerNestedRoots = [];
     private string[]? _nestedDragPaths;
     private bool _nestedReady;
+
+    /// <summary>Set when a drive answered late while the panes were being given the drives: they are given them again before any is entered.</summary>
+    private bool _nestedDrivesLate;
 
     /// <summary>
     /// The switches between the nested canvas and the tree so far, so the way
@@ -77,7 +81,7 @@ public partial class MainWindow : INestedPaneHost
     private void FocusCanvas(NestedPane pane)
     {
         UIElement canvas = IsNested ? pane.Canvas : Editor;
-        if (!IsActive && (IsTestWindow || IsDiagnosticsRun))
+        if (!IsActive && (WithholdsKeyboard || IsDiagnosticsRun))
         {
             FocusManager.SetFocusedElement(this, canvas);
             return;
@@ -101,16 +105,26 @@ public partial class MainWindow : INestedPaneHost
         _viewModel.PropertyChanged += OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
         _viewModel.Tree.DeepRefreshRequested += OnTreeDeepRefreshRequested;
+        _viewModel.Tree.DriveAdded += OnDriveAddedForNested;
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged += OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
+
+        // What the canvas being worked with draws of the selection, for
+        // Delete to ask about the rest (see MainViewModel.ShownSelectionCount).
+        // Only a canvas holding the selection as it is now can say.
+        _viewModel.ShownSelectionCount = () => _viewModel.IsNestedLayout && ActivePane.IsReady
+            ? ActivePane.Canvas.ShownOfSelection(_viewModel.Tree.Selection.Version)
+            : null;
     }
 
     private void DetachNested()
     {
+        _viewModel.ShownSelectionCount = null;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
         _viewModel.Tree.DeepRefreshRequested -= OnTreeDeepRefreshRequested;
+        _viewModel.Tree.DriveAdded -= OnDriveAddedForNested;
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged -= OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged -= OnMarkChangedForNested;
@@ -219,39 +233,81 @@ public partial class MainWindow : INestedPaneHost
     /// row of cells in every pane, the hidden-folder rules are copied over, and
     /// the camera is put back where the last session left it.
     /// </summary>
-    private Task InitializeNestedAsync()
+    private async Task InitializeNestedAsync()
     {
-        // A file dialog always shows the tree; it never needs this canvas.
-        if (IsPickerMode)
+        if (_closeRequested) return;
+        // A standalone picker keeps the tree; native replacements use tiles.
+        if (IsPickerMode && !IsNested)
         {
-            return Task.CompletedTask;
+            return;
         }
 
         // The drives the tree already found, not a second scan of them: a
         // drive that is slow to answer would otherwise hold up startup twice.
+        // One the tree is still waiting for joins later (OnDriveAddedForNested).
+        _nestedDrivesLate = false;
         _nestedDrives.Clear();
         _nestedDrives.AddRange(_viewModel.Tree.Roots
             .Where(root => root.IsDrive)
             .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
 
-        var roots = NestedRoots();
+        // The folder keeps its physical ancestors. Only their named entries
+        // are materialized, so no drive or parent listing delays the first view.
+        if (IsPickerMode && IsNested)
+        {
+            _pickerNestedRoots.Clear();
+            EnsurePickerVolumeRoot(_pickerStartFolder);
+        }
+        var roots = IsPickerMode && IsNested ? PickerNestedRoots() : NestedRoots();
         foreach (var pane in _panes)
         {
+            pane.Canvas.LoadUnfocusedRoots = !IsPickerMode && !_folderPaneRoots.ContainsKey(pane);
             pane.Initialize(roots);
+            var initial = IsPickerMode ? _pickerStartFolder : _folderInitialPath;
+            var start = initial is { Length: > 0 } ? await pane.Tree.MaterializePathAsync(initial) : null;
+            if (_closeRequested) return;
+
+            // A dialog's folder is read by name, as a flight reads where it
+            // goes: a junction, a link or a placeholder is never read for
+            // being drawn, and the dialog would open on it empty.
+            if (IsPickerMode && start is not null) _ = pane.Tree.LoadAsync(start);
+        }
+
+        // A drive that answered while the panes were being started.
+        if (_nestedDrivesLate)
+        {
+            _nestedDrivesLate = false;
+            SyncNestedRoots();
         }
 
         SyncNestedSelection();
         _nestedReady = true;
 
+        // A drive plugged in or pulled out while the canvas was starting:
+        // the drives it copied above may be from before it.
+        if (_nestedDrivesMissed)
+        {
+            _nestedDrivesMissed = false;
+            ScheduleDriveRescan();
+        }
+
         // The split the last session left, before any pane is entered.
         RestoreSplit();
+
+        // A folder launch goes to the pane being worked with, which the split
+        // put back may have changed: the first pane, kept from reading its
+        // drives above for a launch it will not have, reads them as ever.
+        if (!ReferenceEquals(ActivePane, FirstPane))
+        {
+            FirstPane.Canvas.LoadUnfocusedRoots = true;
+        }
+
         _viewModel.NestedZoomLabel = ActivePane.Canvas.ZoomText;
-        if (IsNested)
+        if (IsNested && !IsPickerMode)
         {
             EnterNested(fromStartup: true);
         }
 
-        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -289,14 +345,79 @@ public partial class MainWindow : INestedPaneHost
         }
     }
 
+    /// <summary>
+    /// A drive that had not answered as the window started has, and the tree
+    /// has it now: it joins the canvas's drives where a start that waited for
+    /// it would have put it, named as the tree names it, and a camera the
+    /// last session left on it is put back.  Before the canvas copied the
+    /// tree's drives, the copy takes it in.  Once the drives have been listed
+    /// again for a volume arriving or leaving, that listing is newer than this
+    /// answer, and stands.
+    /// </summary>
+    private void OnDriveAddedForNested(ViewAllNodeViewModel drive)
+    {
+        var listed = _nestedDrives.Any(existing => ViewAllPath.Equals(existing.FullPath, drive.FullPath));
+        if (!listed && DriveRescans == 0)
+        {
+            var place = _nestedDrives.FindIndex(existing => string.Compare(existing.FullPath, drive.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
+            _nestedDrives.Insert(place < 0 ? _nestedDrives.Count : place,
+                new NestedRoot(drive.FullPath, drive.DisplayName, NestedFolderKind.Drive, drive.SecondaryText));
+            if (!_nestedReady)
+            {
+                _nestedDrivesLate = true;
+                return;
+            }
+
+            SyncNestedRoots();
+            listed = true;
+        }
+
+        if (listed && _nestedReady)
+        {
+            foreach (var pane in _panes)
+            {
+                pane.DriveArrived(drive.FullPath);
+            }
+        }
+    }
+
     /// <summary>Drives, plus every share and WSL distribution the tree has as a root of its own, in every pane.</summary>
     private void SyncNestedRoots()
     {
-        var roots = NestedRoots();
+        var roots = IsPickerMode && IsNested ? PickerNestedRoots() : NestedRoots();
         foreach (var pane in _panes)
         {
             pane.Tree.SetRoots(roots);
         }
+    }
+
+    private void EnsureNestedLocation(string folder)
+    {
+        if (IsPickerMode && IsNested)
+        {
+            EnsurePickerVolumeRoot(folder);
+        }
+        SyncNestedRoots();
+    }
+
+    private void EnsurePickerVolumeRoot(string folder)
+    {
+        var full = ViewAllPath.Normalize(folder);
+        if (NestedRoots().Concat(_pickerNestedRoots).Any(root => IsNestedPathInside(full, root.FullPath))) return;
+        var volume = ViewAllPath.AncestorChain(full).FirstOrDefault();
+        if (volume is { Length: > 0 })
+            _pickerNestedRoots.Add(new(volume, FolderName(volume), NestedFolderKind.Drive));
+    }
+
+    internal static bool IsNestedPathInside(string path, string folder) => ViewAllPath.Equals(path, folder)
+        || path.StartsWith(folder.TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+
+    private List<NestedRoot> PickerNestedRoots()
+    {
+        var roots = NestedRoots();
+        foreach (var root in _pickerNestedRoots)
+            if (roots.All(existing => !ViewAllPath.Equals(existing.FullPath, root.FullPath))) roots.Add(root);
+        return roots;
     }
 
     /// <summary>
@@ -404,6 +525,13 @@ public partial class MainWindow : INestedPaneHost
                 }
 
                 ScheduleBeacons();
+                break;
+            case nameof(MainViewModel.ShowFavoriteLinks):
+                foreach (var pane in _panes)
+                {
+                    pane.Canvas.ShowFavoriteLinks = _viewModel.ShowFavoriteLinks;
+                    pane.RebuildBeacons();
+                }
                 break;
         }
     }
@@ -595,6 +723,21 @@ public partial class MainWindow : INestedPaneHost
     // ---- what a pane asks of the window ------------------------------------------
 
     bool INestedPaneHost.IsPickerMode => IsPickerMode;
+
+    void INestedPaneHost.PickerFolderChanged(string? folder, bool movedByUser) => OnPickerNestedFolderChanged(folder, movedByUser);
+
+    void INestedPaneHost.PickerFileOpened(string path) => OpenPickerNestedFile(path);
+
+    void INestedPaneHost.PickerFolderOpened(string path) => OpenPickerNestedFolder(path);
+
+    void INestedPaneHost.EnsureNestedLocation(NestedPane pane, string folder)
+    {
+        // Only a launch under way keeps its pane's other drives unread: a
+        // flight that finds no folder later would leave them so, with
+        // nothing to have them read again.
+        if (_folderLoadOwners.ContainsKey(pane)) SetFolderPaneLocation(pane, folder);
+        else EnsureNestedLocation(folder);
+    }
 
     string[]? INestedPaneHost.NestedDragPaths
     {

@@ -67,6 +67,8 @@ internal static partial class Program
             await SettingsResetChecks(shell);
             SettingsWordsChecks();
             ChromeFocusChecks(main);
+            await PreparedPickerWindowChecksAsync();
+            await SearchResultWindowClickChecksAsync();
             await SplitPaneWindowChecks(main, shell);
             await SplitViewWindowChecks(main, shell);
             await SplitBetweenPanesWindowChecks(main, shell);
@@ -169,6 +171,18 @@ internal static partial class Program
             window.NestedLayoutChoice.IsChecked == true && window.TreeLayoutChoice.IsChecked == false
             && !window.MinimapSwitch.IsEnabled);
 
+        var favoritesBefore = shell.ShowFavoriteLinks;
+        Check("favorite shortcuts show the remembered setting in their own toggle",
+            window.FavoriteLinksSwitch.IsChecked == favoritesBefore && window.FavoriteLinksSwitch.IsEnabled);
+        Toggle(window.FavoriteLinksSwitch);
+        await SettingsSettle();
+        Check("the favorite shortcut switch updates the setting and nested canvas",
+            shell.ShowFavoriteLinks == !favoritesBefore && main.Nested.ShowFavoriteLinks == shell.ShowFavoriteLinks);
+        shell.ShowFavoriteLinks = favoritesBefore;
+        await SettingsSettle();
+        Check("favorite shortcuts changed elsewhere update the toggle and canvas",
+            window.FavoriteLinksSwitch.IsChecked == favoritesBefore && main.Nested.ShowFavoriteLinks == favoritesBefore);
+
         // Canvas: the split view.
         Check("the split view shows off, side by side", window.SplitSwitch.IsChecked == false && window.SplitSideBySideChoice.IsChecked == true);
         Toggle(window.SplitSwitch);
@@ -181,6 +195,12 @@ internal static partial class Program
         shell.SplitOrientation = SplitOrientation.SideBySide;
         await SettingsSettle();
         Check("the split changed elsewhere shows at once", window.SplitSwitch.IsChecked == false && window.SplitSideBySideChoice.IsChecked == true);
+        Click(window.SplitSideBySideChoice);
+        await SettingsSettle();
+        Check("a click on Side by side, already chosen, splits the view (I165)",
+            shell.IsSplit && shell.SplitOrientation == SplitOrientation.SideBySide && window.SplitSwitch.IsChecked == true);
+        shell.IsSplit = false;
+        await SettingsSettle();
 
         // Canvas: the renderer.
         if (GpuBootstrap.ExplicitPreference is null)
@@ -263,6 +283,19 @@ internal static partial class Program
         shell.LeftDrag = NestedLeftDrag.SelectArea;
         await SettingsSettle();
         Check("left drag changed from the menu shows at once", window.SelectAreaChoice.IsChecked == true && window.PanChoice.IsChecked == false);
+
+        // Windows integration: the keyboard shortcut is a separate choice.
+        Check("Win+E has its own available switch with the same appearance as Windows integration",
+            window.WinEShortcutChoice.IsEnabled
+            && window.WinEShortcutChoice.Style == window.DialogReplacementChoice.Style
+            && System.Windows.Automation.AutomationProperties.GetName(window.WinEShortcutChoice) == "Open UltraExplorer with Win+E");
+        Check("the two Windows integration switches change separate settings",
+            window.DialogReplacementChoice.GetBindingExpression(ToggleButton.IsCheckedProperty)?.ParentBinding is
+                { Path.Path: nameof(SettingsViewModel.IsDialogReplacementEnabled), Mode: System.Windows.Data.BindingMode.TwoWay }
+            && window.WinEShortcutChoice.GetBindingExpression(ToggleButton.IsCheckedProperty)?.ParentBinding is
+                { Path.Path: nameof(SettingsViewModel.IsWinEShortcutEnabled), Mode: System.Windows.Data.BindingMode.TwoWay });
+        Check("the Win+E switch shows its own chosen state",
+            window.WinEShortcutChoice.IsChecked == window.Settings.IsWinEShortcutEnabled);
 
         // About.
         Check("About names the version, the program's folder and the state folder",

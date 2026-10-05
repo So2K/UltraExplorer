@@ -90,6 +90,9 @@ public sealed partial class ChangeHub
         public FileDelta[]? Files;
         public int FileCount;
         public bool FilesIncomplete;
+        public FileDelta[]? Folders;
+        public int FolderCount;
+        public bool FoldersIncomplete;
 
         public void Reset()
         {
@@ -103,6 +106,9 @@ public sealed partial class ChangeHub
             Files = null;
             FileCount = 0;
             FilesIncomplete = false;
+            Folders = null;
+            FolderCount = 0;
+            FoldersIncomplete = false;
         }
     }
 
@@ -272,8 +278,8 @@ public sealed partial class ChangeHub
     /// <summary>
     /// Merges one record's change into its folder's pending change: on a
     /// watcher's thread, for a registered folder.  Allocates only for what a
-    /// change carries - a rename's names, a changed file's name - and only up
-    /// to <see cref="MaximumDetails"/> of each.
+    /// change carries - a rename's names, a changed file's or sub-folder's
+    /// name - and only up to <see cref="MaximumDetails"/> of each.
     /// </summary>
     internal void Note(string key, ChangeKinds kinds, WatchRoot root, in ChangeRecord record, ReadOnlySpan<char> leaf, ReadOnlySpan<char> renamedFrom)
     {
@@ -293,6 +299,10 @@ public sealed partial class ChangeHub
                 {
                     change.FilesIncomplete = true;
                 }
+            }
+            else if (kinds == ChangeKinds.DirDate && !change.FoldersIncomplete)
+            {
+                AddFolder(change, leaf, in record);
             }
 
             if (!renamedFrom.IsEmpty && change.RenameCount < MaximumDetails)
@@ -454,6 +464,33 @@ public sealed partial class ChangeHub
         files[change.FileCount++] = delta with { Name = leaf.ToString() };
     }
 
+    /// <summary>
+    /// Lists a sub-folder whose own entry changed, with its attributes now,
+    /// once however often it changed - what tells one hidden or shown from
+    /// one only written in; past the limit the list is given up.
+    /// </summary>
+    private static void AddFolder(PendingChange change, ReadOnlySpan<char> leaf, in ChangeRecord record)
+    {
+        var folders = change.Folders ??= new FileDelta[MaximumDetails];
+        var delta = new FileDelta(string.Empty, 0, record.LastWriteTicks) { Attributes = (FileAttributes)record.Attributes };
+        for (var index = 0; index < change.FolderCount; index++)
+        {
+            if (leaf.Equals(folders[index].Name, StringComparison.OrdinalIgnoreCase))
+            {
+                folders[index] = delta with { Name = folders[index].Name };
+                return;
+            }
+        }
+
+        if (change.FolderCount == MaximumDetails)
+        {
+            change.FoldersIncomplete = true;
+            return;
+        }
+
+        folders[change.FolderCount++] = delta with { Name = leaf.ToString() };
+    }
+
     /// <summary>Sets when the change falls due and has the timer come for it.  Under the gate.</summary>
     private void Settle(PendingChange change)
     {
@@ -608,7 +645,10 @@ public sealed partial class ChangeHub
                 change.Kinds,
                 change.First,
                 change.Renames is { } renames ? renames.AsMemory(0, change.RenameCount) : default,
-                change.Files is { } files && !change.FilesIncomplete ? files.AsMemory(0, change.FileCount) : default);
+                change.Files is { } files && !change.FilesIncomplete ? files.AsMemory(0, change.FileCount) : default)
+            {
+                Folders = change.Folders is { } folders && !change.FoldersIncomplete ? folders.AsMemory(0, change.FolderCount) : default
+            };
             if (interest is not null && change.IsNetwork && (change.Kinds & ChangeKinds.Gone) == 0)
             {
                 ref var timing = ref CollectionsMarshal.GetValueRefOrAddDefault(_timings, change.Key, out _);

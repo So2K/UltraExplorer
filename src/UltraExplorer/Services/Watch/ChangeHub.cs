@@ -125,6 +125,9 @@ public sealed partial class ChangeHub : IDisposable
     private int _sweeping;
     private int _nestedAfterSweep;
 
+    /// <summary>Set when a root was dropped, until a scan finds no path still registered under a dropped one (<see cref="Adopt"/>).</summary>
+    private int _orphans;
+
     public ChangeHub(TimeProvider time)
         : this(time, new VolumeResolver())
     {
@@ -211,30 +214,7 @@ public sealed partial class ChangeHub : IDisposable
 
         var root = FindRoot(key, create: true, depth: 0);
         var added = Registry.Add(consumer, key, target, root, out var moved);
-
-        // The path's registrations moved roots with it: their counts go
-        // along, or the new root would count no interest in the path - no
-        // bump after it arms, no polls, a share let go while the list shows
-        // it - and a later Unregister would take one away from another's.
-        if (moved.Nested != 0 || moved.Other != 0)
-        {
-            if (moved.From is { } from)
-            {
-                Release(ref from.NestedInterest, moved.Nested);
-                Release(ref from.OtherInterest, moved.Other);
-            }
-
-            if (moved.To is { } to)
-            {
-                Interlocked.Add(ref to.NestedInterest, moved.Nested);
-                Interlocked.Add(ref to.OtherInterest, moved.Other);
-                if (moved.Other != 0)
-                {
-                    ArmWhenIdle(to);
-                }
-            }
-        }
-
+        MoveInterest(moved);
         if (!added)
         {
             return;
@@ -255,6 +235,36 @@ public sealed partial class ChangeHub : IDisposable
         {
             Interlocked.Increment(ref root.OtherInterest);
             ArmWhenIdle(root);
+        }
+    }
+
+    /// <summary>
+    /// A path's registrations moved roots with it: their counts go along, or
+    /// the new root would count no interest in the path - no bump after it
+    /// arms, no polls, a share let go while the list shows it - and a later
+    /// Unregister would take one away from another's.
+    /// </summary>
+    private void MoveInterest(in ChangeRegistry.RootMove moved)
+    {
+        if (moved.Nested == 0 && moved.Other == 0)
+        {
+            return;
+        }
+
+        if (moved.From is { } from)
+        {
+            Release(ref from.NestedInterest, moved.Nested);
+            Release(ref from.OtherInterest, moved.Other);
+        }
+
+        if (moved.To is { } to)
+        {
+            Interlocked.Add(ref to.NestedInterest, moved.Nested);
+            Interlocked.Add(ref to.OtherInterest, moved.Other);
+            if (moved.Other != 0)
+            {
+                ArmWhenIdle(to);
+            }
         }
     }
 
@@ -359,7 +369,8 @@ public sealed partial class ChangeHub : IDisposable
     /// Forgets <paramref name="root"/>: its volume is gone.  The handle is
     /// closed, and the next <see cref="RootFor"/> for a path on it makes a new
     /// root, which is how a drive that comes back at the same letter is
-    /// watched afresh.
+    /// watched afresh - with what is still registered under this one moved
+    /// to it (<see cref="Adopt"/>).
     /// </summary>
     public void Drop(WatchRoot root)
     {
@@ -381,6 +392,7 @@ public sealed partial class ChangeHub : IDisposable
             watcher?.Stop();
         }
 
+        Volatile.Write(ref _orphans, 1);
         lock (_rootsGate)
         {
             if (_roots.TryGetValue(root.Key, out var known) && ReferenceEquals(known, root))
@@ -611,12 +623,48 @@ public sealed partial class ChangeHub : IDisposable
             _letters[index] = root;
         }
 
+        // Before it arms, so that the bump arming makes reaches what it takes in.
+        Adopt(root);
         if (root.Kind == WatchKind.Local)
         {
             ArmWhenIdle(root);
         }
 
         return root;
+    }
+
+    /// <summary>
+    /// A letter was found to be <paramref name="root"/>, after a root was
+    /// dropped - a drive taken out and put back is a new root: the paths still
+    /// registered under the dropped one, which nobody registers again - the
+    /// folder list's folder, until the list goes elsewhere - move to the root
+    /// that now holds them.  Left under the dropped one, nothing would hear
+    /// or poll them.  A walk over the registered paths, only after a drop.
+    /// </summary>
+    private void Adopt(WatchRoot root)
+    {
+        if (Interlocked.Exchange(ref _orphans, 0) == 0)
+        {
+            return;
+        }
+
+        foreach (var key in Registry.Keys)
+        {
+            if (!Registry.TryGet(key, out var interest) || interest.Root is not { IsDropped: true })
+            {
+                continue;
+            }
+
+            if (ReferenceEquals(FindRoot(key, create: false, depth: 0), root))
+            {
+                MoveInterest(Registry.Rehome(key, root));
+            }
+            else
+            {
+                // Another letter's, not back yet: looked for again when one is.
+                Volatile.Write(ref _orphans, 1);
+            }
+        }
     }
 
     /// <summary>
@@ -638,6 +686,8 @@ public sealed partial class ChangeHub : IDisposable
             {
                 known.IsDropped = true;
             }
+
+            Volatile.Write(ref _orphans, 1);
         }
 
         return AddRootLocked(key, kind, isNetwork);

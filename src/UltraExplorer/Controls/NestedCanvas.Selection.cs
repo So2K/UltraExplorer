@@ -80,6 +80,30 @@ public sealed partial class NestedCanvas
     }
 
     /// <summary>
+    /// How many of the window's selected items this canvas shows, for Delete
+    /// to ask about the rest; null when the canvas holds another version of
+    /// the selection than <paramref name="version"/> and cannot say.  An item
+    /// waiting for a folder the canvas has not read - a search result
+    /// elsewhere, a folder the list went into - counts as shown: nothing
+    /// says it is left out; so does one in a folder too large for the canvas
+    /// to list whole.  One left out of a folder the canvas has read - hidden
+    /// while hidden items are hidden, or a file while the Files layer is
+    /// off - does not.
+    /// </summary>
+    internal int? ShownOfSelection(long version)
+    {
+        TakeSetSelection();
+        if (_selection.LoadedVersion != version)
+        {
+            return null;
+        }
+
+        return _selection.Count + _selection.CountWaiting(path =>
+            _tree?.Find(path) is not { } folder || !folder.IsLoaded && !folder.IsComputer
+            || folder.IsTruncated || folder.UnlistedFileCount > 0);
+    }
+
+    /// <summary>
     /// Takes in the window's selection, unless the canvas already holds that
     /// version - its own gestures come back this way, and are ignored.  What
     /// the rectangle being drawn would do is kept on top of it.
@@ -219,15 +243,40 @@ public sealed partial class NestedCanvas
         _selection.Anchor = key;
         _selection.Active = key;
         var path = key.Path;
+        List<string> removed = selected ? [] : [path];
+        var above = selected && DeselectFoldersAbove(key.Container, removed);
         Commit(new SelectionEdit
         {
-            Container = key.Container.FullPath,
+            Container = above ? null : key.Container.FullPath,
             Added = selected ? [ItemOf(key, path)] : [],
-            Removed = selected ? [] : [path],
+            Removed = removed,
             Anchor = path,
             Focus = path,
             Source = SelectionSource.Canvas
         });
+    }
+
+    /// <summary>
+    /// Items added inside a folder that is selected itself - the folder gone
+    /// into, which going there selects - take that folder and every selected
+    /// folder above it out, their paths added to <paramref name="removed"/>:
+    /// kept, a Delete or a Move would act on the whole folder rather than on
+    /// what was picked in it.  True when there were any; the edit's items are
+    /// then not all in one folder.
+    /// </summary>
+    private bool DeselectFoldersAbove(NestedFolder container, List<string> removed)
+    {
+        var any = false;
+        for (var folder = container; folder.Parent is not null; folder = folder.Parent)
+        {
+            if (_selection.SetFolder(folder, false))
+            {
+                removed.Add(folder.FullPath);
+                any = true;
+            }
+        }
+
+        return any;
     }
 
     /// <summary>
@@ -296,14 +345,17 @@ public sealed partial class NestedCanvas
             _selection.Settle(container, fileSet, filesBefore);
         }
 
+        List<string> removed = [];
+        var above = add && DeselectFoldersAbove(container, removed);
         _selection.Anchor = anchor;
         _selection.Active = to;
         _selection.CurrentFolder = container;
         Commit(new SelectionEdit
         {
             Clear = !add,
-            Container = container.FullPath,
+            Container = above ? null : container.FullPath,
             Added = items,
+            Removed = removed,
             Anchor = anchor.Path,
             Focus = to.Path,
             Source = SelectionSource.Canvas
@@ -717,12 +769,13 @@ public sealed partial class NestedCanvas
             _selection.Active = focus;
         }
 
+        var above = !replace && added.Count > 0 && DeselectFoldersAbove(container, removed);
         _selection.CurrentFolder = container;
         MarqueePreview?.Invoke(-1);
         Commit(new SelectionEdit
         {
             Clear = replace,
-            Container = container.FullPath,
+            Container = above ? null : container.FullPath,
             Added = added,
             Removed = removed,
             Anchor = anchorKey?.Path,

@@ -1,6 +1,7 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using UltraExplorer.Controls;
@@ -36,8 +37,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 {
     private readonly ShellIconService _iconService = new();
     private readonly NativeShellService _shellService = new();
-    private readonly WorkspaceStore _workspaceStore = new();
-    private readonly FolderMarkService _marks = new();
+    private readonly WorkspaceStore _workspaceStore;
+    private readonly FolderMarkService _marks;
+    private readonly bool _isFolderWindow;
     private readonly FileSystemService _fileSystemService;
 
     /// <summary>Where the pane being worked with has been (see <see cref="History"/>).</summary>
@@ -62,6 +64,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private bool _isDisposed;
 
+    /// <summary>The navigation pane's latest drive listing asked for; one older that answers after it is let go (<see cref="ShowDrivesAsync"/>).</summary>
+    private int _drivesListing;
+
     private bool _isMinimapVisible;
     private double _sidebarWidth = 240;
     private CanvasMode _mode = CanvasMode.ViewAll;
@@ -74,6 +79,30 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private Controls.NestedLeftDrag _leftDrag = Controls.NestedLeftDrag.SelectArea;
     private bool _leftDragHintShown;
     private CanvasLayer _layers = CanvasLayer.All;
+    private bool _showFavoriteLinks;
+    private bool _favoriteLinksChanged;
+    private bool _favoritesChanged;
+
+    /// <summary>
+    /// The workspace as this window last read or wrote it: its own settings
+    /// as they were then.  A save writes over the file only the settings
+    /// that differ from these - the ones changed in this window since - and
+    /// keeps the file's for the rest, which another window, a dialog or
+    /// another process may have changed meanwhile.  Written whole from
+    /// memory, a window loaded earlier put back what it had read at its
+    /// start over every such change.  Null until the workspace is loaded.
+    /// </summary>
+    private WorkspaceState? _savedWorkspace;
+
+    /// <summary>
+    /// The pins as this window last read or wrote them.  Its pins and unpins
+    /// since are laid over the pins the file has then; its list written
+    /// whole took off every pin made in a dialog or another window meanwhile.
+    /// </summary>
+    private List<FavoriteState> _savedFavorites = [];
+
+    private readonly SemaphoreSlim _stateSaving = new(1, 1);
+    private bool? _pickerShowsFiles;
     private bool _isSplit;
     private SplitOrientation _splitOrientation = SplitOrientation.SideBySide;
     private double _splitRatio = SplitLayout.DefaultRatio;
@@ -85,17 +114,32 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// Overrides where the canvas layout is saved; a picker session keeps its
     /// own so it cannot rearrange the user's workspace.
     /// </param>
-    public MainViewModel(string? treeStatePath = null)
+    public MainViewModel(string? treeStatePath = null, bool nestedPicker = false)
+        : this(treeStatePath, nestedPicker, null)
     {
+    }
+
+    /// <param name="normalWorkspacePath">
+    /// Set for a folder window - an Explorer window taken over, or one opened
+    /// with --new-window - whose own view the caller keeps under that name
+    /// (<paramref name="treeStatePath"/> is made from it).  Its pins, orders,
+    /// colours and settings are the user's like any other window's, and go
+    /// where every window reads them: kept in files of its own, they were
+    /// never read again, and lost with the window.
+    /// </param>
+    internal MainViewModel(string? treeStatePath, bool nestedPicker, string? normalWorkspacePath)
+    {
+        _isFolderWindow = normalWorkspacePath is not null;
+        _workspaceStore = new WorkspaceStore();
+        _marks = new FolderMarkService();
         _fileSystemService = new FileSystemService(_iconService);
 
-        // A file dialog lists files on its canvas and its rules are built around
-        // the tree, so it keeps that picture whatever the user chose for their
-        // own window.
-        _isPickerSession = treeStatePath is not null;
+        // Pickers keep their own state. Native replacement starts with the
+        // tile canvas; standalone picker callers retain the original tree.
+        _isPickerSession = treeStatePath is not null && !_isFolderWindow;
         if (_isPickerSession)
         {
-            _layout = CanvasLayout.Tree;
+            _layout = nestedPicker ? CanvasLayout.Nested : CanvasLayout.Tree;
         }
 
         Tree = new ViewAllViewModel(_marks, _iconService, treeStatePath);
@@ -128,7 +172,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Tree.BeginNavigation,
             Tree.IsLatestNavigation,
             RecentLocations,
-            (message, isError) => OnTreeMessage(message, isError));
+            (message, isError) => OnTreeMessage(message, isError),
+            // A crumb's chevron shows or leaves out hidden and system folders
+            // as the window does.
+            () => Tree.ShowHiddenItems);
 
         NewFolderCommand = new AsyncRelayCommand(CreateFolderAsync);
         NewTextFileCommand = new AsyncRelayCommand(CreateTextFileAsync);
@@ -243,8 +290,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>Zoom factor, or 0 to reset the canvas to 100%.</summary>
     public event Action<double>? ZoomRequested;
 
-    public event Func<string, string, string, string?>? PromptRequested;
-    public event Func<string, string, bool>? ConfirmRequested;
+    /// <summary>
+    /// Asks the user for a line of text: the title, the prompt, the text to
+    /// start from, and whether that text is a file's name - then only what
+    /// comes before its extension is picked out, so typing keeps the
+    /// extension.  A folder's name or a note is picked out whole: what follows
+    /// a dot in "Photos 2024.06" is no extension.
+    /// </summary>
+    public event Func<string, string, string, bool, string?>? PromptRequested;
+    /// <summary>
+    /// Asks the user before something is done: the title, the message and the
+    /// confirming button's label.  "Delete" is drawn as a danger; anything
+    /// else - opening sixteen files - as the usual accent button.
+    /// </summary>
+    public event Func<string, string, string, bool>? ConfirmRequested;
     public event Action<IReadOnlyList<string>, FrameworkElement, Point>? ContextMenuRequested;
 
     public CanvasMode Mode
@@ -396,21 +455,49 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     }
 
     /// <summary>
-    /// The nested canvas's layers that are showing (see <see cref="CanvasLayer"/>):
-    /// all of them unless the user switched some off from the layers menu,
-    /// Canvas options or Settings.  Remembered with the workspace.
+    /// Optional round navigation links above This PC, remembered with the workspace.
     /// </summary>
+    public bool ShowFavoriteLinks
+    {
+        get => _showFavoriteLinks;
+        set
+        {
+            if (SetProperty(ref _showFavoriteLinks, value))
+            {
+                _favoriteLinksChanged = true;
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
+    /// <summary>The visible nested canvas layers, remembered with the workspace.</summary>
     public CanvasLayer Layers
     {
         get => _layers;
         set
         {
-            if (SetProperty(ref _layers, value & CanvasLayer.All))
+            var normalized = NormalizePickerLayers(value & CanvasLayer.All);
+            if (SetProperty(ref _layers, normalized))
             {
                 _ = SaveNowAsync();
             }
+            else if (normalized != value) OnPropertyChanged();
         }
     }
+
+    internal void ConfigurePickerFiles(bool shown)
+    {
+        _pickerShowsFiles = shown;
+        _layers = NormalizePickerLayers(_layers);
+        OnPropertyChanged(nameof(Layers));
+    }
+
+    private CanvasLayer NormalizePickerLayers(CanvasLayer layers) => _pickerShowsFiles switch
+    {
+        true => layers | CanvasLayer.Files,
+        false => layers & ~CanvasLayer.Files,
+        _ => layers
+    };
 
     /// <summary>Whether a layer is showing.</summary>
     public bool IsLayerShown(CanvasLayer layer) => (_layers & layer) == layer;
@@ -587,12 +674,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    /// <summary>File Explorer on one item, whatever is selected.</summary>
+    /// <summary>File Explorer on one item, whatever is selected: Windows Explorer itself, as the command says.</summary>
     public void ShowInExplorer(string path)
     {
         try
         {
-            NativeShellService.ShowInExplorer(path);
+            NativeShellService.ShowInWindowsExplorer(path);
         }
         catch (Exception ex)
         {
@@ -603,7 +690,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>Asks for one item's note - the one it has, to edit, or a new one - and keeps what comes back.</summary>
     public void EditNoteOf(string path, string name)
     {
-        var note = PromptRequested?.Invoke("Note", $"Note for {name}", _marks.Get(path).Note);
+        var note = PromptRequested?.Invoke("Note", $"Note for {name}", _marks.Get(path).Note, false);
         if (note is not null)
         {
             Tree.ApplyNote(path, note);
@@ -671,7 +758,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     public async Task InitializeAsync(string? initialPath = null)
     {
-        if (_isInitialized)
+        if (_isInitialized || _isDisposed)
         {
             return;
         }
@@ -679,7 +766,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _isInitialized = true;
 
         await _marks.LoadAsync();
+        if (_isDisposed) return;
         var state = await _workspaceStore.LoadAsync();
+        if (_isDisposed) return;
+        if (_isFolderWindow && state is not null)
+        {
+            state.IsSplit = false;
+            state.ActivePane = 0;
+            state.CanvasLayout = nameof(CanvasLayout.Nested);
+        }
         if (state is not null)
         {
             SidebarWidth = Math.Clamp(state.SidebarWidth <= 0 ? 240 : state.SidebarWidth, 190, 340);
@@ -700,7 +795,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             Rendering.Gpu.GpuBootstrap.SetSettingPreference(Renderer);
             _leftDrag = WorkspaceState.ParseLeftDrag(state.NestedLeftDrag);
             _leftDragHintShown = state.NestedLeftDragHintShown;
-            _layers = CanvasLayers.Parse(state.CanvasLayersOff);
+            _layers = NormalizePickerLayers(CanvasLayers.Parse(state.CanvasLayersOff));
+            _showFavoriteLinks = state.ShowFavoriteLinks;
+            OnPropertyChanged(nameof(ShowFavoriteLinks));
 
             // A file dialog shows the tree and never splits, and writes back
             // whatever the file says (see SaveNowAsync).
@@ -750,7 +847,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
         }
 
-        var quickAccess = _fileSystemService.GetQuickAccess();
+        // The settings as read, before the wait below: the window is shown and
+        // usable while it lasts, and a setting changed in it is this window's
+        // change, to be written by the next save.  Taken after the wait, it
+        // counted as what the file already had and was never written.
+        _savedWorkspace = CaptureWorkspace();
+
+        // Which known folders, drives and WSL distributions are there is asked
+        // off the UI thread, the three at once: a drive mapped to a server that
+        // is off takes some twenty seconds to say it is not ready, and every
+        // window of the process - Explorer's replacements and the pickers too -
+        // shares this thread.  The drives are not waited for: the window is not
+        // ready until its tree is, and the broker gives a window it made
+        // fifteen seconds, so the pane's drives come in when they have answered
+        // (ShowDrivesAsync), as they do when a volume arrives or leaves.
+        var knownPlaces = Task.Run(FileSystemService.ListQuickAccess);
+        var readyDrives = Task.Run(FileSystemService.ListReadyDrives);
+        var distributions = Task.Run(FileSystemService.ListWslDistributions);
+        await Task.WhenAll(knownPlaces, distributions);
+        if (_isDisposed) return;
+
+        var quickAccess = _fileSystemService.GetQuickAccess(await knownPlaces);
         foreach (var item in quickAccess)
         {
             if (item.Name == "Home")
@@ -794,14 +911,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         _isStateLoaded = true;
 
+        // The pins once they are all in the pane; the settings' baseline
+        // above has none, and a save lays pins over these, never over that.
+        _savedFavorites = FavoriteSnapshot();
+
         _fileSystemService.AttachIcons(HomeItems.Concat(QuickAccess).ToArray());
 
-        foreach (var drive in _fileSystemService.GetDrives())
-        {
-            Drives.Add(drive);
-        }
+        _ = ShowDrivesAsync(readyDrives);
 
-        foreach (var location in _fileSystemService.GetNetworkLocations())
+        foreach (var location in _fileSystemService.GetNetworkLocations(await distributions))
         {
             NetworkLocations.Add(location);
         }
@@ -813,6 +931,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Tree.IsCanvasShown = IsTreeLayout;
         Tree.RestoresSecondPane = _isSplit;
         await Tree.InitializeAsync(initialPath);
+        if (_isDisposed) return;
         Address.SetPath(Tree.ActivePath);
         UpdateSidebarSelection();
     }
@@ -826,10 +945,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// spinning up takes seconds to say - and the list is only replaced when
     /// it changed.
     /// </summary>
-    public async Task RefreshDrivesAsync()
+    public Task RefreshDrivesAsync() => ShowDrivesAsync(Task.Run(FileSystemService.ListReadyDrives));
+
+    /// <summary>
+    /// Puts the drives a listing found in the navigation pane once it has
+    /// answered - the start's own listing, or one made because a volume came
+    /// or went.  A start's listing waits for a drive mapped to a server that
+    /// is off, so a newer listing can answer first: only the latest asked for
+    /// is shown, and an older one answering after it is let go.
+    /// </summary>
+    private async Task ShowDrivesAsync(Task<IReadOnlyList<ReadyDrive>> listing)
     {
-        var ready = await Task.Run(FileSystemService.ListReadyDrives);
-        if (_isDisposed)
+        var ticket = ++_drivesListing;
+        var ready = await listing;
+        if (_isDisposed || ticket != _drivesListing)
         {
             return;
         }
@@ -856,17 +985,23 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// so it is taken as given rather than worked out again here from
     /// whatever keys seem to be down.
     /// </summary>
-    public async Task DropIntoPathAsync(
+    public Task DropIntoPathAsync(
+        IReadOnlyList<string> paths,
+        string targetDirectory,
+        bool move)
+        => DropIntoPathWithResultAsync(paths, targetDirectory, move);
+
+    internal Task<bool> DropIntoPathWithResultAsync(
         IReadOnlyList<string> paths,
         string targetDirectory,
         bool move)
     {
         if (paths.Count == 0)
         {
-            return;
+            return Task.FromResult(false);
         }
 
-        await TransferAsync(paths, targetDirectory, move, move ? "Moving" : "Copying");
+        return TransferAsync(paths, targetDirectory, move, move ? "Moving" : "Copying");
     }
 
     /// <summary>
@@ -889,78 +1024,113 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         return paths.All(path => NativeShellService.IsSameVolume(path, targetDirectory));
     }
 
+    internal async Task RefreshPickerNavigationPreferencesAsync()
+    {
+        if (!_isPickerSession || _isDisposed) return;
+        var state = await _workspaceStore.LoadAsync();
+        if (state is null || _isDisposed) return;
+        if (!_favoriteLinksChanged && _showFavoriteLinks != state.ShowFavoriteLinks)
+        {
+            _showFavoriteLinks = state.ShowFavoriteLinks;
+            OnPropertyChanged(nameof(ShowFavoriteLinks));
+        }
+        if (_favoritesChanged) return;
+        foreach (var item in QuickAccess.Where(item => item.IsCustom).ToArray()) QuickAccess.Remove(item);
+        foreach (var favorite in state.Favorites ?? [])
+        {
+            if (favorite is null || string.IsNullOrWhiteSpace(favorite.Path)
+                || HomeItems.Concat(QuickAccess).Any(item => ViewAllPath.Equals(item.Path, favorite.Path))) continue;
+            // Link metadata needs no directory reads or Shell icons at bind time.
+            QuickAccess.Add(new FavoriteItemViewModel
+            {
+                Name = string.IsNullOrWhiteSpace(favorite.Name) ? favorite.Path : favorite.Name,
+                Path = favorite.Path,
+                Glyph = favorite.Glyph ?? "\uE8B7",
+                AccentHex = favorite.AccentHex ?? "#E3B341",
+                IsCustom = true
+            });
+        }
+
+        // Read again: the pins a later pin or unpin here is laid over.
+        _savedFavorites = FavoriteSnapshot();
+    }
+
+    private List<FavoriteState> FavoriteSnapshot() => QuickAccess.Where(item => item.IsCustom)
+        .Select(item => new FavoriteState(item.Name, item.Path, item.Glyph, item.AccentHex)).ToList();
+
     public async Task SaveNowAsync()
     {
-        if (!_isStateLoaded)
+        if (_isDisposed) return;
+        // Serialize the whole snapshot/read/merge, not just the final write.
+        // A delayed read must never enqueue an older captured UI state last.
+        await _stateSaving.WaitAsync();
+        try { await SaveNowCoreAsync(); }
+        finally { _stateSaving.Release(); }
+    }
+
+    private async Task SaveNowCoreAsync()
+    {
+        if (!_isStateLoaded || _isDisposed)
         {
             return;
         }
-
-        // A file dialog never changes the layout or the order, and must not put
-        // back the ones it read at its start over a choice made meanwhile in
-        // the window.
-        var layout = _savedLayout;
-        string? sort = (_isPickerSession ? ItemSort.Default : Orders.Default).ToSetting();
-        string? scope = FolderOrders.ScopeSetting(Orders.Scope);
-        string? flow = FolderOrders.FlowSetting(Orders.Flow);
-        var folderSorts = _isPickerSession ? null : Orders.Saved();
-        var renderer = _savedRenderer;
-        var leftDrag = WorkspaceState.LeftDragSetting(_leftDrag);
-        var hintShown = _leftDragHintShown;
-        var layersOff = CanvasLayers.OffSetting(_layers);
-        var isSplit = _isSplit;
-        string? orientation = SplitLayout.OrientationSetting(_splitOrientation);
-        var ratio = _splitRatio;
-        var activePane = _isSplit ? _activePaneIndex : 0;
-
-        // A file dialog's hidden items are its caller's rules, not a choice.
-        var showHidden = !_isPickerSession && Tree.ShowHiddenItems;
-        if (_isPickerSession && await _workspaceStore.LoadAsync() is { } current)
+        if (SuppressShellWrites)
         {
-            layout = current.CanvasLayout;
-            sort = current.CanvasSort;
-            scope = current.CanvasSortScope;
-            flow = current.CanvasLayoutOrder;
-            folderSorts = current.FolderSorts;
-            renderer = current.CanvasRenderer;
-            leftDrag = current.NestedLeftDrag;
-            hintShown = current.NestedLeftDragHintShown;
-            layersOff = current.CanvasLayersOff;
-            showHidden = current.ShowHiddenItems;
-            isSplit = current.IsSplit;
-            orientation = current.SplitOrientation;
-            ratio = current.SplitRatio;
-            activePane = current.ActivePane;
+            // A native picker keeps layout/session writes suppressed, but an
+            // explicit favorite preference or pin edit still needs to persist.
+            await SaveNavigationPreferencesCoreAsync();
+
+            // So does a colour or a note set in it.  Its canvas, kept from
+            // writing as well, saves those and nothing else; left to the
+            // canvas's own save, a second after the last click, one set just
+            // before OK was lost with the dialog, which stops that save.
+            if (Tree.SuppressWrites)
+            {
+                await Tree.SaveAsync();
+            }
+
+            return;
         }
 
-        var state = new WorkspaceState
-        {
-            SidebarWidth = SidebarWidth,
-            IsMinimapVisible = IsMinimapVisible,
-            IsFolderListVisible = Tree.FolderList.IsVisible,
-            ShowHiddenItems = showHidden,
-            CanvasLayout = layout,
-            CanvasSort = sort,
-            CanvasSortScope = scope,
-            CanvasLayoutOrder = flow,
-            FolderSorts = folderSorts,
-            CanvasRenderer = renderer,
-            NestedLeftDrag = leftDrag,
-            NestedLeftDragHintShown = hintShown,
-            CanvasLayersOff = layersOff,
-            IsSplit = isSplit,
-            SplitOrientation = orientation,
-            SplitRatio = ratio,
-            ActivePane = activePane,
-            Favorites = QuickAccess
-                .Where(favorite => favorite.IsCustom)
-                .Select(favorite => new FavoriteState(favorite.Name, favorite.Path, favorite.Glyph, favorite.AccentHex))
-                .ToList()
-        };
-
+        // Read, merged and written in the workspace's turn among every window
+        // and process (see WorkspaceStore.UpdateAsync); the merge runs off
+        // this thread, so it is handed everything it needs now.
+        var here = CaptureWorkspace();
+        var before = _savedWorkspace!;
+        var favoritesBefore = _savedFavorites;
+        var ownLinks = _favoriteLinksChanged;
+        var ownFavorites = _favoritesChanged;
         try
         {
-            await _workspaceStore.SaveAsync(state);
+            await _workspaceStore.UpdateAsync(current =>
+            {
+                if (_isDisposed)
+                {
+                    return null;
+                }
+
+                if (current is null)
+                {
+                    return here;
+                }
+
+                // Nothing of this window's to write - a window closed after
+                // another saved its change must not write that file back as
+                // it read it a moment before.
+                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownFavorites);
+                return JsonSerializer.SerializeToUtf8Bytes(state).AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(current))
+                    ? null
+                    : state;
+            });
+
+            _savedWorkspace = here;
+            if (ownFavorites)
+            {
+                _savedFavorites = here.Favorites;
+            }
+
+            if (_showFavoriteLinks == here.ShowFavoriteLinks) _favoriteLinksChanged = false;
+            if (FavoriteSnapshot().SequenceEqual(here.Favorites)) _favoritesChanged = false;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -968,6 +1138,192 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         await Tree.SaveAsync();
     }
+
+    /// <summary>The workspace as this window has it now, before anything of the file is merged in.</summary>
+    private WorkspaceState CaptureWorkspace() => new()
+    {
+        SidebarWidth = SidebarWidth,
+        IsMinimapVisible = IsMinimapVisible,
+        IsFolderListVisible = Tree.FolderList.IsVisible,
+
+        // A file dialog's hidden items are its caller's rules, not a choice.
+        ShowHiddenItems = !_isPickerSession && Tree.ShowHiddenItems,
+        CanvasLayout = _savedLayout,
+        CanvasSort = (_isPickerSession ? ItemSort.Default : Orders.Default).ToSetting(),
+        CanvasSortScope = FolderOrders.ScopeSetting(Orders.Scope),
+        CanvasLayoutOrder = FolderOrders.FlowSetting(Orders.Flow),
+        FolderSorts = _isPickerSession ? null : Orders.Saved(),
+        CanvasRenderer = _savedRenderer,
+        NestedLeftDrag = WorkspaceState.LeftDragSetting(_leftDrag),
+        NestedLeftDragHintShown = _leftDragHintShown,
+        CanvasLayersOff = CanvasLayers.OffSetting(_layers),
+        ShowFavoriteLinks = _showFavoriteLinks,
+        IsSplit = _isSplit,
+        SplitOrientation = SplitLayout.OrientationSetting(_splitOrientation),
+        SplitRatio = _splitRatio,
+        ActivePane = _isSplit ? _activePaneIndex : 0,
+        Favorites = FavoriteSnapshot()
+    };
+
+    /// <summary>
+    /// What a save writes: the workspace as the file has it now
+    /// (<paramref name="there"/>), with what this window changed since it
+    /// last read or wrote it (<paramref name="here"/> against
+    /// <paramref name="before"/>) laid over it - a folder's order and a pin
+    /// one by one - and nothing else.  Every other window, dialog and
+    /// process does the same, so none puts back over another's change what
+    /// it read at its start.  A file dialog never writes the canvas's
+    /// settings, and a folder window never the everyday window's view: its
+    /// layout and split are its own.  The pin preference and the pins are
+    /// this window's to write once it changed them (<paramref name="ownLinks"/>,
+    /// <paramref name="ownFavorites"/>), as a dialog's are.
+    /// </summary>
+    private WorkspaceState MergeWorkspace(
+        WorkspaceState here,
+        WorkspaceState before,
+        WorkspaceState there,
+        List<FavoriteState> favoritesBefore,
+        bool ownLinks,
+        bool ownFavorites)
+    {
+        var settings = !_isPickerSession;
+        var view = !_isPickerSession && !_isFolderWindow;
+        return new WorkspaceState
+        {
+            SidebarWidth = Own(here.SidebarWidth, before.SidebarWidth, there.SidebarWidth),
+            IsMinimapVisible = Own(here.IsMinimapVisible, before.IsMinimapVisible, there.IsMinimapVisible),
+            IsFolderListVisible = Own(here.IsFolderListVisible, before.IsFolderListVisible, there.IsFolderListVisible),
+            ShowHiddenItems = settings ? Own(here.ShowHiddenItems, before.ShowHiddenItems, there.ShowHiddenItems) : there.ShowHiddenItems,
+            CanvasLayout = view ? Own(here.CanvasLayout, before.CanvasLayout, there.CanvasLayout) : there.CanvasLayout,
+            CanvasSort = settings ? Own(here.CanvasSort, before.CanvasSort, there.CanvasSort) : there.CanvasSort,
+            CanvasSortScope = settings ? Own(here.CanvasSortScope, before.CanvasSortScope, there.CanvasSortScope) : there.CanvasSortScope,
+            CanvasLayoutOrder = settings ? Own(here.CanvasLayoutOrder, before.CanvasLayoutOrder, there.CanvasLayoutOrder) : there.CanvasLayoutOrder,
+            FolderSorts = settings ? MergeFolderSorts(here.FolderSorts, before.FolderSorts, there.FolderSorts) : there.FolderSorts,
+            CanvasRenderer = settings ? Own(here.CanvasRenderer, before.CanvasRenderer, there.CanvasRenderer) : there.CanvasRenderer,
+            NestedLeftDrag = settings ? Own(here.NestedLeftDrag, before.NestedLeftDrag, there.NestedLeftDrag) : there.NestedLeftDrag,
+            NestedLeftDragHintShown = settings
+                ? Own(here.NestedLeftDragHintShown, before.NestedLeftDragHintShown, there.NestedLeftDragHintShown)
+                : there.NestedLeftDragHintShown,
+            CanvasLayersOff = settings && !(here.CanvasLayersOff ?? []).SequenceEqual(before.CanvasLayersOff ?? [])
+                ? here.CanvasLayersOff
+                : there.CanvasLayersOff,
+            ShowFavoriteLinks = ownLinks ? here.ShowFavoriteLinks : there.ShowFavoriteLinks,
+            IsSplit = view ? Own(here.IsSplit, before.IsSplit, there.IsSplit) : there.IsSplit,
+            SplitOrientation = view ? Own(here.SplitOrientation, before.SplitOrientation, there.SplitOrientation) : there.SplitOrientation,
+            SplitRatio = view ? Own(here.SplitRatio, before.SplitRatio, there.SplitRatio) : there.SplitRatio,
+            ActivePane = view ? Own(here.ActivePane, before.ActivePane, there.ActivePane) : there.ActivePane,
+            Favorites = ownFavorites ? MergeFavorites(here.Favorites, favoritesBefore, there.Favorites) : there.Favorites ?? []
+        };
+    }
+
+    /// <summary>This window's value where it changed it since <paramref name="before"/>, the file's otherwise.</summary>
+    private static T Own<T>(T here, T before, T there) =>
+        EqualityComparer<T>.Default.Equals(here, before) ? there : here;
+
+    /// <summary>
+    /// The folders' own orders as the file has them, with the folders this
+    /// window sorted, let go of or renamed since <paramref name="before"/>
+    /// taken out and this window's orders of them put in, as the most
+    /// recently sorted: another window's folders keep theirs.
+    /// </summary>
+    private static List<FolderSortState>? MergeFolderSorts(
+        List<FolderSortState>? here,
+        List<FolderSortState>? before,
+        List<FolderSortState>? there)
+    {
+        var mine = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in here ?? [])
+        {
+            mine[entry.Path] = entry.Sort;
+        }
+
+        var old = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in before ?? [])
+        {
+            old[entry.Path] = entry.Sort;
+        }
+
+        var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (path, sort) in mine)
+        {
+            if (!old.TryGetValue(path, out var was) || was != sort)
+            {
+                changed.Add(path);
+            }
+        }
+
+        changed.UnionWith(old.Keys.Where(path => !mine.ContainsKey(path)));
+        if (changed.Count == 0)
+        {
+            return there;
+        }
+
+        var merged = (there ?? [])
+            .Where(entry => entry is not null && !string.IsNullOrWhiteSpace(entry.Path) && !changed.Contains(entry.Path))
+            .ToList();
+        merged.AddRange((here ?? []).Where(entry => changed.Contains(entry.Path)));
+        if (merged.Count > FolderOrders.MaximumFolders)
+        {
+            merged.RemoveRange(0, merged.Count - FolderOrders.MaximumFolders);
+        }
+
+        return merged;
+    }
+
+    /// <summary>
+    /// The pins as the file has them, with the folders this window pinned
+    /// since <paramref name="before"/> added and the ones it unpinned taken
+    /// off: a pin made meanwhile in a dialog or another window stays.
+    /// </summary>
+    private static List<FavoriteState> MergeFavorites(List<FavoriteState> here, List<FavoriteState> before, List<FavoriteState>? there)
+    {
+        var merged = (there ?? []).Where(item => item is not null && !string.IsNullOrWhiteSpace(item.Path)).ToList();
+        foreach (var unpinned in before.Where(old => !here.Any(item => ViewAllPath.Equals(item.Path, old.Path))))
+        {
+            merged.RemoveAll(item => ViewAllPath.Equals(item.Path, unpinned.Path));
+        }
+
+        foreach (var pinned in here.Where(item => !before.Any(old => ViewAllPath.Equals(old.Path, item.Path))))
+        {
+            if (!merged.Any(item => ViewAllPath.Equals(item.Path, pinned.Path)))
+            {
+                merged.Add(pinned);
+            }
+        }
+
+        return merged;
+    }
+
+    private async Task SaveNavigationPreferencesCoreAsync()
+    {
+        if (_isDisposed || !_favoriteLinksChanged && !_favoritesChanged) return;
+        var links = _showFavoriteLinks;
+        var favorites = FavoriteSnapshot();
+        var favoritesBefore = _savedFavorites;
+        var saveLinks = _favoriteLinksChanged;
+        var saveFavorites = _favoritesChanged;
+        try
+        {
+            await _workspaceStore.UpdateAsync(current =>
+            {
+                if (_isDisposed) return null;
+                current ??= new WorkspaceState();
+                if (saveLinks) current.ShowFavoriteLinks = links;
+                if (saveFavorites) current.Favorites = MergeFavorites(favorites, favoritesBefore, current.Favorites);
+                return current;
+            });
+            if (saveLinks && _showFavoriteLinks == links) _favoriteLinksChanged = false;
+            if (saveFavorites)
+            {
+                _savedFavorites = favorites;
+                if (FavoriteSnapshot().SequenceEqual(favorites)) _favoritesChanged = false;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        { Toast.ShowError(ex.Message); }
+    }
+
+    internal bool SuppressShellWrites { get; set; }
 
     public void Dispose()
     {
@@ -979,10 +1335,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _isDisposed = true;
         Search.Dispose();
         Tree.PropertyChanged -= OnTreePropertyChanged;
+        Tree.Orders.Changed -= OnOrdersChanged;
         Tree.MessageRequested -= OnTreeMessage;
         Address.Dispose();
         Tree.Dispose();
         _changes.Dispose();
+
+        // Its thread (an STA of its own, with the Shell's objects and COM's
+        // hidden window) waits for work until told there is no more: without
+        // this, every window closed left one behind, for the life of the
+        // process - one per dialog in the resident dialog worker.
+        _iconService.Dispose();
     }
 
     private void OnTreePropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -1045,6 +1408,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _ = Toast.ShowSuccessAsync(message);
         }
     }
+
+    /// <summary>
+    /// Says a file command is done, and leaves the message to go by itself.
+    /// Waited for, it kept the command running for the seconds the message
+    /// shows, and a command still running cannot be used again: a second
+    /// Delete, F2 or Ctrl+V pressed meanwhile did nothing at all.
+    /// </summary>
+    private void ShowDone(string message) => _ = Toast.ShowSuccessAsync(message);
 
     /// <summary>
     /// Where this window has already been, newest first and each place once.
@@ -1153,7 +1524,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder");
+        var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder", false);
         if (name is null)
         {
             return;
@@ -1163,7 +1534,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             var path = NativeShellService.CreateFolder(target, name);
             await Tree.RefreshPathAsync(target);
-            await Toast.ShowSuccessAsync($"Created {Path.GetFileName(path)}");
+            ShowDone($"Created {Path.GetFileName(path)}");
         }
         catch (Exception ex)
         {
@@ -1179,7 +1550,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var name = PromptRequested?.Invoke("New text file", "File name", "New note.txt");
+        var name = PromptRequested?.Invoke("New text file", "File name", "New note.txt", true);
         if (name is null)
         {
             return;
@@ -1207,7 +1578,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         if (!NativeShellService.CopyPathsToClipboard(paths, cut))
         {
-            Toast.ShowError("Another application is holding the clipboard — try again.");
+            // Refused either because nothing selected is there any more -
+            // deleted from outside since it was selected - or because another
+            // program holds the clipboard.  Trying again only helps the second.
+            Toast.ShowError(paths.Any(ItemExists)
+                ? "Another application is holding the clipboard — try again."
+                : paths.Count == 1
+                    ? $"{(Path.GetFileName(Path.TrimEndingDirectorySeparator(paths[0])) is { Length: > 0 } name ? name : paths[0])} is no longer there."
+                    : "The selected items are no longer there.");
             return;
         }
 
@@ -1251,16 +1629,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         await TransferAsync(payload.Paths, target, payload.Cut, payload.Cut ? "Moving" : "Copying");
     }
 
-    private async Task TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
+    /// <summary>
+    /// How a file command asks whether an item it was given is still there.
+    /// Five thousand items on a share are as many questions to the network,
+    /// seconds of them on a LAN and minutes over a VPN, so they are asked off
+    /// the UI thread.  A test puts a slow answer here to see that nothing
+    /// waits for it there.
+    /// </summary>
+    internal static Func<string, bool> ItemExists { get; set; } = path => File.Exists(path) || Directory.Exists(path);
+
+    private async Task<bool> TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
     {
-        var safePaths = paths
-            .Where(path => File.Exists(path) || Directory.Exists(path))
+        var given = paths.ToArray();
+        var safePaths = await Task.Run(() => given
+            .Where(ItemExists)
             .Where(path => !NativeShellService.IsInvalidMoveTarget(path, targetDirectory))
-            .ToArray();
+            .ToArray());
+        if (_isDisposed)
+        {
+            return false;
+        }
+
         if (safePaths.Length == 0)
         {
             Toast.ShowError("This drop target is not valid for the selected item(s).");
-            return;
+            return false;
         }
 
         var sourceDirectories = safePaths
@@ -1290,18 +1683,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
 
             var targetName = Path.GetFileName(targetDirectory.TrimEnd(Path.DirectorySeparatorChar));
-            await Toast.ShowSuccessAsync(
+            ShowDone(
                 $"{(move ? "Moved" : "Copied")} {safePaths.Length} item(s) to {(string.IsNullOrEmpty(targetName) ? targetDirectory : targetName)}");
+            return true;
         }
         catch (OperationCanceledException)
         {
             await RefreshAfterOperationAsync(targetDirectory, sourceDirectories);
-            await Toast.ShowSuccessAsync($"{(move ? "Move" : "Copy")} cancelled");
+            ShowDone($"{(move ? "Move" : "Copy")} cancelled");
         }
         catch (Exception ex)
         {
             Toast.ShowError(ex.Message);
         }
+
+        return false;
     }
 
     private async Task RefreshAfterOperationAsync(string? targetDirectory, IEnumerable<string?> sourceDirectories)
@@ -1328,7 +1724,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         var path = paths[0];
         var currentName = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
-        var newName = PromptRequested?.Invoke("Rename", "Enter a new name", currentName);
+        var isFolder = Tree.Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : Directory.Exists(path);
+        var newName = PromptRequested?.Invoke("Rename", "Enter a new name", currentName, !isFolder);
         if (string.IsNullOrWhiteSpace(newName) || string.Equals(newName, currentName, StringComparison.Ordinal))
         {
             return;
@@ -1344,7 +1741,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 await Tree.RevealPathAsync(renamed, focus: false);
             }
 
-            await Toast.ShowSuccessAsync($"Renamed to {Path.GetFileName(renamed)}");
+            ShowDone($"Renamed to {Path.GetFileName(renamed)}");
         }
         catch (Exception ex)
         {
@@ -1376,12 +1773,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 }
             }
 
-            await Toast.ShowSuccessAsync($"Duplicated {paths.Count} item(s)");
+            ShowDone($"Duplicated {paths.Count} item(s)");
         }
         catch (OperationCanceledException)
         {
             await RefreshAfterOperationAsync(null, paths.Select(Path.GetDirectoryName));
-            await Toast.ShowSuccessAsync("Duplicate cancelled");
+            ShowDone("Duplicate cancelled");
         }
         catch (Exception ex)
         {
@@ -1389,23 +1786,66 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// How many of the selected items the canvas being worked with draws, as
+    /// the window counts them; null where it cannot say.  Hidden items or the
+    /// Files layer switched off after Ctrl+A leave items selected that nothing
+    /// shows, and they stay selected so that switching back on brings them
+    /// back as they were.
+    /// </summary>
+    internal Func<int?>? ShownSelectionCount { get; set; }
+
+    /// <summary>
+    /// Whether Delete may go on: at once when the canvas shows everything
+    /// selected, otherwise once the user agrees to it after being told how
+    /// many of the items it would take are not shown - desktop.ini or .git
+    /// were recycled with the rest without a word.
+    /// </summary>
+    private bool ConfirmUnshownSelection()
+    {
+        var count = Tree.Selection.Count;
+        if (ShownSelectionCount?.Invoke() is not { } shown || shown >= count)
+        {
+            return true;
+        }
+
+        return ConfirmRequested?.Invoke(
+            "Delete",
+            $"{count - shown:N0} of the {count:N0} selected items are not shown. Delete all {count:N0}?",
+            "Delete") == true;
+    }
+
     private async Task DeleteSelectionAsync(bool permanently)
     {
+        if (!ConfirmUnshownSelection())
+        {
+            return;
+        }
+
         // What is selected and still there: a file deleted from outside since
-        // it was selected is not the Shell's to be asked about.
-        var paths = Tree.SelectedPaths.Where(path => File.Exists(path) || Directory.Exists(path)).ToArray();
+        // it was selected is not the Shell's to be asked about.  Asked off
+        // the UI thread (see ItemExists), about what was selected when Delete
+        // was pressed, whatever is selected by the time the answers are in.
+        var selected = Tree.SelectedPaths.ToArray();
+        if (selected.Length == 0)
+        {
+            return;
+        }
+
+        var paths = await Task.Run(() => selected.Where(ItemExists).ToArray());
+        if (_isDisposed)
+        {
+            return;
+        }
+
         if (paths.Length == 0)
         {
-            if (Tree.SelectedPaths.Count > 0)
-            {
-                Tree.Selection.Remove(Tree.SelectedPaths, SelectionSource.Command);
-            }
-
+            Tree.Selection.Remove(selected, SelectionSource.Command);
             return;
         }
 
         if (permanently
-            && ConfirmRequested?.Invoke("Permanently delete", $"Permanently delete {paths.Length} item(s)? This cannot be undone.") != true)
+            && ConfirmRequested?.Invoke("Permanently delete", $"Permanently delete {paths.Length} item(s)? This cannot be undone.", "Delete") != true)
         {
             return;
         }
@@ -1429,12 +1869,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 await Tree.RefreshPathAsync(parent!);
             }
 
-            await Toast.ShowSuccessAsync(permanently ? "Deleted" : "Moved to Recycle Bin");
+            ShowDone(permanently ? "Deleted" : "Moved to Recycle Bin");
         }
         catch (OperationCanceledException)
         {
             await RefreshAfterOperationAsync(null, parents);
-            await Toast.ShowSuccessAsync("Delete cancelled");
+            ShowDone("Delete cancelled");
         }
         catch (Exception ex)
         {
@@ -1486,7 +1926,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (files.Length > 0)
             {
                 if (files.Length > OpenWithoutAsking
-                    && ConfirmRequested?.Invoke("Open", $"Open all {files.Length:N0} selected files?") != true)
+                    && ConfirmRequested?.Invoke("Open", $"Open all {files.Length:N0} selected files?", "Open") != true)
                 {
                     return;
                 }
@@ -1556,7 +1996,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             try
             {
-                NativeShellService.ShowInExplorer(path);
+                NativeShellService.ShowInWindowsExplorer(path);
             }
             catch (Exception ex)
             {
@@ -1591,6 +2031,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 IsCustom = true
             };
             _fileSystemService.AttachIcons([item]);
+            _favoritesChanged = true;
             QuickAccess.Add(item);
         }
     }
@@ -1599,7 +2040,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         if (favorite is { IsCustom: true })
         {
-            QuickAccess.Remove(favorite);
+            if (!QuickAccess.Remove(favorite)) return;
+            _favoritesChanged = true;
             _ = SaveNowAsync();
         }
     }
@@ -1622,7 +2064,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return Task.CompletedTask;
         }
 
-        var note = PromptRequested?.Invoke("Note", $"Note for {node.DisplayName}", node.Note);
+        var note = PromptRequested?.Invoke("Note", $"Note for {node.DisplayName}", node.Note, false);
         if (note is not null)
         {
             Tree.ApplyNote(node, note);
@@ -1685,8 +2127,16 @@ internal static class ShellSelection
             }
         });
 
+    /// <summary>
+    /// Windows Explorer on the folder the paths share, with all of them
+    /// selected; false where it cannot be done so, for the caller to show the
+    /// first.  Not while folders open through UltraExplorer: the Shell finds
+    /// UltraExplorer's own windows - they answer "Show in folder" - and would
+    /// select the items there, not in Explorer.
+    /// </summary>
     public static bool ShowInExplorer(IReadOnlyList<string> paths) =>
-        WithItems(paths, (folder, items) => SHOpenFolderAndSelectItems(folder, (uint)items.Length, items, 0) == 0);
+        !Picker.Integration.DialogIntegrationStore.Read().Enabled
+        && paths.Count > 0 && WithItems(paths, (folder, items) => SHOpenFolderAndSelectItems(folder, (uint)items.Length, items, 0) == 0);
 
     /// <summary>
     /// The folder the paths share and each item as the Shell names it inside

@@ -34,8 +34,8 @@ internal static partial class Program
     /// The Shell for the checks: records every path it is asked about, in
     /// order, can hold the first question until released, and paints a
     /// 16-pixel square whose colour comes from the file's type - or from the
-    /// whole path for the types listed as having an icon per file, the way a
-    /// management console (.msc) has.
+    /// whole path for the types listed as having an icon per file, the way
+    /// some icon handlers read every file of their type.
     /// </summary>
     private sealed class FakeShell(params string[] perFileTypes)
     {
@@ -297,14 +297,14 @@ internal static partial class Program
     {
         var disk = new FakeDisk();
         disk.Folder(@"Q:\consoles");
-        foreach (var name in new[] { "a.msc", "b.msc", "c.txt", "d.txt", "e.ani", "f.ani", "g.exe" })
+        foreach (var name in new[] { "a.console", "b.console", "c.txt", "d.txt", "e.anim", "f.anim", "g.exe" })
         {
             disk.AddFile(@"Q:\consoles", name);
         }
 
         using var tree = await IconTreeAsync(disk, @"Q:\consoles");
         var consoles = tree.Find(@"Q:\consoles")!;
-        var shell = new FakeShell(".msc", ".ani");
+        var shell = new FakeShell(".console", ".anim");
         using var icons = new ShellIconService(shell.Extract, Dispatcher.CurrentDispatcher);
         icons.CanvasArrivals.Driver.Fallback = new CountingDriver();
 
@@ -312,17 +312,17 @@ internal static partial class Program
         IconSpinUntil(() => icons.PendingCount == 0);
         var prefetched = shell.Asked.Select(Path.GetFileName).ToArray();
         Check($"a prefetch asks about the first file of each type, and not about programs ({string.Join(", ", prefetched)})",
-            prefetched is ["a.msc", "c.txt", "e.ani"]);
-        var aPicture = icons.GetCached(@"Q:\consoles\a.msc", false);
-        Check("what it found is known at once", IconSamePicture(aPicture, FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(@"Q:\consoles\a.msc"))));
+            prefetched is ["a.console", "c.txt", "e.anim"]);
+        var aPicture = icons.GetCached(@"Q:\consoles\a.console", false);
+        Check("what it found is known at once", IconSamePicture(aPicture, FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(@"Q:\consoles\a.console"))));
 
-        var b = IconIndexOf(consoles, "b.msc");
+        var b = IconIndexOf(consoles, "b.console");
         var shownFirst = icons.GetForCanvas(consoles, b);
         Check("a console drawn after the prefetch shows the prefetched icon meanwhile", ReferenceEquals(shownFirst, aPicture));
         IconSpinUntil(() => icons.PendingCount == 0);
         var shownAfter = icons.GetForCanvas(consoles, b);
         Check("then the icon of the console drawn, which differs, and says so in one arrival",
-            IconSamePicture(shownAfter, FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(@"Q:\consoles\b.msc")))
+            IconSamePicture(shownAfter, FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(@"Q:\consoles\b.console")))
             && icons.CanvasArrivalsPosted == 1);
 
         var d = IconIndexOf(consoles, "d.txt");
@@ -335,10 +335,10 @@ internal static partial class Program
 
         // The folder list asks the same way: a prefetched type waits for the list's own file.
         ImageSource? listed = null;
-        var synchronous = icons.Request(@"Q:\consoles\f.ani", false, icon => listed = icon);
+        var synchronous = icons.Request(@"Q:\consoles\f.anim", false, icon => listed = icon);
         var answered = await IconWaitUntilAsync(() => listed is not null);
         Check("the folder list, asking about a type only a prefetch knows, is answered about its own file",
-            !synchronous && answered && IconSamePicture(listed, FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(@"Q:\consoles\f.ani"))));
+            !synchronous && answered && IconSamePicture(listed, FakeShell.Picture(StringComparer.OrdinalIgnoreCase.GetHashCode(@"Q:\consoles\f.anim"))));
     }
 
     /// <summary>The folder list's callbacks come in batches, at most one every sixteen milliseconds, however fast the answers come.</summary>

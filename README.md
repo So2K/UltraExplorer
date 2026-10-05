@@ -1,110 +1,224 @@
+<div align="center">
+
 # UltraExplorer
 
-A file manager for Windows that shows your whole disk as one zoomable picture.
+### Your files. One zoomable map.
 
-Every folder is a cell drawn inside its parent, with its sub-folders and files
-inside it, so the entire This PC fits on one screen and "opening" a folder is
-just zooming into it. It keeps the Windows 11 File Explorer shell around the
-canvas — address bar, navigation pane, the real Shell context menus — so it
-works like the Explorer you know, with a map of everything underneath.
+A native Windows file manager that turns your folder hierarchy into a canvas.
+See the structure, fly into a folder, and keep your bearings.
 
-![The nested canvas: C:\Windows sorted by date, newest first, top to bottom](docs/images/canvas.png)
+[![Build](https://github.com/So2K/UltraExplorer/actions/workflows/release.yml/badge.svg)](https://github.com/So2K/UltraExplorer/actions/workflows/release.yml)
+[![Windows x64](https://img.shields.io/badge/Windows-x64-0078D4?logo=windows)](https://github.com/So2K/UltraExplorer/releases)
+[![C# · .NET 10](https://img.shields.io/badge/C%23-.NET%2010-512BD4)](src/UltraExplorer/UltraExplorer.csproj)
+[![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-## Features
+[Download for Windows](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0-beta.1) ·
+[Watch the demos](#see-it-in-action) ·
+[Build from source](BUILD.md) ·
+[Русский](docs/README.ru.md)
 
-- **The whole disk on one canvas.** Folders nest inside folders; zoom to any
-  depth without losing your place. Nothing is read up front — a folder is read
-  the moment it is drawn large enough to matter.
-- **Drawn by the GPU.** Direct3D 11 draws every cell and file tile as an
-  instance of one mesh, icons come from one texture atlas, and names from an
-  SDF glyph atlas, so zooming stays smooth on a 4K screen. A CPU renderer takes
-  over where there is no GPU (remote desktop, software rendering).
-- **Sorting like Explorer.** Name, Date modified, Type, Size — ascending or
-  descending — with Explorer-style column headers. Each folder remembers its own
-  order; grids fill top to bottom, then across (switchable). File tiles show the
-  value they are sorted by: size, date or type.
-- **Selection.** Drag a marquee inside a folder, Shift+click a range, Ctrl+click
-  to toggle, Shift+arrows, Ctrl+A. The canvas and the folder list share one
-  selection, and copy, cut, delete, drag-and-drop and the context menu act on
-  all of it.
-- **Split view.** Two panes side by side or stacked (Ctrl + \\), like the split
-  network editor in Houdini. Each is a whole canvas at its own place on the
-  disk, with its own camera, selection, filter, sort headers and Back/Forward,
-  and a path bar naming its folder. Drag files from one onto a folder of the
-  other, copy or move the selection to the other pane with Shift + F5 /
-  Shift + F6, or open a folder there from its menu; F6 switches panes.
-- **Live.** Every change on disk shows up on the canvas and in the list within a
-  moment — one watcher per volume, not per folder.
-- **Find things on a huge map.** Colour marks, notes and pins stay visible as
-  beacons at any zoom, with arrows at the edge for what is off screen. A name
-  filter (`report`, `*.png`, `a;b`) lights up matches.
-- **Search every drive, this folder first.** Results appear as you type, what
-  is in the folder you are in on top, then everything else; exact names first,
-  `node_modules` and caches last. They stay up while you move around the
-  canvas: ↑↓ to walk them, Enter to show one, Ctrl+Enter to open. Instant with
-  [Everything](https://www.voidtools.com/) running (no DLL needed); without it
-  the drives are walked.
-- **Layers.** Hide files to see only the folder structure, or turn off icons,
-  details, counts, hidden items and marks.
-- **A tree canvas too.** Switch to a node-graph view of the same folders at any
-  time (Settings → View).
-- **Replaces the Open/Save dialog** for programs that ask for it (see
-  [BUILD.md](BUILD.md#file-dialog-mode)).
+![UltraExplorer: a generated workspace and its nested folders](docs/media/overview.png)
 
-## Install
+[GIF version](docs/media/overview.gif)
 
-**Installer:** download
-[`UltraExplorer-Setup-x64.exe`](../../releases/latest/download/UltraExplorer-Setup-x64.exe)
-from the [latest release](../../releases/latest) and run it. It installs for
-you alone, without administrator rights, into
-`%LOCALAPPDATA%\Programs\UltraExplorer` (or for all users, if you choose so),
-adds UltraExplorer to the Start menu and to Apps → Installed apps, and updates
-an earlier copy in place. No .NET install needed.
+</div>
 
-**Portable:** grab
-[`UltraExplorer-win-x64.zip`](../../releases/latest/download/UltraExplorer-win-x64.zip),
-unzip it anywhere and run `UltraExplorer.exe`. It is a single self-contained
-file.
+You remember roughly where something lives: a project inside a client folder,
+an export beside its source, a reference tucked several levels down. UltraExplorer
+makes that structure visible. Every drive is a root; folders and files sit
+inside their parents. Opening a folder moves the camera into it.
 
-**From source** (Windows 10 1903+ / 11, x64, [.NET 10 SDK](https://dotnet.microsoft.com/download)):
+The address bar, navigation pane, file operations and Windows Shell menus
+remain familiar. The canvas gives you another way to find and move your files.
+
+## Same folder, two views
+
+| Navigation | Windows Explorer | UltraExplorer |
+| --- | --- | --- |
+| Move through a hierarchy | Enter directories as the current folder view changes. | Fly into nested folders on one map. |
+| Keep your bearings | Breadcrumbs, Back/Forward and the navigation pane. | The same path navigation, plus the surrounding folder structure. |
+| Return to a project | Pinned locations in the navigation pane. | Favorites, color Tags and visual marks on the canvas. |
+
+![Native Explorer Details view on the left and UltraExplorer's animated canvas on the right, showing the same folder](docs/media/explorer-comparison.png)
+
+[GIF version](docs/media/explorer-comparison.gif)
+
+Left: native Windows Explorer's Details view, already in the destination
+folder. Right: UltraExplorer flying from the overview to that same folder,
+then to Library and back. The destination is 12 directory levels below the
+generated workspace. Both apps can open a pasted path. This compares the
+views, with no artificial disk delay or timing race.
+
+## See it in action
+
+These 30 fps animated PNG demos were captured from the running app with
+Windows Graphics Capture, using the CPU fallback and a preloaded, generated
+workspace. Playback follows elapsed frame timestamps. GIF alternatives are
+linked under each clip.
+
+### Go deep without losing the bigger picture
+
+Double-click a folder to fly into it. Zoom back out to see its siblings and
+parents, or paste a path to jump straight there. Directory contents load as
+they become visible. Cold directories and network paths depend on filesystem
+response time.
+
+![Flying from the overview into a deeply nested folder and back](docs/media/deep-zoom.png)
+
+[GIF version](docs/media/deep-zoom.gif)
+
+### Search, then land on the result
+
+Press `Ctrl+F` to search across drives. Results in and below your current folder
+come first. Select a result to reveal its place on the map; `Ctrl+Enter` opens
+it in its default application.
+
+[Everything](https://www.voidtools.com/) is recommended for indexed global
+search. UltraExplorer talks to the running application directly, with no SDK
+DLL to install. Without Everything it walks directories in the background,
+and results arrive as that walk progresses. Index coverage and disk access
+determine what can be found.
+
+![Searching for a file and revealing its folder on the canvas](docs/media/search.png)
+
+[GIF version](docs/media/search.gif)
+
+The search recording uses a background directory walk scoped to the demo
+workspace.
+
+### Remember folders by color
+
+Give a folder a color and it appears in **Tags**, below **Network** in the
+navigation pane. Use the compact list when you know the color, or find the
+same mark on the canvas. Click a tag to go to its folder.
+
+Right-click a tag for **Change color** or **Unpin**. Unpin removes its color
+and sidebar entry while keeping its note. `Shift+F10` and the Menu key work
+too. Colors and notes belong to paths and are shared between app windows.
+
+![Navigating between already colored folders through the Tags sidebar](docs/media/tags.png)
+
+[GIF version](docs/media/tags.gif)
+
+### Work in two places at once
+
+Split the canvas side by side or top to bottom. Each pane keeps its own
+camera, selection, filter and history. Drag a file onto a folder in the other
+pane, or use `Shift+F5` to copy and `Shift+F6` to move the selection there.
+
+![Two independent canvas panes for moving between project folders](docs/media/split-view.png)
+
+[GIF version](docs/media/split-view.gif)
+
+## What you can do
+
+| Feature | How it helps |
+| --- | --- |
+| Nested canvas | See folders inside folders, with each drive as a root. Switch to a tree canvas in Settings → View. |
+| Native GPU rendering | A C#/.NET 10 Windows app: WPF for the shell, Direct3D 11 for the nested canvas, with a CPU fallback. |
+| Familiar file operations | Open, copy, cut, paste, rename, duplicate, delete, recycle, properties and drag-and-drop. |
+| Windows context menus | Use installed Shell actions and extensions for files and folders. Mixed-parent selections use the app's menu. |
+| Selection and sorting | Marquee, Ctrl/Shift selection, shared canvas/list selection, and per-folder Name, Date modified, Type or Size order. |
+| Visual landmarks | Colors, notes and pins; canvas beacons help locate marks outside the current view. |
+| Local name filter | Highlight names and wildcard matches in loaded branches without rearranging the map. |
+| Layers | Hide files, icons, details or marks to focus on the structure you need. |
+
+The map shows **directory structure**, not storage usage: sibling folder cells
+have equal sizes. It is useful for navigating a hierarchy, rather than judging
+which folder occupies the most bytes.
+
+## Download
+
+The current release is a **Windows x64 prerelease**. Get the assets from
+[v1.2.0-beta.1](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0-beta.1):
+
+- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0-beta.1/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
+- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0-beta.1/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
+
+Both include the .NET runtime. Settings, favorites, colors and notes are stored
+in `%LOCALAPPDATA%\UltraExplorer`.
+
+Windows 11, x64. For earlier and newer builds, see
+[all releases](https://github.com/So2K/UltraExplorer/releases).
+
+## A few keys to get started
+
+| Action | Shortcut |
+| --- | --- |
+| Zoom toward the pointer | `Ctrl+wheel` |
+| Pan | Middle/right drag, `Space+drag`, wheel / `Shift+wheel` |
+| Enter a folder / open a file | Double-click |
+| Fit the whole map / selected item | `Shift+1` / `Shift+2` |
+| Type or paste a path | `Ctrl+L` or `Alt+D` |
+| Search across drives | `Ctrl+F` |
+| Reveal / open a search result | `Enter` / `Ctrl+Enter` |
+| Filter loaded names | `Ctrl+Shift+F` |
+| Split side by side / stacked | `Ctrl+\` / `Ctrl+Shift+\` |
+| Switch panes | `F6` |
+| Copy / move to the other pane | `Shift+F5` / `Shift+F6` |
+| Settings | `Ctrl+,` |
+
+Standard Explorer keys such as `Ctrl+C`, `Ctrl+X`, `Ctrl+V`, `F2`, `Delete`,
+`Alt+Left` and `Alt+Up` work too.
+
+## Optional Windows integration
+
+Start with UltraExplorer as a standalone file manager. In Settings you can
+enable folder-opening integration, supported Open/Save/folder dialogs, and
+the separate `Win+E` preference. Fresh installations leave these off.
+
+Unsupported virtual locations, inaccessible dialogs and custom controls can
+remain with Windows. The dialog footer offers **Use the Windows dialog this
+time**; Settings provides **Restore and pause**.
+
+See [Explorer integration](docs/EXPLORER_REPLACEMENT.md),
+[dialog integration](docs/DIALOG_INTEGRATION.md) and the
+[picker API](PICKER.md) for coverage, recovery and application integration.
+
+## Current limits
+
+- **View select** is reserved and disabled; **View all** is implemented.
+- The name filter covers loaded branches. Use global search for an unvisited path.
+- Large directories can use capped canvas listings. The canvas is not a complete disk index.
+- Open/Save integration does not support every application or Shell namespace.
+
+## Build and contribute
+
+On Windows x64 with the [.NET 10 SDK](https://dotnet.microsoft.com/download):
 
 ```powershell
-git clone <this repository>
+git clone https://github.com/So2K/UltraExplorer.git
 cd UltraExplorer
-powershell -ExecutionPolicy Bypass -File scripts/install.ps1 -Launch
+dotnet build UltraExplorer.sln -c Release
+dotnet run --project src/UltraExplorer/UltraExplorer.csproj -c Release
 ```
 
-That builds a Release copy into `%LOCALAPPDATA%\Programs\UltraExplorer` and adds
-an **UltraExplorer** shortcut to the Start menu, so Windows Search and launchers
-find it. Run it again to update. Settings live in `%LOCALAPPDATA%\UltraExplorer`.
+[BUILD.md](BUILD.md) covers publishing, the smoke harnesses, GPU checks and
+reproducible canvas benchmarks. The [rendering review](docs/RENDERING_ZOOM_REVIEW.md)
+explains the renderer and its measured checks. Performance depends on the
+machine, directory contents and cache state; recorded demos are examples,
+not benchmarks.
 
-## Using it
+Useful contributions include keyboard and accessibility polish, reproducible
+edge cases, documentation and translations. For a first contribution, choose
+one focused issue: name the exact interaction, describe the expected result,
+and include a small reproduction. Look for
+[good first issues](https://github.com/So2K/UltraExplorer/issues?q=is%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22),
+or [open an issue](https://github.com/So2K/UltraExplorer/issues/new) to discuss it.
 
-| | |
-|---|---|
-| Zoom | Ctrl + wheel, or the + / − buttons |
-| Move around | Right or middle drag, Space + drag, wheel / Shift + wheel |
-| Open a folder | Double-click it (the canvas flies into it) |
-| Select | Click, Ctrl + click, Shift + click, or drag a marquee in a folder's open space |
-| Everything / the selection | Shift + 1 / Shift + 2 |
-| Search every drive | Ctrl + F, then ↑↓, Enter to show, Ctrl + Enter to open, Esc |
-| Filter by name | Ctrl + Shift + F |
-| Split view / stacked | Ctrl + \\ / Ctrl + Shift + \\, or the split button; drag the divider to resize |
-| Switch panes | F6, or click in a pane |
-| Copy / move to the other pane | Shift + F5 / Shift + F6, or drag onto a folder there |
-| Settings | the gear, or Ctrl + , |
+Development priorities:
 
-Right-click a folder's open space for its own menu: sort this folder, colour,
-note, pin, properties, open in the other pane. Items get Copy and Move to
-other pane below the Windows menu while the view is split.
+- Make navigation, selection and file operations predictable across keyboard,
+  mouse, DPI settings and large directories.
+- Broaden real-world coverage for removable drives, offline paths and Windows
+  integration.
+- Improve search feedback and discoverability of visual landmarks.
+- Define **View select** before implementing its interaction model.
 
-## Build and test
-
-See [BUILD.md](BUILD.md): building, the headless test harness (`ViewAllSmoke`,
-about 2,100 checks), the benchmark and snapshot switches, and a self-contained
-publish. [PROJECT_HANDOFF.md](PROJECT_HANDOFF.md) describes how it works inside
-(in Russian).
+If the idea is useful to you, star the repository and share a workflow or a
+problem it should solve. Specific feedback helps shape the next release.
 
 ## License
 
-[MIT](LICENSE) — use it, change it, ship it, commercially or not.
+[MIT](LICENSE). Third-party components and references are listed in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

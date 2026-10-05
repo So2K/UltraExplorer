@@ -1,9 +1,5 @@
-# Builds UltraExplorer on every push and pull request, packages it two ways -
-# a portable zip holding the self-contained single-file exe, and an installer
-# (Setup.exe, Inno Setup) that installs that exe with Start menu shortcuts and
-# an uninstaller - and publishes both as a release when a version tag (v1.2.3)
-# is pushed.  Every run keeps the packages as workflow artifacts, so a build of
-# any branch can be downloaded and tried.
+# Every build is tested and packaged. A version tag additionally publishes the
+# installer and a portable folder that includes its own .NET/WPF runtime.
 name: Build and release
 
 on:
@@ -14,11 +10,22 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: 'true'
     steps:
       - uses: actions/checkout@v4
 
@@ -41,64 +48,117 @@ jobs:
           } else {
             $version = "0.0.0-ci.$env:RUN_NUMBER"
           }
-          if ($version -notmatch '^(\d+)\.(\d+)\.(\d+)(\.\d+)?(-[0-9A-Za-z.-]+)?$') {
+          if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$') {
             throw "A release tag looks like v1.2.3 or v1.2.3-beta.1, not '$env:REF'."
           }
           $fileVersion = ($version -split '-', 2)[0]
+          if (($fileVersion -split '\.' | Where-Object { [long]$_ -gt 65535 }).Count -gt 0) {
+            throw 'Each Windows file-version component must fit in 16 bits.'
+          }
           "version=$version" >> $env:GITHUB_OUTPUT
           "file_version=$fileVersion" >> $env:GITHUB_OUTPUT
+          "prerelease=$($version.Contains('-').ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
           Write-Host "Version $version (file version $fileVersion)"
 
       - name: Build the app and the checks
+        shell: pwsh
         run: |
-          dotnet build src/UltraExplorer/UltraExplorer.csproj -c Release -nologo
-          dotnet build tests/ViewAllSmoke/ViewAllSmoke.csproj -c Release -nologo
+          foreach ($project in @(
+            'src/UltraExplorer/UltraExplorer.csproj',
+            'tests/ViewAllSmoke/ViewAllSmoke.csproj',
+            'tests/NativeDialogProxySmoke/NativeDialogProxySmoke.csproj',
+            'tests/FolderTagsSmoke/FolderTagsSmoke.csproj'
+          )) {
+            dotnet build $project -c Release -p:SelfContained=true -nologo
+            if ($LASTEXITCODE -ne 0) { throw "$project failed with exit code $LASTEXITCODE." }
+          }
 
-      - name: Publish a self-contained single file
+      - name: Check colour Tags sidebar
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-tags-checks'
+          & tests/FolderTagsSmoke/bin/Release/net10.0-windows/win-x64/FolderTagsSmoke.exe
+          if ($LASTEXITCODE -ne 0) { throw "Folder Tags checks failed with exit code $LASTEXITCODE." }
+
+      - name: Check file-dialog contracts
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-contract-checks'
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only PickerFilters,PickerCommandLine,PickerNames,PickerSessionRules,PickerValidation,PickerGraphRules,DialogIntegrationChecks
+          if ($LASTEXITCODE -ne 0) { throw "File-dialog checks failed with exit code $LASTEXITCODE." }
+
+      - name: Publish with the .NET and WPF runtime beside the app
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          FILE_VERSION: ${{ steps.version.outputs.file_version }}
         run: |
           dotnet publish src/UltraExplorer/UltraExplorer.csproj -c Release -r win-x64 -o publish `
-            --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true `
-            -p:EnableCompressionInSingleFile=true "-p:Version=$env:VERSION" -nologo
+            --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=true `
+            -p:IncludeNativeLibrariesForSelfExtract=false -p:EnableCompressionInSingleFile=false `
+            "-p:Version=$env:VERSION" "-p:FileVersion=$env:FILE_VERSION" -nologo
           if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
+          foreach ($file in @('UltraExplorer.exe', 'UltraExplorer.dll', 'coreclr.dll', 'hostfxr.dll', 'PresentationNative_cor3.dll')) {
+            if (-not (Test-Path -LiteralPath (Join-Path 'publish' $file) -PathType Leaf)) {
+              throw "Self-contained publish is missing $file."
+            }
+          }
 
       # The packages carry no version in their names, so a link to
       # releases/latest/download/<name> always gets the newest one.
-      - name: Pack the portable zip
+      - name: Pack and verify the portable zip
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path packages | Out-Null
-          Copy-Item LICENSE, README.md publish/
-          Compress-Archive -Path publish/UltraExplorer.exe, publish/LICENSE, publish/README.md `
-            -DestinationPath packages/UltraExplorer-win-x64.zip
+          Copy-Item LICENSE, README.md, THIRD-PARTY-NOTICES.md publish/
+          $publishRoot = (Resolve-Path 'publish').Path
+          $relativeFiles = @(Get-ChildItem -LiteralPath $publishRoot -Recurse -File -Force |
+            ForEach-Object { [IO.Path]::GetRelativePath($publishRoot, $_.FullName) })
+          $relativeFiles += 'UltraExplorer-package-files.txt'
+          $relativeFiles | Sort-Object -Unique | Set-Content -LiteralPath 'publish/UltraExplorer-package-files.txt' -Encoding utf8BOM
+          Compress-Archive -Path publish/* -DestinationPath packages/UltraExplorer-win-x64.zip
+          $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path 'packages/UltraExplorer-win-x64.zip').Path)
+          try {
+            $entries = @($zip.Entries | ForEach-Object { $_.FullName.Replace('/', '\').TrimEnd('\') })
+            $missing = @($relativeFiles | Where-Object { $_ -notin $entries })
+            if ($missing.Count) { throw "Portable archive is missing: $($missing -join ', ')" }
+            Write-Host "Portable archive verified: $($relativeFiles.Count) files."
+          } finally {
+            $zip.Dispose()
+          }
 
-      # Inno Setup comes with the Windows runner images; it is installed from
-      # Chocolatey only where an image no longer has it.
+      # Use the same compiler on every runner; the NuGet tool package contains
+      # the original signed Inno Setup binaries and requires no installation.
       - name: Build the installer
         shell: pwsh
         env:
           VERSION: ${{ steps.version.outputs.version }}
           FILE_VERSION: ${{ steps.version.outputs.file_version }}
         run: |
-          function Find-Iscc {
-            $command = Get-Command iscc.exe -ErrorAction SilentlyContinue
-            if ($command) { return $command.Source }
-            Get-ChildItem -Path "${env:ProgramFiles(x86)}\Inno Setup *\ISCC.exe", "$env:ProgramFiles\Inno Setup *\ISCC.exe" -ErrorAction SilentlyContinue |
-              Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'UltraExplorer-InnoSetup-6.4.3'
+          $toolZip = "$toolRoot.zip"
+          Invoke-WebRequest 'https://api.nuget.org/v3-flatcontainer/tools.innosetup/6.4.3/tools.innosetup.6.4.3.nupkg' -OutFile $toolZip
+          $expectedHash = '9D67A2B1155CA5BC825475CEB907AA357C5FEB42E474CFD5347EDDEEF5AD92A5'
+          if ((Get-FileHash -LiteralPath $toolZip -Algorithm SHA256).Hash -ne $expectedHash) {
+            throw 'The pinned Inno Setup package checksum did not match.'
           }
-          $iscc = Find-Iscc
-          if (-not $iscc) {
-            choco install innosetup --no-progress -y
-            if ($LASTEXITCODE -ne 0) { throw "Installing Inno Setup failed with exit code $LASTEXITCODE." }
-            $iscc = Find-Iscc
+          Expand-Archive -LiteralPath $toolZip -DestinationPath $toolRoot -Force
+          $iscc = Join-Path $toolRoot 'tools/ISCC.exe'
+          if ((Get-AuthenticodeSignature -LiteralPath $iscc).Status -ne 'Valid') {
+            throw 'The Inno Setup compiler signature did not validate.'
           }
-          if (-not $iscc) { throw 'Inno Setup (ISCC.exe) was not found.' }
           Write-Host "Using $iscc"
           & $iscc "/DAppVersion=$env:VERSION" "/DAppFileVersion=$env:FILE_VERSION" `
             "/DPublishDir=..\publish" "/DOutputDir=..\packages" installer\UltraExplorer.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with exit code $LASTEXITCODE." }
+
+      - name: Write SHA-256 checksums
+        shell: pwsh
+        run: |
+          Get-ChildItem packages/* -File | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
+          } | Set-Content -LiteralPath packages/SHA256SUMS.txt -Encoding utf8NoBOM
+          Get-Content packages/SHA256SUMS.txt
 
       - name: Keep the packages
         uses: actions/upload-artifact@v4
@@ -108,10 +168,39 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: UltraExplorer-${{ needs.build.outputs.version }}-win-x64
+          path: packages
+
+      - name: Check planned release notes
+        if: github.ref_name == 'v1.2.0-beta.1'
+        run: test -s docs/RELEASE_NOTES_v1.2.0-beta.1.md
+
       - name: Create the release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: packages/*
+          fail_on_unmatched_files: true
           generate_release_notes: true
-          prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}
+          make_latest: ${{ needs.build.outputs.prerelease == 'false' }}
+          body_path: ${{ github.ref_name == 'v1.2.0-beta.1' && 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' || '' }}
+          body: |
+            ## Download
+
+            - **UltraExplorer-Setup-x64.exe**: install for your user, with Start menu shortcut and uninstaller.
+            - **UltraExplorer-win-x64.zip**: extract the entire folder, then run UltraExplorer.exe.
+            - **SHA256SUMS.txt**: checksums for both downloads.
+
+            Both packages include the .NET and WPF runtime. No separate .NET installation is required.
+            Your settings, notes and colour tags are kept in your local profile when updating.

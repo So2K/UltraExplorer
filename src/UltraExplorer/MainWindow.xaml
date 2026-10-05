@@ -324,6 +324,7 @@
                                   VerticalScrollBarVisibility="Disabled"
                                   Background="Transparent"
                                   Cursor="IBeam"
+                                  ScrollChanged="CrumbStrip_ScrollChanged"
                                   Visibility="{Binding Address.IsShowingCrumbs, Converter={StaticResource BoolToVisibility}}">
                         <ItemsControl ItemsSource="{Binding Address.Breadcrumbs}" VerticalAlignment="Center">
                             <ItemsControl.ItemsPanel>
@@ -678,6 +679,62 @@
                         <ItemsControl ItemsSource="{Binding Drives}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
                         <Separator Margin="12,8" />
                         <ItemsControl ItemsSource="{Binding NetworkLocations}" ItemTemplate="{StaticResource SidebarItemTemplate}" />
+
+                        <!-- macOS-like colour tags.  This section is only a
+                             projection of folder-marks.json: no duplicate
+                             bookmark or sidecar state is created. -->
+                        <StackPanel x:Name="FolderTagsSection"
+                                    Visibility="Collapsed"
+                                    Loaded="FolderTagsSection_Loaded">
+                            <Separator Margin="12,8" />
+                            <TextBlock Text="Tags"
+                                       Margin="16,2,0,4"
+                                       FontSize="11"
+                                       Foreground="{StaticResource TextDimBrush}" />
+                            <ItemsControl x:Name="FolderTagItems">
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate DataType="{x:Type models:FolderTagItemViewModel}">
+                                        <Button Style="{StaticResource SidebarItem}"
+                                                Height="28"
+                                                Margin="8,0"
+                                                Padding="8,0"
+                                                Tag="{Binding StateTag}"
+                                                ToolTip="{Binding ToolTipText}"
+                                                AutomationProperties.Name="{Binding AccessibleName}"
+                                                AutomationProperties.HelpText="{Binding ToolTipText}"
+                                                Click="FolderTagItem_Click"
+                                                PreviewMouseRightButtonUp="FolderTagItem_PreviewMouseRightButtonUp"
+                                                PreviewKeyDown="FolderTagItem_PreviewKeyDown">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="20" />
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+                                                <Ellipse Width="8"
+                                                         Height="8"
+                                                         HorizontalAlignment="Left"
+                                                         VerticalAlignment="Center"
+                                                         Fill="{Binding AccentBrush}" />
+                                                <TextBlock Grid.Column="1"
+                                                           Text="{Binding Name}"
+                                                           VerticalAlignment="Center"
+                                                           FontSize="12"
+                                                           TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Grid.Column="2"
+                                                           MaxWidth="76"
+                                                           Margin="6,0,0,0"
+                                                           Text="{Binding ParentHint}"
+                                                           VerticalAlignment="Center"
+                                                           FontSize="10"
+                                                           Foreground="{StaticResource TextDimBrush}"
+                                                           TextTrimming="CharacterEllipsis" />
+                                            </Grid>
+                                        </Button>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </StackPanel>
                     </StackPanel>
                 </ScrollViewer>
             </Border>
@@ -1346,6 +1403,7 @@
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto" />
                     <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
                 </Grid.RowDefinitions>
 
                 <TextBlock Text="{Binding FileNameLabel}"
@@ -1388,12 +1446,36 @@
                           SelectedIndex="{Binding SelectedFilterIndex, Mode=TwoWay}"
                           AutomationProperties.Name="Files of type" />
 
-                <Button Grid.Row="1"
+                <Button x:Name="PickerCancelButton" Grid.Row="1"
                         Grid.Column="2"
                         Margin="0,9,0,0"
                         Style="{StaticResource DialogButton}"
                         Content="Cancel"
                         Click="PickerCancel_Click" />
+
+                <Border x:Name="PickerPendingChoice" Grid.Row="2" Grid.ColumnSpan="3" Margin="0,9,0,0"
+                        Visibility="{Binding HasPendingSelection, Converter={StaticResource BoolToVisibility}}"
+                        ToolTip="{Binding PendingSelectionDetails}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <ScrollViewer Margin="0,0,12,0" MaxHeight="96" VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel>
+                                <TextBlock x:Name="PickerPendingName" Text="{Binding PendingSelectionLabel}"
+                                           TextWrapping="Wrap" FontSize="12" Foreground="{StaticResource TextBrush}" />
+                                <TextBlock x:Name="PickerPendingLocation" Text="{Binding PendingSelectionLocation}"
+                                           TextWrapping="Wrap" Margin="0,3,0,0" FontSize="11"
+                                           Foreground="{StaticResource TextMutedBrush}" />
+                            </StackPanel>
+                        </ScrollViewer>
+                        <Button x:Name="PickerClearChoiceButton" Grid.Column="1" Content="Clear"
+                                Style="{StaticResource DialogButton}" VerticalAlignment="Center"
+                                AutomationProperties.Name="Clear selected file" Click="PickerClearChoice_Click" />
+                    </Grid>
+                </Border>
             </Grid>
         </Border>
 

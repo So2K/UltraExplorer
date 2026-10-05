@@ -285,14 +285,19 @@ internal static partial class Program
                 names.All(name => calls.Texts.Any(text => text.Text == name)));
         }
 
+        var all = Say(CanvasLayer.All);
+        var withoutIcons = Say(CanvasLayer.All & ~CanvasLayer.Icons);
+        var withoutDetails = Say(CanvasLayer.All & ~CanvasLayer.Details);
+        var withoutCounts = Say(CanvasLayer.All & ~CanvasLayer.FolderCounts);
+        Console.WriteLine($"        label calls (Icons/Glyphs/Sizes/Counts/Names): all={all}; no-icons={withoutIcons}; no-details={withoutDetails}; no-counts={withoutCounts}");
         Check($"with every layer on, the files have icons and sizes, the folders glyphs, and the title its counts ({counts})",
-            Say(CanvasLayer.All) == (true, true, true, true, true));
+            all == (true, true, true, true, true));
         Check("Icons off: no icon on a file and no glyph on a title, every name and size still there",
-            Say(CanvasLayer.All & ~CanvasLayer.Icons) == (false, false, true, true, true));
+            withoutIcons == (false, false, true, true, true));
         Check("Details off: no size on a tile, the rest still there",
-            Say(CanvasLayer.All & ~CanvasLayer.Details) == (true, true, false, true, true));
+            withoutDetails == (true, true, false, true, true));
         Check("Folder counts off: no counts on a title, the rest still there",
-            Say(CanvasLayer.All & ~CanvasLayer.FolderCounts) == (true, true, true, false, true));
+            withoutCounts == (true, true, true, false, true));
 
         var p = tree.Find(@"Q:\p")!;
         var child = p.Children.First(folder => folder.ModifiedTicks > 0);

@@ -29,7 +29,11 @@ internal readonly record struct IconArrival(string Key, ImageSource? Icon);
 /// take milliseconds per distinct executable, and doing that inline while a
 /// folder of several thousand entries is being materialised freezes the UI
 /// thread for however long the folder is big.  Callers get the cached icon
-/// immediately if there is one and are told about the rest.</para>
+/// immediately if there is one and are told about the rest.  The Shell can
+/// also hang on one file - a shortcut to a share that does not answer holds
+/// it for the network's timeout - so when every worker has been on one icon
+/// for a few seconds while others wait, another is started, as the GPU
+/// canvas's extractor does (IconExtractor), and takes the rest.</para>
 ///
 /// <para><b>Two ways of being told.</b>  The nested canvas asks through
 /// <see cref="GetForCanvas"/>, and what the Shell answers goes into one queue,
@@ -52,8 +56,9 @@ internal readonly record struct IconArrival(string Key, ImageSource? Icon);
 ///
 /// <para><b>Which file speaks for a type.</b>  The Shell is always asked about
 /// a real file, and for most types any file of the type gives the same
-/// picture.  Not for all of them: a management console (.msc) or an animated
-/// cursor (.ani) shows its own icon even when only its type is asked about.
+/// picture.  Not for all of them: the types known to give every file a
+/// picture of its own are asked about file by file (<see cref="IsPathSpecificIcon"/>),
+/// but an icon handler can do the same for any other type.
 /// The picture a type is drawn with has always been the one of the first file
 /// of it somebody showed, so a prefetch - asked about whichever file of the
 /// type the folder listed first - only holds the type's place: its icon shows
@@ -65,11 +70,38 @@ public sealed class ShellIconService : IDisposable
     /// <summary>The key every folder's icon is kept under.</summary>
     private const string FolderKey = "<folder>";
 
-    /// <summary>At most this many icons are asked for on the canvas's behalf, so a walk through a million programs cannot grow the tables without end.</summary>
+    /// <summary>
+    /// The canvas remembers at most this many keys it asked for; past it, it
+    /// forgets them all and asks again for what it still draws.  A key it
+    /// asked for is answered from the cache, so only those still on their way
+    /// are asked again, and the Shell is not: the one question waits for them.
+    /// </summary>
     private const int CanvasAskLimit = 20_000;
+
+    /// <summary>
+    /// At most this many icons of single files - programs, shortcuts and the
+    /// like, one per path - are kept; the next one lets all of them go, to be
+    /// asked for again as they are shown, so a walk through a million
+    /// programs, or one search after another, cannot grow the cache without
+    /// end.  Far more than a screen shows at once: what is on screen is asked
+    /// for again once, not over and over.
+    /// </summary>
+    private const int FileIconLimit = 20_000;
 
     /// <summary>Callbacks are called at most this often: one batch per frame of a 60 Hz display.</summary>
     private const double CallbackIntervalMilliseconds = 16;
+
+    /// <summary>At most this many threads ask the Shell, however many are stuck.</summary>
+    private const int MaximumWorkerCount = 4;
+
+    /// <summary>How often the watchdog looks while work waits.</summary>
+    private const int WatchIntervalMilliseconds = 1000;
+
+    /// <summary>A worker on one icon for longer than this (Stopwatch ticks, four seconds) is stuck: no icon takes that long but one the network holds up.</summary>
+    private static readonly long StuckTicks = Stopwatch.Frequency * 4;
+
+    /// <summary>The types whose every file has an icon of its own (<see cref="IsPathSpecificIcon"/>), the most common first.</summary>
+    private static readonly string[] PathSpecificTypes = ["exe", "lnk", "ico", "url", "cur", "ani", "msc", "appref-ms"];
 
     private readonly ConcurrentDictionary<string, CachedIcon> _cache = new(StringComparer.OrdinalIgnoreCase);
 
@@ -89,7 +121,13 @@ public sealed class ShellIconService : IDisposable
     private readonly object _gate = new();
     private readonly Func<string, bool, ImageSource?> _extract;
     private readonly Dispatcher? _callbackDispatcher;
-    private readonly Thread _worker;
+
+    /// <summary>The threads asking the Shell: one, and another each time every one of them is stuck (<see cref="ReplaceStuckWorkers"/>).  Guarded by <see cref="_gate"/>.</summary>
+    private readonly List<IconWorker> _workers = [];
+
+    /// <summary>Looks once a second, while work waits, for workers stuck on one icon; disarmed while nothing waits.</summary>
+    private readonly Timer _watchdog;
+    private bool _watchArmed;
 
     // The callbacks' batches.
     private readonly ConcurrentQueue<Answer> _answers = new();
@@ -101,6 +139,15 @@ public sealed class ShellIconService : IDisposable
     // Only ever touched on the thread the canvas draws on.
     private readonly HashSet<string> _canvasAsked = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _prefetchFirsts = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>The <see cref="_fileIconsLetGo"/> the canvas last forgot what it asked for at.</summary>
+    private int _canvasLetGoSeen;
+
+    /// <summary>Icons of single files added to the cache since they were last let go of.  Guarded by <see cref="_gate"/>.</summary>
+    private int _fileIcons;
+
+    /// <summary>How often the icons of single files were let go of (<see cref="LetFileIconsGo"/>).</summary>
+    private int _fileIconsLetGo;
 
     private volatile bool _disposed;
     private int _extractions;
@@ -129,14 +176,11 @@ public sealed class ShellIconService : IDisposable
         CanvasArrivals = NewCanvasInbox();
         _canvasInboxes = [CanvasArrivals];
 
-        _worker = new Thread(Work)
+        _watchdog = new Timer(_ => Watch(), null, Timeout.Infinite, Timeout.Infinite);
+        lock (_gate)
         {
-            IsBackground = true,
-            Name = "UltraExplorer Shell icons",
-            Priority = ThreadPriority.BelowNormal
-        };
-        _worker.SetApartmentState(ApartmentState.STA);
-        _worker.Start();
+            StartWorker();
+        }
     }
 
     /// <summary>
@@ -291,8 +335,8 @@ public sealed class ShellIconService : IDisposable
     /// <para>Called for every file name on screen in every frame of names, so
     /// it builds nothing for a file whose icon is its type's: the type is
     /// the file's interned extension, already the key it is cached under.
-    /// Only the few types whose icon is per file - programs, shortcuts, icon
-    /// files - make the file's path, which is their key.  On the thread the
+    /// Only the few types whose icon is per file - programs, shortcuts and
+    /// the like - make the file's path, which is their key.  On the thread the
     /// canvas draws on.</para>
     /// </summary>
     internal ImageSource? GetForCanvas(NestedFolder folder, int index)
@@ -311,7 +355,16 @@ public sealed class ShellIconService : IDisposable
             return cached.Icon;
         }
 
-        if (_canvasAsked.Count < CanvasAskLimit && _canvasAsked.Add(key) && AskForCanvas(key, path ?? folder.PathOf(file)) is { } answered)
+        var letGo = Volatile.Read(ref _fileIconsLetGo);
+        if (_canvasAsked.Count >= CanvasAskLimit || _canvasLetGoSeen != letGo)
+        {
+            // Too many to remember, or icons it asked for were let go of: the
+            // canvas forgets what it asked, and asks again for what it draws.
+            _canvasAsked.Clear();
+            _canvasLetGoSeen = letGo;
+        }
+
+        if (_canvasAsked.Add(key) && AskForCanvas(key, path ?? folder.PathOf(file)) is { } answered)
         {
             return answered;
         }
@@ -383,6 +436,7 @@ public sealed class ShellIconService : IDisposable
 
             if (queued)
             {
+                WatchWhileWaiting();
                 Monitor.Pulse(_gate);
             }
         }
@@ -411,13 +465,17 @@ public sealed class ShellIconService : IDisposable
         }
 
         _flushTimer.Dispose();
+        _watchdog.Dispose();
     }
 
     /// <summary>
     /// Whether a file's icon is the file's own rather than its type's:
-    /// programs, shortcuts and icon files.  With or without the dot, in any
-    /// case - ".EXE" is a program too.  The only test of its kind, so the
-    /// canvas's key and the cache's never disagree.
+    /// programs, shortcuts, icon and cursor files, Internet shortcuts,
+    /// management consoles and ClickOnce references - each of them asked
+    /// about by its type would show the first one's picture for all.  With or
+    /// without the dot, in any case - ".EXE" is a program too.  The only test
+    /// of its kind - the GPU canvas's atlas asks it too - so the canvases'
+    /// keys and the cache's never disagree.
     /// </summary>
     internal static bool IsPathSpecificIcon(ReadOnlySpan<char> extension)
     {
@@ -426,9 +484,20 @@ public sealed class ShellIconService : IDisposable
             extension = extension[1..];
         }
 
-        return extension.Equals("exe", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals("lnk", StringComparison.OrdinalIgnoreCase)
-            || extension.Equals("ico", StringComparison.OrdinalIgnoreCase);
+        if (extension.Length is < 3 or > 9)
+        {
+            return false;
+        }
+
+        foreach (var type in PathSpecificTypes)
+        {
+            if (extension.Equals(type, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -464,7 +533,7 @@ public sealed class ShellIconService : IDisposable
     /// <summary>
     /// The key a file of the canvas is cached under when that is its type -
     /// its interned extension, so looking it up makes nothing - or null when
-    /// it has to be keyed by its path: a program, shortcut or icon file, or a
+    /// it has to be keyed by its path: a program, shortcut or the like, or a
     /// name whose type the Shell reads from more than the tree keeps (one
     /// that starts with its only dot, or an extension past 32 characters).
     /// </summary>
@@ -531,15 +600,83 @@ public sealed class ShellIconService : IDisposable
         }
 
         _visible.Push(entry);
+        WatchWhileWaiting();
         Monitor.Pulse(_gate);
         return entry;
     }
 
     // ---- the worker ------------------------------------------------------------------
 
-    private void Work()
+    private void StartWorker()
     {
-        while (TryTakeNext(out var entry, out var path, out var isDirectory, out var visible))
+        var worker = new IconWorker(new Thread(Work)
+        {
+            IsBackground = true,
+            Name = _workers.Count == 0 ? "UltraExplorer Shell icons" : $"UltraExplorer Shell icons {_workers.Count + 1}",
+            Priority = ThreadPriority.BelowNormal
+        });
+        worker.Thread.SetApartmentState(ApartmentState.STA);
+        _workers.Add(worker);
+        worker.Thread.Start(worker);
+    }
+
+    /// <summary>
+    /// Work was queued: every worker stuck on one icon is made up for now,
+    /// and the watchdog looks again in a second, in case they get stuck with
+    /// nothing new asked.  Under the gate.
+    /// </summary>
+    private void WatchWhileWaiting()
+    {
+        ReplaceStuckWorkers();
+        if (!_watchArmed && !_disposed)
+        {
+            _watchArmed = true;
+            _watchdog.Change(WatchIntervalMilliseconds, Timeout.Infinite);
+        }
+    }
+
+    /// <summary>The watchdog's round: while work waits, workers stuck on one icon are made up for, and it looks again.</summary>
+    private void Watch()
+    {
+        lock (_gate)
+        {
+            _watchArmed = false;
+            if (!_disposed && _visible.Count + _prefetch.Count > 0)
+            {
+                WatchWhileWaiting();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Starts one more worker when every one is stuck: busy on a single icon
+    /// for longer than any icon should take.  The stuck ones finish or not in
+    /// their own time.  Under the gate.
+    /// </summary>
+    private void ReplaceStuckWorkers()
+    {
+        if (_workers.Count >= MaximumWorkerCount)
+        {
+            return;
+        }
+
+        var now = Stopwatch.GetTimestamp();
+        foreach (var worker in _workers)
+        {
+            var since = Volatile.Read(ref worker.BusySince);
+            if (since == 0 || now - since < StuckTicks)
+            {
+                return;
+            }
+        }
+
+        StartWorker();
+    }
+
+    private void Work(object? state)
+    {
+        var worker = (IconWorker)state!;
+        while (TryTakeNext(worker, out var entry, out var path, out var isDirectory, out var visible))
         {
             // Known meanwhile, from GetSmallIcon: the Shell is not asked twice.
             if (!_cache.TryGetValue(entry.Key, out var known) || known.Provisional)
@@ -553,11 +690,16 @@ public sealed class ShellIconService : IDisposable
                 catch (Exception ex) when (ex is COMException or InvalidOperationException or ExternalException)
                 {
                 }
+                finally
+                {
+                    Volatile.Write(ref worker.BusySince, 0);
+                }
 
                 Complete(entry, icon, visible);
             }
             else
             {
+                Volatile.Write(ref worker.BusySince, 0);
                 Complete(entry, known.Icon, visible);
             }
         }
@@ -566,9 +708,10 @@ public sealed class ShellIconService : IDisposable
     /// <summary>
     /// The next entry to answer, with what to ask the Shell as it stands now:
     /// the newest on-screen one first, then the oldest prefetch.  An entry met
-    /// in both lanes, or already answered, is skipped.  False once disposed.
+    /// in both lanes, or already answered, is skipped.  Marks
+    /// <paramref name="worker"/> busy from now.  False once disposed.
     /// </summary>
-    private bool TryTakeNext(out PendingIcon entry, out string path, out bool isDirectory, out bool visible)
+    private bool TryTakeNext(IconWorker worker, out PendingIcon entry, out string path, out bool isDirectory, out bool visible)
     {
         lock (_gate)
         {
@@ -584,6 +727,7 @@ public sealed class ShellIconService : IDisposable
                     path = entry.Path;
                     isDirectory = entry.IsDirectory;
                     visible = entry.Visible;
+                    Volatile.Write(ref worker.BusySince, Stopwatch.GetTimestamp());
                     return true;
                 }
 
@@ -638,6 +782,12 @@ public sealed class ShellIconService : IDisposable
                 icon = previous.Icon;
             }
 
+            if (!had && IsPathSpecificIcon(Path.GetExtension(entry.Key.AsSpan())) && ++_fileIcons > FileIconLimit)
+            {
+                LetFileIconsGo();
+                _fileIcons = 1;
+            }
+
             _cache[entry.Key] = new CachedIcon(icon, Provisional: !settled);
             callbacks = entry.Callbacks;
             tellCanvas = entry.ForCanvas && (!had || !ReferenceEquals(previous.Icon, icon));
@@ -658,6 +808,26 @@ public sealed class ShellIconService : IDisposable
             _answers.Enqueue(new Answer(callbacks, icon));
             ScheduleFlush();
         }
+    }
+
+    /// <summary>
+    /// Lets go of every icon of a single file in the cache, once there are
+    /// more than <see cref="FileIconLimit"/>: each is asked about again when
+    /// it is shown again, and the canvas forgets having asked
+    /// (<see cref="_fileIconsLetGo"/>).  Whoever was given one keeps it.
+    /// Under the gate.
+    /// </summary>
+    private void LetFileIconsGo()
+    {
+        foreach (var (key, _) in _cache)
+        {
+            if (IsPathSpecificIcon(Path.GetExtension(key.AsSpan())))
+            {
+                _cache.TryRemove(key, out _);
+            }
+        }
+
+        Interlocked.Increment(ref _fileIconsLetGo);
     }
 
     // ---- the callbacks' batches -----------------------------------------------------
@@ -807,6 +977,13 @@ public sealed class ShellIconService : IDisposable
         public bool Visible = visible;
         public bool ForCanvas;
         public List<Action<ImageSource?>>? Callbacks;
+    }
+
+    /// <summary>A thread asking the Shell, and since when it has been on its current icon (Stopwatch ticks), or zero while it waits for one.</summary>
+    private sealed class IconWorker(Thread thread)
+    {
+        public readonly Thread Thread = thread;
+        public long BusySince;
     }
 
     [Flags]

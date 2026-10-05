@@ -1,0 +1,16 @@
+name: Workflow or feature idea
+description: Suggest a concrete workflow UltraExplorer should improve.
+title: "[Idea] "
+body:
+  - type: textarea
+    attributes:
+      label: What are you trying to do?
+      description: Describe the task and where the current interaction gets in the way.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Proposed behavior
+      description: A short scenario, sketch or reference is useful.
+    validations:
+      required: true

@@ -95,9 +95,25 @@ public static class FileDialogNaming
                 return expanded + Path.DirectorySeparatorChar;
             }
 
-            return string.IsNullOrEmpty(currentFolder)
-                ? null
-                : Path.GetFullPath(Path.Combine(currentFolder, expanded));
+            if (string.IsNullOrEmpty(currentFolder))
+            {
+                return null;
+            }
+
+            var here = Path.GetFullPath(currentFolder);
+            if (Path.IsPathRooted(expanded))
+            {
+                // A drive with no root ("D:mix.wav") or a root with no drive
+                // ("\Exports\mix.wav") is finished from the folder in view.
+                // GetFullPath would finish it from this process's own drive
+                // and per-drive folders, which mean nothing to the user.
+                var root = Path.GetPathRoot(expanded)!;
+                expanded = root.Length == 2
+                    ? Path.Combine(here.StartsWith(root, StringComparison.OrdinalIgnoreCase) ? here : root + Path.DirectorySeparatorChar, expanded[2..])
+                    : Path.GetPathRoot(here)!.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + expanded;
+            }
+
+            return Path.GetFullPath(Path.Combine(here, expanded));
         }
         catch (Exception exception) when (exception is ArgumentException or PathTooLongException or NotSupportedException)
         {

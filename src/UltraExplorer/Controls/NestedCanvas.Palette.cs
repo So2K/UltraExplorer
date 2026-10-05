@@ -1,4 +1,6 @@
+using System.Runtime.InteropServices;
 using System.Windows.Media;
+using System.Windows.Threading;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
 
@@ -71,6 +73,13 @@ public sealed partial class NestedCanvas
     /// wildcard pattern for the whole name (*.png); several patterns can be
     /// separated by ';'.  Only what has been read can match: a folder not read
     /// yet stays half faded until it is, and then it is judged like the rest.
+    ///
+    /// The first <see cref="FilterNamesAtOnce"/> names read are judged before
+    /// this returns - all of them, but in a window that has read a few big
+    /// drives - and the rest a slice at a time between the frames and the
+    /// input (<see cref="JudgeFilterOn"/>), lighting folders and adding
+    /// matches as it goes.  Judged in one go, a filter over a tree read for
+    /// hours held the window still for most of a second on every key.
     /// </summary>
     public void SetFilter(string? text)
     {
@@ -86,23 +95,308 @@ public sealed partial class NestedCanvas
         _filterCursor = -1;
         _filterMatches.Clear();
         _filterMatchSet.Clear();
+        _filterJudging = null;
         if (matcher is not null && _tree is not null)
         {
-            Evaluate(_tree.Root);
+            var judging = new FilterJudging(_tree, _tree.IsSorting ? -1 : _tree.SortGeneration);
+            judging.Steps.Add(EnterForFilter(_tree.Root));
 
-            // Gathered while the tree was still placing folders for a new
-            // order, the list is in a mixture of orders: it is put in the
-            // current one when the placing is done.
-            _filterOrderGeneration = _tree.IsSorting ? -1 : _tree.SortGeneration;
-            if (_tree.IsSorting)
+            // Counted in names rather than time, so a tree of any but the
+            // biggest size is judged before this returns however busy the
+            // machine.  A thread whose dispatcher nobody runs has nobody to
+            // judge the rest later: it judges everything now, as it always did.
+            var budget = SynchronizationContext.Current is DispatcherSynchronizationContext
+                ? new FrameBudget { Deadline = long.MaxValue, Items = FilterNamesAtOnce }
+                : FrameBudget.Unlimited;
+            if (JudgeFilter(judging, ref budget))
             {
-                _ = ReorderFilterWhenPlacedAsync();
+                FilterJudged(judging);
+            }
+            else
+            {
+                _filterJudging = judging;
+                _filterOrderGeneration = judging.OrderGeneration;
+                (_filterDriver ??= new DispatcherFrameDriver(Dispatcher, JudgeFilterOn, () => _filterJudging is not null, DispatcherPriority.Background)).Wake();
             }
         }
 
         _paletteStamp++;
         RequestFrame(Layers.All);
         RaiseFilterChanged();
+    }
+
+    /// <summary>How many names <see cref="SetFilter"/> judges before it leaves the rest to slices between the frames: about ten milliseconds' worth.</summary>
+    private const int FilterNamesAtOnce = 250_000;
+
+    /// <summary>Names judged between two looks at the budget: a folder of files is judged whole, however many it holds.</summary>
+    private const int FilterNamesPerCheck = 512;
+
+    /// <summary>
+    /// A filter's judging of the whole tree, while it is under way: the
+    /// folders it has gone into and not yet come out of, outermost first, and
+    /// the order the tree was placed for when it began - or -1 when the tree
+    /// was still placing folders for a new one.
+    /// </summary>
+    private sealed class FilterJudging(NestedTree tree, int orderGeneration)
+    {
+        public NestedTree Tree { get; } = tree;
+
+        public int OrderGeneration { get; } = orderGeneration;
+
+        public List<FilterStep> Steps { get; } = [];
+    }
+
+    /// <summary>
+    /// A folder the judging has gone into: how its own name and its files
+    /// were judged on the way in, and the sub-folders it is going through -
+    /// the ones it had then - with how many of them it has gone into so far.
+    /// </summary>
+    private struct FilterStep(NestedFolder folder, IReadOnlyList<NestedFolder> children, int state)
+    {
+        public readonly NestedFolder Folder = folder;
+        public readonly IReadOnlyList<NestedFolder> Children = children;
+        public readonly int State = state;
+        public int Next;
+    }
+
+    /// <summary>The judging of the filter still under way, or null; see <see cref="SetFilter"/>.</summary>
+    private FilterJudging? _filterJudging;
+
+    /// <summary>What judges the rest of a filter a slice at a time: the dispatcher, below input and rendering.</summary>
+    private DispatcherFrameDriver? _filterDriver;
+
+    /// <summary>
+    /// Judges on from where <paramref name="judging"/> left off, until the
+    /// whole tree is judged - true - or <paramref name="budget"/> is spent.
+    /// The walk <see cref="Evaluate"/> makes, kept on a list of its own rather
+    /// than on the stack so it can stop anywhere: each folder's own name and
+    /// then its files on the way in, so the matches are listed in the same
+    /// order, and whether it holds a match on the way out.
+    /// </summary>
+    private bool JudgeFilter(FilterJudging judging, ref FrameBudget budget)
+    {
+        var steps = judging.Steps;
+        var names = 0;
+        while (steps.Count > 0)
+        {
+            if (names >= FilterNamesPerCheck)
+            {
+                budget.Take(names);
+                names = 0;
+                if (budget.Spent)
+                {
+                    return false;
+                }
+            }
+
+            ref var step = ref CollectionsMarshal.AsSpan(steps)[^1];
+            if (step.Next < step.Children.Count)
+            {
+                // A sub-folder read since the judging began was judged, with
+                // everything below it, there and then; one gone or hidden
+                // since is not on the canvas to be judged.
+                var child = step.Children[step.Next++];
+                if (child.FilterStamp != _filterStamp && child.Index >= 0)
+                {
+                    steps.Add(EnterForFilter(child));
+                    names += 1 + child.Files.Count;
+                }
+
+                continue;
+            }
+
+            var (folder, state) = (step.Folder, step.State);
+            steps.RemoveAt(steps.Count - 1);
+            if (folder.FilterStamp != _filterStamp)
+            {
+                LeaveForFilter(folder, state);
+            }
+
+            names += 1 + folder.Children.Count;
+        }
+
+        return true;
+    }
+
+    /// <summary>The judging goes into <paramref name="folder"/>: its own name and its files are judged, and matches listed, as <see cref="Evaluate"/> does first.</summary>
+    private FilterStep EnterForFilter(NestedFolder folder)
+    {
+        var matcher = _filter!;
+        var state = 0;
+        if (!folder.IsComputer && matcher(folder.Name))
+        {
+            state |= FilterSelf;
+            AddMatch(folder.FullPath);
+        }
+
+        foreach (var file in folder.Files)
+        {
+            if (matcher(file.Name))
+            {
+                state |= FilterInside;
+                AddMatch(folder.PathOf(file));
+            }
+        }
+
+        return new FilterStep(folder, folder.Children, state);
+    }
+
+    /// <summary>
+    /// The judging comes out of <paramref name="folder"/>, every sub-folder
+    /// judged: whether it holds a match - asked of what its sub-folders hold
+    /// now, which reads since may have changed - and its colours worked out
+    /// again if that changes how it is drawn, as <see cref="Evaluate"/> ends.
+    /// </summary>
+    private void LeaveForFilter(NestedFolder folder, int state)
+    {
+        if (AnyChildMatches(folder))
+        {
+            state |= FilterInside;
+        }
+
+        if (!folder.IsComputer && !folder.IsLoaded)
+        {
+            state |= FilterUnknown;
+        }
+
+        if (FilterStateOf(folder) != state)
+        {
+            folder.PaletteStamp = PaletteOutOfDate;
+        }
+
+        folder.FilterStamp = _filterStamp;
+        folder.FilterState = state;
+    }
+
+    /// <summary>Whether one of a folder's sub-folders matches or holds a match, as the filter last judged it.</summary>
+    private bool AnyChildMatches(NestedFolder folder)
+    {
+        foreach (var child in folder.Children)
+        {
+            if ((FilterStateOf(child) & (FilterSelf | FilterInside)) != 0)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>Whether one of a folder's own files matches.</summary>
+    private bool AnyFileMatches(NestedFolder folder)
+    {
+        var matcher = _filter!;
+        foreach (var file in folder.Files)
+        {
+            if (matcher(file.Name))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A slice of the judging under way, from the dispatcher between frames
+    /// and input.  Reads applied since the last slice are taken account of
+    /// first (<see cref="TrimFilterSteps"/>).  What it judged is drawn as
+    /// folders read are, at loading's rate, and new matches are said once a
+    /// frame; once the whole tree is judged, that is said too.
+    /// </summary>
+    private void JudgeFilterOn(ref FrameBudget budget)
+    {
+        if (_filterJudging is not { } judging)
+        {
+            return;
+        }
+
+        if (_filter is null || !ReferenceEquals(judging.Tree, _tree))
+        {
+            _filterJudging = null;
+            return;
+        }
+
+        var before = _filterMatches.Count;
+        TrimFilterSteps(judging);
+        var done = JudgeFilter(judging, ref budget);
+        if (done)
+        {
+            _filterJudging = null;
+            FilterJudged(judging);
+        }
+
+        _loadDirtyEverywhere = true;
+        HoldLoadRedraw(Layers.All);
+        if (done || _filterMatches.Count != before)
+        {
+            RaiseFilterChangedWithFrame();
+        }
+    }
+
+    /// <summary>
+    /// Before a slice: what reads applied since the last one did to the
+    /// folders the judging is inside.  One read again was judged whole there
+    /// and then (<see cref="OnFolderLoadedForFilter"/>), and one gone or
+    /// hidden since is not on the canvas: the judging comes out of either -
+    /// and out of everything it had gone into below it - without judging it
+    /// again.
+    /// </summary>
+    private void TrimFilterSteps(FilterJudging judging)
+    {
+        var steps = judging.Steps;
+        for (var index = 0; index < steps.Count; index++)
+        {
+            var folder = steps[index].Folder;
+            if (folder.FilterStamp == _filterStamp || folder.Parent is not null && folder.Index < 0)
+            {
+                steps.RemoveRange(index, steps.Count - index);
+                return;
+            }
+        }
+    }
+
+    /// <summary>Whether <paramref name="folder"/> is one the judging under way has gone into and not yet come out of.</summary>
+    private bool IsBeingJudged(NestedFolder folder)
+    {
+        if (_filterJudging is { } judging)
+        {
+            foreach (var step in judging.Steps)
+            {
+                if (ReferenceEquals(step.Folder, folder))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// The whole tree is judged.  Gathered while the tree was still placing
+    /// folders for a new order - or across a change of order - the list is in
+    /// a mixture of orders: it is put in the current one when the placing is
+    /// done.
+    /// </summary>
+    private void FilterJudged(FilterJudging judging)
+    {
+        var tree = judging.Tree;
+        var placed = !tree.IsSorting && judging.OrderGeneration == tree.SortGeneration;
+        _filterOrderGeneration = placed ? tree.SortGeneration : -1;
+        if (!placed)
+        {
+            _ = ReorderFilterWhenPlacedAsync();
+        }
+    }
+
+    /// <summary>A filter is still being judged, a slice at a time.</summary>
+    partial void PendingFilterWork(ref bool pending)
+    {
+        if (_filterJudging is not null)
+        {
+            pending = true;
+        }
     }
 
     /// <summary>
@@ -131,6 +425,14 @@ public sealed partial class NestedCanvas
     /// </summary>
     public bool GoToMatch(int direction)
     {
+        // The order on screen is known only of what has been judged: a step
+        // taken while the filter is still being judged judges the rest first.
+        if (_filterJudging is not null)
+        {
+            var budget = FrameBudget.Unlimited;
+            JudgeFilterOn(ref budget);
+        }
+
         if (_filterMatches.Count == 0)
         {
             return false;
@@ -324,13 +626,14 @@ public sealed partial class NestedCanvas
 
     /// <summary>
     /// A folder was read while a filter is on: judge what came in, and let
-    /// every folder above it know if something in it matched.  Only the
-    /// folders whose standing changed - the one read, what came in with it,
-    /// and the ancestors that now hold a match for the first time - have
-    /// their colours worked out again; every other cell on screen keeps its
-    /// own, where a read used to make every cell of the frame work its
-    /// colours and its mark out afresh.  The window hears of new matches once
-    /// per frame, however many folders the frame took in.
+    /// every folder above it know if something in it matched - or if nothing
+    /// in it does any more.  Only the folders whose standing changed - the one
+    /// read, what came in with it, and the ancestors that now hold a match for
+    /// the first time, or hold one no longer - have their colours worked out
+    /// again; every other cell on screen keeps its own, where a read used to
+    /// make every cell of the frame work its colours and its mark out afresh.
+    /// The window hears of new matches once per frame, however many folders
+    /// the frame took in.
     /// </summary>
     private void OnFolderLoadedForFilter(NestedFolder folder)
     {
@@ -346,9 +649,12 @@ public sealed partial class NestedCanvas
         // folder that held a match inside it can lose one: its own name, the
         // only other match it can be, does not change while it is the same
         // folder - so a folder's first read, which has nothing inside it to
-        // lose, never looks through the matches.
+        // lose, never looks through the matches.  Nor can one the judging of
+        // a new filter has not come to yet; one it is still going through
+        // may already have matches listed under it.
         var before = _filterMatches.Count;
-        _filterUnconfirmed = folder.FilterStamp == _filterStamp && (folder.FilterState & FilterInside) != 0
+        var held = folder.FilterStamp == _filterStamp && (folder.FilterState & (FilterSelf | FilterInside)) != 0;
+        _filterUnconfirmed = folder.FilterStamp == _filterStamp && (folder.FilterState & FilterInside) != 0 || IsBeingJudged(folder)
             ? MatchesAtOrUnder(folder.FullPath)
             : null;
         bool matched;
@@ -379,6 +685,23 @@ public sealed partial class NestedCanvas
                     parent.FilterState |= FilterInside;
                     parent.PaletteStamp = PaletteOutOfDate;
                 }
+            }
+        }
+        else if (held)
+        {
+            // The last match at or under it went with the read: the folders
+            // above it that held a match only through it hold none either,
+            // up to the first that still holds another, and fade too.
+            for (var parent = folder.Parent; parent is not null; parent = parent.Parent)
+            {
+                if (parent.FilterStamp != _filterStamp || (parent.FilterState & FilterInside) == 0
+                    || AnyChildMatches(parent) || AnyFileMatches(parent))
+                {
+                    break;
+                }
+
+                parent.FilterState &= ~FilterInside;
+                parent.PaletteStamp = PaletteOutOfDate;
             }
         }
 

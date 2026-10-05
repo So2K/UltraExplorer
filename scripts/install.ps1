@@ -7,8 +7,9 @@
     Publishes src/UltraExplorer framework-dependent for win-x64 into
     %LOCALAPPDATA%\Programs\UltraExplorer and puts an "UltraExplorer" shortcut
     in the Start menu.  Running it again updates the installed copy in place:
-    a copy started from the install folder is asked to close first (it saves
-    its state as it always does), and settings stay where they live, in
+    installed dialog integration is recovered and stopped first, and ordinary
+    installed windows close normally and save their state. The prior dialog
+    preference is restored after the update. Settings stay where they live, in
     %LOCALAPPDATA%\UltraExplorer.  Nothing needs administrator rights.
 
 .PARAMETER Launch
@@ -25,36 +26,328 @@ param(
 $ErrorActionPreference = 'Stop'
 $repository = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $repository 'src\UltraExplorer\UltraExplorer.csproj'
-$destination = Join-Path $env:LOCALAPPDATA 'Programs\UltraExplorer'
+$programsRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
+$destination = Join-Path $programsRoot 'UltraExplorer'
 $executable = Join-Path $destination 'UltraExplorer.exe'
-$staging = Join-Path ([System.IO.Path]::GetTempPath()) ("UltraExplorer-install-" + [guid]::NewGuid().ToString('N'))
+$temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+$staging = Join-Path $temporaryRoot ("UltraExplorer-install-" + [guid]::NewGuid().ToString('N'))
+$backup = Join-Path $programsRoot ("UltraExplorer-update-backup-" + [guid]::NewGuid().ToString('N'))
+$stateDirectory = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'UltraExplorer'))
+$settingsPath = Join-Path $stateDirectory 'dialog-integration.json'
+$runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+$runName = 'UltraExplorer dialogs'
+
+# Restart Manager closes owned modal/settings windows through the application's
+# existing WM_QUERYENDSESSION save handler. Never use force-shutdown flags.
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+public static class UltraExplorerGracefulUpdate
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FileTime { public uint Low, High; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UniqueProcess { public uint Id; public FileTime Started; }
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint session, uint flags, [Out] StringBuilder key);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(uint session, uint files, string[] fileNames,
+        uint processes, UniqueProcess[] processNames, uint services, string[] serviceNames);
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmShutdown(uint session, uint flags, IntPtr callback);
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmEndSession(uint session);
+    public static int Close(uint process, long started)
+    {
+        uint session;
+        var result = RmStartSession(out session, 0, new StringBuilder(33));
+        if (result != 0) return result;
+        try
+        {
+            var identity = new UniqueProcess { Id = process,
+                Started = new FileTime { Low = (uint)started, High = (uint)((ulong)started >> 32) } };
+            result = RmRegisterResources(session, 0, null, 1, new[] { identity }, 0, null);
+            return result == 0 ? RmShutdown(session, 0, IntPtr.Zero) : result;
+        }
+        finally { RmEndSession(session); }
+    }
+}
+'@
+
+function Assert-UpdatePath([string]$path, [string]$root) {
+    $full = [System.IO.Path]::GetFullPath($path)
+    $boundary = [System.IO.Path]::GetFullPath($root).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+    if (-not $full.StartsWith($boundary + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Update path is outside its intended directory: $full"
+    }
+    # Do not traverse a junction/symlink during recursive removal or moving.
+    $cursor = $full
+    while ($cursor.Length -ge $boundary.Length) {
+        if (Test-Path -LiteralPath $cursor) {
+            if ((Get-Item -LiteralPath $cursor -Force).Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "Update path contains a filesystem link: $cursor"
+            }
+        }
+        if ([string]::Equals($cursor, $boundary, [System.StringComparison]::OrdinalIgnoreCase)) { break }
+        $cursor = Split-Path -Parent $cursor
+    }
+    if (Test-Path -LiteralPath $full -PathType Container) {
+        $pending = New-Object 'System.Collections.Generic.Stack[string]'
+        $pending.Push($full)
+        while ($pending.Count -gt 0) {
+            foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force) {
+                if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw "Update directory contains a filesystem link: $($item.FullName)"
+                }
+                if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+            }
+        }
+    }
+}
+
+function Get-InstalledCopies {
+    foreach ($entry in Get-CimInstance Win32_Process -Filter "Name = 'UltraExplorer.exe'") {
+        if (-not [string]::Equals($entry.ExecutablePath, $executable, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        try { $process = Get-Process -Id $entry.ProcessId -ErrorAction Stop }
+        catch [Microsoft.PowerShell.Commands.ProcessCommandException] { continue }
+        if ($process.HasExited -or -not [string]::Equals($process.Path, $executable, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        if (-not $entry.CommandLine) { throw "Cannot identify installed UltraExplorer process $($process.Id)." }
+        [pscustomobject]@{ Process = $process; Started = $process.StartTime; IsRole =
+            $entry.CommandLine -match '(?i)(?:^|\s)"?--(?:dialog-(agent|guardian|worker|proxy|recover)|shortcut-agent)"?(?:\s|$)' }
+    }
+}
+
+# A copy built against the shared .NET Desktop runtime cannot start once that
+# runtime is gone from the machine: its host asks the user to download .NET and
+# waits on that prompt. Reading its runtimeconfig tells beforehand.
+function Test-CanStart([string]$path) {
+    $config = [System.IO.Path]::ChangeExtension($path, '.runtimeconfig.json')
+    if (-not (Test-Path -LiteralPath $config -PathType Leaf)) { return $true }
+    try { $options = (Get-Content -LiteralPath $config -Raw | ConvertFrom-Json).runtimeOptions } catch { return $true }
+    $frameworks = @(@($options.frameworks) + @($options.framework) | Where-Object { $null -ne $_ -and $_.name })
+    $roots = @($env:DOTNET_ROOT, (Join-Path $env:ProgramFiles 'dotnet')) | Where-Object { $_ }
+    foreach ($framework in $frameworks) {
+        $major = ([string]$framework.version -split '\.')[0]
+        $present = $false
+        foreach ($root in $roots) {
+            $shared = Join-Path $root "shared\$($framework.name)"
+            if ((Test-Path -LiteralPath $shared) -and @(Get-ChildItem -LiteralPath $shared -Directory | Where-Object { $_.Name -like "$major.*" }).Count -gt 0) { $present = $true; break }
+        }
+        if (-not $present) { return $false }
+    }
+    return $true
+}
+
+function Start-InstalledRole([string]$argument, [string]$file = $executable) {
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $file
+    $start.Arguments = $argument
+    $start.WorkingDirectory = $destination
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    # An installer invoked from a test shell must still address the installed
+    # user's state, and must not inherit a fixture-only integration listener.
+    foreach ($name in @($start.EnvironmentVariables.Keys)) {
+        if ($name -eq 'ULTRAEXPLORER_STATE_DIR' -or $name -eq 'ULTRAEXPLORER_TEST_WINDOW' -or $name -like 'ULTRAEXPLORER_DIALOG_TEST_*') {
+            $start.EnvironmentVariables.Remove($name)
+        }
+    }
+    [System.Diagnostics.Process]::Start($start)
+}
+
+# The same identity and mutex as DialogIntegrationStore.Update. Read the
+# current document again when restoring, so exclusions changed meanwhile stay.
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value + '|' + $stateDirectory.ToUpperInvariant()
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $instanceKey = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($identity))).Replace('-', '').Substring(0, 24) }
+finally { $sha.Dispose() }
+$settingsMutexName = 'Local\UltraExplorer.DialogSettings.' + $instanceKey
+function Use-IntegrationPreference([object]$restore = $null) {
+    $mutex = New-Object System.Threading.Mutex($false, $settingsMutexName)
+    $entered = $false
+    try {
+        try { $entered = $mutex.WaitOne(3000) } catch [System.Threading.AbandonedMutexException] { $entered = $true }
+        if (-not $entered) { throw 'Another window is changing dialog integration. Try the update again.' }
+        $settings = if (Test-Path -LiteralPath $settingsPath) {
+            if ((Get-Item -LiteralPath $settingsPath).Length -gt 65536) { throw 'Dialog integration settings are too large to update safely.' }
+            Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        } else { [pscustomobject]@{ Enabled = $false; ExcludedApplications = @(); LastRecovery = '' } }
+        if ($settings -isnot [pscustomobject] -or ($null -ne $settings.Enabled -and $settings.Enabled -isnot [bool])) {
+            throw 'Dialog integration settings contain an invalid Enabled preference.'
+        }
+        if ($null -ne $settings.WinEEnabled -and $settings.WinEEnabled -isnot [bool]) {
+            throw 'Dialog integration settings contain an invalid Win+E preference.'
+        }
+        if ($null -eq $restore) { return [pscustomobject]@{ Enabled = $settings.Enabled -eq $true;
+            WinEEnabled = if ($null -eq $settings.WinEEnabled) { $settings.Enabled -eq $true } else { $settings.WinEEnabled -eq $true };
+            WinELastError = [string]$settings.WinELastError; LastRecovery = [string]$settings.LastRecovery } }
+        $settings | Add-Member -NotePropertyName Enabled -NotePropertyValue ([bool]$restore.Enabled) -Force
+        $settings | Add-Member -NotePropertyName WinEEnabled -NotePropertyValue ([bool]$restore.WinEEnabled) -Force
+        $settings | Add-Member -NotePropertyName WinELastError -NotePropertyValue ([string]$restore.WinELastError) -Force
+        $settings | Add-Member -NotePropertyName LastRecovery -NotePropertyValue ([string]$restore.LastRecovery) -Force
+        New-Item -ItemType Directory -Force -Path $stateDirectory | Out-Null
+        $temporary = $settingsPath + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+        try {
+            $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes(($settings | ConvertTo-Json -Depth 32))
+            $stream = New-Object System.IO.FileStream($temporary, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+            if (Test-Path -LiteralPath $settingsPath) { [System.IO.File]::Replace($temporary, $settingsPath, [NullString]::Value) }
+            else { [System.IO.File]::Move($temporary, $settingsPath) }
+        } finally { if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force } }
+    } finally { if ($entered) { $mutex.ReleaseMutex() }; $mutex.Dispose() }
+}
 
 # Build into a staging folder first, so a failed build never leaves a
 # half-updated install behind.
 Write-Host "Building UltraExplorer (Release)..."
-dotnet publish $project -c Release -r win-x64 --self-contained false -nologo -v q -o $staging --artifacts-path (Join-Path $staging '.artifacts')
-if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
-Remove-Item -Recurse -Force -LiteralPath (Join-Path $staging '.artifacts') -ErrorAction SilentlyContinue
+$preference = $null
+$recovered = $false
+$replacing = $false
+$copying = $false
+$installed = $false
+$oldRunValue = $null
+$oldShortcutRunValue = $null
+try {
+    # Self-contained: the app carries its own .NET, so it starts on a machine
+    # whose shared .NET Desktop runtime is missing, removed or out of date.
+    dotnet publish $project -c Release -r win-x64 --self-contained true -nologo -v q -o $staging --artifacts-path (Join-Path $staging '.artifacts')
+    if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
+    $buildArtifacts = Join-Path $staging '.artifacts'
+    if (Test-Path -LiteralPath $buildArtifacts) { Assert-UpdatePath $buildArtifacts $staging; Remove-Item -Recurse -Force -LiteralPath $buildArtifacts }
+    Assert-UpdatePath $staging $temporaryRoot
+    Assert-UpdatePath $destination $programsRoot
+    Assert-UpdatePath $backup $programsRoot
+    if (-not (Test-Path -LiteralPath (Join-Path $staging 'UltraExplorer.exe') -PathType Leaf)) { throw 'Publish produced no UltraExplorer executable.' }
+    $preference = Use-IntegrationPreference
+    # Get-ItemPropertyValue throws for an absent value even with
+    # SilentlyContinue. Reading the optional property from the key does not.
+    $runProperties = Get-ItemProperty -LiteralPath $runKey -ErrorAction SilentlyContinue
+    $runProperty = if ($null -ne $runProperties) { $runProperties.PSObject.Properties[$runName] } else { $null }
+    $oldRunValue = if ($null -ne $runProperty) { $runProperty.Value } else { $null }
+    $shortcutProperty = if ($null -ne $runProperties) { $runProperties.PSObject.Properties['UltraExplorer Win+E'] } else { $null }
+    $oldShortcutRunValue = if ($null -ne $shortcutProperty) { $shortcutProperty.Value } else { $null }
 
-# Only a copy running from the install folder holds its files; other copies
-# (a development build, a test copy) are left alone.
-$running = Get-Process UltraExplorer -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and [string]::Equals($_.Path, $executable, [System.StringComparison]::OrdinalIgnoreCase) }
-foreach ($process in $running) {
-    Write-Host "Closing the installed UltraExplorer (pid $($process.Id)) so it can be updated..."
-    [void]$process.CloseMainWindow()
-    if (-not $process.WaitForExit(15000)) { throw "UltraExplorer (pid $($process.Id)) did not close; close it and run this again." }
+    $roles = @(Get-InstalledCopies | Where-Object IsRole)
+    # With the mode on, Windows opens every folder through the installed
+    # executable even when no background role is running. Pause it all the
+    # same, so folders open in Windows Explorer while the files are replaced.
+    if ($roles.Count -gt 0 -or ($preference.Enabled -and (Test-Path -LiteralPath $executable -PathType Leaf))) {
+        # Recovery uses the shared per-user integration state. A different
+        # executable may share that state, so do not pause its listener indirectly.
+        $foreignRoles = @(Get-CimInstance Win32_Process -Filter "Name = 'UltraExplorer.exe'" | Where-Object {
+            $_.ExecutablePath -and -not [string]::Equals($_.ExecutablePath, $executable, [System.StringComparison]::OrdinalIgnoreCase) -and
+            $_.CommandLine -match '(?i)(?:^|\s)"?--(?:dialog-(agent|guardian|worker|proxy|recover)|shortcut-agent)"?(?:\s|$)'
+        })
+        if ($foreignRoles.Count -gt 0) {
+            throw 'Another UltraExplorer copy has background integration running. Finish that copy before updating installed integration; no processes or application files were changed.'
+        }
+        Write-Host 'Restoring Windows dialogs and stopping installed background integration...'
+        $recovered = $true
+        # The installed copy runs recovery unless it can no longer start; then
+        # the new build, which carries its own runtime, does the same work.
+        $recoveryExecutable = if (Test-CanStart $executable) { $executable } else { Join-Path $staging 'UltraExplorer.exe' }
+        $recovery = Start-InstalledRole '--dialog-recover' $recoveryExecutable
+        try {
+            if (-not $recovery.WaitForExit(15000)) {
+                # End only the recovery helper started by this invocation;
+                # leave every existing guardian/proxy responsible for its originals.
+                $recovery.Kill()
+                [void]$recovery.WaitForExit(5000)
+                throw 'Installed dialog recovery did not finish; no application files were replaced.'
+            }
+            if ($recovery.ExitCode -ne 0) { throw "Installed dialog recovery failed with exit code $($recovery.ExitCode); no application files were replaced." }
+        } finally { $recovery.Dispose() }
+        $deadline = [DateTime]::UtcNow.AddSeconds(15)
+        do {
+            $roles = @(Get-InstalledCopies | Where-Object IsRole)
+            if ($roles.Count -eq 0) { break }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        foreach ($role in $roles) {
+            $process = $role.Process
+            if (-not $process.HasExited -and $process.StartTime -eq $role.Started -and
+                [string]::Equals($process.Path, $executable, [System.StringComparison]::OrdinalIgnoreCase)) {
+                # Recovery has already restored originals. A lingering installed
+                # background provider may be ended without discarding canvas state.
+                Stop-Process -InputObject $process -Force
+                if (-not $process.WaitForExit(5000)) { throw "Installed background process $($process.Id) did not stop." }
+            }
+        }
+    }
+    foreach ($copy in @(Get-InstalledCopies | Where-Object { -not $_.IsRole })) {
+        $process = $copy.Process
+        if ($process.HasExited) { continue }
+        Write-Host "Closing the installed UltraExplorer (pid $($process.Id)) so it can be updated..."
+        [void]$process.CloseMainWindow()
+        if (-not $process.WaitForExit(15000)) {
+            if ($process.StartTime -ne $copy.Started -or -not [string]::Equals($process.Path, $executable, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw 'The installed window process changed during its graceful close.'
+            }
+            Write-Host 'Finishing the installed window through Windows Restart Manager...'
+            $closeResult = [UltraExplorerGracefulUpdate]::Close([uint32]$process.Id, $copy.Started.ToUniversalTime().ToFileTimeUtc())
+            if ($closeResult -ne 0 -or -not $process.WaitForExit(10000)) {
+                throw "UltraExplorer (pid $($process.Id)) did not close gracefully (Windows error $closeResult); no application files were replaced."
+            }
+        }
+    }
+    if (@(Get-InstalledCopies).Count -gt 0) { throw 'An installed copy started during the update; no application files were replaced.' }
+
+    New-Item -ItemType Directory -Force -Path $destination | Out-Null
+    New-Item -ItemType Directory -Force -Path $backup | Out-Null
+    $replacing = $true
+    # Keep Setup's uninstaller in place; retain old application files until the
+    # staged copy succeeds, so a failed copy can be rolled back.
+    foreach ($item in Get-ChildItem -LiteralPath $destination -Force | Where-Object { $_.Name -notlike 'unins*' }) {
+        Assert-UpdatePath $item.FullName $destination
+        Move-Item -LiteralPath $item.FullName -Destination $backup
+    }
+    $copying = $true
+    foreach ($item in Get-ChildItem -LiteralPath $staging -Force) { Copy-Item -LiteralPath $item.FullName -Destination $destination -Recurse -Force }
+    $installed = $true
+} catch {
+    if ($replacing -and -not $installed) {
+        Write-Host 'Restoring the previous installed application...'
+        if ($copying) {
+            foreach ($item in Get-ChildItem -LiteralPath $destination -Force | Where-Object { $_.Name -notlike 'unins*' }) {
+                Assert-UpdatePath $item.FullName $destination
+                Remove-Item -LiteralPath $item.FullName -Recurse -Force
+            }
+        }
+        foreach ($item in Get-ChildItem -LiteralPath $backup -Force) {
+            Assert-UpdatePath $item.FullName $backup
+            Move-Item -LiteralPath $item.FullName -Destination $destination
+        }
+    }
+    throw
+} finally {
+    if ($recovered -and $null -ne $preference) {
+        Use-IntegrationPreference $preference
+    }
+    if ($null -ne $preference -and $preference.Enabled -and ($installed -or $recovered)) {
+        New-Item -Path $runKey -Force | Out-Null
+        $value = if ($installed -or $null -eq $oldRunValue) { '"' + $executable + '" --dialog-agent' } else { $oldRunValue }
+        if ($null -ne $value) { New-ItemProperty -LiteralPath $runKey -Name $runName -Value $value -PropertyType String -Force | Out-Null }
+    }
+    if ($null -ne $preference -and $preference.Enabled -and ($installed -or $recovered) -and (Test-Path -LiteralPath $executable) -and (Test-CanStart $executable)) {
+        $resident = Start-InstalledRole '--dialog-agent'
+        $resident.Dispose()
+    }
+    # A failed first upgrade still has the older executable, which does not
+    # recognise --shortcut-agent and would open an ordinary window instead.
+    if ($null -ne $preference -and $preference.WinEEnabled -and ($installed -or ($recovered -and $null -ne $oldShortcutRunValue)) -and (Test-Path -LiteralPath $executable) -and (Test-CanStart $executable)) {
+        $shortcut = Start-InstalledRole '--shortcut-agent'
+        $shortcut.Dispose()
+    }
+    if (Test-Path -LiteralPath $staging) { Assert-UpdatePath $staging $temporaryRoot; Remove-Item -LiteralPath $staging -Recurse -Force }
+    if (Test-Path -LiteralPath $backup) {
+        if ($installed -or @(Get-ChildItem -LiteralPath $backup -Force).Count -eq 0) {
+            Assert-UpdatePath $backup $programsRoot
+            Remove-Item -LiteralPath $backup -Recurse -Force
+        } else { Write-Warning "Previous application files remain available at $backup" }
+    }
 }
-
-New-Item -ItemType Directory -Force -Path $destination | Out-Null
-# The Setup installer (installer/UltraExplorer.iss) uses the same folder and
-# keeps its uninstaller there (unins000.exe and .dat); removing those would
-# leave an entry in Apps & features whose Uninstall fails.
-Get-ChildItem -LiteralPath $destination -Force |
-    Where-Object { $_.Name -notlike 'unins*' } |
-    Remove-Item -Recurse -Force
-Copy-Item -Path (Join-Path $staging '*') -Destination $destination -Recurse -Force
-Remove-Item -Recurse -Force -LiteralPath $staging
 
 # The app sets this taskbar id on itself (App.AppUserModelId); a shortcut that
 # carries the same id is one taskbar entry with the running window.  Test and

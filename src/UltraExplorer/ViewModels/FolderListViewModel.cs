@@ -48,6 +48,9 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>How long a new row keeps its fade: longer than the fade itself, so it has always played.</summary>
     private static readonly TimeSpan NewRowTime = TimeSpan.FromMilliseconds(600);
 
+    /// <summary>How long after a read for a change failed, its folder still there, it is tried the once more (see <see cref="LeaveGoneFolderAsync"/>).</summary>
+    private static readonly TimeSpan UnreadableRetryTime = TimeSpan.FromSeconds(1);
+
     private readonly Func<string, ItemSort, CancellationToken, Task<ViewAllDirectorySnapshot>> _read;
     private readonly Func<string, bool, Task> _activate;
     private readonly Func<string, bool> _isOnCanvas;
@@ -63,6 +66,7 @@ public sealed class FolderListViewModel : ObservableObject
     private CancellationTokenSource? _load;
 
     private string _folderPath = string.Empty;
+    private long _folderVersion;
     private string _title = "No folder";
     private string _countText = string.Empty;
     private string _filter = string.Empty;
@@ -72,6 +76,22 @@ public sealed class FolderListViewModel : ObservableObject
 
     /// <summary>True while the list is revealing one of its own rows on the canvas.</summary>
     public bool IsHoldingFolder => _held > 0;
+
+    /// <summary>
+    /// Whether a target was asked for while the list was held, and which:
+    /// a folder by path with its focus, or a node alone (<see cref="_heldFolder"/>
+    /// null).  A reveal on a share that does not answer holds the list for
+    /// most of a minute, and the canvas, the address bar or Back can go
+    /// somewhere else meanwhile; the last of those is where the list goes
+    /// once the hold ends (<see cref="ApplyHeldTarget"/>).
+    /// </summary>
+    private bool _heldAsked;
+    private string? _heldFolder;
+    private ViewAllNodeViewModel? _heldNode;
+
+    /// <summary>What the list itself asked the canvas to go to while it may be held (<see cref="ActivateOwn"/>).</summary>
+    private readonly HashSet<string> _ownTargets = new(StringComparer.OrdinalIgnoreCase);
+
     private bool _isLoading;
     private bool _isTruncated;
     private FolderListItem? _selected;
@@ -97,7 +117,16 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>The folder's own last-write time as a read for a change or a poll last found it; zero before either.</summary>
     private long _listedWriteTicks;
 
-    private readonly List<FolderListItem> _newRows = [];
+    /// <summary>
+    /// A read for a change failed with the folder still there, and it is
+    /// being tried once more: failing again, the list says it could not be
+    /// read and waits for the next change, rather than read it again at once
+    /// - which would fail again at once, thousands of times a second.
+    /// </summary>
+    private bool _unreadableRetried;
+
+    /// <summary>The rows still fading in, oldest first, each with when it came (<see cref="Environment.TickCount64"/>).</summary>
+    private readonly List<(FolderListItem Row, long Since)> _newRows = [];
     private System.Windows.Threading.DispatcherTimer? _newRowsTimer;
 
     private bool _typeNamesWaiting;
@@ -203,6 +232,7 @@ public sealed class FolderListViewModel : ObservableObject
         {
             if (SetProperty(ref _folderPath, value))
             {
+                _folderVersion++;
                 // A folder has an order of its own: the list is read in it.
                 // Nothing to reorder - the rows of the folder before are
                 // about to be replaced.
@@ -216,6 +246,7 @@ public sealed class FolderListViewModel : ObservableObject
                 RegisterFolder();
                 _staleWhileHidden = false;
                 _listedWriteTicks = 0;
+                _unreadableRetried = false;
                 OnPropertyChanged(nameof(CanGoUp));
                 OnPropertyChanged(nameof(CanGoBack));
                 (UpCommand as AsyncRelayCommand)?.RaiseCanExecuteChanged();
@@ -305,7 +336,9 @@ public sealed class FolderListViewModel : ObservableObject
     private async Task RereadKeepingHighlightAsync()
     {
         var highlighted = _selected?.FullPath;
+        var version = _folderVersion;
         await ReloadAsync();
+        if (version != _folderVersion) return;
         var match = highlighted is null
             ? null
             : Items.FirstOrDefault(item => string.Equals(item.FullPath, highlighted, StringComparison.OrdinalIgnoreCase));
@@ -478,7 +511,100 @@ public sealed class FolderListViewModel : ObservableObject
 
             _released = true;
             _list._held--;
+            if (_list._held == 0)
+            {
+                _list.ApplyHeldTarget();
+            }
         }
+    }
+
+    /// <summary>
+    /// The hold is over: the list goes where the last target asked for while
+    /// it was held points (<see cref="NoteHeldTarget"/>), as it would have had
+    /// nothing held it.
+    /// </summary>
+    private void ApplyHeldTarget()
+    {
+        _ownTargets.Clear();
+        if (!_heldAsked)
+        {
+            return;
+        }
+
+        var folder = _heldFolder;
+        var node = _heldNode;
+        ForgetHeldTarget();
+        if (folder is not null)
+        {
+            SetTarget(folder, node);
+            return;
+        }
+
+        SetTarget(node);
+    }
+
+    /// <summary>
+    /// A target asked for while the list is held, remembered for when the
+    /// hold ends - unless it is the list's own doing, which leaves nothing to
+    /// go to and is newer than whatever was asked before it: the folder the
+    /// list is in, or an item in it; a folder that is one of its rows, picked
+    /// there - going into it would make a single click open it; or what the
+    /// list itself asked the canvas to go to, however late the canvas gets
+    /// there - after the list went on somewhere else, going back to it would
+    /// undo the list's own newer step; or a focus the list's own pick is
+    /// still bringing in (a key, Ctrl or Shift on a row), which a step the
+    /// list took itself meanwhile outranks.  Likewise a folder picked, under a
+    /// hold of its own, among the rows of the folder already asked for by path
+    /// - a reveal of a folder's items points the list at the folder, then
+    /// selects them so held: had nothing held the list, it would be in that
+    /// folder by then, and the folder picked would be lit there, not gone into.
+    /// </summary>
+    private void NoteHeldTarget(string? folder, ViewAllNodeViewModel? node)
+    {
+        var goesTo = folder ?? (node is null ? string.Empty : node.IsDirectory ? node.FullPath : node.Parent?.FullPath ?? string.Empty);
+        if (string.Equals(goesTo, FolderPath, StringComparison.OrdinalIgnoreCase)
+            || folder is null && node is { IsDirectory: true } && string.Equals(ParentOf(node.FullPath), FolderPath, StringComparison.OrdinalIgnoreCase)
+            || (folder ?? node?.FullPath) is { } path && _ownTargets.Contains(path)
+            || SharedSelection?.LastSource == SelectionSource.List)
+        {
+            ForgetHeldTarget();
+            return;
+        }
+
+        if (_held > 1 && folder is null && node is { IsDirectory: true } && _heldAsked && _heldFolder is { } asked
+            && string.Equals(ParentOf(node.FullPath), asked, StringComparison.OrdinalIgnoreCase))
+        {
+            _heldNode = node;
+            return;
+        }
+
+        _heldAsked = true;
+        _heldFolder = folder;
+        _heldNode = node;
+    }
+
+    /// <summary>
+    /// Asks the canvas to go to <paramref name="path"/> for the list, noting
+    /// it as the list's own (see <see cref="NoteHeldTarget"/>): kept for as
+    /// long as a hold may still see the canvas get there.
+    /// </summary>
+    private Task ActivateOwn(string path, bool open)
+    {
+        if (_held == 0)
+        {
+            _ownTargets.Clear();
+        }
+
+        _ownTargets.Add(path);
+        return _activate(path, open);
+    }
+
+    /// <summary>A target asked for while held is older than the list going somewhere itself.</summary>
+    private void ForgetHeldTarget()
+    {
+        _heldAsked = false;
+        _heldFolder = null;
+        _heldNode = null;
     }
 
     /// <summary>
@@ -491,7 +617,9 @@ public sealed class FolderListViewModel : ObservableObject
         if (_held > 0)
         {
             // The list is driving the canvas, not the other way round.  The row
-            // still follows the selection; the folder does not move.
+            // still follows the selection; the folder does not move until the
+            // hold ends.
+            NoteHeldTarget(null, node);
             SelectExisting(node);
             return;
         }
@@ -523,6 +651,11 @@ public sealed class FolderListViewModel : ObservableObject
     /// </summary>
     public void SetTarget(string folderPath, ViewAllNodeViewModel? focus)
     {
+        if (_held > 0)
+        {
+            NoteHeldTarget(folderPath, focus);
+        }
+
         if (_held > 0 || string.Equals(folderPath, FolderPath, StringComparison.OrdinalIgnoreCase))
         {
             SelectExisting(focus);
@@ -534,6 +667,7 @@ public sealed class FolderListViewModel : ObservableObject
 
     private void GoTo(string folder, string title, ViewAllNodeViewModel? focus)
     {
+        ForgetHeldTarget();
         if (FolderPath.Length > 0)
         {
             _history.Add(FolderPath);
@@ -575,6 +709,7 @@ public sealed class FolderListViewModel : ObservableObject
             return;
         }
 
+        ForgetHeldTarget();
         if (remember && FolderPath.Length > 0)
         {
             _history.Add(FolderPath);
@@ -592,12 +727,14 @@ public sealed class FolderListViewModel : ObservableObject
         _filter = string.Empty;
         OnPropertyChanged(nameof(Filter));
 
+        var version = _folderVersion;
         await ReloadAsync();
+        if (version != _folderVersion || !ViewAllPath.Equals(normalized, FolderPath)) return;
 
         // The canvas comes along.  Going into a folder already moved it - the
         // row was clicked - and going back up leaving it behind was the half of
         // the gesture that felt broken.
-        await _activate(normalized, false);
+        await ActivateOwn(normalized, false);
     }
 
     private Task GoUpAsync() =>
@@ -677,6 +814,7 @@ public sealed class FolderListViewModel : ObservableObject
 
             _readSort = sort;
             _staleWhileHidden = false;
+            _unreadableRetried = false;
 
             _all.Clear();
             foreach (var entry in snapshot.Entries)
@@ -704,6 +842,9 @@ public sealed class FolderListViewModel : ObservableObject
         catch (Exception exception) when (exception is IOException
             or UnauthorizedAccessException or DirectoryNotFoundException)
         {
+            // An overtaken provider can fail after the new folder succeeded.
+            // Its error must not erase that folder or its current status.
+            if (cancellation.IsCancellationRequested || !ReferenceEquals(_load, cancellation)) return;
             _all.Clear();
             _byPath.Clear();
             ReplaceRows([]);
@@ -762,10 +903,16 @@ public sealed class FolderListViewModel : ObservableObject
         }
     }
 
-    /// <summary>What to say when no row is shown, and nothing when one is.</summary>
+    /// <summary>
+    /// What to say when no row is shown, and nothing when one is.  A folder
+    /// with more entries than one read holds was filtered among the rows read
+    /// only, and says so: a name past them is not "nothing".
+    /// </summary>
     private void UpdateEmptyText() =>
         EmptyText = Items.Count == 0
-            ? _all.Count == 0 ? "This folder is empty." : $"Nothing matches “{_filter.Trim()}”."
+            ? _all.Count == 0 ? "This folder is empty."
+                : _isTruncated ? $"Nothing matches “{_filter.Trim()}” among the first {_all.Count:N0}."
+                : $"Nothing matches “{_filter.Trim()}”."
             : string.Empty;
 
     /// <summary>
@@ -810,7 +957,7 @@ public sealed class FolderListViewModel : ObservableObject
     }
 
     private Task Activate(FolderListItem? item, bool open)
-        => item is null ? Task.CompletedTask : _activate(item.FullPath, open);
+        => item is null ? Task.CompletedTask : ActivateOwn(item.FullPath, open);
 
     // ---- changes on disk ---------------------------------------------------------
 
@@ -958,7 +1105,10 @@ public sealed class FolderListViewModel : ObservableObject
     /// rows.  One read at a time: a change that comes while one is under way
     /// has it followed by another, and a full read under way - a new folder,
     /// a new order - is left to finish and followed by one.  A read that finds
-    /// the list has moved to another folder meanwhile is dropped.
+    /// the list has moved to another folder meanwhile is dropped - but not a
+    /// change that came for the folder the list is in now while it was out:
+    /// that one is read next.  Hidden before a change that came is read, the
+    /// list reads its folder afresh when it is shown.
     /// </summary>
     private async Task RefreshLiveAsync()
     {
@@ -989,21 +1139,43 @@ public sealed class FolderListViewModel : ObservableObject
                     // Gone between the change and the read, most likely.
                     if (generation == _loadGeneration && string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
                     {
-                        _ = LeaveGoneFolderAsync(path);
+                        _ = LeaveGoneFolderAsync(path, exception);
+                        return;
                     }
 
-                    return;
+                    if (_load is not null || !_liveAgain || FolderPath.Length == 0)
+                    {
+                        return;
+                    }
+
+                    continue;
                 }
 
                 if (generation != _loadGeneration || _load is not null || !string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
                 {
-                    return;
+                    // The list moved on while this was read.  The full read of
+                    // where it is now covers what changed before that read; a
+                    // change since is still to be read - by the full read under
+                    // way, when there is one, as it lands, otherwise here.
+                    if (_load is not null || !_liveAgain || FolderPath.Length == 0)
+                    {
+                        return;
+                    }
+
+                    continue;
                 }
 
                 _listedWriteTicks = writeTicks;
+                _unreadableRetried = false;
                 Merge(snapshot, sort);
             }
             while (_liveAgain && IsVisible);
+
+            if (_liveAgain && !IsVisible)
+            {
+                _liveAgain = false;
+                _staleWhileHidden = true;
+            }
         }
         finally
         {
@@ -1029,6 +1201,7 @@ public sealed class FolderListViewModel : ObservableObject
         }
 
         _all.Clear();
+        var now = Environment.TickCount64;
         foreach (var entry in snapshot.Entries)
         {
             var isDirectory = entry.Kind is ViewAllEntryKind.Drive or ViewAllEntryKind.Folder;
@@ -1040,7 +1213,7 @@ public sealed class FolderListViewModel : ObservableObject
             }
 
             var added = new FolderListItem(entry) { IsNew = true };
-            _newRows.Add(added);
+            _newRows.Add((added, now));
             _all.Add(added);
         }
 
@@ -1127,7 +1300,12 @@ public sealed class FolderListViewModel : ObservableObject
         }
     }
 
-    /// <summary>Ends the fade of the rows that came with this change a moment from now.</summary>
+    /// <summary>
+    /// Ends the fade of the rows that came with this change a moment from now.
+    /// Each row's moment is its own, counted from when it came: a timer put
+    /// back to the start by every change never ran out while a folder kept
+    /// changing - a download, a log - and every row added kept fading.
+    /// </summary>
     private void EndNewRowsLater()
     {
         if (_newRows.Count == 0)
@@ -1141,27 +1319,46 @@ public sealed class FolderListViewModel : ObservableObject
             _newRowsTimer.Tick += (_, _) =>
             {
                 _newRowsTimer!.Stop();
-                foreach (var row in _newRows)
+                var now = Environment.TickCount64;
+                var ended = 0;
+                while (ended < _newRows.Count && now - _newRows[ended].Since >= (long)NewRowTime.TotalMilliseconds)
                 {
-                    row.IsNew = false;
+                    _newRows[ended].Row.IsNew = false;
+                    ended++;
                 }
 
-                _newRows.Clear();
+                _newRows.RemoveRange(0, ended);
+                if (_newRows.Count > 0)
+                {
+                    // Oldest first: the next to end is the first left.
+                    _newRowsTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, _newRows[0].Since + (long)NewRowTime.TotalMilliseconds - now));
+                    _newRowsTimer.Start();
+                }
             };
         }
 
-        _newRowsTimer.Stop();
-        _newRowsTimer.Start();
+        if (!_newRowsTimer.IsEnabled)
+        {
+            _newRowsTimer.Interval = TimeSpan.FromMilliseconds(Math.Max(1, _newRows[0].Since + (long)NewRowTime.TotalMilliseconds - Environment.TickCount64));
+            _newRowsTimer.Start();
+        }
     }
 
     /// <summary>
     /// The list's folder went from disk.  The list goes to the nearest folder
     /// above it that is still there, as Explorer does when the folder it shows
     /// is deleted; a folder only renamed or replaced in the same place and back
-    /// already is simply read again.
+    /// already is simply read again.  One still there that a read for a change
+    /// could not list (<paramref name="failure"/>) - a dangling junction, a
+    /// folder taken out of reach - is tried once more a moment later, and
+    /// failing again says so and waits for the next change: read again at
+    /// once, it would fail again at once, over and over.  With nothing above
+    /// it there either - its drive or share went with it - the list keeps no
+    /// rows that lead nowhere.
     /// </summary>
-    private async Task LeaveGoneFolderAsync(string path)
+    private async Task LeaveGoneFolderAsync(string path, Exception? failure = null)
     {
+        var generation = _loadGeneration;
         string? nearest;
         try
         {
@@ -1193,19 +1390,62 @@ public sealed class FolderListViewModel : ObservableObject
             return;
         }
 
+        // A full read since - F5, another order - says for itself what it found.
+        var readSince = generation != _loadGeneration || _load is not null;
         if (string.Equals(nearest, path, StringComparison.OrdinalIgnoreCase))
         {
-            RefreshForChange();
+            if (failure is null)
+            {
+                RefreshForChange();
+            }
+            else if (!readSince && !_unreadableRetried)
+            {
+                // Once more, a moment later: a share that blinked, a folder
+                // replaced just as it was read.
+                _unreadableRetried = true;
+                await Task.Delay(UnreadableRetryTime);
+                if (generation == _loadGeneration && _load is null && string.Equals(path, FolderPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    RefreshForChange();
+                }
+            }
+            else if (!readSince)
+            {
+                _unreadableRetried = false;
+                ShowEmpty(failure is UnauthorizedAccessException ? "Access denied." : "This folder could not be read.");
+            }
+
             return;
         }
 
         if (nearest is null)
         {
+            if (!readSince)
+            {
+                ShowEmpty("This location is no longer available.");
+            }
+
             return;
         }
 
         LeftGoneFolders++;
         await NavigateAsync(nearest, remember: false);
+    }
+
+    /// <summary>
+    /// No rows, and why: as a full read of the folder that fails leaves the
+    /// list.  The folder's time the last good read found is let go of with
+    /// its rows: a share that comes back, or a folder readable again, keeps
+    /// that time, and a poll comparing with it would never read it again.
+    /// </summary>
+    private void ShowEmpty(string reason)
+    {
+        _all.Clear();
+        _byPath.Clear();
+        ReplaceRows([]);
+        CountText = string.Empty;
+        EmptyText = reason;
+        _listedWriteTicks = 0;
     }
 
     /// <summary>Times the list left a folder that went from disk, for tests.</summary>
