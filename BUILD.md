@@ -22,13 +22,14 @@ it. Run it again to update: it closes the installed copy (which saves its
 state), replaces it and, with `-Launch`, starts it. `-Desktop` also adds a
 desktop shortcut. Settings stay in `%LOCALAPPDATA%\UltraExplorer`.
 
-Every push and pull request builds, on GitHub Actions
-(`.github/workflows/release.yml`), a self-contained single-file
-`UltraExplorer.exe` and packs it twice: `UltraExplorer-win-x64.zip` (portable)
+Every main-branch push and pull request builds, on GitHub Actions
+(`.github/workflows/release.yml`), a self-contained application folder
+with its .NET/WPF runtime and packs it twice: `UltraExplorer-win-x64.zip` (portable)
 and `UltraExplorer-Setup-x64.exe`, an Inno Setup installer made from
 [`installer/UltraExplorer.iss`](installer/UltraExplorer.iss). Both are kept as
 the run's artifacts; pushing a `v*` tag (`v1.2.3`, `v1.2.3-beta.1`) stamps
-that version into the exe and the installer and attaches both to a release.
+that version into the exe and the installer and attaches both plus SHA-256
+checksums to a release. Tags with a prerelease suffix become GitHub prereleases.
 
 The installer installs per user without elevation into the same folder as
 `install.ps1` (or, on request, for all users into Program Files), adds the
@@ -40,7 +41,7 @@ an uninstaller. The uninstaller also removes the file-dialog COM registration
 relative to the script); the setup lands in `artifacts\installer\`:
 
 ```powershell
-iscc /DAppVersion=1.2.3 /DPublishDir=..\artifacts\win-x64 installer\UltraExplorer.iss
+iscc /DAppVersion=1.2.3 /DAppFileVersion=1.2.3 /DPublishDir=..\artifacts\win-x64 installer\UltraExplorer.iss
 ```
 
 ## Run
@@ -85,16 +86,31 @@ change to the graph, layout, index or viewport services.
 
 ## Publish
 
-Self-contained single file, ReadyToRun:
+Self-contained folder, ReadyToRun:
 
 ```powershell
-dotnet publish src/UltraExplorer/UltraExplorer.csproj -c Release -o artifacts/win-x64 --self-contained true -p:PublishSingleFile=true -p:PublishReadyToRun=true
+dotnet publish src/UltraExplorer/UltraExplorer.csproj -c Release -o artifacts/win-x64 --self-contained true -p:PublishSingleFile=false -p:PublishReadyToRun=true -p:IncludeNativeLibrariesForSelfExtract=false
 ```
 
-The output is one ~157 MB `artifacts/win-x64/UltraExplorer.exe` with no runtime
-prerequisite. These switches deliberately live on the command line and not in
+Keep the entire output folder together. It has no runtime prerequisite and
+does not extract native DLLs into TEMP at launch. These switches deliberately
+live on the command line and not in
 the project file: a self-contained project cannot be referenced by the test
 harness.
+
+For the installer, add `LICENSE`, `README.md` and `THIRD-PARTY-NOTICES.md`
+to the publish folder, then create `UltraExplorer-package-files.txt` containing
+every publish-relative filename, including the manifest itself. The workflow
+performs this step and verifies every file is present in the ZIP. Setup uses
+the old and new manifests to remove obsolete package files after an update.
+
+`tests/FolderTagsSmoke` checks tag navigation, persistence, path classification
+and asynchronous refresh. CI publishes the focused harnesses self-contained,
+so they also run when the machine has only the SDK installed.
+
+The five public demonstrations can be reproduced with
+[`tools/DemoRecorder`](tools/DemoRecorder). Capture details and encoding are in
+[docs/media/README.md](docs/media/README.md).
 
 ## File dialog mode
 
