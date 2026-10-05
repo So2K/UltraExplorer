@@ -1007,7 +1007,7 @@ public sealed class ViewAllGraphService : IDisposable
     /// </param>
     /// <param name="preRead">
     /// What the folder holds, already read by a refresh before it took the
-    /// branch down (see <see cref="ReadForRefreshAsync"/>), read with
+    /// branch down (see <see cref="RefreshBranchAsync"/>), read with
     /// <paramref name="childLimit"/>: put in without asking the disk again.
     /// </param>
     private async Task<ViewAllExpansionResult> ExpandAsync(
@@ -1142,48 +1142,6 @@ public sealed class ViewAllGraphService : IDisposable
         => childLimit > Options.SafeMaximumChildren
             ? Options with { MaximumChildrenPerFolder = Math.Min(childLimit, ViewAllGraphOptions.MaximumChildrenCeiling) }
             : Options;
-
-    /// <summary>
-    /// The read <see cref="RefreshBranchAsync"/> makes before it takes the
-    /// branch down, as <see cref="ExpandAsync(ViewAllNodeViewModel, CancellationToken, int)"/>
-    /// reads, and cancelled as that read is: by collapsing the folder, or by
-    /// a refresh of it or of a folder above it.  Null when cancelled so, or
-    /// when the folder was let go of meanwhile; a folder that cannot be read
-    /// throws.
-    /// </summary>
-    private async Task<ViewAllDirectorySnapshot?> ReadForRefreshAsync(
-        ViewAllNodeViewModel node,
-        int childLimit,
-        CancellationToken cancellationToken)
-    {
-        CancelLoad(node);
-        var loadCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        _loads[node.Id] = loadCancellation;
-        node.IsLoading = true;
-
-        // Taken once, before the read, for the reason given in ExpandAsync.
-        var token = loadCancellation.Token;
-        try
-        {
-            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, ReadOptionsFor(childLimit), token, _layout.SortFor(node.FullPath));
-            token.ThrowIfCancellationRequested();
-            return _disposed || !IsLive(node) ? null : snapshot;
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            return null;
-        }
-        finally
-        {
-            if (_loads.TryGetValue(node.Id, out var active) && ReferenceEquals(active, loadCancellation))
-            {
-                _loads.Remove(node.Id);
-                node.IsLoading = false;
-            }
-
-            loadCancellation.Dispose();
-        }
-    }
 
     public void Collapse(ViewAllNodeViewModel node)
     {
@@ -1349,19 +1307,34 @@ public sealed class ViewAllGraphService : IDisposable
             // moment - left the folder emptied and closed, with everything
             // that was open in it gone and no longer watched; now all of it
             // stays as it was, and the folder only says it could not be read.
-            // A folder that is gone is let go of as ever.  Collapsing it, or a
+            // A folder that is gone is let go of as ever.  Read as ExpandAsync
+            // reads, and cancelled as that read is: collapsing the folder, or a
             // refresh of it or above it, meanwhile ends this one with nothing
-            // touched: the other has it.
+            // touched - the other has it.  Read here and not in a method of its
+            // own, so that nothing can happen between the read coming back and
+            // the branch being taken down: an await more let a refresh above
+            // replace the folder in between, and this one then took the
+            // replacement's read away from it.
             ViewAllDirectorySnapshot? read = null;
             if (CanExpand(node))
             {
+                CancelLoad(node);
+                var reading = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                _loads[node.Id] = reading;
+                node.IsLoading = true;
+                var token = reading.Token;
                 try
                 {
-                    read = await ReadForRefreshAsync(node, node.ChildLoadLimit, cancellationToken);
-                    if (read is null)
+                    read = await _fileSystem.GetChildrenAsync(node.FullPath, ReadOptionsFor(node.ChildLoadLimit), token, _layout.SortFor(node.FullPath));
+                    token.ThrowIfCancellationRequested();
+                    if (_disposed || !IsLive(node))
                     {
                         return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
                     }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
                 }
                 catch (Exception ex) when (ex is UnauthorizedAccessException or IOException && ex is not DirectoryNotFoundException)
                 {
@@ -1371,6 +1344,16 @@ public sealed class ViewAllGraphService : IDisposable
                 catch (DirectoryNotFoundException)
                 {
                     // Gone: taken down below, and the read again says so.
+                }
+                finally
+                {
+                    if (_loads.TryGetValue(node.Id, out var active) && ReferenceEquals(active, reading))
+                    {
+                        _loads.Remove(node.Id);
+                        node.IsLoading = false;
+                    }
+
+                    reading.Dispose();
                 }
             }
 

@@ -226,11 +226,13 @@ internal static partial class Program
     /// F5 on a folder and then on the folder above it - or the watch reading
     /// both, in that order, during a build: the folder above found the
     /// sub-folder already emptied and closed by its own refresh, and brought
-    /// it back closed, with everything open in it gone.
+    /// it back closed, with everything open in it gone.  Which of the two
+    /// reads answers first varies, so it is done a few dozen times.
     /// </summary>
     private static async Task GraphNestedRefreshChecksAsync(string root)
     {
         Section("graph review: a folder read again while its open sub-folder is keeps the sub-folder open (J049)");
+        const int rounds = 40;
         var top = Path.Combine(root, "nested-refresh");
         var child = Path.Combine(top, "child");
         var grand = Path.Combine(child, "grand");
@@ -238,23 +240,36 @@ internal static partial class Program
         File.WriteAllText(Path.Combine(grand, "g.txt"), "x");
         File.WriteAllText(Path.Combine(child, "c.txt"), "x");
 
-        using var graph = new ViewAllGraphService();
-        var topNode = (await graph.AddRootAsync(top))!;
-        await graph.ExpandAsync(topNode);
-        graph.TryGetNode(child, out var childNode);
-        await graph.ExpandAsync(childNode);
-        graph.TryGetNode(grand, out var grandNode);
-        await graph.ExpandAsync(grandNode);
+        var childOpen = 0;
+        var grandOpen = 0;
+        for (var round = 0; round < rounds; round++)
+        {
+            using var graph = new ViewAllGraphService();
+            var topNode = (await graph.AddRootAsync(top))!;
+            await graph.ExpandAsync(topNode);
+            graph.TryGetNode(child, out var childNode);
+            await graph.ExpandAsync(childNode);
+            graph.TryGetNode(grand, out var grandNode);
+            await graph.ExpandAsync(grandNode);
 
-        // Both begun before either is answered, as on the window's thread.
-        var first = graph.RefreshBranchAsync(childNode);
-        var second = graph.RefreshBranchAsync(topNode);
-        await Task.WhenAll(first, second);
-        Check("the sub-folder is open again",
-            graph.TryGetNode(child, out var childAgain) && childAgain.IsExpanded && childAgain.Children.Count == 2);
-        Check("and so is the folder open inside it, with what it holds",
-            graph.TryGetNode(grand, out var grandAgain) && grandAgain.IsExpanded
-            && graph.TryGetNode(Path.Combine(grand, "g.txt"), out var leaf) && leaf.IsTreeVisible);
+            // Both begun before either is answered, as on the window's thread.
+            var first = graph.RefreshBranchAsync(childNode);
+            var second = graph.RefreshBranchAsync(topNode);
+            await Task.WhenAll(first, second);
+            if (graph.TryGetNode(child, out var childAgain) && childAgain.IsExpanded && childAgain.Children.Count == 2)
+            {
+                childOpen++;
+            }
+
+            if (graph.TryGetNode(grand, out var grandAgain) && grandAgain.IsExpanded
+                && graph.TryGetNode(Path.Combine(grand, "g.txt"), out var leaf) && leaf.IsTreeVisible)
+            {
+                grandOpen++;
+            }
+        }
+
+        Check($"the sub-folder is open again ({childOpen} of {rounds} times)", childOpen == rounds);
+        Check($"and so is the folder open inside it, with what it holds ({grandOpen} of {rounds} times)", grandOpen == rounds);
     }
 
     // ---- J045: a closed folder read again ----------------------------------------------------
