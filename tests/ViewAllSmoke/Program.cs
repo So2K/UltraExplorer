@@ -178,6 +178,7 @@ internal static partial class Program
         await Group(PanesRound2Checks);
         await Group(PickerDialogsReviewChecks);
         await Group(PickerDialogsWindowReviewChecks);
+        await Group(PickerDialogsAgentReviewChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.
