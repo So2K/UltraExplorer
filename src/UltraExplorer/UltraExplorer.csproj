@@ -20,6 +20,7 @@
        harness can reference this project. See BUILD.md for the publish command. -->
 
   <ItemGroup>
+    <PackageReference Include="FlaUI.UIA3" Version="5.0.0" />
     <PackageReference Include="Nodify" Version="7.3.0" />
   </ItemGroup>
 
@@ -36,6 +37,7 @@
 
   <ItemGroup>
     <Resource Include="Assets\UltraExplorer.ico" />
+    <None Include="..\..\THIRD-PARTY-NOTICES.md" Link="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 
   <!-- The canvas's shaders, compiled at start-up by ShaderCache with the
@@ -48,5 +50,6 @@
   <!-- The headless harness exercises the graph internals directly. -->
   <ItemGroup>
     <InternalsVisibleTo Include="ViewAllSmoke" />
+    <InternalsVisibleTo Include="NativeDialogProxySmoke" />
   </ItemGroup>
 </Project>

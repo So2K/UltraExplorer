@@ -21,13 +21,19 @@ internal abstract class FileDialogComBase
 
     private readonly ConcurrentQueue<Action> _callerWork = new();
 
+    /// <summary>Wakes the thread the caller waits in as soon as there is work for it.</summary>
+    private readonly AutoResetEvent _callerWorkQueued = new(false);
+
+    /// <summary>The <see cref="Notice"/>s on their way to the caller, not yet made.</summary>
+    private int _pendingNotices;
+
     private FileDialogSession? _session;
     private MainWindow? _window;
     private volatile bool _dialogRunning;
     private FileDialogResult _result = FileDialogResult.Cancelled();
     private uint _nextCookie = 1;
     private int _closeResult;
-    private bool _closeRequested;
+    private volatile bool _closeRequested;
 
     protected FileDialogRequest Request => _request;
 
@@ -71,6 +77,9 @@ internal abstract class FileDialogComBase
         var result = Hresult.Cancelled;
         using var finished = new ManualResetEventSlim(false);
 
+        // Here, not once the window is being built: a Close the caller makes
+        // from now on is for this Show, however early it comes.
+        _closeRequested = false;
         _dialogRunning = true;
         _ = Ui.InvokeAsync(async () =>
         {
@@ -85,8 +94,10 @@ internal abstract class FileDialogComBase
             }
         });
 
-        while (!finished.Wait(25))
+        WaitHandle[] wakes = [finished.WaitHandle, _callerWorkQueued];
+        while (!finished.IsSet)
         {
+            WaitHandle.WaitAny(wakes);
             DrainCallerWork();
         }
 
@@ -104,9 +115,10 @@ internal abstract class FileDialogComBase
 
     /// <summary>
     /// Runs <paramref name="work"/> on the thread the caller is waiting in, and
-    /// does not come back until it has.  Used only for calls out to the caller's
-    /// event sinks; anything the sink asks us in return is answered from a
-    /// snapshot on whatever thread COM brings it in on.
+    /// does not come back until it has.  Used only for the calls out to the
+    /// caller's event sinks that have an answer to wait for (the rest go
+    /// through <see cref="Notify"/>); anything the sink asks us in return is
+    /// answered from a snapshot on whatever thread COM brings it in on.
     /// </summary>
     private void OnCallerThread(Action work)
     {
@@ -129,7 +141,47 @@ internal abstract class FileDialogComBase
             }
         });
 
+        _callerWorkQueued.Set();
         done.Wait();
+    }
+
+    /// <summary>The changes a caller is told about after the fact, which nothing waits on.</summary>
+    [Flags]
+    private enum Notice
+    {
+        Folder = 1,
+        Selection = 2,
+        Type = 4
+    }
+
+    /// <summary>
+    /// Tells the caller of a change without waiting for it to listen.  Only
+    /// <c>OnFileOk</c> and <c>OnOverwrite</c> have an answer to wait for;
+    /// for the rest the interface thread goes on at once, and a change of a
+    /// kind already on its way is that same call - a sink reads what is
+    /// current when it is called, and a rubber band over three hundred files
+    /// is one call rather than three hundred, each of which the window would
+    /// otherwise have waited for.
+    /// </summary>
+    private void Notify(Notice notice, Action raise)
+    {
+        if (!_dialogRunning)
+        {
+            raise();
+            return;
+        }
+
+        if ((Interlocked.Or(ref _pendingNotices, (int)notice) & (int)notice) != 0)
+        {
+            return;
+        }
+
+        _callerWork.Enqueue(() =>
+        {
+            Interlocked.And(ref _pendingNotices, ~(int)notice);
+            raise();
+        });
+        _callerWorkQueued.Set();
     }
 
     /// <summary>
@@ -137,15 +189,13 @@ internal abstract class FileDialogComBase
     /// purpose: two programs can each have a dialog open from this one server,
     /// and nested ShowDialog loops would disable the first one's window and
     /// keep its Show from returning until the second was dismissed.  The
-    /// caller's own window is what has to be modal to, and it is disabled by
-    /// hand below.
+    /// caller's own window owns it, and is left enabled (see below).
     /// </summary>
     private async Task<int> ShowOnUiAsync(IntPtr owner)
     {
         try
         {
             ComTrace.Write($"Show(owner=0x{owner:X}) mode={_request.Mode} filters={_request.Filters.Count} initial={_request.InitialFolder}");
-            _closeRequested = false;
             var session = new FileDialogSession(_request);
             ComTrace.Write($"session starts in {session.CurrentFolder}");
             _session = session;
@@ -160,34 +210,26 @@ internal abstract class FileDialogComBase
             _window = window;
             FileDialogHost.AttachOwner(window, owner);
 
-            // The caller is blocked inside this call, so its window takes no
-            // input anyway; disabling it makes that visible, and the finally is
-            // what guarantees it comes back.
-            var disable = owner != IntPtr.Zero
-                && ShellNative.IsWindow(owner)
-                && ShellNative.IsWindowEnabled(owner);
-
-            if (disable)
+            // A Close that came while the window was being built found no
+            // window to close; it is made now, once the window is up.
+            Interlocked.MemoryBarrier();
+            if (_closeRequested)
             {
-                ShellNative.EnableWindow(owner, false);
+                Post(window.CloseFromCaller);
             }
 
-            try
-            {
-                var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                window.Closed += (_, _) => closed.TrySetResult();
-                window.Show();
-                window.Activate();
-                await closed.Task;
-            }
-            finally
-            {
-                if (disable)
-                {
-                    ShellNative.EnableWindow(owner, true);
-                    _ = ShellNative.SetForegroundWindow(owner);
-                }
-            }
+            // The caller's window is not disabled, as the system dialog
+            // disables it from inside the caller: from this process nothing
+            // could enable it again if this process ended while the dialog
+            // was up.  It owns the dialog, which stays above it, and the
+            // caller, blocked in this call, takes no input meanwhile.  Being
+            // enabled as the dialog goes is also what has Windows hand the
+            // activation back to it, rather than to some other program.
+            var closed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            window.Closed += (_, _) => closed.TrySetResult();
+            window.Show();
+            window.Activate();
+            await closed.Task;
 
             _result = window.PickerResult.IsCompleted
                 ? window.PickerResult.Result
@@ -291,7 +333,10 @@ internal abstract class FileDialogComBase
         ComTrace.Write($"SetFolder({path ?? "<null>"})");
         if (path is null)
         {
-            return Hresult.InvalidArg;
+            // This PC, a library, a phone: nothing the canvas opens, and
+            // nothing the system dialog refuses.  A caller that stops at its
+            // first failed HRESULT would never reach Show.
+            return folder is null ? Hresult.InvalidArg : Hresult.Ok;
         }
 
         _request.InitialFolder = path;
@@ -391,7 +436,8 @@ internal abstract class FileDialogComBase
     {
         if (ShellNative.PathOf(place) is not { Length: > 0 } path)
         {
-            return Hresult.InvalidArg;
+            // As SetFolder: a place the canvas cannot show is left out, not refused.
+            return place is null ? Hresult.InvalidArg : Hresult.Ok;
         }
 
         _request.Places.Add(new FileDialogPlace(path, placement == FileDialogAddPlacement.Top));
@@ -407,8 +453,12 @@ internal abstract class FileDialogComBase
     /// <summary>The caller dismissing its own dialog, with the HRESULT it wants back.</summary>
     public int Close(int result)
     {
-        _closeRequested = true;
         _closeResult = result;
+        _closeRequested = true;
+
+        // Paired with the barrier in ShowOnUiAsync: either this sees the
+        // window, or the window being built sees the request.
+        Interlocked.MemoryBarrier();
         if (_window is { } window)
         {
             Post(window.CloseFromCaller);
@@ -574,7 +624,7 @@ internal abstract class FileDialogComBase
             return;
         }
 
-        OnCallerThread(() =>
+        Notify(Notice.Folder, () =>
         {
             foreach (var sink in _sinks.Values.ToArray())
             {
@@ -590,7 +640,7 @@ internal abstract class FileDialogComBase
             return;
         }
 
-        OnCallerThread(() =>
+        Notify(Notice.Selection, () =>
         {
             foreach (var sink in _sinks.Values.ToArray())
             {
@@ -606,7 +656,7 @@ internal abstract class FileDialogComBase
             return;
         }
 
-        OnCallerThread(() =>
+        Notify(Notice.Type, () =>
         {
             foreach (var sink in _sinks.Values.ToArray())
             {

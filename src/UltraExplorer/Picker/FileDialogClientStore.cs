@@ -24,10 +24,13 @@ public sealed class FileDialogClientStore
     };
 
     private readonly string _path;
+    private readonly string _mutexName;
 
     public FileDialogClientStore(string? path = null)
     {
-        _path = path ?? AppPaths.State("picker-clients.json");
+        _path = Path.GetFullPath(path ?? AppPaths.State("picker-clients.json"));
+        _mutexName = @"Local\UltraExplorer.PickerClients." + Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(_path.ToUpperInvariant())));
     }
 
     public string StatePath => _path;
@@ -50,9 +53,7 @@ public sealed class FileDialogClientStore
             return;
         }
 
-        var all = ReadAll();
-        all[client.ToString("D")] = state;
-        WriteAll(all);
+        Mutate(all => { all[client.ToString("D")] = state; return true; });
     }
 
     public void Clear(Guid client)
@@ -62,14 +63,32 @@ public sealed class FileDialogClientStore
             return;
         }
 
-        var all = ReadAll();
-        if (all.Remove(client.ToString("D")))
+        Mutate(all => all.Remove(client.ToString("D")));
+    }
+
+    private void Mutate(Func<Dictionary<string, FileDialogClientState>, bool> change)
+    {
+        try
         {
-            WriteAll(all);
+            using var mutex = new Mutex(false, _mutexName);
+            var entered = false;
+            try
+            {
+                try { entered = mutex.WaitOne(TimeSpan.FromSeconds(3)); }
+                catch (AbandonedMutexException) { entered = true; }
+                if (!entered) return;
+                var all = ReadAll(preserveOnReadFailure: true);
+                if (change(all)) WriteAll(all);
+            }
+            finally { if (entered) mutex.ReleaseMutex(); }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or System.Security.SecurityException)
+        {
+            // Remembering a folder must never fail the file dialog itself.
         }
     }
 
-    private Dictionary<string, FileDialogClientState> ReadAll()
+    private Dictionary<string, FileDialogClientState> ReadAll(bool preserveOnReadFailure = false)
     {
         try
         {
@@ -78,11 +97,12 @@ public sealed class FileDialogClientStore
                 return new Dictionary<string, FileDialogClientState>(StringComparer.OrdinalIgnoreCase);
             }
 
-            var text = File.ReadAllText(_path);
-            return JsonSerializer.Deserialize<Dictionary<string, FileDialogClientState>>(text, JsonOptions)
+            using var file = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return JsonSerializer.Deserialize<Dictionary<string, FileDialogClientState>>(file, JsonOptions)
                 ?? new Dictionary<string, FileDialogClientState>(StringComparer.OrdinalIgnoreCase);
         }
-        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or JsonException)
+        catch (Exception exception) when (exception is JsonException
+            || !preserveOnReadFailure && (exception is IOException or UnauthorizedAccessException))
         {
             return new Dictionary<string, FileDialogClientState>(StringComparer.OrdinalIgnoreCase);
         }
@@ -90,16 +110,21 @@ public sealed class FileDialogClientStore
 
     private void WriteAll(Dictionary<string, FileDialogClientState> all)
     {
+        var temporary = $"{_path}.{Guid.NewGuid():N}.tmp";
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_path)!);
-            var temporary = $"{_path}.{Guid.NewGuid():N}.tmp";
             File.WriteAllText(temporary, JsonSerializer.Serialize(all, JsonOptions));
             File.Move(temporary, _path, overwrite: true);
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
             // Losing the last folder is not worth failing a file dialog over.
+        }
+        finally
+        {
+            try { File.Delete(temporary); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
         }
     }
 }

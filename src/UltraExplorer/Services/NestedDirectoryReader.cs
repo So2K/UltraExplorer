@@ -175,12 +175,26 @@ public static class NestedDirectoryReader
     }
 
     /// <summary>
-    /// The path in its extended-length form for a local drive.  Without it the
-    /// enumerator normalises the path, which strips a trailing dot or space -
-    /// and a folder named "backup." would be read as its neighbour "backup".
+    /// The path in its extended-length form for a local drive or a share
+    /// (<c>\\server\share\...</c> as <c>\\?\UNC\server\share\...</c>, a WSL
+    /// distribution's included).  Without it the enumerator normalises the
+    /// path, which strips a trailing dot or space - and a folder named
+    /// "backup." would be read as its neighbour "backup".  A path in either
+    /// form already, or a device's, is left as it is.
     /// </summary>
-    private static string ExtendedLength(string path) =>
-        path.Length >= 3 && path[1] == ':' && path[2] == Path.DirectorySeparatorChar
-            ? @"\\?\" + path
-            : path;
+    private static string ExtendedLength(string path)
+    {
+        if (path.Length >= 3 && path[1] == ':' && path[2] == Path.DirectorySeparatorChar)
+        {
+            return @"\\?\" + path;
+        }
+
+        if (path.Length > 2 && path[0] == Path.DirectorySeparatorChar && path[1] == Path.DirectorySeparatorChar
+            && !(path.Length > 3 && path[2] is ('?' or '.') && path[3] == Path.DirectorySeparatorChar))
+        {
+            return @"\\?\UNC\" + path[2..];
+        }
+
+        return path;
+    }
 }

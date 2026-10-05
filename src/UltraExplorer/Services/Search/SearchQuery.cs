@@ -277,8 +277,11 @@ internal sealed class SearchQuery
                 continue;
             }
 
+            // A function's argument may be quoted - path:"C:\Program Files\" -
+            // where a quote that opens before the colon makes the colon part
+            // of a phrase.
             var colon = raw.IndexOf(':');
-            if (colon > 0 && !token.Quoted && !IsDrivePath(raw))
+            if (colon > 0 && (token.QuoteAt < 0 || token.QuoteAt > token.Text.IndexOf(':')) && !IsDrivePath(raw))
             {
                 IsPlain = false;
                 var function = raw[..colon].ToLowerInvariant();
@@ -389,18 +392,26 @@ internal sealed class SearchQuery
 
     private static bool IsDrivePath(string text) => text.Length >= 2 && text[1] == ':' && char.IsAsciiLetter(text[0]) && (text.Length == 2 || text[2] is '\\' or '/');
 
-    /// <summary>The text split at spaces outside quotes; a quoted run keeps its spaces and loses its quotes.</summary>
-    private static IEnumerable<(string Text, bool Quoted)> Tokens(string text)
+    /// <summary>
+    /// The text split at spaces outside quotes; a quoted run keeps its spaces
+    /// and loses its quotes.  <c>QuoteAt</c> is where in the token's text the
+    /// first quote was, -1 for none.
+    /// </summary>
+    private static IEnumerable<(string Text, bool Quoted, int QuoteAt)> Tokens(string text)
     {
         var builder = new StringBuilder();
-        var quoted = false;
+        var quoteAt = -1;
         var inQuotes = false;
         foreach (var character in text)
         {
             if (character == '"')
             {
                 inQuotes = !inQuotes;
-                quoted = true;
+                if (quoteAt < 0)
+                {
+                    quoteAt = builder.Length;
+                }
+
                 continue;
             }
 
@@ -408,11 +419,11 @@ internal sealed class SearchQuery
             {
                 if (builder.Length > 0)
                 {
-                    yield return (builder.ToString(), quoted);
+                    yield return (builder.ToString(), quoteAt >= 0, quoteAt);
                 }
 
                 builder.Clear();
-                quoted = false;
+                quoteAt = -1;
                 continue;
             }
 
@@ -421,7 +432,7 @@ internal sealed class SearchQuery
 
         if (builder.Length > 0)
         {
-            yield return (builder.ToString(), quoted);
+            yield return (builder.ToString(), quoteAt >= 0, quoteAt);
         }
     }
 

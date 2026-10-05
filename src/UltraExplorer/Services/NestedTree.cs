@@ -72,6 +72,7 @@ public sealed partial class NestedTree : IDisposable
     private bool _disposed;
     private int _knownCount;
     private bool _includeHidden;
+    private Func<string, bool>? _fileNameFilter;
 
     public NestedTree(Func<string, CancellationToken, NestedListing>? reader = null)
     {
@@ -205,6 +206,22 @@ public sealed partial class NestedTree : IDisposable
             }
 
             _includeHidden = value;
+            RefilterAll();
+        }
+    }
+
+    /// <summary>A picker's selected file type. Folder tiles remain visible;
+    /// switching types reuses listings already read from disk.  The same
+    /// filter's method bound again - a new delegate each time the window
+    /// applies the dialog's rules - is the filter the tree has, and does not
+    /// filter again every folder the picker has ever read.</summary>
+    public Func<string, bool>? FileNameFilter
+    {
+        get => _fileNameFilter;
+        set
+        {
+            if (Equals(_fileNameFilter, value)) return;
+            _fileNameFilter = value;
             RefilterAll();
         }
     }
@@ -352,23 +369,50 @@ public sealed partial class NestedTree : IDisposable
     /// A child of <paramref name="folder"/> by name.  Listings are sorted by the
     /// reader in culture order, so this is a binary search; a name culture order
     /// treats oddly falls back to a plain scan rather than being reported missing.
+    /// A case-sensitive folder (a WSL tree) can hold names that differ in case
+    /// alone, "Build" and "build": the one spelt exactly as asked is the one
+    /// meant, and only a name spelt like neither takes the first of them.
     /// </summary>
     internal static NestedFolder? FindChild(NestedFolder folder, string name)
     {
         var children = folder.AllChildren;
         if (!folder.IsComputer && children.Length >= 16)
         {
+            var comparer = StringComparer.CurrentCultureIgnoreCase;
             var low = 0;
             var high = children.Length - 1;
             while (low <= high)
             {
                 var middle = (low + high) / 2;
-                var order = StringComparer.CurrentCultureIgnoreCase.Compare(children[middle].Name, name);
+                var order = comparer.Compare(children[middle].Name, name);
                 if (order == 0)
                 {
-                    if (string.Equals(children[middle].Name, name, StringComparison.OrdinalIgnoreCase))
+                    // Names culture order calls equal sit side by side, and
+                    // the search can land on any of them: look through the run.
+                    var first = middle;
+                    while (first > 0 && comparer.Compare(children[first - 1].Name, name) == 0)
                     {
-                        return children[middle];
+                        first--;
+                    }
+
+                    NestedFolder? caseless = null;
+                    for (var index = first; index < children.Length && comparer.Compare(children[index].Name, name) == 0; index++)
+                    {
+                        var candidate = children[index];
+                        if (string.Equals(candidate.Name, name, StringComparison.Ordinal))
+                        {
+                            return candidate;
+                        }
+
+                        if (caseless is null && string.Equals(candidate.Name, name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            caseless = candidate;
+                        }
+                    }
+
+                    if (caseless is not null)
+                    {
+                        return caseless;
                     }
 
                     break;
@@ -385,16 +429,24 @@ public sealed partial class NestedTree : IDisposable
             }
         }
 
+        NestedFolder? match = null;
         foreach (var child in children)
         {
-            if (string.Equals(child.Name, name, StringComparison.OrdinalIgnoreCase)
-                || folder.IsComputer && string.Equals(child.FullPath, name, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(child.Name, name, StringComparison.Ordinal)
+                || folder.IsComputer && string.Equals(child.FullPath, name, StringComparison.Ordinal))
             {
                 return child;
             }
+
+            if (match is null
+                && (string.Equals(child.Name, name, StringComparison.OrdinalIgnoreCase)
+                    || folder.IsComputer && string.Equals(child.FullPath, name, StringComparison.OrdinalIgnoreCase)))
+            {
+                match = child;
+            }
         }
 
-        return null;
+        return match;
     }
 
     /// <summary>Whether the folder is still one of the cells, rather than filtered out or forgotten.</summary>
@@ -586,6 +638,10 @@ public sealed partial class NestedTree : IDisposable
         return root.EndsWith(Path.DirectorySeparatorChar) || path[root.Length] == Path.DirectorySeparatorChar;
     }
 
+    /// <summary>
+    /// A path as the tree keys it: the one spelling every map uses, a name
+    /// ending in a dot or a space included (see <see cref="ViewAllPath.KeepNameEnds"/>).
+    /// </summary>
     private static string Key(string path)
     {
         try

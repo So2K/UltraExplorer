@@ -99,8 +99,8 @@ internal abstract class LabelTarget
     /// <summary>
     /// Draws a file's icon into <paramref name="bounds"/>, in DIPs, if it is
     /// known yet; true when it was drawn.  A file whose icon has not arrived
-    /// is drawn without it - its name moves left into the room - and drawn
-    /// again when the icon comes.
+    /// is drawn without it while retaining its reserved slot, and drawn
+    /// again when the icon comes without shifting the filename.
     /// </summary>
     /// <param name="folder">The folder the file is in.</param>
     /// <param name="fileIndex">

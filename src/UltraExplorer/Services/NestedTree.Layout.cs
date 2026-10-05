@@ -16,6 +16,15 @@ public sealed partial class NestedTree
     private readonly HashSet<string> _forcedVisible = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
+    /// Every folder on the way to one opened by name (<see cref="MaterializePathAsync"/>):
+    /// the address bar, a program opening a folder, a dialog's start folder.
+    /// Kept on the canvas even when the user hid one of them - going there
+    /// is the user's word too, and the later one - until the user next hides
+    /// or shows a folder.  A beacon's chain or a mark is no such word.
+    /// </summary>
+    private readonly HashSet<string> _openedByName = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
     /// Folders that have at least one child in either set above.  Only their
     /// children need looking up at all; every other folder's children are
     /// filtered by their attributes alone, without hashing a single path.
@@ -82,7 +91,26 @@ public sealed partial class NestedTree
     private readonly List<string> _typeKinds = [];
     private readonly Dictionary<string, int> _typeSlots = new(ReferenceEqualityComparer.Instance);
 
-    /// <summary>Folders the user hid from the canvas, with everything under them.</summary>
+    /// <summary>
+    /// Set by <see cref="TypeOrder"/> when it ordered a kind the Shell has not
+    /// named yet by its stand-in, and taken by <see cref="ApplyVisibleChildren"/>
+    /// for the folder it was placing.
+    /// </summary>
+    private bool _orderedByStandIn;
+
+    /// <summary>
+    /// Folders placed by type with a stand-in for some kind's name, to be
+    /// placed again once the Shell has named it; null while there are none.
+    /// </summary>
+    private HashSet<NestedFolder>? _typeStandIns;
+
+    private bool _typeNamesWaiting;
+
+    /// <summary>
+    /// Folders the user hid from the canvas, with everything under them.  Said
+    /// again whenever the user hides or shows one, which is the newer word
+    /// than any folder opened by name inside them: those are hidden again.
+    /// </summary>
     public void SetUserHidden(IEnumerable<string> paths)
     {
         _userHidden.Clear();
@@ -91,11 +119,47 @@ public sealed partial class NestedTree
             _userHidden.Add(Key(path));
         }
 
+        _openedByName.Clear();
         RebuildFilterParents();
         RefilterAll();
     }
 
     public bool IsUserHidden(string path) => _userHidden.Contains(Key(path));
+
+    /// <summary>
+    /// Keeps every folder on the way to <paramref name="path"/>, which is being
+    /// opened by name, on the canvas even when the user hid one of them (see
+    /// <see cref="_openedByName"/>).  A folder already in the tree and left out
+    /// for being hidden is placed again in its parent at once.
+    /// </summary>
+    private void ShowOpenedByName(string path)
+    {
+        var parents = new HashSet<NestedFolder>();
+        foreach (var step in Chain(path))
+        {
+            if (!_openedByName.Add(step) || Path.GetDirectoryName(step) is not { Length: > 0 } directory)
+            {
+                continue;
+            }
+
+            _filterParents.Add(Key(directory));
+            if (_userHidden.Contains(step) && Find(directory) is { } holder
+                && FindChild(holder, Path.GetFileName(step)) is { Index: < 0 })
+            {
+                parents.Add(holder);
+            }
+        }
+
+        foreach (var parent in parents)
+        {
+            ApplyVisibleChildren(parent);
+        }
+
+        if (parents.Count > 0)
+        {
+            RaiseChanged();
+        }
+    }
 
     /// <summary>
     /// Keeps every folder on the way to these paths on the canvas even when it
@@ -436,10 +500,11 @@ public sealed partial class NestedTree
         foreach (var child in all)
         {
             // "Hide from canvas" is the user's own word and outranks a folder
-            // being asked for by name; being asked for outranks only the
-            // hidden attribute.
+            // being asked for by name - a mark, a beacon; being asked for
+            // outranks only the hidden attribute.  A folder opened by name
+            // since, on the way to one the user went to, is the later word.
             bool shown;
-            if (hasRules && _userHidden.Contains(child.FullPath))
+            if (hasRules && _userHidden.Contains(child.FullPath) && !_openedByName.Contains(child.FullPath))
             {
                 shown = false;
             }
@@ -464,7 +529,8 @@ public sealed partial class NestedTree
 
         // A hidden file someone marked or searched for is shown like a hidden
         // folder on the way to one: asking for it by name outranks the filter.
-        bool IsShown(NestedFile file) => !file.IsHidden || hasRules && _forcedVisible.Contains(folder.PathOf(file));
+        bool IsShown(NestedFile file) => (_fileNameFilter?.Invoke(file.Name) ?? true)
+            && (_includeHidden || !file.IsHidden || hasRules && _forcedVisible.Contains(folder.PathOf(file)));
 
         // This PC's drives keep the order they were given in; everywhere else
         // the chosen order applies.  Names from A is the order the listings
@@ -489,10 +555,17 @@ public sealed partial class NestedTree
             OrderFolders(visible, sort);
             files = OrderFiles(
                 folder.AllFiles,
-                _includeHidden || folder.HiddenFileCount == 0 ? null : ShownIndices(folder.AllFiles, IsShown),
+                _fileNameFilter is null && (_includeHidden || folder.HiddenFileCount == 0)
+                    ? null : ShownIndices(folder.AllFiles, IsShown),
                 sort);
+            if (_orderedByStandIn)
+            {
+                _orderedByStandIn = false;
+                (_typeStandIns ??= []).Add(folder);
+                _ = PlaceAgainWhenTypeNamesArriveAsync();
+            }
         }
-        else if (_includeHidden || folder.HiddenFileCount == 0)
+        else if (_fileNameFilter is null && (_includeHidden || folder.HiddenFileCount == 0))
         {
             files = folder.AllFiles;
         }
@@ -1022,12 +1095,26 @@ public sealed partial class NestedTree
             }
 
             // Two extensions can share a name - "jpg" and "jpeg" are both a
-            // JPEG image - and then they share a rank too.
+            // JPEG image - and then they share a rank too.  A kind the Shell
+            // has not named yet is not asked about here, on the tree's thread:
+            // a folder of thousands of kinds - rotated logs - stalled the
+            // window for seconds.  It is ordered by its stand-in, and the
+            // folder placed again once the name is in.  Only a thread that
+            // can be come back to waits for it; any other asks the Shell.
+            var deferNames = SynchronizationContext.Current is not null;
             var names = new string[kinds.Count];
             var byName = new int[kinds.Count];
             for (var kind = 0; kind < kinds.Count; kind++)
             {
-                names[kind] = FileTypeNames.Of(kinds[kind]);
+                if (!deferNames)
+                {
+                    names[kind] = FileTypeNames.Of(kinds[kind]);
+                }
+                else if (!FileTypeNames.TryGet(kinds[kind], out names[kind]))
+                {
+                    _orderedByStandIn = true;
+                }
+
                 byName[kind] = kind;
             }
 
@@ -1072,6 +1159,56 @@ public sealed partial class NestedTree
             ArrayPool<int>.Shared.Return(slotOf);
             kinds.Clear();
             slots.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Places again, once the Shell has named every kind waiting, the folders
+    /// <see cref="TypeOrder"/> had to order by a stand-in: the few files whose
+    /// kind was new move to their places a moment after the rest.  One
+    /// <see cref="Changed"/> for all of them.  A folder dropped meanwhile, or
+    /// placed since for an order that is not by type, has nothing to put right.
+    /// </summary>
+    private async Task PlaceAgainWhenTypeNamesArriveAsync()
+    {
+        if (_typeNamesWaiting)
+        {
+            return;
+        }
+
+        _typeNamesWaiting = true;
+        try
+        {
+            // Never straight back into the placing that asked: the names may
+            // all be in already, and that folder is only half placed.
+            await Task.Yield();
+            await FileTypeNames.WhenPrefetchedAsync();
+        }
+        finally
+        {
+            _typeNamesWaiting = false;
+        }
+
+        var folders = _typeStandIns;
+        _typeStandIns = null;
+        if (_disposed || folders is null)
+        {
+            return;
+        }
+
+        var placed = false;
+        foreach (var folder in folders)
+        {
+            if (!folder.IsForgotten && folder.LayoutSortGeneration >= 0 && folder.PlacedSort.Column == SortColumn.Type)
+            {
+                ApplyVisibleChildren(folder);
+                placed = true;
+            }
+        }
+
+        if (placed)
+        {
+            RaiseChanged();
         }
     }
 

@@ -50,6 +50,13 @@ public sealed class NavigationHistory
         _index = _places.Count - 1;
     }
 
+    /// <summary>Forgets every place: a prepared picker bound to a new dialog starts its Back and Forward afresh.</summary>
+    public void Clear()
+    {
+        _places.Clear();
+        _index = -1;
+    }
+
     /// <summary>One step back: the place to go to, or null at the first.</summary>
     public string? Back() => CanGoBack ? _places[--_index] : null;
 

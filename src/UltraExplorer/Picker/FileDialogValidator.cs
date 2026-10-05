@@ -69,7 +69,9 @@ public static class FileDialogValidator
             paths = [paths[0]];
         }
 
-        if (!request.Has(FileDialogOptions.NoDereferenceLinks) && !request.IsSave)
+        // A replaced dialog hands a shortcut back as it is: the application's
+        // own dialog follows it, or not, as that application asked it to.
+        if (!request.Has(FileDialogOptions.NoDereferenceLinks) && !request.IsSave && !request.IsNativeProxy)
         {
             paths = [.. paths.Select(ShellLinkResolver.Resolve)];
         }

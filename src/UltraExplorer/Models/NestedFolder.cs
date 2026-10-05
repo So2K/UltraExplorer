@@ -309,6 +309,10 @@ public sealed class NestedFolder
 
     public NestedLoadState LoadState { get; internal set; }
 
+    /// <summary>Only named descendants are known; the contents have not been
+    /// listed. The camera can still reach them through their physical parents.</summary>
+    public bool HasPartialListing { get; internal set; }
+
     /// <summary>When the last read failed, as a <see cref="System.Diagnostics.Stopwatch"/> timestamp.</summary>
     internal long FailedAt { get; set; }
 

@@ -28,6 +28,7 @@ internal static partial class Program
         await SearchWalkChecks();
         await LiveEverythingChecks();
         RunOnSta("search panel", SearchPanelOnStaAsync);
+        RunOnSta("search result content hit-testing", SearchResultContentChecksAsync);
     }
 
     private static void SearchQueryChecks()

@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using UltraExplorer.Infrastructure;
+using UltraExplorer.Models;
 
 namespace UltraExplorer.Picker;
 
@@ -40,6 +41,8 @@ public sealed class FileDialogSession : ObservableObject
 
     private int _selectedFilterIndex;
     private string _fileNameText = string.Empty;
+    private string? _selectionNameText;
+    private IReadOnlyList<string> _pendingSelection = [];
     private string _currentFolder = string.Empty;
     private bool _hasInteracted;
     private FileDialogFilter _selectedFilter;
@@ -187,6 +190,8 @@ public sealed class FileDialogSession : ObservableObject
         {
             if (SetProperty(ref _fileNameText, value ?? string.Empty))
             {
+                _selectionNameText = null;
+                SetPendingSelection([]);
                 OnPropertyChanged(nameof(CanAccept));
             }
         }
@@ -262,6 +267,59 @@ public sealed class FileDialogSession : ObservableObject
     /// </summary>
     public IReadOnlyList<string> LastSelection { get; private set; } = [];
 
+    /// <summary>The file choice awaiting OK, independent of the canvas highlight.</summary>
+    public IReadOnlyList<string> PendingSelection => _pendingSelection;
+
+    public bool HasPendingSelection => _pendingSelection.Count > 0;
+
+    public string PendingSelectionLabel => _pendingSelection.Count switch
+    {
+        0 => string.Empty,
+        1 => $"Selected {(PicksFolders ? "folder" : "file")}: {NameOrPath(_pendingSelection[0])}",
+        _ => $"Selected files ({_pendingSelection.Count})"
+    };
+
+    /// <summary>Where the one choice is; nothing for a drive, which is in no folder.</summary>
+    public string PendingSelectionLocation => _pendingSelection.Count == 1
+        ? Path.GetDirectoryName(_pendingSelection[0]) is { Length: > 0 } parent ? $"Location: {parent}" : string.Empty
+        : string.Join(Environment.NewLine, _pendingSelection);
+
+    /// <summary>A path's own name, or the whole path for a drive, which has none.</summary>
+    private static string NameOrPath(string path) =>
+        Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)) is { Length: > 0 } name ? name : path;
+
+    public string PendingSelectionDetails => string.Join(Environment.NewLine, _pendingSelection);
+
+    private void SetPendingSelection(IReadOnlyList<string> paths)
+    {
+        _pendingSelection = paths.ToArray();
+        OnPropertyChanged(nameof(PendingSelection));
+        OnPropertyChanged(nameof(HasPendingSelection));
+        OnPropertyChanged(nameof(PendingSelectionLabel));
+        OnPropertyChanged(nameof(PendingSelectionLocation));
+        OnPropertyChanged(nameof(PendingSelectionDetails));
+    }
+
+    public void ClearChoice()
+    {
+        _selectionNameText = null;
+        LastSelection = [];
+        FileNameText = string.Empty;
+        SetPendingSelection([]);
+    }
+
+    /// <summary>Contract completion for the same dialog retains a choice even
+    /// after navigation removed its highlight. A new request never calls this.</summary>
+    internal void CarryChoiceFrom(FileDialogSession previous)
+    {
+        if (previous._selectionNameText is not { } name || previous.PendingSelection.Count == 0
+            || !string.Equals(FileNameText.Trim(), name, StringComparison.Ordinal)) return;
+        var paths = AllowsMultipleSelection ? previous.PendingSelection : [previous.PendingSelection[0]];
+        FileNameText = FileDialogNaming.Describe(paths);
+        SetPendingSelection(paths);
+        _selectionNameText = FileNameText.Trim();
+    }
+
     /// <summary>Reflects a canvas selection in the name box.</summary>
     public void ReportSelection(IReadOnlyList<string> paths)
     {
@@ -269,37 +327,73 @@ public sealed class FileDialogSession : ObservableObject
             .Where(path => PicksFolders ? Directory.Exists(path) : !Directory.Exists(path))
             .ToArray();
 
+        ReportUsableSelection(usable);
+    }
+
+    /// <summary>The tile canvas already knows which selected entries are
+    /// folders. Avoid a synchronous filesystem probe on each selection click.</summary>
+    public void ReportSelection(IEnumerable<SelectionItem> items)
+    {
+        var usable = items.Where(item => PicksFolders == item.IsDirectory)
+            .Select(item => item.Path).ToArray();
+        ReportUsableSelection(usable);
+    }
+
+    private void ReportUsableSelection(string[] usable)
+    {
         LastSelection = usable;
 
         if (usable.Length == 0)
         {
+            SelectionChanged?.Invoke();
             return;
         }
 
         MarkInteraction();
         FileNameText = FileDialogNaming.Describe(
             AllowsMultipleSelection ? usable : [usable[0]]);
+        SetPendingSelection(AllowsMultipleSelection ? usable : [usable[0]]);
+        _selectionNameText = FileNameText.Trim();
         SelectionChanged?.Invoke();
     }
 
-    /// <summary>Decides what pressing OK, or double-clicking, should do now.</summary>
-    public FileDialogAction Prepare(IReadOnlyList<string> selection)
+    /// <summary>
+    /// Decides what pressing OK, or double-clicking, should do now.  Without
+    /// <paramref name="readDisk"/> - the disk did not answer in time - every
+    /// name is taken to be what the dialog asks for, and the application's
+    /// own dialog, which checks it again, decides.
+    /// </summary>
+    public FileDialogAction Prepare(IReadOnlyList<string> selection, bool readDisk = true)
     {
+        bool IsFolder(string path) => readDisk ? Directory.Exists(path) : PicksFolders;
+
         var text = FileNameText.Trim();
         if (text.Length > 0)
         {
-            return PrepareTyped(text);
+            // Selection labels are display names, not newly typed relative
+            // paths. Keep their exact locations even while the asynchronous
+            // navigation/focus catches up or when two folders contain the
+            // same basename. Editing the name clears this provenance.
+            if (_selectionNameText == text && PendingSelection.Count > 0)
+            {
+                // A chosen shortcut to a folder opens the folder.
+                if (readDisk && !PicksFolders && PendingSelection.Count == 1 && FolderBehindLink(PendingSelection[0]) is { } linked)
+                    return new FileDialogAction(FileDialogActionKind.Navigate, [], Folder: linked);
+                return new FileDialogAction(FileDialogActionKind.Accept,
+                    AllowsMultipleSelection ? PendingSelection : [PendingSelection[0]]);
+            }
+            return PrepareTyped(text, IsFolder, readDisk);
         }
 
         if (selection.Count > 0)
         {
-            if (!PicksFolders && selection.Count == 1 && Directory.Exists(selection[0]))
+            if (!PicksFolders && selection.Count == 1 && IsFolder(selection[0]))
             {
                 return new FileDialogAction(FileDialogActionKind.Navigate, [], Folder: selection[0]);
             }
 
             var usable = selection
-                .Where(path => PicksFolders ? Directory.Exists(path) : !Directory.Exists(path))
+                .Where(path => PicksFolders ? IsFolder(path) : !IsFolder(path))
                 .ToArray();
 
             if (usable.Length > 0)
@@ -311,12 +405,29 @@ public sealed class FileDialogSession : ObservableObject
         }
 
         // "Select Folder" with nothing highlighted means the folder in view.
-        return PicksFolders && Directory.Exists(CurrentFolder)
+        return PicksFolders && IsFolder(CurrentFolder)
             ? new FileDialogAction(FileDialogActionKind.Accept, [CurrentFolder])
             : FileDialogAction.None;
     }
 
-    private FileDialogAction PrepareTyped(string text)
+    /// <summary>
+    /// The folder <paramref name="path"/> leads to when it is a shortcut to
+    /// one: opening it opens that folder, in an Open and a Save dialog alike,
+    /// as in the standard dialog.  Null for anything else, and for a caller
+    /// that asked for shortcuts themselves.
+    /// </summary>
+    public string? FolderBehindLink(string path)
+    {
+        if (Request.Has(FileDialogOptions.NoDereferenceLinks) || !path.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        var target = ShellLinkResolver.Resolve(path);
+        return !string.Equals(target, path, StringComparison.OrdinalIgnoreCase) && Directory.Exists(target) ? target : null;
+    }
+
+    private FileDialogAction PrepareTyped(string text, Func<string, bool> isFolder, bool readDisk)
     {
         if (FileDialogFilter.LooksLikePattern(text))
         {
@@ -350,15 +461,23 @@ public sealed class FileDialogSession : ObservableObject
             return FileDialogAction.None;
         }
 
-        if (paths.Count == 1 && Directory.Exists(paths[0]) && !PicksFolders)
+        if (paths.Count == 1 && !PicksFolders)
         {
-            return new FileDialogAction(FileDialogActionKind.Navigate, [], Folder: paths[0]);
+            if (isFolder(paths[0]))
+            {
+                return new FileDialogAction(FileDialogActionKind.Navigate, [], Folder: paths[0]);
+            }
+
+            if (readDisk && FolderBehindLink(paths[0]) is { } linked)
+            {
+                return new FileDialogAction(FileDialogActionKind.Navigate, [], Folder: linked);
+            }
         }
 
         // Windows' GetFullPath drops a trailing dot, so "report." has become
         // "...\report" by now; the dot that asks for no extension is read
         // from what was typed instead.
-        if (Request.IsSave && !FileDialogNaming.AsksForNoExtension(typed[0]))
+        if (Request.IsSave && !Request.IsNativeProxy && !FileDialogNaming.AsksForNoExtension(typed[0]))
         {
             var directory = Path.GetDirectoryName(paths[0]) ?? CurrentFolder;
             var name = FileDialogNaming.ApplyDefaultExtension(
@@ -366,6 +485,13 @@ public sealed class FileDialogSession : ObservableObject
                 Request.DefaultExtension,
                 CurrentFilter);
             paths[0] = Path.Combine(directory, name);
+        }
+
+        // A replaced dialog hands the dot back: it is how the application's
+        // own dialog is told not to add an extension of its own.
+        if (Request.IsSave && Request.IsNativeProxy && FileDialogNaming.AsksForNoExtension(typed[0]))
+        {
+            paths[0] += ".";
         }
 
         return new FileDialogAction(
@@ -430,6 +556,15 @@ public sealed class FileDialogSession : ObservableObject
         if (!previous.MatchesEverything && !previous.Matches(Path.GetFileName(trimmed)))
         {
             return trimmed;
+        }
+
+        // Leaving All Files, only an extension one of the dialog's own types
+        // names is retyped: "Report 01.10.2026" keeps its ".2026", which is
+        // part of the name, and has the new type's extension added.
+        if (previous.MatchesEverything && !Filters.Any(spec => FileDialogFilter.Parse(spec.Pattern) is { MatchesEverything: false } type
+            && type.Matches(Path.GetFileName(trimmed))))
+        {
+            return $"{trimmed}.{extension}";
         }
 
         return Path.ChangeExtension(trimmed, extension);

@@ -22,7 +22,8 @@ namespace UltraExplorer.Rendering.Gpu;
 /// - per page, its used rows of texels;
 /// - a SHA-256 of everything before it.
 /// Only the three fixed faces' entries are kept: fallback faces get their
-/// ids in the order a run meets them, so their ids mean nothing next time.
+/// ids in the order a run meets them, so their ids mean nothing next time -
+/// and nor is the room their glyphs took (<see cref="GlyphAtlas.Snapshot"/>).
 ///
 /// Written to a temporary file, flushed to the disk and moved over the old
 /// one, so a crash mid-write never leaves half a file to be read.  Read
@@ -106,6 +107,8 @@ internal static class GlyphCacheFile
 
             var usedHeights = new int[pageCount];
             var shelves = new List<ShelfPacker.Shelf>[pageCount];
+            long shelved = 0;
+            long named = 0;
             for (var page = 0; page < pageCount; page++)
             {
                 usedHeights[page] = reader.ReadInt32();
@@ -134,6 +137,7 @@ internal static class GlyphCacheFile
                     }
 
                     bottom += shelf.Height;
+                    shelved += (long)shelf.Used * shelf.Height;
                     shelves[page].Add(shelf);
                 }
 
@@ -169,6 +173,18 @@ internal static class GlyphCacheFile
                 }
 
                 entries.Add((key, entry));
+                named += entry.Width == 0 ? 0 : (long)(entry.Width + 1) * (entry.Height + 1);
+            }
+
+            // A file whose shelves are mostly room no entry names is made
+            // again rather than read: one the cache wrote before it left
+            // fallback fonts' room out (see GlyphAtlas.Snapshot), grown with
+            // every run that met CJK or emoji names, perhaps to all sixteen
+            // pages - read, no new glyph would find room.  In a file of named
+            // glyphs alone they fill nearly nine tenths of the shelves.
+            if (named * 3 < shelved)
+            {
+                return false;
             }
 
             // The texels fill the rest of the file exactly; restoring then
@@ -197,6 +213,52 @@ internal static class GlyphCacheFile
         {
             Debug.WriteLine($"The glyph cache {path} could not be read: {ex.Message}");
             return false;
+        }
+    }
+
+    /// <summary>
+    /// Deletes the glyph cache files beside <paramref name="path"/> that are
+    /// not it: each font or format update names a new file, 6 MB and up, and
+    /// the old ones are never read again.  So are temporary files a write
+    /// cut short left; only this file's own is spared, which another copy
+    /// of the program may be writing.  Nothing else in the folder is touched,
+    /// and a file that will not go is left for next time.
+    /// </summary>
+    public static void DeleteOthers(string path)
+    {
+        try
+        {
+            var current = Path.GetFullPath(path);
+            var temporary = current + ".tmp";
+            var folder = Path.GetDirectoryName(current);
+            if (string.IsNullOrEmpty(folder) || !Directory.Exists(folder))
+            {
+                return;
+            }
+
+            foreach (var file in Directory.EnumerateFiles(folder, "glyphs-v*"))
+            {
+                var name = Path.GetFileName(file);
+                if (!name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) && !name.EndsWith(".bin.tmp", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(file, current, StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(file, temporary, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                try
+                {
+                    File.Delete(file);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    Debug.WriteLine($"The old glyph cache {file} could not be deleted: {ex.Message}");
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or System.Security.SecurityException)
+        {
+            Debug.WriteLine($"The glyph cache folder of {path} could not be tidied: {ex.Message}");
         }
     }
 
@@ -257,7 +319,9 @@ internal static class GlyphCacheFile
                 for (var page = 0; page < snapshot.PageCount; page++)
                 {
                     var bytes = snapshot.UsedHeights[page] * GlyphAtlas.PageSize;
-                    stream.Write(new ReadOnlySpan<byte>((void*)atlas.PagePointer(page), bytes));
+                    stream.Write(snapshot.Texels is { } texels
+                        ? texels[page].AsSpan(0, bytes)
+                        : new ReadOnlySpan<byte>((void*)atlas.PagePointer(page), bytes));
                 }
 
                 // The hash of what was written, read back from the cache the

@@ -39,6 +39,7 @@ internal static partial class Program
         // The atlas first: its timing is the one most disturbed by what ran
         // before (see GpuTextAtlasChecks).
         using var atlas = GpuTextAtlasChecks(faces);
+        GpuTextZoomChecks(faces, atlas);
         GpuTextShapingChecks(faces, corpus);
         GpuTextTrimmingChecks(faces, corpus);
         GpuTextSdfChecks(faces);

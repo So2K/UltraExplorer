@@ -218,15 +218,13 @@ internal static class ComServerHost
     /// <summary>
     /// Nothing locked, nothing on screen and no live objects means no client is
     /// left.  Finalizers have to be pushed through first, because that is the
-    /// only signal a CCW gives when its last reference goes.
+    /// only signal a CCW gives when its last reference goes.  An object its
+    /// client let go of is let go of here at every look, whatever else is
+    /// going on: kept while another dialog is up or a lock is held, it would
+    /// keep its own closed dialog's whole window with it.
     /// </summary>
     private static void CheckIdle(Application application)
     {
-        if (Volatile.Read(ref _locks) > 0 || Volatile.Read(ref _showing) > 0)
-        {
-            return;
-        }
-
         int remaining;
         lock (Gate)
         {
@@ -247,7 +245,7 @@ internal static class ComServerHost
             remaining = Live.Count;
         }
 
-        if (remaining > 0)
+        if (remaining > 0 || Volatile.Read(ref _locks) > 0 || Volatile.Read(ref _showing) > 0)
         {
             return;
         }

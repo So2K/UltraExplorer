@@ -53,6 +53,14 @@ jobs:
         run: |
           dotnet build src/UltraExplorer/UltraExplorer.csproj -c Release -nologo
           dotnet build tests/ViewAllSmoke/ViewAllSmoke.csproj -c Release -nologo
+          dotnet build tests/NativeDialogProxySmoke/NativeDialogProxySmoke.csproj -c Release -nologo
+
+      - name: Check file-dialog contracts
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-contract-checks'
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only PickerFilters,PickerCommandLine,PickerNames,PickerSessionRules,PickerValidation,PickerGraphRules,DialogIntegrationChecks
+          if ($LASTEXITCODE -ne 0) { throw "File-dialog checks failed with exit code $LASTEXITCODE." }
 
       - name: Publish a self-contained single file
         shell: pwsh
@@ -70,8 +78,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path packages | Out-Null
-          Copy-Item LICENSE, README.md publish/
-          Compress-Archive -Path publish/UltraExplorer.exe, publish/LICENSE, publish/README.md `
+          Copy-Item LICENSE, README.md, THIRD-PARTY-NOTICES.md publish/
+          Compress-Archive -Path publish/UltraExplorer.exe, publish/LICENSE, publish/README.md, publish/THIRD-PARTY-NOTICES.md `
             -DestinationPath packages/UltraExplorer-win-x64.zip
 
       # Inno Setup comes with the Windows runner images; it is installed from

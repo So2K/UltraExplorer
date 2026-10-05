@@ -171,8 +171,10 @@ internal sealed unsafe class GlyphAtlas : IDisposable
     /// name reordered as the bidi algorithm orders it - with the ellipsis
     /// after them, at the end of the left-to-right line, where WPF puts it.
     ///
-    /// Glyphs not in the atlas yet are queued and left out; the count of
-    /// them is returned, so the caller knows the label is not complete.
+    /// Preferred fields not in the atlas yet are queued; a resident tier
+    /// keeps the glyph visible in the meantime, or the glyph is left out
+    /// when none exists. The count of preferred fields still missing is
+    /// returned, so the caller knows the label is not yet at full detail.
     /// Allocates nothing when every glyph is present.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -186,8 +188,6 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         }
 
         var tier = TierFor(fontPx);
-        var tierInfo = TierTable[tier];
-        var pxRangePerPx = 2f * tierInfo.Spread / tierInfo.Em;
         var missing = 0;
 
         var glyphs = text.Glyphs;
@@ -225,19 +225,9 @@ internal sealed unsafe class GlyphAtlas : IDisposable
 
             var face = faces[index];
             var glyph = glyphs[index];
-            var slot = SlotOf(face, glyph, tier);
+            var slot = EmissionSlot(face, glyph, tier, out var drawnTier, ref missing);
             if (slot <= 0)
             {
-                if (slot == Unknown)
-                {
-                    Request(face, glyph, tier);
-                    missing++;
-                }
-                else if (slot == Pending)
-                {
-                    missing++;
-                }
-
                 continue;
             }
 
@@ -257,8 +247,9 @@ internal sealed unsafe class GlyphAtlas : IDisposable
                 (float)(penY + entry.Bottom * size));
             quad.UV0 = entry.UV0;
             quad.UV1 = entry.UV1;
-            quad.PageTier = entry.Page | (uint)tier << 8;
-            quad.PxRange = (float)(pxRangePerPx * size);
+            var tierInfo = TierTable[drawnTier];
+            quad.PageTier = entry.Page | (uint)drawnTier << 8;
+            quad.PxRange = (float)(2f * tierInfo.Spread / tierInfo.Em * size);
             sink.Add(in quad);
         }
 
@@ -267,7 +258,7 @@ internal sealed unsafe class GlyphAtlas : IDisposable
             var info = _faces[text.Face];
             if (info.EllipsisGlyph != 0)
             {
-                var slot = SlotOf(text.Face, info.EllipsisGlyph, tier);
+                var slot = EmissionSlot(text.Face, info.EllipsisGlyph, tier, out var drawnTier, ref missing);
                 if (slot > 0)
                 {
                     ref readonly var entry = ref EntryRef(slot - 1);
@@ -281,24 +272,65 @@ internal sealed unsafe class GlyphAtlas : IDisposable
                             (float)(baselineY + entry.Bottom * fontPx));
                         quad.UV0 = entry.UV0;
                         quad.UV1 = entry.UV1;
-                        quad.PageTier = entry.Page | (uint)tier << 8;
-                        quad.PxRange = (float)(pxRangePerPx * fontPx);
+                        var tierInfo = TierTable[drawnTier];
+                        quad.PageTier = entry.Page | (uint)drawnTier << 8;
+                        quad.PxRange = (float)(2f * tierInfo.Spread / tierInfo.Em * fontPx);
                         sink.Add(in quad);
                     }
-                }
-                else
-                {
-                    if (slot == Unknown)
-                    {
-                        Request(text.Face, info.EllipsisGlyph, tier);
-                    }
-
-                    missing += slot == Unavailable ? 0 : 1;
                 }
             }
         }
 
         return missing;
+    }
+
+    /// <summary>
+    /// A new scale must not make a glyph blink while its preferred field is
+    /// made. Request that field, but keep drawing the closest resident tier
+    /// with its own range and bounds. The hot path is still one table read.
+    /// Missing counts the preferred field so callers keep their readiness
+    /// signal until it arrives; the fallback needs no additional work.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int EmissionSlot(byte face, ushort glyph, int tier, out int drawnTier, ref int missing)
+    {
+        drawnTier = tier;
+        var slot = SlotOf(face, glyph, tier);
+        if (slot > 0)
+        {
+            return slot;
+        }
+
+        if (slot == Unknown)
+        {
+            Request(face, glyph, tier);
+        }
+
+        if (slot != Unavailable)
+        {
+            missing++;
+        }
+
+        // At an equal distance favour more detail over magnifying the
+        // smaller field. Only the cold path checks neighbouring tiers.
+        for (var distance = 1; distance < TierCount; distance++)
+        {
+            var higher = tier + distance;
+            if (higher < TierCount && SlotOf(face, glyph, higher) is var highSlot && highSlot > 0)
+            {
+                drawnTier = higher;
+                return highSlot;
+            }
+
+            var lower = tier - distance;
+            if (lower >= 0 && SlotOf(face, glyph, lower) is var lowSlot && lowSlot > 0)
+            {
+                drawnTier = lower;
+                return lowSlot;
+            }
+        }
+
+        return slot;
     }
 
     /// <summary>
@@ -313,7 +345,9 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         var clock = Stopwatch.StartNew();
         if (cachePath is not null && GlyphCacheFile.TryLoad(this, cachePath))
         {
-            return new GlyphWarmUpResult(true, EntryCount, clock.Elapsed, TimeSpan.Zero);
+            var loaded = clock.Elapsed;
+            GlyphCacheFile.DeleteOthers(cachePath);
+            return new GlyphWarmUpResult(true, EntryCount, loaded, TimeSpan.Zero);
         }
 
         var items = WarmItems();
@@ -332,8 +366,12 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         if (cachePath is not null)
         {
             var saveClock = Stopwatch.StartNew();
-            GlyphCacheFile.TrySave(this, cachePath);
+            var written = GlyphCacheFile.TrySave(this, cachePath);
             saved = saveClock.Elapsed;
+            if (written)
+            {
+                GlyphCacheFile.DeleteOthers(cachePath);
+            }
         }
 
         return new GlyphWarmUpResult(false, items.Count, rasterised, saved);
@@ -428,11 +466,40 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         }
     }
 
-    /// <summary>Everything the cache file stores, taken under the lock: the packers' shelves and the placed entries of the fixed faces.</summary>
+    /// <summary>
+    /// Everything the cache file stores, taken under the lock: the packers'
+    /// shelves and the placed entries of the fixed faces.  When fallback
+    /// faces' glyphs took room on the pages, that room is not kept: their
+    /// entries cannot be named in another run, so the fixed faces' glyphs are
+    /// packed afresh onto pages of their own (<see cref="RepackLocked"/>).
+    /// Kept, it was placed again every run that met them, until the pages
+    /// were full and no new glyph could be drawn.
+    /// </summary>
     internal GlyphAtlasSnapshot Snapshot()
     {
         lock (_gate)
         {
+            var entries = new List<(GlyphKey Key, GlyphEntry Entry)>();
+            var fallbackRoom = false;
+            for (var index = 0; index < _entryCount; index++)
+            {
+                var key = _keys[index >> ChunkShift]![index & (ChunkSize - 1)];
+                var entry = _entries[index >> ChunkShift]![index & (ChunkSize - 1)];
+                if (key.Face < FaceRegistry.FirstFallback)
+                {
+                    entries.Add((key, entry));
+                }
+                else
+                {
+                    fallbackRoom |= !entry.IsEmpty;
+                }
+            }
+
+            if (fallbackRoom && RepackLocked(entries) is { } repacked)
+            {
+                return repacked;
+            }
+
             var shelves = new List<ShelfPacker.Shelf>[_pageCount];
             var usedHeights = new int[_pageCount];
             for (var page = 0; page < _pageCount; page++)
@@ -441,18 +508,76 @@ internal sealed unsafe class GlyphAtlas : IDisposable
                 usedHeights[page] = _packers[page]!.UsedHeight;
             }
 
-            var entries = new List<(GlyphKey Key, GlyphEntry Entry)>();
-            for (var index = 0; index < _entryCount; index++)
+            return new GlyphAtlasSnapshot(_pageCount, usedHeights, shelves, entries);
+        }
+    }
+
+    /// <summary>
+    /// The fixed faces' <paramref name="entries"/> packed in their order onto
+    /// new pages, their texels copied there, as a snapshot whose pages are
+    /// those copies; null in the unlikely case they would not fit, and the
+    /// live pages are saved as they are.  The atlas itself is not changed.
+    /// </summary>
+    private GlyphAtlasSnapshot? RepackLocked(List<(GlyphKey Key, GlyphEntry Entry)> entries)
+    {
+        var packers = new List<ShelfPacker>();
+        var pages = new List<byte[]>();
+        var moved = new List<(GlyphKey Key, GlyphEntry Entry)>(entries.Count);
+        foreach (var (key, entry) in entries)
+        {
+            if (entry.IsEmpty)
             {
-                var key = _keys[index >> ChunkShift]![index & (ChunkSize - 1)];
-                if (key.Face < FaceRegistry.FirstFallback)
+                moved.Add((key, entry));
+                continue;
+            }
+
+            int x = 0, y = 0;
+            var page = 0;
+            while (page < packers.Count && !packers[page].TryAllocate(entry.Width, entry.Height, out x, out y))
+            {
+                page++;
+            }
+
+            if (page == packers.Count)
+            {
+                if (packers.Count == MaximumPages)
                 {
-                    entries.Add((key, _entries[index >> ChunkShift]![index & (ChunkSize - 1)]));
+                    return null;
+                }
+
+                packers.Add(new ShelfPacker(PageSize, PageSize));
+                pages.Add(new byte[PageSize * PageSize]);
+                if (!packers[page].TryAllocate(entry.Width, entry.Height, out x, out y))
+                {
+                    return null;
                 }
             }
 
-            return new GlyphAtlasSnapshot(_pageCount, usedHeights, shelves, entries);
+            var source = (byte*)_pages[entry.Page];
+            for (var row = 0; row < entry.Height; row++)
+            {
+                new ReadOnlySpan<byte>(source + (long)(entry.Y + row) * PageSize + entry.X, entry.Width)
+                    .CopyTo(pages[page].AsSpan((y + row) * PageSize + x, entry.Width));
+            }
+
+            moved.Add((key, new GlyphEntry((ushort)page, (ushort)x, (ushort)y, entry.Width, entry.Height, entry.Left, entry.Top, entry.Right, entry.Bottom)));
         }
+
+        if (packers.Count == 0)
+        {
+            packers.Add(new ShelfPacker(PageSize, PageSize));
+            pages.Add(new byte[PageSize * PageSize]);
+        }
+
+        var shelves = new List<ShelfPacker.Shelf>[packers.Count];
+        var usedHeights = new int[packers.Count];
+        for (var page = 0; page < packers.Count; page++)
+        {
+            shelves[page] = [.. packers[page].Shelves];
+            usedHeights[page] = packers[page].UsedHeight;
+        }
+
+        return new GlyphAtlasSnapshot(packers.Count, usedHeights, shelves, moved) { Texels = [.. pages] };
     }
 
     /// <summary>
@@ -540,7 +665,17 @@ internal sealed unsafe class GlyphAtlas : IDisposable
 
         Interlocked.Increment(ref _pendingCount);
         EnsureWorker();
-        _requests.Add(new GlyphKey(face, glyph, (byte)tier));
+        try
+        {
+            _requests.Add(new GlyphKey(face, glyph, (byte)tier));
+        }
+        catch (InvalidOperationException)
+        {
+            // Dispose may have closed the producer queue after the initial
+            // flag check. Nothing is queued, so do not leave it pending.
+            Volatile.Write(ref _tables[face * TierCount + tier]![glyph], Unavailable);
+            Interlocked.Decrement(ref _pendingCount);
+        }
     }
 
     private void EnsureWorker()
@@ -552,7 +687,7 @@ internal sealed unsafe class GlyphAtlas : IDisposable
 
         lock (_gate)
         {
-            if (_worker is not null)
+            if (_worker is not null || Volatile.Read(ref _disposed) != 0)
             {
                 return;
             }
@@ -570,14 +705,23 @@ internal sealed unsafe class GlyphAtlas : IDisposable
 
     private void RunWorker()
     {
-        foreach (var key in _requests.GetConsumingEnumerable())
+        try
         {
-            Make(key);
-            Interlocked.Decrement(ref _pendingCount);
-            if (_requests.Count == 0)
+            foreach (var key in _requests.GetConsumingEnumerable())
             {
-                GlyphsArrived?.Invoke();
+                if (Volatile.Read(ref _disposed) == 0) Make(key);
+                Interlocked.Decrement(ref _pendingCount);
+                if (_requests.Count == 0 && Volatile.Read(ref _disposed) == 0)
+                {
+                    GlyphsArrived?.Invoke();
+                }
             }
+        }
+        finally
+        {
+            // A slow font call can outlive Dispose's bounded wait. The worker
+            // frees its pages only after it has stopped touching them.
+            if (Volatile.Read(ref _disposed) != 0) FreePages();
         }
     }
 
@@ -593,6 +737,15 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         {
             var rasterizer = GlyphRasterizer.ForThread;
             var inked = rasterizer.Rasterise(_faces.Factory, _faces[key.Face], key.Glyph, TierTable[key.Tier]);
+            if (!inked && HasInk(_faces[key.Face], key.Glyph))
+            {
+                // Ink, but no field: too big for this tier.  Unavailable, not
+                // empty, so a name drawn at this tier's sizes draws the glyph
+                // from a smaller tier that has it rather than leaving it out.
+                Volatile.Write(ref table[key.Glyph], Unavailable);
+                return;
+            }
+
             if (!inked)
             {
                 lock (_gate)
@@ -613,6 +766,20 @@ internal sealed unsafe class GlyphAtlas : IDisposable
             Debug.WriteLine($"Glyph {key.Glyph} of face {key.Face} could not be made: {ex.Message}");
             Volatile.Write(ref table[key.Glyph], Unavailable);
         }
+    }
+
+    /// <summary>
+    /// Whether the glyph's outline covers anything, by its design metrics:
+    /// what tells a glyph the rasteriser left without a field because it has
+    /// no ink (a space) from one it left because it is too big.
+    /// </summary>
+    private static bool HasInk(FaceInfo face, ushort glyph)
+    {
+        var metrics = new Vortice.DirectWrite.GlyphMetrics[1];
+        face.Face.GetDesignGlyphMetrics([glyph], metrics, false);
+        var width = (long)metrics[0].AdvanceWidth - metrics[0].LeftSideBearing - metrics[0].RightSideBearing;
+        var height = (long)metrics[0].AdvanceHeight - metrics[0].TopSideBearing - metrics[0].BottomSideBearing;
+        return width > 0 && height > 0;
     }
 
     private void Place(GlyphKey key, int[] table, GlyphRasterizer rasterizer)
@@ -738,7 +905,16 @@ internal sealed unsafe class GlyphAtlas : IDisposable
         }
 
         _requests.CompleteAdding();
-        _worker?.Join(TimeSpan.FromSeconds(2));
+        Thread? worker;
+        // EnsureWorker publishes while holding this gate. Reading it under
+        // the same gate also covers a worker just starting as disposal began.
+        lock (_gate) worker = _worker;
+        if (worker is not null && !worker.Join(TimeSpan.FromSeconds(2))) return;
+        FreePages();
+    }
+
+    private void FreePages()
+    {
         lock (_gate)
         {
             for (var page = 0; page < _pageCount; page++)
@@ -759,4 +935,8 @@ internal readonly record struct GlyphKey(byte Face, ushort Glyph, byte Tier);
 internal readonly record struct GlyphWarmUpResult(bool FromCache, int Glyphs, TimeSpan Elapsed, TimeSpan Saving);
 
 /// <summary>The atlas's state for the cache file.</summary>
-internal sealed record GlyphAtlasSnapshot(int PageCount, int[] UsedHeights, List<ShelfPacker.Shelf>[] Shelves, List<(GlyphKey Key, GlyphEntry Entry)> Entries);
+internal sealed record GlyphAtlasSnapshot(int PageCount, int[] UsedHeights, List<ShelfPacker.Shelf>[] Shelves, List<(GlyphKey Key, GlyphEntry Entry)> Entries)
+{
+    /// <summary>The pages' texels when they were packed afresh for the file; null when the file takes the atlas's own pages.</summary>
+    public byte[][]? Texels { get; init; }
+}

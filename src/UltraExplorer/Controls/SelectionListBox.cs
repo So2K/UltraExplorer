@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Reflection;
 using System.Windows.Controls;
 
 namespace UltraExplorer.Controls;
@@ -16,11 +17,23 @@ namespace UltraExplorer.Controls;
 public sealed class SelectionListBox : ListBox
 {
     /// <summary>
+    /// Where the row is inside what the list box hands over as its anchor:
+    /// a type of WPF's own that holds the row together with its place in
+    /// the list.
+    /// </summary>
+    private static readonly PropertyInfo? RowInAnchor =
+        typeof(ItemsControl).GetNestedType("ItemInfo", BindingFlags.NonPublic)?.GetProperty("Item", BindingFlags.Instance | BindingFlags.NonPublic);
+
+    /// <summary>
     /// The row a Shift+click in the list runs from, shared with the canvas:
     /// a Shift+click after a click on the canvas extends from what was
-    /// clicked there.
+    /// clicked there.  The list box hands its anchor over wrapped with the
+    /// row's place in the list; this is the row itself.
     /// </summary>
-    public object? AnchorRow => AnchorItem;
+    public object? AnchorRow =>
+        AnchorItem is { } anchor && RowInAnchor?.DeclaringType?.IsInstanceOfType(anchor) == true
+            ? RowInAnchor.GetValue(anchor)
+            : AnchorItem;
 
     /// <summary>
     /// Selects exactly <paramref name="rows"/>, in one change, and makes
@@ -38,13 +51,15 @@ public sealed class SelectionListBox : ListBox
         SetSelectedItems(rows);
 
         // The list box takes as its anchor only a row it has made a container
-        // for - one on screen, or near it - and throws otherwise; a row
-        // scrolled far away keeps the list's own anchor.
-        if (anchor is not null && rows.Contains(anchor) && ItemContainerGenerator.ContainerFromItem(anchor) is not null)
+        // for - one on screen, or near it - and throws otherwise.  A new
+        // anchor scrolled far away leaves the list with no anchor rather than
+        // its own old one, so a Shift+click runs from the rows selected now,
+        // not from a row picked before them.
+        if (anchor is not null && rows.Contains(anchor) && !Equals(AnchorRow, anchor))
         {
             try
             {
-                AnchorItem = anchor;
+                AnchorItem = ItemContainerGenerator.ContainerFromItem(anchor) is not null ? anchor : null;
             }
             catch (InvalidOperationException)
             {

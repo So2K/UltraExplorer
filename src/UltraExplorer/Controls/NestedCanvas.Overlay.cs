@@ -707,14 +707,33 @@ public sealed partial class NestedCanvas
     {
         if (_hover is null && _press == PressKind.None && HotspotAt(_hoverPoint) is { Tip: { Length: > 0 } tip })
         {
-            var tipText = Text(tip, 12, TextBrush, 360, bold: false);
+            // One layout per line: a layout holds a single line (see Text),
+            // and a favourite's tip is three - its name, its path and how to
+            // go there.  A tip of one line is drawn exactly as it always was.
+            var lines = tip.Split('\n');
+            var tipTexts = new ScaledText[lines.Length];
+            var tipWidth = 0.0;
+            var tipHeight = 0.0;
+            for (var index = 0; index < lines.Length; index++)
+            {
+                tipTexts[index] = Text(lines[index], 12, TextBrush, 360, bold: false);
+                tipWidth = Math.Max(tipWidth, tipTexts[index].Width);
+                tipHeight += tipTexts[index].Height;
+            }
+
             var tipBox = new Rect(
-                Math.Clamp(_hoverPoint.X - tipText.Width / 2 - 8, 4, Math.Max(4, _viewWidth - tipText.Width - 20)),
-                Math.Clamp(_hoverPoint.Y + 16, 4, Math.Max(4, _viewHeight - tipText.Height - 14)),
-                tipText.Width + 16,
-                tipText.Height + 8);
+                Math.Clamp(_hoverPoint.X - tipWidth / 2 - 8, 4, Math.Max(4, _viewWidth - tipWidth - 20)),
+                Math.Clamp(_hoverPoint.Y + 16, 4, Math.Max(4, _viewHeight - tipHeight - 14)),
+                tipWidth + 16,
+                tipHeight + 8);
             dc.DrawRoundedRectangle(TipBrush, TipPen, tipBox, 5, 5);
-            DrawTextAt(dc, tipText, new Point(tipBox.X + 8, tipBox.Y + 4));
+            var lineY = tipBox.Y + 4;
+            foreach (var line in tipTexts)
+            {
+                DrawTextAt(dc, line, new Point(tipBox.X + 8, lineY));
+                lineY += line.Height;
+            }
+
             return;
         }
 
@@ -827,9 +846,14 @@ public sealed partial class NestedCanvas
 
                         try
                         {
-                            // A folder resolves to itself; a file to the folder it
-                            // is in, once that folder's listing has it.
-                            await tree.RevealAsync(path);
+                            // Marks only need a physical chain to their target,
+                            // not listings of every ancestor. A file needs its
+                            // own container listing so its tile can be located.
+                            var container = await tree.MaterializeContainerAsync(path);
+                            if (container is not null && !ViewAllPath.Equals(container.FullPath, path))
+                            {
+                                await tree.LoadAsync(container);
+                            }
                             if (ResolveAsPlaced(path) is null)
                             {
                                 _unresolvable.Add(path);
@@ -1323,5 +1347,5 @@ public sealed partial class NestedCanvas
     private readonly record struct Pin(NestedBeacon Beacon, NestedFolder Folder, int FileIndex, Point Centre, int Priority);
 
     /// <summary>A clickable spot drawn this frame (a beacon, a trail step) or a handle to grab a folder by.</summary>
-    private sealed record Hotspot(Rect Bounds, Action? Click, NestedFolder? Grab, string? Tip = null);
+    private sealed record Hotspot(Rect Bounds, Action? Click, NestedFolder? Grab, string? Tip = null, Action? DoubleClick = null);
 }

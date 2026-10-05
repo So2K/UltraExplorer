@@ -1,4 +1,3 @@
-using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
@@ -17,9 +16,38 @@ namespace UltraExplorer;
 /// </summary>
 public partial class MainWindow
 {
+    internal void AttachNativeDialogControls(System.Windows.Controls.UserControl controls)
+    {
+        if (PickerFooter.Child is not Grid grid) return;
+        grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        Grid.SetRow(controls, 3);
+        Grid.SetColumnSpan(controls, 3);
+        grid.Children.Add(controls);
+    }
+
     private FileDialogSession? _picker;
+    private bool _pickerNestedReady;
     private TaskCompletionSource<FileDialogResult>? _pickerCompletion;
     private bool _pickerFinished;
+    private bool _pickerBindingSession;
+
+    /// <summary>Set once the window class gives a picker the first look at each key, which is once per process.</summary>
+    private static int _pickerKeysWatched;
+
+    /// <summary>
+    /// Whether a crumb's list of folders was open as the key went down.  The
+    /// window's own Escape closes those lists without claiming the key, so
+    /// by the time an unclaimed Escape comes back up, the list is gone.
+    /// </summary>
+    private bool _pickerMenuOpenAtKey;
+
+    /// <summary>
+    /// How long a replaced dialog waits for the disk before the application's
+    /// own dialog, which checks the answer again anyway, decides instead.  A
+    /// server that does not answer takes some 20 s to say so, and the guardian
+    /// takes an interface thread that stops for 5 s for a hung one.
+    /// </summary>
+    private static readonly TimeSpan PickerDiskBudget = TimeSpan.FromSeconds(1);
 
     /// <summary>
     /// The folder the caller asked for, kept from before the canvas is built:
@@ -36,7 +64,7 @@ public partial class MainWindow
 
     /// <summary>What is highlighted right now, for a caller that is watching.</summary>
     public IReadOnlyList<string> PickerSelection =>
-        _picker is null ? [] : _viewModel.Tree.SelectedPaths;
+        _picker is null ? [] : IsNested ? _viewModel.Tree.Selection.Paths : _viewModel.Tree.SelectedPaths;
 
     /// <summary>The caller dismissing its own dialog through <c>IFileDialog::Close</c>.</summary>
     public void CloseFromCaller()
@@ -56,34 +84,57 @@ public partial class MainWindow
         _pickerCompletion = new TaskCompletionSource<FileDialogResult>(
             TaskCreationOptions.RunContinuationsAsynchronously);
 
+        ShowPickerSession(session);
+        _viewModel.Tree.ActivationOverride = OnPickerActivate;
+        _viewModel.Tree.Selection.Changed += OnPickerSelectionChanged;
+        _viewModel.Tree.PropertyChanged += OnPickerTreePropertyChanged;
+        KeyDown += OnPickerKeyDown;
+        if (Interlocked.Exchange(ref _pickerKeysWatched, 1) == 0)
+        {
+            EventManager.RegisterClassHandler(typeof(MainWindow), PreviewKeyDownEvent, new KeyEventHandler(OnPickerClassPreviewKeyDown));
+        }
+    }
+
+    /// <summary>
+    /// Everything of the window that follows the session: title, footer,
+    /// file-type row, New folder, the pinned places and the caller's own
+    /// places, and the file-type subscription.  Repeatable: a prepared picker
+    /// bound to another dialog (<see cref="RebindAsync"/>) goes through it
+    /// again, and nothing of the previous session is left.
+    /// </summary>
+    private void ShowPickerSession(FileDialogSession session)
+    {
         _pickerStartFolder = session.CurrentFolder;
+        _viewModel.ConfigurePickerFiles(session.Request.ShowsFiles);
         Title = session.Title;
         _viewModel.DialogTitle = session.Title;
-        PickerFooter.DataContext = session;
+        // A previous dialog may have left the name editor focused. Binding
+        // the new request's text is setup, not the user's keyboard input.
+        _pickerBindingSession = true;
+        try
+        {
+            PickerFooter.DataContext = session;
+            PickerNameBox.GetBindingExpression(ComboBox.TextProperty)?.UpdateTarget();
+        }
+        finally { _pickerBindingSession = false; }
         PickerFooter.Visibility = Visibility.Visible;
 
         var typeRow = session.ShowsFileTypes ? Visibility.Visible : Visibility.Collapsed;
         PickerTypeLabel.Visibility = typeRow;
         PickerTypeBox.Visibility = typeRow;
 
-        if (session.Request.HideNewFolderButton)
-        {
-            NewFolderButton.Visibility = Visibility.Collapsed;
-        }
+        NewFolderButton.Visibility = session.Request.HideNewFolderButton ? Visibility.Collapsed : Visibility.Visible;
 
-        if (session.Request.Has(FileDialogOptions.HidePinnedPlaces))
-        {
-            QuickAccessItems.Visibility = Visibility.Collapsed;
-            QuickAccessSeparator.Visibility = Visibility.Collapsed;
-        }
+        var pinned = session.Request.Has(FileDialogOptions.HidePinnedPlaces) ? Visibility.Collapsed : Visibility.Visible;
+        QuickAccessItems.Visibility = pinned;
+        QuickAccessSeparator.Visibility = pinned;
 
+        _viewModel.PickerPlaces.Clear();
+        PlacesItems.Visibility = Visibility.Collapsed;
+        PlacesSeparator.Visibility = Visibility.Collapsed;
         AddPickerPlaces(session);
 
         session.FilterChanged += OnPickerFilterChanged;
-        _viewModel.Tree.ActivationOverride = OnPickerActivate;
-        _viewModel.Tree.SelectedNodes.CollectionChanged += OnPickerSelectionChanged;
-        _viewModel.Tree.PropertyChanged += OnPickerTreePropertyChanged;
-        PreviewKeyDown += OnPickerPreviewKeyDown;
     }
 
     /// <summary>
@@ -132,6 +183,14 @@ public partial class MainWindow
         }
 
         var forceHidden = session.Request.Has(FileDialogOptions.ForceShowHidden);
+        if (IsNested)
+        {
+            var filter = session.GraphFilter;
+            ActivePane.Tree.ShowFiles = session.Request.ShowsFiles;
+            ActivePane.Tree.FileNameFilter = filter.MatchesEverything ? null : filter.Matches;
+            ActivePane.Tree.IncludeHidden = forceHidden || _viewModel.Tree.ShowHiddenItems;
+            return;
+        }
         await _viewModel.Tree.ApplyEntryRulesAsync(
             session.Request.ShowsFiles,
             session.GraphFilter.MatchesEverything ? null : session.GraphFilter,
@@ -150,14 +209,108 @@ public partial class MainWindow
         }
     }
 
-    private void OnPickerSelectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    /// <summary>
+    /// The tree's choice, once the shared selection has taken a click in.
+    /// Nodify's own copy is no guide: a click adds the new node before it
+    /// takes the old one out, and the selection follows only afterwards. The
+    /// tile canvas reports from the same change (<see cref="OnSharedSelectionChanged"/>).
+    /// </summary>
+    private void OnPickerSelectionChanged(ItemSelection selection)
     {
-        _picker?.ReportSelection(_viewModel.Tree.SelectedPaths);
+        if (!IsNested) _picker?.ReportSelection(selection.Paths);
+    }
+
+    /// <summary>
+    /// The folder the canvas's view rests on.  With nothing selected it is
+    /// the dialog's folder.  Moved there by the user's hand, it is also when
+    /// the only thing selected is a folder only gone to - the one the dialog
+    /// opened at, revealed and selected for it: the dialog goes there as a
+    /// folder opened in it does, so Save writes there and Select Folder
+    /// answers it rather than the folder it opened at.  What the user chose
+    /// themselves stays chosen.
+    /// </summary>
+    internal void OnPickerNestedFolderChanged(string? folder, bool movedByUser = false)
+    {
+        if (!_pickerNestedReady || _picker is not { } session || folder is not { Length: > 0 })
+        {
+            return;
+        }
+
+        var selection = _viewModel.Tree.Selection;
+        if (selection.Count == 0)
+        {
+            session.CurrentFolder = folder;
+        }
+        else if (movedByUser && selection.Count == 1 && selection.FolderCount == 1
+            && selection.LastSource == SelectionSource.Navigation
+            && !ViewAllPath.Equals(folder, session.CurrentFolder))
+        {
+            OpenPickerNestedFolder(folder);
+        }
+    }
+
+    internal void OpenPickerNestedFolder(string path)
+    {
+        if (_picker is not { } session) return;
+        session.CurrentFolder = path;
+        _viewModel.Tree.Selection.Apply(new SelectionEdit
+        { Clear = true, Focus = path, Source = SelectionSource.Navigation });
+        if (session.PicksFolders) session.FileNameText = string.Empty;
+    }
+
+    internal void OpenPickerNestedFile(string path)
+    {
+        if (_picker is not { } session || session.PicksFolders) return;
+        session.MarkInteraction();
+        session.FileNameText = Path.GetFileName(path);
+        _ = OpenPickerFileAsync(path);
+    }
+
+    /// <summary>
+    /// A file opened on the canvas is the caller's answer, unless it is a
+    /// shortcut to a folder: that opens the folder, as in the standard dialog.
+    /// </summary>
+    private async Task OpenPickerFileAsync(string path)
+    {
+        if (_picker is { } session
+            && await ReadPickerDiskAsync(session, () => session.FolderBehindLink(path), () => null) is { } folder)
+        {
+            if (!ReferenceEquals(session, _picker) || _pickerFinished) return;
+            session.FileNameText = string.Empty;
+            await NavigatePickerAsync(folder);
+            return;
+        }
+
+        await FinishIfValidAsync([path]);
+    }
+
+    /// <summary>
+    /// Runs <paramref name="read"/>, which looks at the disk.  A replaced
+    /// dialog looks on a worker thread, for <see cref="PickerDiskBudget"/> at
+    /// most, and takes <paramref name="unanswered"/> when that runs out;
+    /// anything else looks in place, as it always has.
+    /// </summary>
+    private static async Task<T> ReadPickerDiskAsync<T>(FileDialogSession session, Func<T> read, Func<T> unanswered)
+    {
+        if (!session.Request.IsNativeProxy)
+        {
+            return read();
+        }
+
+        var reading = Task.Run(read);
+        if (await Task.WhenAny(reading, Task.Delay(PickerDiskBudget)) == reading)
+        {
+            return await reading;
+        }
+
+        // The look goes on until Windows gives up; what it finds then is not wanted.
+        _ = reading.ContinueWith(late => _ = late.Exception, TaskContinuationOptions.OnlyOnFaulted);
+        return unanswered();
     }
 
     private void OnPickerTreePropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (_picker is not { } session || e.PropertyName != nameof(_viewModel.Tree.ActiveNode))
+        if (IsNested || _picker is not { } session || e.PropertyName != nameof(_viewModel.Tree.ActiveNode))
         {
             return;
         }
@@ -202,18 +355,62 @@ public partial class MainWindow
         }
 
         session.FileNameText = node.DisplayName;
-        _ = FinishIfValidAsync([node.FullPath]);
+        _ = OpenPickerFileAsync(node.FullPath);
         return true;
     }
 
-    private void OnPickerPreviewKeyDown(object sender, KeyEventArgs e)
+    /// <summary>
+    /// A picker's first look at a key, before the window's own handlers (a
+    /// class handler comes before every one of them).  F4 in the name or
+    /// type box opens that box's list, as in the standard dialog, not the
+    /// address bar's recent places; whether a crumb's list is open is noted
+    /// before the window's Escape closes it; and Escape in the list's empty
+    /// filter, which would otherwise take every Escape, cancels.
+    /// </summary>
+    private static void OnPickerClassPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (sender is not MainWindow { _picker: not null } window)
+        {
+            return;
+        }
+
+        window._pickerMenuOpenAtKey = window._viewModel.Address.Breadcrumbs.Any(crumb => crumb.IsMenuOpen);
+
+        // The list's filter keeps the keyboard once Escape has cleared it, so
+        // an Escape there with nothing left to clear is the dialog's, as one
+        // that nothing else wanted is everywhere else.
+        if (e.Key == Key.Escape && !window._pickerMenuOpenAtKey
+            && !window._viewModel.Search.IsOpen && !window._viewModel.Address.IsEditing
+            && window.FolderListFilterBox.Text.Length == 0
+            && (window.FolderListFilterBox.IsKeyboardFocusWithin || ReferenceEquals(e.OriginalSource, window.FolderListFilterBox)))
+        {
+            e.Handled = true;
+            window.CancelPicker();
+            return;
+        }
+
+        if (e.Key == Key.F4 && Keyboard.Modifiers == ModifierKeys.None
+            && new[] { window.PickerNameBox, window.PickerTypeBox }.FirstOrDefault(box => box.IsKeyboardFocusWithin
+                || (e.OriginalSource is System.Windows.Media.Visual source && box.IsAncestorOf(source))) is { } box)
+        {
+            box.IsDropDownOpen = !box.IsDropDownOpen;
+            e.Handled = true;
+        }
+    }
+
+    /// <summary>
+    /// Escape that nothing else wanted cancels the dialog.  It is taken on
+    /// the way back up, so a filter clears, an open drop-down closes and a
+    /// crumb's list of folders goes away first, each with an Escape of its own.
+    /// </summary>
+    private void OnPickerKeyDown(object sender, KeyEventArgs e)
     {
         if (_picker is null)
         {
             return;
         }
 
-        if (e.Key == Key.Escape && !_viewModel.Search.IsOpen && !_viewModel.Address.IsEditing)
+        if (e.Key == Key.Escape && !_pickerMenuOpenAtKey && !_viewModel.Search.IsOpen && !_viewModel.Address.IsEditing)
         {
             e.Handled = true;
             CancelPicker();
@@ -252,7 +449,25 @@ public partial class MainWindow
                 break;
 
             case Key.Escape:
+                // The box's own list of names closes first, as in any combo
+                // box; so does a crumb's list of folders, which the window
+                // leaves open while the keyboard is in a text box.
+                if (sender is ComboBox { IsDropDownOpen: true })
+                {
+                    break;
+                }
+
                 e.Handled = true;
+                if (_pickerMenuOpenAtKey)
+                {
+                    foreach (var crumb in _viewModel.Address.Breadcrumbs)
+                    {
+                        crumb.IsMenuOpen = false;
+                    }
+
+                    break;
+                }
+
                 CancelPicker();
                 break;
         }
@@ -266,7 +481,7 @@ public partial class MainWindow
     /// </summary>
     private void PickerNameBox_TextChanged(object sender, TextChangedEventArgs e)
     {
-        if (_picker is { } session && sender is UIElement { IsKeyboardFocusWithin: true })
+        if (!_pickerBindingSession && _picker is { } session && sender is UIElement { IsKeyboardFocusWithin: true })
         {
             session.MarkInteraction();
         }
@@ -279,6 +494,14 @@ public partial class MainWindow
     }
 
     private void PickerCancel_Click(object sender, RoutedEventArgs e) => CancelPicker();
+
+    private void PickerClearChoice_Click(object sender, RoutedEventArgs e)
+    {
+        if (_picker is not { } session) return;
+        _viewModel.Tree.Selection.Apply(new SelectionEdit { Clear = true, Source = SelectionSource.Navigation });
+        if (!IsNested) _viewModel.Tree.SelectedNodes.Clear();
+        session.ClearChoice();
+    }
 
     /// <summary>
     /// What OK means right now: open a folder, re-filter on a wildcard, or
@@ -293,7 +516,20 @@ public partial class MainWindow
 
         try
         {
-            var action = session.Prepare(_viewModel.Tree.SelectedPaths);
+            // The editable ComboBox's inner text can be ahead of its Text
+            // binding (paste, automation, a rapid type/OK sequence). Commit
+            // what is actually displayed before resolving the destination.
+            if (PickerNameBox.Template?.FindName("PART_EditableTextBox", PickerNameBox) is TextBox editable)
+                PickerNameBox.SetCurrentValue(ComboBox.TextProperty, editable.Text);
+            PickerNameBox.GetBindingExpression(ComboBox.TextProperty)?.UpdateSource();
+            var selection = PickerSelection;
+            var action = await ReadPickerDiskAsync(session,
+                () => session.Prepare(selection), () => session.Prepare(selection, readDisk: false));
+            if (_pickerFinished)
+            {
+                return;
+            }
+
             switch (action.Kind)
             {
                 case FileDialogActionKind.Navigate:
@@ -334,6 +570,7 @@ public partial class MainWindow
 
         session.CurrentFolder = folder;
         await _viewModel.Tree.RevealPathAsync(folder);
+        if (IsNested) await ActivePane.FlyToAsync(folder, gentle: false, animated: false);
     }
 
     /// <summary>
@@ -342,7 +579,22 @@ public partial class MainWindow
     /// </summary>
     private async Task FinishIfValidAsync(IReadOnlyList<string> paths)
     {
-        if (_picker is not { } session)
+        if (_pickerFinished || _picker is null)
+        {
+            return;
+        }
+
+        // The contract may arrive after Cancel, or after this prepared
+        // window has been rebound to another dialog. A same-dialog rebind
+        // keeps its completion, so a valid pending attempt can still finish
+        // with the fully read session.
+        var completion = _pickerCompletion;
+        bool IsCurrentAttempt() => !_pickerFinished && ReferenceEquals(completion, _pickerCompletion);
+
+        // A replacement shown before the caller's dialog was fully read
+        // accepts nothing until its file types, options and multiple
+        // selection are confirmed; a double-click or Enter meanwhile waits.
+        if (!await WhenContractConfirmedAsync() || !IsCurrentAttempt() || _picker is not { } session)
         {
             return;
         }
@@ -356,7 +608,13 @@ public partial class MainWindow
         // Each answered question is remembered, so the loop always advances.
         for (var attempt = 0; attempt < 4; attempt++)
         {
-            var verdict = session.Validate(paths);
+            if (!IsCurrentAttempt() || !ReferenceEquals(session, _picker)) return;
+
+            // Unanswered, what was chosen goes to the application's own
+            // dialog, whose checks are the final ones.
+            var verdict = await ReadPickerDiskAsync(session, () => session.Validate(paths),
+                () => new FileDialogVerdict(FileDialogVerdictKind.Accept, session.AllowsMultipleSelection ? paths : [.. paths.Take(1)]));
+            if (!IsCurrentAttempt() || !ReferenceEquals(session, _picker)) return;
 
             if (verdict.IsAccept)
             {
@@ -366,6 +624,9 @@ public partial class MainWindow
                     return;
                 }
 
+                // A caller's guard can close or replace its dialog while
+                // validating. That ended attempt records no accepted state.
+                if (!IsCurrentAttempt() || !ReferenceEquals(session, _picker)) return;
                 foreach (var path in verdict.Paths)
                 {
                     session.RememberName(Path.GetFileName(path));
@@ -446,10 +707,21 @@ public partial class MainWindow
         Close();
     }
 
-    /// <summary>Closing the window is a cancel, however it was closed.</summary>
+    /// <summary>
+    /// Closing the window is a cancel, however it was closed.  The session
+    /// lets go of the window too: a COM caller keeps it, through the dialog
+    /// object, for as long as it keeps that, and a closed window has nothing
+    /// to filter.
+    /// </summary>
     private void CompletePickerOnClose()
     {
-        if (_picker is { } session && !_pickerFinished)
+        if (_picker is not { } session)
+        {
+            return;
+        }
+
+        session.FilterChanged -= OnPickerFilterChanged;
+        if (!_pickerFinished)
         {
             _pickerFinished = true;
             _pickerCompletion?.TrySetResult(session.Cancelled());

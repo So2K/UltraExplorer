@@ -1321,6 +1321,21 @@ internal static partial class Program
             Check("as does a layout chosen from the menu", shell.Layout == CanvasLayout.Nested && shell.IsSplit && shell.SplitOrientation == SplitOrientation.SideBySide);
             Click(main.SplitButton);
             Check("and on show, the button closes it", !shell.IsSplit && main.Panes.Count == 1 && !Lit());
+
+            // Close the new pane before its sparse path description returns.
+            // Its queued Enter and the late flight must not revive a camera
+            // or ask the surviving window to add roots for a disposed tree.
+            shell.IsSplit = true;
+            var closingPane = main.SecondPane!;
+            closingPane.Tree.SetRoots([drive]);
+            var closingFlight = closingPane.FlyToAsync(deep, gentle: false, animated: false);
+            var flightPendingAtClose = !closingFlight.IsCompleted;
+            shell.IsSplit = false;
+            await closingFlight;
+            await SettingsSettle();
+            Check("closing a pane while its destination is still being read cancels the late flight and drops its canvas tree",
+                flightPendingAtClose && closingPane.FlightsUnderWay == 0 && !closingPane.IsReady
+                && closingPane.Canvas.Tree is null && closingPane.Canvas.CaptureCamera() is null && main.Panes.Count == 1);
         }
         finally
         {

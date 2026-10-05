@@ -1,0 +1,36 @@
+name: Bug report
+description: Report a reproducible problem in navigation or file operations.
+title: "[Bug] "
+body:
+  - type: textarea
+    attributes:
+      label: What happened?
+      description: Describe the expected result and the actual result.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Steps to reproduce
+      description: Use a small example and omit private files or personal paths.
+      placeholder: "1. Open a folder...\n2. Select...\n3. Press..."
+    validations:
+      required: true
+  - type: input
+    attributes:
+      label: App and Windows versions
+      placeholder: "UltraExplorer 1.1.0-beta.1; Windows 11; display scaling 150%"
+    validations:
+      required: true
+  - type: dropdown
+    attributes:
+      label: Where is the affected path?
+      options:
+        - Local disk
+        - Removable drive
+        - Network share or mapped drive
+        - WSL or another provider
+        - Not path-specific
+  - type: textarea
+    attributes:
+      label: Relevant settings and evidence
+      description: Mention GPU/CPU renderer, Everything, optional Windows integration, and a screenshot or small fixture if helpful.

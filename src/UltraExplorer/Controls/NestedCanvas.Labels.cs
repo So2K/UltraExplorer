@@ -216,6 +216,15 @@ public sealed partial class NestedCanvas
             _dirty |= Layers.Labels;
         }
 
+        // Another canvas on the card - a split view's other pane, another
+        // window - grew a shared atlas and let go of the views this frame's
+        // names sample: a frame that only redraws the scene, for a folder
+        // read, would present them with nothing bound.
+        if (_labelsOnGpu && _gpuLabels is { } labels && _gpuFrame is { } frame && labels.ViewsOutOfDate(frame))
+        {
+            _dirty |= Layers.Labels;
+        }
+
         if (_labelsOnGpu && !_labelVisualRecorded && _wpfLabels.ShowsRuns)
         {
             _wpfLabels.Hide();
@@ -490,10 +499,18 @@ public sealed partial class NestedCanvas
         LabelsDrawnWhileMoving = cameraMoving;
         _askTextWorker = _inFrameLoop && !cameraMoving;
         _recordingLabels = _inFrameLoop;
-        if (cameraMoving)
+
+        // What was asked at another scale - the window moved to a monitor of
+        // another DPI - comes back made for that scale and is dropped
+        // (TakePreparedTexts); still counted as asked, it would never be asked
+        // again at this one, and with nothing else to draw the names again
+        // they would stay out.
+        if (cameraMoving || _textsAskedAtScale != _scaleY)
         {
             ForgetTextAsks();
         }
+
+        _textsAskedAtScale = _scaleY;
 
         if (!_inFrameLoop)
         {
@@ -560,6 +577,9 @@ public sealed partial class NestedCanvas
     /// <summary>What this canvas has asked the text worker for and not had back yet, and where it comes back to; null until it first asks.</summary>
     private TextAsks? _textAsks;
     private readonly HashSet<TextKey> _textsAsked = [];
+
+    /// <summary>The DPI scale the last label layer asked the text worker at; its asks are made for that scale alone.</summary>
+    private double _textsAskedAtScale;
 
     /// <summary>
     /// Texts the worker handed back unmade, which the frames make themselves
@@ -694,6 +714,7 @@ public sealed partial class NestedCanvas
             if (!TryCached(prepared.Key, out _))
             {
                 _textCache[prepared.Key] = prepared.Text;
+                RememberTrimmed(prepared.Key, prepared.Text);
                 if (prepared.Recording is { } recording)
                 {
                     _textDrawings.AddOrUpdate(prepared.Text, recording);
@@ -804,7 +825,7 @@ public sealed partial class NestedCanvas
 
                     if (request.Key.Width >= 0)
                     {
-                        text.MaxTextWidth = Math.Max(1, request.Key.Width * (request.Scaled ? 8 : 6));
+                        text.MaxTextWidth = Math.Max(1, request.Key.Width * TextWidthStep);
                     }
 
                     _ = text.Width;
@@ -900,9 +921,11 @@ public sealed partial class NestedCanvas
         var right = job.X + job.W - font * 0.5;
 
         var iconSize = Math.Min(job.H * 0.72, 20);
-        if (iconSize >= 9 && Shows(CanvasLayer.Icons)
-            && target.DrawIcon(folder, job.Index, file, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize)))
+        if (iconSize >= 9 && Shows(CanvasLayer.Icons))
         {
+            // The icon atlas streams independently. Its arrival changes the
+            // ink, never the filename's origin or available room.
+            target.DrawIcon(folder, job.Index, file, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize));
             cursor += iconSize + font * 0.4;
         }
 
@@ -932,33 +955,60 @@ public sealed partial class NestedCanvas
             right -= font * 0.4;
         }
 
-        // A folder ordered by date or type is being read for exactly that, so
-        // its tiles say it where they are narrower, and leave the name less.
+        // Metadata grows into a bounded part of the extra room. A date-only
+        // label must not suddenly become a full timestamp and take back the
+        // filename's characters halfway through a zoom.
         var column = folder.PlacedSort.Column;
-        var asked = column is SortColumn.Modified or SortColumn.Type;
-        var nameRoom = font * (asked ? 3.5 : 5);
-        if (job.W >= (asked ? 120 : 190) && Shows(CanvasLayer.Details) && FileDetailText(column, file, dateOnly: false) is { Length: > 0 } text)
+        var faded = file.IsHidden || _filter is not null && !_filter(file.Name);
+        var ink = faded ? TextDimColour : TextColour;
+        var available = right - cursor;
+        var metadataRight = right;
+        if (available > font && Shows(CanvasLayer.Details) && FileDetailText(column, file, dateOnly: false) is { Length: > 0 } text)
         {
+            var wholeName = target.Text(file.Name, font, ink, double.MaxValue, LabelFace.Regular, scaled: true);
             var detail = target.Text(text, font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
-
-            // A date and a time that leave the name no room give up the time.
-            if (right - detail.Width - cursor <= nameRoom && column == SortColumn.Modified)
+            var gap = font * 0.6;
+            var wholeFits = wholeName.Handle is not null && detail.Handle is not null && wholeName.Width + detail.Width + gap <= available;
+            if (!wholeFits && column == SortColumn.Modified)
             {
-                detail = target.Text(FileDetailText(SortColumn.Modified, file, dateOnly: true), font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+                text = FileDetailText(SortColumn.Modified, file, dateOnly: true);
+                detail = target.Text(text, font * 0.85, TextDimColour, double.MaxValue, LabelFace.Regular, scaled: true);
+                wholeFits = wholeName.Handle is not null && detail.Handle is not null && wholeName.Width + detail.Width + gap <= available;
             }
 
-            if (right - detail.Width - cursor > nameRoom)
+            // A detail the target has not made yet - its budget for new text
+            // spent this frame - has no width to go by: it is given the most
+            // it could take, so the name is not drawn into that room for a
+            // frame and then cut back when the size or date arrives.
+            var bounded = Math.Max(0, available - font * 8) * 0.35;
+            var budget = wholeFits
+                ? detail.Width + gap
+                : detail.Handle is null ? bounded : Math.Min(detail.Width + gap, bounded);
+            if (budget > 0)
             {
-                right -= detail.Width;
-                target.DrawText(detail, new Point(right, job.Y + (job.H - detail.Height) / 2));
-                right -= font * 0.6;
+                // Reserve the allocation rather than the trimmed text's
+                // measured width: revealing another glyph cannot move the
+                // filename edge backwards. Very small metadata allocations
+                // wait for readable room, while the budget remains continuous.
+                right -= budget;
+                // A complete short value ("0 B", for example) is already
+                // readable when it fits. The minimum room is for a value
+                // that needs trimming, not a reason to hide a whole one.
+                if (wholeFits || budget - gap >= font * 2)
+                {
+                    if (detail.Width > budget - gap)
+                    {
+                        detail = target.Text(text, font * 0.85, TextDimColour, budget - gap, LabelFace.Regular, scaled: true);
+                    }
+
+                    target.DrawText(detail, new Point(metadataRight - detail.Width, job.Y + (job.H - detail.Height) / 2));
+                }
             }
         }
 
         if (right - cursor > font)
         {
-            var faded = file.IsHidden || _filter is not null && !_filter(file.Name);
-            var name = target.Text(file.Name, font, faded ? TextDimColour : TextColour, right - cursor, LabelFace.Regular, scaled: true);
+            var name = target.Text(file.Name, font, ink, right - cursor, LabelFace.Regular, scaled: true);
             target.DrawText(name, new Point(cursor, job.Y + (job.H - name.Height) / 2));
         }
     }
@@ -1486,9 +1536,18 @@ public sealed partial class NestedCanvas
             message = string.IsNullOrEmpty(folder.ErrorMessage) ? "Could not be read" : folder.ErrorMessage;
             ink = DangerColour;
         }
+        else if (folder.HasPartialListing && folder.LoadState == NestedLoadState.NotLoaded)
+        {
+            // A sparse ancestor already shows its known children. Its full
+            // listing is intentionally deferred, rather than being read.
+            return;
+        }
         else if (folder.LoadState is NestedLoadState.NotLoaded or NestedLoadState.Queued or NestedLoadState.Loading)
         {
-            message = folder.IsComputer ? string.Empty : "Reading…";
+            message = folder.IsComputer ? string.Empty
+                : folder.LoadState == NestedLoadState.NotLoaded && !LoadUnfocusedRoots
+                    && folder.Parent?.IsComputer == true && !_chain.ContainsKey(folder)
+                    ? "Open to view contents" : "Reading…";
         }
         else if (folder.Children.Count == 0 && !Shows(CanvasLayer.Files) && FilesBehindLayer(folder) is > 0 and var files)
         {
@@ -1601,7 +1660,7 @@ public sealed partial class NestedCanvas
             return folder.SecondaryText;
         }
 
-        if (folder.LoadState != NestedLoadState.Loaded)
+        if (folder.HasPartialListing || folder.LoadState != NestedLoadState.Loaded)
         {
             return string.Empty;
         }
@@ -1803,6 +1862,11 @@ public sealed partial class NestedCanvas
         if (!MayMakeText())
         {
             TextWaits(askedOfWorker: AskTextWorker(key, text, level, brush, bold, icon, scaled));
+            if (TryTrimmedFitting(key, scale, maxWidth, out var fitting))
+            {
+                return new ScaledText(fitting, scale);
+            }
+
             if (scaled)
             {
                 for (var step = 1; step <= 3; step++)
@@ -1811,7 +1875,8 @@ public sealed partial class NestedCanvas
                     {
                         var near = LevelAway(level, direction * step);
                         var nearScale = size / near;
-                        if (TryCached(KeyFor(text, near, nearScale, maxWidth, brush, bold, icon, scaled: true), out var neighbour))
+                        var nearKey = KeyFor(text, near, nearScale, maxWidth, brush, bold, icon, scaled: true);
+                        if (TryCached(nearKey, out var neighbour) || TryTrimmedFitting(nearKey, nearScale, maxWidth, out neighbour))
                         {
                             return new ScaledText(neighbour, nearScale);
                         }
@@ -1839,7 +1904,7 @@ public sealed partial class NestedCanvas
 
         if (key.Width >= 0)
         {
-            formatted.MaxTextWidth = Math.Max(1, key.Width * (scaled ? 8 : 6));
+            formatted.MaxTextWidth = Math.Max(1, key.Width * TextWidthStep);
         }
 
         // Laid out here rather than on first being measured, so the time is
@@ -1848,6 +1913,7 @@ public sealed partial class NestedCanvas
         TextMade(started);
         NewTextLayouts++;
         _textCache[key] = formatted;
+        RememberTrimmed(key, formatted);
         if (_recordingLabels)
         {
             RecordText(formatted);
@@ -1856,11 +1922,71 @@ public sealed partial class NestedCanvas
         return new ScaledText(formatted, scale);
     }
 
+    /// <summary>
+    /// The layout of each text cut short that was made last, by the text and
+    /// everything but its room (<see cref="AnyWidth"/>).  A trimmed name's
+    /// room changes with every frame of a zoom, and the layouts are kept by
+    /// it to an eighth of a DIP, so past the frame's allowance the one wanted
+    /// is nearly never there: this one is drawn instead when it fits the room
+    /// it is drawn in (<see cref="TryTrimmedFitting"/>), rather than the name
+    /// blinking out for the frame.
+    /// </summary>
+    private readonly Dictionary<TextKey, FormattedText> _lastTrimmed = [];
+
+    /// <summary>The width a key in <see cref="_lastTrimmed"/> carries: none of the widths a layout is kept by.</summary>
+    private const int AnyWidth = -2;
+
+    /// <summary>Texts cut short remembered at most; past it they are forgotten together, as they never are on one screen.</summary>
+    private const int MaximumLastTrimmed = 8192;
+
+    /// <summary>Keeps <paramref name="formatted"/>, just made here or by the text worker, as its text's last layout cut short when it is one.</summary>
+    private void RememberTrimmed(TextKey key, FormattedText formatted)
+    {
+        if (key.Width < 0)
+        {
+            return;
+        }
+
+        if (_lastTrimmed.Count >= MaximumLastTrimmed)
+        {
+            _lastTrimmed.Clear();
+        }
+
+        _lastTrimmed[key with { Width = AnyWidth }] = formatted;
+    }
+
+    /// <summary>
+    /// The last layout made of <paramref name="key"/>'s text cut short, at
+    /// its level and in its face and brush, when drawn at
+    /// <paramref name="scale"/> it is no wider than <paramref name="maxWidth"/>
+    /// and was made at this scale: a cut a little before the one wanted while
+    /// the room grows - and while it shrinks, until the room is narrower than
+    /// what it shows - and the one wanted is made by a later frame.
+    /// </summary>
+    private bool TryTrimmedFitting(TextKey key, double scale, double maxWidth, out FormattedText formatted)
+    {
+        if (key.Width >= 0
+            && _lastTrimmed.TryGetValue(key with { Width = AnyWidth }, out formatted!)
+            && formatted.PixelsPerDip == _scaleY
+            && formatted.Width * scale <= maxWidth)
+        {
+            return true;
+        }
+
+        formatted = null!;
+        return false;
+    }
+
+    // Sub-DIP cache bins do not visibly change the character cut when the
+    // raster size moves to another level. The GPU trims its shaped run in
+    // exact em units; this bounds the WPF cache's difference to 1/8 DIP.
+    private const double TextWidthStep = 0.125;
+
     private static TextKey KeyFor(string text, double level, double scale, double maxWidth, Brush brush, bool bold, bool icon, bool scaled)
     {
         var widthKey = double.IsInfinity(maxWidth) || maxWidth >= 10_000
             ? -1
-            : Math.Max(0, (int)Math.Floor(maxWidth / scale / (scaled ? 8 : 6)));
+            : Math.Max(0, (int)Math.Floor(maxWidth / scale / TextWidthStep));
         return new TextKey(text, level, widthKey, brush, bold, icon);
     }
 
@@ -2565,6 +2691,13 @@ public sealed partial class NestedCanvas
 
     /// <summary>For tests: icons the last WPF label layer drew.</summary>
     internal int LabelIconsDrawn => _wpfLabels.IconsDrawn;
+
+    /// <summary>Exercises a real file-label layout at an exact continuous tile size, independent of the scene's camera.</summary>
+    internal void DrawFileLabelForTests(LabelTarget target, NestedFolder folder, int index, double width, double height)
+    {
+        FolderFacts? facts = null;
+        DrawFileLabel(target, new FileLabelJob(folder, index, 0, 0, width, height), ref facts);
+    }
 
     /// <summary>
     /// For tests: a frame that draws the names and nothing else, as the loop

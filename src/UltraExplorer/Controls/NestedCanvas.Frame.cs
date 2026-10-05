@@ -64,6 +64,7 @@ public sealed partial class NestedCanvas
     private int _wakePosted;
     private bool _cameraMotionActive;
     private bool _transitionsActive;
+    private bool _cameraReadDeferred;
 
     /// <summary>What the last frame of the loop did, phase by phase.</summary>
     internal FrameStats LastFrameStats { get; private set; }
@@ -87,9 +88,10 @@ public sealed partial class NestedCanvas
 
     /// <summary>
     /// Whether anything is still under way that a picture taken now would
-    /// catch half done: eased camera motion, a transition, or results waiting
-    /// in an inbox - finished reads, icons, changes on disk.  What a snapshot
-    /// waits out besides the tree's reads (see <see cref="IsIdle"/>).
+    /// catch half done: eased camera motion, a transition, results waiting
+    /// in an inbox - finished reads, icons, changes on disk - or a filter
+    /// still being judged.  What a snapshot waits out besides the tree's
+    /// reads (see <see cref="IsIdle"/>).
     /// </summary>
     internal bool HasPendingWork
     {
@@ -98,6 +100,7 @@ public sealed partial class NestedCanvas
             var pending = _cameraMotionActive || _transitionsActive || _tree?.HasWork == true;
             PendingHubWork(ref pending);
             PendingIconWork(ref pending);
+            PendingFilterWork(ref pending);
             return pending;
         }
     }
@@ -109,6 +112,7 @@ public sealed partial class NestedCanvas
         && !moving
         && !_lodDegraded
         && !_textAnimated
+        && !_cameraReadDeferred
         && !HasPendingWork;
 
     /// <summary>Marks layers out of date and makes sure the next frame draws them; with none, only that there is a next frame.</summary>
@@ -589,6 +593,15 @@ public sealed partial class NestedCanvas
 
             // 8. Settle, and draw what is out of date.
             var moving = IsMoving();
+            var retryCameraReads = !moving && _cameraReadDeferred;
+            if (retryCameraReads)
+            {
+                // A folder visible during transit may have deliberately
+                // refused its listing. Retry the final viewport once, even
+                // if motion needed neither degraded geometry nor text.
+                _cameraReadDeferred = false;
+                _dirty |= Layers.All;
+            }
 
             // The camera has come to rest after frames drawn with less detail, or
             // with text set for motion: one more frame, at full quality.  Not the
@@ -607,6 +620,7 @@ public sealed partial class NestedCanvas
             // when they were read (OnBatchApplied) - joins the frame, unless
             // it is held back to loading's own rate.
             var scoped = TakeLoadRedraw(moving);
+            if (retryCameraReads) scoped = false;
 
             stats.Skipped = _dirty == Layers.None;
             LastFrameLayers = Layers.None;
@@ -696,6 +710,9 @@ public sealed partial class NestedCanvas
     private const double SettleMilliseconds = 350;
 
     /// <summary>Whether the camera moved in the last few frames.</summary>
+    /// <summary>Transient camera frames must not turn a passing ancestor into a visited folder.</summary>
+    internal bool IsCameraMoving => IsMoving();
+
     private bool IsMoving() =>
         _flight is not null
         || _lastMotion != 0 && System.Diagnostics.Stopwatch.GetElapsedTime(_lastMotion).TotalMilliseconds < 140;
@@ -746,6 +763,9 @@ public sealed partial class NestedCanvas
 
     /// <summary>Sets <paramref name="pending"/> when icons are waiting, or a redraw for them is held back (NestedCanvas.Icons.cs); never clears it.</summary>
     partial void PendingIconWork(ref bool pending);
+
+    /// <summary>Sets <paramref name="pending"/> while a new filter is still being judged, a slice at a time (NestedCanvas.Palette.cs); never clears it.</summary>
+    partial void PendingFilterWork(ref bool pending);
 
     /// <summary>
     /// Phase 8, the names (NestedCanvas.Labels.cs): sets the frame's allowance
@@ -875,7 +895,9 @@ public sealed partial class NestedCanvas
     /// once when the drives and roots were replaced or no frame has been
     /// drawn yet, and as a loading redraw, at loading's rate, when the name
     /// filter is on, which lights and fades the folders around one read as
-    /// well as the folder itself.
+    /// well as the folder itself, and when a folder above the camera's own
+    /// was placed anew, which moves everything round the camera's folder
+    /// (<see cref="MovedAroundAnchor"/>).
     /// </summary>
     private void OnBatchApplied(NestedChangeBatch batch)
     {
@@ -904,6 +926,13 @@ public sealed partial class NestedCanvas
         var layers = Layers.None;
         foreach (var folder in batch.Applied)
         {
+            if (MovedAroundAnchor(folder))
+            {
+                _loadDirtyEverywhere = true;
+                HoldLoadRedraw(Layers.All);
+                return;
+            }
+
             if (!TryDrawnCell(folder, out var cell))
             {
                 continue;
@@ -929,6 +958,39 @@ public sealed partial class NestedCanvas
         }
 
         HoldLoadRedraw(layers);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="folder"/>, just read, is one of the folders
+    /// above the camera's own and placed the way down to it anew - a sub-folder
+    /// more, say, so the one the view is in is smaller.  The camera holds its
+    /// folder still, so then this folder and everything round it moved: every
+    /// cell, name and mark on screen outside the camera's folder, not only
+    /// what is in this folder's cell.  Worked out from the folder below it on
+    /// the chain the last frame drew, exactly as that frame worked it out.
+    /// </summary>
+    private bool MovedAroundAnchor(NestedFolder folder)
+    {
+        if (ReferenceEquals(folder, _anchor) || !_chain.TryGetValue(folder, out var drawn))
+        {
+            return false;
+        }
+
+        for (var below = _anchor; below?.Parent is { } parent; below = parent)
+        {
+            if (ReferenceEquals(parent, folder))
+            {
+                if (!_chain.TryGetValue(below, out var rect))
+                {
+                    return true;
+                }
+
+                PlaceParent(below, rect.X, rect.Y, rect.W, out var x, out var y, out var w);
+                return x != drawn.X || y != drawn.Y || w != drawn.W;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>
@@ -1169,6 +1231,13 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // A file type or hidden rule can bring back selected names from a
+        // cached listing without loading its folder again. Those names have
+        // waited in the selection since the tiles disappeared; FolderLoaded
+        // will not run for this visibility-only change.
+        if (sender is NestedTree changed && ReferenceEquals(changed, _tree))
+            ReselectWaitingFiles(changed);
+
         RequestFrame(Layers.All);
     }
 
@@ -1229,7 +1298,8 @@ public sealed partial class NestedCanvas
     /// pointer's layer with it - unless the frame is <paramref name="scoped"/>:
     /// its scene is only there for folders read, whose batch said which of the
     /// other layers they touch (<see cref="OnBatchApplied"/>), and the rest are
-    /// left as they are.
+    /// left as they are - all but the names, when they were in a GPU picture
+    /// this scene is no longer drawn on.
     /// </summary>
     private bool RenderLayers(Layers layers, bool inMotion, bool scoped = false)
     {
@@ -1288,6 +1358,14 @@ public sealed partial class NestedCanvas
             if (!scoped)
             {
                 layers |= Layers.Labels | Layers.Decor | Layers.Overlay;
+            }
+            else if (_labelsOnGpu && !_presentPending)
+            {
+                // The names were in the GPU's picture alone, and this frame's
+                // cells went to the bitmap - the card let go of since the last
+                // frame: they are drawn with WPF now, or there would be none
+                // until something else drew them.
+                layers |= Layers.Labels;
             }
 
             sceneAllocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
@@ -1368,6 +1446,7 @@ public sealed partial class NestedCanvas
             DrawDropTarget(dc);
             DrawBeacons(dc);
             DrawTrail(dc);
+            DrawFavoriteLinks(dc);
         }
 
         LastDecorMilliseconds = System.Diagnostics.Stopwatch.GetElapsedTime(layerStarted).TotalMilliseconds;

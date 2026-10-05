@@ -7,8 +7,13 @@ using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Services;
 
-/// <summary>A colour label and a note, both optional.</summary>
-public sealed record FolderMark(string AccentHex = "", string Note = "")
+/// <summary>
+/// A colour label and a note, both optional.  <paramref name="IsDirectory"/>
+/// is nullable for state written before Tags existed; once an item is seen,
+/// its kind is kept beside the mark so a cold start never probes a dead share
+/// merely to decide whether the sidebar should list it.
+/// </summary>
+public sealed record FolderMark(string AccentHex = "", string Note = "", bool? IsDirectory = null)
 {
     public static readonly FolderMark None = new();
 
@@ -32,25 +37,53 @@ public sealed class FolderMarkService
 
     private readonly ConcurrentDictionary<string, FolderMark> _marks = new(StringComparer.OrdinalIgnoreCase);
 
-    // The folders that hold a mark, rebuilt whole with every change - marks
-    // change a few times a session, and are asked about thousands of times a
-    // frame - and handed out as a set nobody changes once it is published,
-    // so the canvas reads it on the UI thread without a lock while a mark is
-    // set on another.
+    // The folders that hold a mark, rebuilt whole the first time they are
+    // asked for after a change, not at every change - marks change a few
+    // times a session, or thousands at once when a large selection is
+    // coloured, and are asked about thousands of times a frame - and handed
+    // out as a set nobody changes once it is published, so the canvas reads
+    // it on the UI thread without a lock while a mark is set on another.
     private readonly Lock _markedFoldersGate = new();
     private volatile HashSet<string> _markedFolders = new(StringComparer.OrdinalIgnoreCase);
+    private int _markedFoldersStale;
     private static long _pathsNormalised;
+
+    /// <summary>
+    /// What this copy changed since it last saved: the halves of each mark,
+    /// by key.  Other copies of the app - another window's process, a
+    /// replaced dialog, the prepared picker - keep the same file and save it
+    /// too, so a save writes only these over the file as it is then, never
+    /// the whole set this copy read at its start: that set would put back
+    /// marks cleared elsewhere since, and erase every one made there.
+    /// </summary>
+    private readonly Dictionary<string, MarkHalves> _changed = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Lock _changedGate = new();
 
     /// <summary>
     /// One save at a time.  The debounced save and the one made on closing can
     /// overlap, and the one that started with the older snapshot must not be
-    /// the one that lands last.
+    /// the one that lands last.  A reading of the file waits its turn too
+    /// (see <see cref="LoadAsync"/>).
     /// </summary>
     private readonly SemaphoreSlim _saving = new(1, 1);
+
+    /// <summary>The file's turn among every copy of the app: the same name in every process for the same file.</summary>
+    private readonly string _turnName;
 
     public FolderMarkService(string? statePath = null)
     {
         StatePath = statePath ?? AppPaths.State("folder-marks.json");
+        _turnName = @"Local\UltraExplorer.FolderMarks." + Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(StatePath.ToUpperInvariant())));
+    }
+
+    [Flags]
+    private enum MarkHalves
+    {
+        Accent = 1,
+        Note = 2,
+        Kind = 4,
+        Both = Accent | Note | Kind
     }
 
     public string StatePath { get; }
@@ -85,7 +118,7 @@ public sealed class FolderMarkService
     /// nearly every folder holds none, and for those no file needs a path
     /// made, normalised or looked up at all.
     /// </summary>
-    public IReadOnlySet<string> MarkedFolders => _markedFolders;
+    public IReadOnlySet<string> MarkedFolders => CurrentMarkedFolders();
 
     /// <summary>
     /// The mark of one of the nested canvas's folders, looked up by its path
@@ -116,7 +149,7 @@ public sealed class FolderMarkService
     /// </summary>
     public bool HasMarksIn(Models.NestedFolder folder)
     {
-        var marked = _markedFolders;
+        var marked = CurrentMarkedFolders();
         return marked.Count > 0 && marked.Contains(KeyOf(folder));
     }
 
@@ -262,11 +295,36 @@ public sealed class FolderMarkService
         => BrushCache.Get(GetAccentHex(path, fallback));
 
     public void SetAccent(string path, string? accentHex)
+        => SetAccent(path, accentHex, isDirectory: null);
+
+    public void SetAccent(string path, string? accentHex, bool? isDirectory)
     {
         var key = Key(path);
         var current = Get(key);
-        var updated = current with { AccentHex = accentHex ?? string.Empty };
-        Store(key, updated);
+        var updated = current with
+        {
+            AccentHex = accentHex ?? string.Empty,
+            IsDirectory = isDirectory ?? current.IsDirectory
+        };
+        var halves = MarkHalves.Accent | (isDirectory.HasValue ? MarkHalves.Kind : 0);
+        Store(key, updated, halves);
+    }
+
+    /// <summary>
+    /// Records the kind discovered for an existing colour/note without
+    /// changing either. Empty paths are not retained solely for metadata.
+    /// </summary>
+    public bool SetItemKind(string path, bool isDirectory)
+    {
+        var key = Key(path);
+        var current = Get(key);
+        if (current.IsEmpty || current.IsDirectory == isDirectory)
+        {
+            return false;
+        }
+
+        Store(key, current with { IsDirectory = isDirectory }, MarkHalves.Kind);
+        return true;
     }
 
     public void SetNote(string path, string? note)
@@ -274,7 +332,7 @@ public sealed class FolderMarkService
         var key = Key(path);
         var current = Get(key);
         var updated = current with { Note = note ?? string.Empty };
-        Store(key, updated);
+        Store(key, updated, MarkHalves.Note);
     }
 
     /// <summary>Seeds a mark without raising a change (used by workspace migration).</summary>
@@ -286,70 +344,86 @@ public sealed class FolderMarkService
             return;
         }
 
-        _marks[Key(path)] = mark;
-        IndexMarkedFolders();
+        // Saved like any change of this copy's: the old workspace it came
+        // from no longer carries it once the window has saved.
+        var key = Key(path);
+        lock (_changedGate)
+        {
+            _marks[key] = mark;
+            _changed[key] = MarkHalves.Accent | MarkHalves.Note;
+        }
+
+        MarkFoldersStale();
     }
 
     public async Task LoadAsync(CancellationToken cancellationToken = default)
     {
-        if (!File.Exists(StatePath))
-        {
-            return;
-        }
-
-        Dictionary<string, FolderMark>? stored;
-        try
-        {
-            await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
-            stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
-        }
-        catch (JsonException)
-        {
-            // A damaged marks file must never stop the app from opening - but
-            // the next save, a second or so into the session, would write the
-            // empty set over it, and every note in it would be gone for good.
-            // It is set aside instead, where it can still be recovered by hand.
-            StateFiles.Quarantine(StatePath);
-            return;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        {
-            // A marks file that cannot be read must never stop the app from opening.
-            return;
-        }
-
-        if (stored is null)
-        {
-            return;
-        }
-
-        // A file edited by hand can hold a null for a mark, or for either half
-        // of one; it counts as no mark rather than a crash on the way in.
-        foreach (var (path, mark) in stored)
-        {
-            if (string.IsNullOrWhiteSpace(path) || mark is null)
-            {
-                continue;
-            }
-
-            var complete = new FolderMark(mark.AccentHex ?? string.Empty, mark.Note ?? string.Empty);
-            if (!complete.IsEmpty)
-            {
-                _marks[Key(path)] = complete;
-            }
-        }
-
-        IndexMarkedFolders();
-    }
-
-    public async Task SaveAsync(CancellationToken cancellationToken = default)
-    {
-        // One save at a time, and the one started last is the one written last:
-        // it takes its snapshot only once the one before has finished.
+        // In a save's turn: a save has taken its changes before it writes
+        // them, and a file read in between holds neither them nor anything
+        // left to lay over it - the mark would be cleared here, and that
+        // cleared mark is what the save would then write.
+        StateFiles.SweepTemporaries(StatePath, hidden: true);
         await _saving.WaitAsync(cancellationToken);
         try
         {
-            await SaveSnapshotAsync(cancellationToken);
+            if (!File.Exists(StatePath))
+            {
+                return;
+            }
+
+            Dictionary<string, FolderMark>? stored;
+            try
+            {
+                await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
+                stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
+            }
+            catch (JsonException)
+            {
+                // A damaged marks file must never stop the app from opening - but
+                // a save written over it would leave every note in it gone for
+                // good.  It is set aside instead, where it can still be recovered
+                // by hand.
+                StateFiles.Quarantine(StatePath);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                // A marks file that cannot be read must never stop the app from opening.
+                return;
+            }
+
+            if (stored is null)
+            {
+                return;
+            }
+
+            // Read again - a prepared picker bound to a new dialog - the marks are
+            // the file's as it is now, with this copy's own changes not saved yet
+            // laid over them: a mark cleared elsewhere since goes, and one made
+            // here and not written yet stays.
+            var loaded = Complete(stored);
+            lock (_changedGate)
+            {
+                foreach (var (key, halves) in _changed)
+                {
+                    Apply(loaded, key, halves);
+                }
+
+                foreach (var key in _marks.Keys)
+                {
+                    if (!loaded.ContainsKey(key))
+                    {
+                        _marks.TryRemove(key, out _);
+                    }
+                }
+
+                foreach (var (key, mark) in loaded)
+                {
+                    _marks[key] = mark;
+                }
+            }
+
+            MarkFoldersStale();
         }
         finally
         {
@@ -357,30 +431,207 @@ public sealed class FolderMarkService
         }
     }
 
-    private async Task SaveSnapshotAsync(CancellationToken cancellationToken)
+    public async Task SaveAsync(CancellationToken cancellationToken = default)
     {
-        var directory = Path.GetDirectoryName(StatePath)!;
-        Directory.CreateDirectory(directory);
-        var temporaryPath = Path.Combine(directory, $".{Path.GetFileName(StatePath)}.{Guid.NewGuid():N}.tmp");
-        var snapshot = _marks.Where(pair => !pair.Value.IsEmpty).ToDictionary(pair => pair.Key, pair => pair.Value);
-
+        // One save at a time, and the one started last is the one written last:
+        // it takes its changes only once the one before has finished.
+        await _saving.WaitAsync(cancellationToken);
         try
         {
+            var changes = TakeChanges();
+            if (changes.Count == 0)
+            {
+                // Nothing of this copy's to write: what the file holds is
+                // another's, and newer than what this copy read.
+                return;
+            }
+
+            // On a thread of its own: the file's turn is a mutex, which
+            // belongs to the thread that took it, and the reading, merging and
+            // writing all happen while it is held.  A save that could not be
+            // written leaves its changes to the next.
+            if (!await Task.Run(() => WriteChanges(changes), CancellationToken.None))
+            {
+                PutBack(changes);
+            }
+        }
+        finally
+        {
+            _saving.Release();
+        }
+    }
+
+    /// <summary>
+    /// A file's marks as they are kept: a file edited by hand can hold a null
+    /// for a mark, or for either half of one, which counts as no mark rather
+    /// than a crash on the way in; and a path not in the form keys are kept
+    /// in is normalised to it.
+    /// </summary>
+    private static Dictionary<string, FolderMark> Complete(Dictionary<string, FolderMark> stored)
+    {
+        var marks = new Dictionary<string, FolderMark>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (path, mark) in stored)
+        {
+            if (string.IsNullOrWhiteSpace(path) || mark is null)
+            {
+                continue;
+            }
+
+            var complete = new FolderMark(mark.AccentHex ?? string.Empty, mark.Note ?? string.Empty, mark.IsDirectory);
+            if (!complete.IsEmpty)
+            {
+                marks[IsKeyForm(path) ? path : Key(path)] = complete;
+            }
+        }
+
+        return marks;
+    }
+
+    /// <summary>
+    /// Lays this copy's mark of <paramref name="key"/> over
+    /// <paramref name="marks"/>, only the halves it changed: a note written
+    /// in another copy stays beside a colour chosen in this one.
+    /// </summary>
+    private void Apply(Dictionary<string, FolderMark> marks, string key, MarkHalves halves)
+    {
+        var stored = marks.GetValueOrDefault(key) ?? FolderMark.None;
+        var here = _marks.TryGetValue(key, out var mark) ? mark : FolderMark.None;
+        var merged = new FolderMark(
+            (halves & MarkHalves.Accent) != 0 ? here.AccentHex : stored.AccentHex,
+            (halves & MarkHalves.Note) != 0 ? here.Note : stored.Note,
+            (halves & MarkHalves.Kind) != 0 ? here.IsDirectory : stored.IsDirectory);
+        if (merged.IsEmpty)
+        {
+            marks.Remove(key);
+        }
+        else
+        {
+            marks[key] = merged;
+        }
+    }
+
+    private Dictionary<string, MarkHalves> TakeChanges()
+    {
+        lock (_changedGate)
+        {
+            var changes = new Dictionary<string, MarkHalves>(_changed, StringComparer.OrdinalIgnoreCase);
+            _changed.Clear();
+            return changes;
+        }
+    }
+
+    private void PutBack(Dictionary<string, MarkHalves> changes)
+    {
+        lock (_changedGate)
+        {
+            foreach (var (key, halves) in changes)
+            {
+                _changed[key] = _changed.GetValueOrDefault(key) | halves;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes <paramref name="changes"/> over the file as it is now, in the
+    /// file's turn among every copy of the app: read, merged and replaced
+    /// while no other copy does the same, so neither writes back the file as
+    /// it was before the other's save.  False when it could not be written.
+    /// </summary>
+    private bool WriteChanges(Dictionary<string, MarkHalves> changes)
+    {
+        Mutex? turn = null;
+        var entered = false;
+        try
+        {
+            // A copy that hangs while it holds the turn is not waited for
+            // long, and one made by an elevated copy cannot be opened from
+            // here: either way the changes still go over the file as it is
+            // now, which only a save landing in the same moment could undo.
+            try
+            {
+                turn = new Mutex(false, _turnName);
+                entered = turn.WaitOne(TimeSpan.FromSeconds(3));
+            }
+            catch (AbandonedMutexException) { entered = true; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException) { }
+
+            var marks = ReadForMerge();
+            foreach (var (key, halves) in changes)
+            {
+                Apply(marks, key, halves);
+            }
+
+            return Write(marks);
+        }
+        finally
+        {
+            if (entered)
+            {
+                turn!.ReleaseMutex();
+            }
+
+            turn?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// The marks the file holds now, for this copy's changes to go over.  A
+    /// file that is not there holds none.  One that cannot be understood is
+    /// set aside, as at the start (see <see cref="LoadAsync"/>), and one that
+    /// cannot be read leaves what this copy has: its own marks, which is all
+    /// a save ever wrote before.
+    /// </summary>
+    private Dictionary<string, FolderMark> ReadForMerge()
+    {
+        try
+        {
+            if (!File.Exists(StatePath))
+            {
+                return new Dictionary<string, FolderMark>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 16 * 1024);
+            if (JsonSerializer.Deserialize<Dictionary<string, FolderMark>>(stream, JsonOptions) is { } stored)
+            {
+                return Complete(stored);
+            }
+        }
+        catch (JsonException)
+        {
+            StateFiles.Quarantine(StatePath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+        }
+
+        return _marks.Where(pair => !pair.Value.IsEmpty).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private bool Write(Dictionary<string, FolderMark> marks)
+    {
+        var directory = Path.GetDirectoryName(StatePath)!;
+        var temporaryPath = Path.Combine(directory, $".{Path.GetFileName(StatePath)}.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            Directory.CreateDirectory(directory);
+
             // Written through to the disk before it replaces the old file: a
             // move that reaches the disk ahead of the data it names leaves an
             // empty or torn file behind after a power cut, where the old one
             // would at least have been whole.
-            await using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.Asynchronous | FileOptions.WriteThrough))
+            using (var stream = new FileStream(temporaryPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 16 * 1024, FileOptions.WriteThrough))
             {
-                await JsonSerializer.SerializeAsync(stream, snapshot, JsonOptions, cancellationToken);
-                await stream.FlushAsync(cancellationToken);
+                JsonSerializer.Serialize(stream, marks, JsonOptions);
+                stream.Flush();
             }
 
             File.Move(temporaryPath, StatePath, overwrite: true);
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             // Persisting a colour label is never worth surfacing an error for.
+            return false;
         }
         finally
         {
@@ -397,30 +648,53 @@ public sealed class FolderMarkService
         }
     }
 
-    private void Store(string key, FolderMark mark)
+    private void Store(string key, FolderMark mark, MarkHalves halves)
     {
-        if (mark.IsEmpty)
+        lock (_changedGate)
         {
-            _marks.TryRemove(key, out _);
-        }
-        else
-        {
-            _marks[key] = mark;
+            if (mark.IsEmpty)
+            {
+                _marks.TryRemove(key, out _);
+            }
+            else
+            {
+                _marks[key] = mark;
+            }
+
+            _changed[key] = _changed.GetValueOrDefault(key) | halves;
         }
 
-        IndexMarkedFolders();
+        MarkFoldersStale();
         MarkChanged?.Invoke(key, mark);
     }
 
     /// <summary>
-    /// <see cref="MarkedFolders"/> made again from every mark there is.
-    /// Under a lock, so two marks set at once on two threads cannot publish a
-    /// set that lacks one of them: the second to take the lock sees both.
+    /// A mark changed: <see cref="MarkedFolders"/> is made again the next time
+    /// it is asked for, once for however many changes came before - ten
+    /// thousand files coloured at once would otherwise read every mark ten
+    /// thousand times.
     /// </summary>
-    private void IndexMarkedFolders()
+    private void MarkFoldersStale() => Volatile.Write(ref _markedFoldersStale, 1);
+
+    private HashSet<string> CurrentMarkedFolders() =>
+        Volatile.Read(ref _markedFoldersStale) == 0 ? _markedFolders : IndexMarkedFolders();
+
+    /// <summary>
+    /// <see cref="MarkedFolders"/> made again from every mark there is.
+    /// Under a lock, so two threads that ask at once make it once; and the
+    /// change it answers is taken before the marks are read, so a mark set on
+    /// another thread while they are has it made again next time, never left
+    /// out for good.
+    /// </summary>
+    private HashSet<string> IndexMarkedFolders()
     {
         lock (_markedFoldersGate)
         {
+            if (Interlocked.Exchange(ref _markedFoldersStale, 0) == 0)
+            {
+                return _markedFolders;
+            }
+
             var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var pair in _marks)
             {
@@ -431,6 +705,7 @@ public sealed class FolderMarkService
             }
 
             _markedFolders = folders;
+            return folders;
         }
     }
 

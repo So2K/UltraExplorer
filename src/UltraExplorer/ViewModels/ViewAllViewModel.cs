@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Collections.Specialized;
+using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Threading;
@@ -78,12 +79,17 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     private int _revealTicket;
 
     /// <summary>
-    /// Whose <see cref="Selection"/> the latest ticket from <see cref="BeginNavigation"/>
-    /// was taken for: a navigation that waits before it reveals - a path
-    /// typed into the address bar, checked first - goes where it was asked
-    /// for, whichever pane is being worked with by the time it reveals.
+    /// The latest of those tickets taken in each pane of a split view - by
+    /// its <see cref="SelectionHolder"/>, this view model standing for none -
+    /// and so whose <see cref="Selection"/> each was taken for: a navigation
+    /// that waits before it reveals - a path typed into the address bar,
+    /// checked first - goes where it was asked for, whichever pane is being
+    /// worked with by the time it reveals.  A navigation gives way only to a
+    /// newer one in its own pane; one in the other pane meanwhile leaves it
+    /// to land in its pane (<see cref="NavigationLandedAway"/>), whose history
+    /// has already taken the step.  Weak on the pane, so one closed is let go.
     /// </summary>
-    private object? _navigationHolder;
+    private readonly ConditionalWeakTable<object, StrongBox<int>> _latestReveals = new();
 
     /// <summary>
     /// The selection's focus while the graph is still finding its node
@@ -142,6 +148,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         _graph.NodeCreated += OnNodeCreated;
         _graph.LayoutChanged += OnLayoutChanged;
         _graph.LayoutShifted += delta => ViewShiftRequested?.Invoke(delta);
+        _graph.DriveAdded += OnDriveAdded;
         _graph.SortOf = Orders.SortOf;
         _marks.MarkChanged += OnMarkChanged;
         Orders.Changed += OnOrdersChanged;
@@ -481,10 +488,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         // the canvas would otherwise take the list into it, which would make a
         // single click open the folder.  A single click selects; it does not open.
         // Only the row's own item is selected - a row whose item went meanwhile
-        // must not select its folder - and only while nothing newer was asked for.
+        // must not select its folder - and only while nothing newer was asked for:
+        // no other navigation, and no other pick, a row clicked meanwhile included.
+        var version = Selection.Version;
         using (FolderList.HoldFolder())
         {
-            outcome = await RevealAsync(path, exact: true);
+            outcome = await RevealAsync(path, exact: true, selectionVersion: version);
         }
 
         var node = outcome.IsExact ? outcome.Node : null;
@@ -505,7 +514,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
         if (node.IsDirectory)
         {
+            // A folder on a share can take its time to read, and the user may
+            // have gone somewhere else meanwhile - another navigation, the
+            // other pane, a click elsewhere: the focus, the address and the
+            // list stay with that, not jump back to this folder.
+            var ticket = _revealTicket;
+            var holder = SelectionHolder;
             await ExpandAsync(node);
+            if (ticket != _revealTicket
+                || !ReferenceEquals(holder, SelectionHolder)
+                || Selection.Focus is not { } focus
+                || !ViewAllPath.Equals(focus, node.FullPath))
+            {
+                return;
+            }
+
             ActiveNode = node;
             await FolderList.NavigateAsync(path);
             return;
@@ -753,8 +776,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 }
                 else if (!string.IsNullOrWhiteSpace(state.ActivePath) && _graph.IsInPendingRoot(state.ActivePath))
                 {
-                    // In a share not asked for yet: the first drive stands in,
-                    // and the share's folder is selected when it answers.
+                    // In a share not asked for yet, or on a drive that has not
+                    // answered yet: the first drive stands in, and the folder
+                    // is selected when its share or drive answers.
                     if (_graph.Roots.FirstOrDefault() is { } standIn)
                     {
                         SelectOnly(standIn);
@@ -816,8 +840,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>
     /// The second pane's selection of last session, found as the first
     /// pane's is: a node the restored graph has, or a path brought in by name
-    /// - never one in a share not asked for yet, whose server may take a
-    /// minute to say it is off.  Null for nothing found.
+    /// - never one in a share not asked for yet, or on a drive that has not
+    /// answered yet, whose server may take a minute to say it is off.  Null
+    /// for nothing found.
     /// </summary>
     private async Task<SelectionItem?> FindSecondPaneItemAsync(string? path)
     {
@@ -849,6 +874,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
     /// <summary>Raised when a saved share or distribution answered and became a root, after the start.</summary>
     public event Action<ViewAllNodeViewModel>? ExtraRootAdded;
+
+    /// <summary>Raised when a drive that had not answered as the window started has, and is a root now.</summary>
+    public event Action<ViewAllNodeViewModel>? DriveAdded;
 
     /// <summary>
     /// Asks for the shares and WSL distributions the workspace lists, all at
@@ -898,6 +926,24 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
         RebuildRenderSet();
         ExtraRootAdded?.Invoke(root);
+        SelectHeldActiveIn(root);
+    }
+
+    /// <summary>A drive start-up went on without has answered: the window shows it too, and the folder selected last time, if it is on it.</summary>
+    private void OnDriveAdded(ViewAllNodeViewModel drive)
+    {
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        DriveAdded?.Invoke(drive);
+        SelectHeldActiveIn(drive);
+    }
+
+    /// <summary>The folder selected last time, if it is in <paramref name="root"/>, which has just come.</summary>
+    private void SelectHeldActiveIn(ViewAllNodeViewModel root)
+    {
         if (_heldActivePath is { } held && IsInRoot(held, root))
         {
             _heldActivePath = null;
@@ -942,13 +988,25 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     public bool TryGetNode(string path, out ViewAllNodeViewModel node)
         => _graph.TryGetNode(path, out node);
 
+    /// <summary>True while <paramref name="node"/> is still the graph's node for its path: a folder read again has its children built anew.</summary>
+    private bool IsLive(ViewAllNodeViewModel node)
+        => _graph.TryGetNode(node.FullPath, out var live) && ReferenceEquals(live, node);
+
     /// <summary>Adds a non-drive location (WSL, UNC share) as its own root.</summary>
     public async Task<ViewAllNodeViewModel?> AddRootAsync(string path)
     {
         // A navigation like any other: a share slow to answer does not take
-        // the selection back from somewhere the user went meanwhile.
-        var ticket = ++_revealTicket;
+        // the selection back from somewhere the user went meanwhile, lands in
+        // the pane it was asked in (see RevealAsync), and finds nothing to do
+        // in a window closed while it waited.
+        var holder = SelectionHolder;
+        var ticket = TakeRevealTicket(holder);
         var node = await _graph.AddRootAsync(path);
+        if (_isDisposed)
+        {
+            return null;
+        }
+
         if (node is null)
         {
             MessageRequested?.Invoke($"Could not open {path}", true);
@@ -956,7 +1014,20 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         await _graph.ExpandAsync(node);
-        var superseded = ticket != _revealTicket;
+        if (_isDisposed)
+        {
+            return null;
+        }
+
+        var superseded = ticket != LatestRevealOf(holder);
+        if (!superseded && !ReferenceEquals(holder, SelectionHolder))
+        {
+            RebuildRenderSet();
+            NavigationLandedAway?.Invoke(new NavigationLanding(holder, node, Select: true, Focus: true, Records: true));
+            ScheduleSave();
+            return node;
+        }
+
         if (!superseded)
         {
             SelectOnly(node);
@@ -1056,6 +1127,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         try
         {
             await _graph.ApplyOptionsAsync(_graph.Options with { IncludeHidden = include });
+            FollowRebuiltBranches();
             OnPropertyChanged(nameof(ShowHiddenItems));
             MessageRequested?.Invoke(include ? "Hidden items shown" : "Hidden items hidden", false);
         }
@@ -1090,12 +1162,30 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         try
         {
             await _graph.ApplyOptionsAsync(options);
+            FollowRebuiltBranches();
             OnPropertyChanged(nameof(ShowHiddenItems));
         }
         finally
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>
+    /// Every open branch was read again under other rules - hidden items
+    /// shown or hidden, a file dialog's type changed - and its nodes built
+    /// anew: the focus takes the node its path has now, and the editor's copy
+    /// of the selection the new nodes.  A focus the rules no longer show
+    /// keeps its old node, which is no longer drawn (see <see cref="AlwaysRealized"/>).
+    /// </summary>
+    private void FollowRebuiltBranches()
+    {
+        if (_activeNode is { } active && !IsLive(active) && _graph.TryGetNode(active.FullPath, out var replacement))
+        {
+            SetActive(replacement, records: false);
+        }
+
+        SyncSelectionMirror();
     }
 
     /// <summary>
@@ -1338,6 +1428,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         DeepRefreshRequested?.Invoke(node.FullPath);
         NoteGraphReadDirectly(node.FullPath);
         await _graph.RefreshBranchAsync(node);
+        ReleaseRemovedFocus(node);
         ScheduleSave();
         PathRefreshed?.Invoke(node.FullPath);
     }
@@ -1389,10 +1480,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>
     /// After a refresh built a branch's nodes anew, the focus may be a node
     /// the graph no longer has: the one with its path takes its place, and
-    /// when there is none - it is gone from disk - and nothing else is
-    /// selected, the folder that was refreshed does, so a second Delete does
-    /// not aim at something gone.  The editor's copy of the selection is
-    /// brought up to date with the new nodes.
+    /// when there is none - it is gone from disk, or the read left it out -
+    /// and nothing else is selected, the focus moves to the folder that was
+    /// refreshed.  Only the focus, as Explorer's caret moves: selected, the
+    /// folder would be what a second Delete recycles.  What is still selected
+    /// stays, for the folder's own pruning to let go of once the disk says it
+    /// is gone.  The editor's copy of the selection is brought up to date
+    /// with the new nodes.
     /// </summary>
     private void ReleaseRemovedFocus(ViewAllNodeViewModel refreshed)
     {
@@ -1407,7 +1501,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             {
                 if (_graph.TryGetNode(refreshed.FullPath, out var folder))
                 {
-                    SelectOnly(folder);
+                    Selection.Apply(new SelectionEdit { Focus = folder.FullPath, Source = SelectionSource.Command });
+                    if (!ReferenceEquals(ActiveNode, folder))
+                    {
+                        SetActive(folder, records: false);
+                    }
                 }
             }
         }
@@ -1482,14 +1580,38 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <see cref="RevealAsync"/>.  The navigation is for the selection as it
     /// is now (<see cref="SelectionHolder"/>): the pane it is asked in.
     /// </summary>
-    public int BeginNavigation()
+    public int BeginNavigation() => TakeRevealTicket(SelectionHolder);
+
+    /// <summary>Whether no navigation has started since <paramref name="ticket"/> was taken in the pane it was taken in.</summary>
+    public bool IsLatestNavigation(int ticket) => TryGetRevealHolder(ticket, out _);
+
+    /// <summary>A new ticket, the latest in <paramref name="holder"/>'s pane (see <see cref="_latestReveals"/>).</summary>
+    private int TakeRevealTicket(object? holder)
     {
-        _navigationHolder = SelectionHolder;
-        return ++_revealTicket;
+        var ticket = ++_revealTicket;
+        _latestReveals.AddOrUpdate(holder ?? this, new StrongBox<int>(ticket));
+        return ticket;
     }
 
-    /// <summary>Whether no navigation has started since <paramref name="ticket"/> was taken.</summary>
-    public bool IsLatestNavigation(int ticket) => ticket == _revealTicket;
+    /// <summary>The latest ticket taken in <paramref name="holder"/>'s pane, or 0 before any.</summary>
+    private int LatestRevealOf(object? holder)
+        => _latestReveals.TryGetValue(holder ?? this, out var latest) ? latest.Value : 0;
+
+    /// <summary>The pane <paramref name="ticket"/> was taken in, while no newer one has been taken there.</summary>
+    private bool TryGetRevealHolder(int ticket, out object? holder)
+    {
+        foreach (var (key, latest) in _latestReveals)
+        {
+            if (latest.Value == ticket)
+            {
+                holder = ReferenceEquals(key, this) ? null : key;
+                return true;
+            }
+        }
+
+        holder = null;
+        return false;
+    }
 
     /// <summary>
     /// <see cref="RevealPathAsync"/>, with what a caller that must not act on
@@ -1508,31 +1630,38 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// gone reveals the deepest folder still there, and selecting that for a
     /// search result or a row that vanished would point Delete at the folder.
     /// </param>
+    /// <param name="selectionVersion">
+    /// The <see cref="ItemSelection.Version"/> the reveal was asked at, when
+    /// any pick made since is newer than it - a row clicked while the one
+    /// before still reads its way down: then, as when superseded, nothing is
+    /// selected or flown to.
+    /// </param>
     public async Task<RevealOutcome> RevealAsync(
         string path,
         bool focus = true,
         bool select = true,
         int? ticket = null,
         bool records = true,
-        bool exact = false)
+        bool exact = false,
+        long? selectionVersion = null)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
             return default;
         }
 
+        // The pane of a split view this is for: the one being worked with
+        // when it was asked for, which it goes on being for however long the
+        // way down takes.
+        var holder = ticket is { } begun && TryGetRevealHolder(begun, out var askedIn) ? askedIn : SelectionHolder;
+
         // Going somewhere while an earlier navigation is still reading its way
         // down - Back twice in quick succession, a second favourite clicked
         // while a share takes its time - must end where the last one asked
         // to, whichever finishes last.  Only a reveal that selects takes a
         // new ticket; one that flies there without selecting stands down for
-        // any that starts after it.
-        var taken = ticket ?? (select ? ++_revealTicket : _revealTicket);
-
-        // The pane of a split view this is for: the one being worked with
-        // when it was asked for, which it goes on being for however long the
-        // way down takes.
-        var holder = ticket is { } begun && begun == _revealTicket ? _navigationHolder : SelectionHolder;
+        // any that starts after it.  Either only in its own pane.
+        var taken = ticket ?? (select ? TakeRevealTicket(holder) : LatestRevealOf(holder));
 
         IReadOnlyList<string> chain;
         string normalized;
@@ -1570,32 +1699,53 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 await _graph.AddRootAsync(chain[0]);
             }
 
-            foreach (var step in chain)
+            // A folder on the way can be read again while this waits for it -
+            // a refresh of a busy folder above builds its children anew - and
+            // the next step adopted under the node it let go of would hang
+            // from nothing: the folder, read again, would never show it.  The
+            // walk then starts again from what is there now; the last of
+            // three goes walks on as ever, as the light reveal gives up.
+            for (var attempt = 0; attempt < 3; attempt++)
             {
-                if (!_graph.TryGetNode(step, out var found))
+                node = null;
+                var lost = false;
+                foreach (var step in chain)
                 {
-                    // The step may simply be filtered out of its parent - hidden,
-                    // or not of the file type on offer.  Asking for it by name
-                    // outranks that.
-                    var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
-                    if (adopted is null)
+                    if (!_graph.TryGetNode(step, out var found))
                     {
-                        MessageRequested?.Invoke(
-                            node is null
-                                ? "That drive is not available on this machine."
-                                : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
-                            true);
-                        break;
+                        // The step may simply be filtered out of its parent - hidden,
+                        // or not of the file type on offer.  Asking for it by name
+                        // outranks that.
+                        var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
+                        if (adopted is null)
+                        {
+                            MessageRequested?.Invoke(
+                                node is null
+                                    ? "That drive is not available on this machine."
+                                    : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
+                                true);
+                            break;
+                        }
+
+                        found = adopted;
                     }
 
-                    found = adopted;
+                    node = found;
+                    var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
+                    if (!isDestination && node.IsDirectory)
+                    {
+                        await _graph.ExpandAsync(node);
+                        if (attempt < 2 && !IsLive(node))
+                        {
+                            lost = true;
+                            break;
+                        }
+                    }
                 }
 
-                node = found;
-                var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
-                if (!isDestination && node.IsDirectory)
+                if (!lost)
                 {
-                    await _graph.ExpandAsync(node);
+                    break;
                 }
             }
         }
@@ -1610,7 +1760,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         // that came after.  Short of the path, with only the exact path
         // wanted: the message above has said it is gone, and the selection
         // stays where it was.
-        var superseded = taken != _revealTicket;
+        var superseded = taken != LatestRevealOf(holder) || selectionVersion is { } version && version != Selection.Version;
         var isExact = ViewAllPath.Equals(node.FullPath, normalized);
         var acts = !superseded && (isExact || !exact);
 
@@ -1854,7 +2004,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     {
         foreach (var path in paths)
         {
-            _marks.SetAccent(path, accentHex);
+            bool? isDirectory = TryGetNode(path, out var node)
+                ? node.IsDirectory
+                : Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : null;
+            _marks.SetAccent(path, accentHex, isDirectory);
         }
 
         ScheduleSave();
@@ -1933,10 +2086,51 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         return extent;
     }
 
+    /// <summary>
+    /// Set for the replacement of another program's Windows file dialog: its
+    /// camera and layout are never written, and the marks - a file the
+    /// everyday window writes too - only when a mark was changed in it, so a
+    /// dialog left open cannot put back an older copy of them.
+    /// </summary>
+    internal bool SuppressWrites
+    {
+        get => _suppressWrites;
+        set
+        {
+            if (value && !_suppressWrites)
+            {
+                _marks.MarkChanged += OnMarkChangedHere;
+            }
+
+            _suppressWrites = value;
+        }
+    }
+
+    private bool _suppressWrites;
+    private bool _marksChangedHere;
+
+    private void OnMarkChangedHere(string key, FolderMark mark) => _marksChangedHere = true;
+
     public async Task SaveAsync()
     {
         if (!_isInitialized || _isDisposed)
         {
+            return;
+        }
+
+        if (_suppressWrites)
+        {
+            if (_marksChangedHere)
+            {
+                try
+                {
+                    await _marks.SaveAsync();
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                }
+            }
+
             return;
         }
 
@@ -2000,6 +2194,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         Changes = null;
         _graph.GraphChanged -= OnGraphChanged;
         _graph.NodeCreated -= OnNodeCreated;
+        _graph.DriveAdded -= OnDriveAdded;
         _fillTimer.Stop();
         _graph.LayoutChanged -= OnLayoutChanged;
         _marks.MarkChanged -= OnMarkChanged;
@@ -2147,13 +2342,33 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// thread); something selected that was renamed within the folder is
     /// selected under its new name - as Explorer keeps a renamed item selected
     /// - and whatever mark the old name carried moves with it.
+    ///
+    /// The renames are taken as the chain they are.  A name a safe-save gives
+    /// back later in the same change is still the item the user knows by it:
+    /// an editor's safe-save renames the document to a backup and its new
+    /// copy to the document's name, and the selection and the mark stay with
+    /// the name, not with the backup about to be deleted - only taking the
+    /// spelling it was given back in, should that differ.  Any other chain -
+    /// a swap, a batch rename's shift - is items moving, and they are followed.
     /// </summary>
     private void FollowChangeWithSelection(in FolderChange change)
     {
         if (!change.Renames.IsEmpty)
         {
-            foreach (var pair in change.Renames.Span)
+            var renames = change.Renames.Span;
+            for (var index = 0; index < renames.Length; index++)
             {
+                var pair = renames[index];
+                if (NamedAgain(renames, index) is { } again)
+                {
+                    if (!string.Equals(again, pair.OldName, StringComparison.Ordinal))
+                    {
+                        FollowRename(Path.Combine(change.Key, pair.OldName), Path.Combine(change.Key, again));
+                    }
+
+                    continue;
+                }
+
                 FollowRename(Path.Combine(change.Key, pair.OldName), Path.Combine(change.Key, pair.NewName));
             }
         }
@@ -2162,6 +2377,48 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         {
             _ = PruneSelectionAsync(change.Key);
         }
+    }
+
+    /// <summary>
+    /// The name a later rename of the same change gives back to the old name
+    /// of rename <paramref name="index"/>, spelt as it gives it, when the two
+    /// are a safe-save; null otherwise.  A safe-save's backup stays where it
+    /// was put and its new copy comes from nowhere else in the change: a
+    /// backup that moves on, or a copy that was itself renamed in, is an item
+    /// moving - a swap, or a batch rename's shift or its two passes through
+    /// temporary names - and the mark and the selection follow the item.
+    /// </summary>
+    private static string? NamedAgain(ReadOnlySpan<RenamePair> renames, int index)
+    {
+        var backup = renames[index].NewName;
+        for (var other = 0; other < renames.Length; other++)
+        {
+            if (other != index && string.Equals(renames[other].OldName, backup, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+        }
+
+        for (var later = index + 1; later < renames.Length; later++)
+        {
+            if (!string.Equals(renames[later].NewName, renames[index].OldName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var copy = renames[later].OldName;
+            for (var other = 0; other < renames.Length; other++)
+            {
+                if (other != later && string.Equals(renames[other].NewName, copy, StringComparison.OrdinalIgnoreCase))
+                {
+                    return null;
+                }
+            }
+
+            return renames[later].NewName;
+        }
+
+        return null;
     }
 
     /// <summary>What <paramref name="path"/> is called once <paramref name="oldPath"/> is <paramref name="newPath"/>: null when it is not that or inside it.</summary>
@@ -2242,7 +2499,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             // spelling.
             _marks.SetAccent(path, null);
             _marks.SetNote(path, null);
-            _marks.SetAccent(moved, mark.AccentHex);
+            _marks.SetAccent(moved, mark.AccentHex, mark.IsDirectory);
             _marks.SetNote(moved, mark.Note);
         }
     }
@@ -2768,7 +3025,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
 
         if (node is null)
         {
-            if (!Directory.Exists(path) && !File.Exists(path))
+            // Asked off this thread, and gone only when the disk says it is
+            // not there: a share that has stopped answering would hold the
+            // window up for as long as the network takes to say so, and what
+            // is selected in it is not to be let go of meanwhile.
+            if (await IsGoneAsync(path) && !_isDisposed)
             {
                 Selection.Remove([path], SelectionSource.Command);
                 if (Path.GetDirectoryName(path) is { Length: > 0 } parent)
@@ -2783,6 +3044,29 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         SetActive(node, records);
         SyncSelectionMirror();
     }
+
+    /// <summary>
+    /// Whether <paramref name="path"/> is certainly no longer on disk, asked
+    /// on the thread pool.  Only "not found" says so: a share that does not
+    /// answer, or an item that may not be looked at, is still there as far
+    /// as anyone can tell - where Exists would answer false for both.
+    /// </summary>
+    private static Task<bool> IsGoneAsync(string path) => Task.Run(() =>
+    {
+        try
+        {
+            _ = File.GetAttributes(path);
+            return false;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
+    });
 
     /// <summary>The focus moves to <paramref name="node"/>, as a navigation or not.</summary>
     private void SetActive(ViewAllNodeViewModel node, bool records)
@@ -2968,20 +3252,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>
     /// The nodes the editor keeps whatever the culling says: the selected
     /// ones in view - a rubber band over thousands of nodes must not force a
-    /// container for each one off screen - and the focus.
+    /// container for each one off screen - and the focus.  Only the graph's
+    /// own: a node its folder let go of when it was read again would stay on
+    /// the canvas as a ghost where the item used to be.
     /// </summary>
     private List<ViewAllNodeViewModel> AlwaysRealized(Rect viewport)
     {
         var realized = new List<ViewAllNodeViewModel>();
         foreach (var node in SelectedNodes)
         {
-            if (node.IsTreeVisible && node.HasLayoutPosition && viewport.IntersectsWith(node.Bounds))
+            if (node.IsTreeVisible && node.HasLayoutPosition && viewport.IntersectsWith(node.Bounds) && IsLive(node))
             {
                 realized.Add(node);
             }
         }
 
-        if (_activeNode is { IsTreeVisible: true } active && !realized.Contains(active))
+        if (_activeNode is { IsTreeVisible: true } active && IsLive(active) && !realized.Contains(active))
         {
             realized.Add(active);
         }
@@ -3061,6 +3347,17 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         var node = selected == 1 && TryGetNode(Selection.Paths[0], out var only) ? only : ActiveNode;
+        if (selected == 1 && node is not null && !ViewAllPath.Equals(node.FullPath, Selection.Paths[0])
+            && Selection.TryGetItem(Selection.Paths[0], out var item))
+        {
+            // The one item selected has no node - picked on the nested canvas -
+            // and the focus is on another, one a Ctrl+click let go of: the bar
+            // names the item Delete and F2 act on.
+            StatusCountText = item.IsDirectory ? "1 item selected" : $"1 item selected  ·  {FileSystemService.FormatSize(item.Size)}";
+            StatusPathText = item.Path;
+            return;
+        }
+
         if (node is null)
         {
             StatusCountText = $"{LogicalNodeCount:N0} nodes";

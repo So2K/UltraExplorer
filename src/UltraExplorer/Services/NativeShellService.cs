@@ -20,6 +20,7 @@ public sealed class NativeShellService
 
     public static void Open(string path)
     {
+        if (Directory.Exists(path) && ExplorerLaunchRouter.TryOpenFolder(path)) return;
         Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
     }
 
@@ -122,8 +123,18 @@ public sealed class NativeShellService
     public static void OpenWith(string path)
         => ExecuteShellVerb(path, "openas");
 
+    /// <summary>
+    /// Windows Explorer itself on <paramref name="path"/> - a folder opened,
+    /// anything else selected in its folder - for the commands that name it:
+    /// never routed into UltraExplorer, even while folders open through it
+    /// (<see cref="ExplorerLaunchRouter.OpenExplorerByName"/>).
+    /// </summary>
+    public static void ShowInWindowsExplorer(string path)
+        => ExplorerLaunchRouter.OpenExplorerByName(path, select: !Directory.Exists(path));
+
     public static void ShowInExplorer(string path)
     {
+        if (Directory.Exists(path) ? ExplorerLaunchRouter.TryOpenFolder(path) : ExplorerLaunchRouter.TryReveal([path])) return;
         var args = Directory.Exists(path)
             ? $"/e,\"{path}\""
             : $"/select,\"{path}\"";
@@ -230,14 +241,23 @@ public sealed class NativeShellService
     /// </summary>
     public Task CopyOrMoveAsync(IEnumerable<string> sources, string targetDirectory, bool move)
     {
-        var sourceArray = sources
-            .Where(PathExists)
+        var requested = sources.ToArray();
+        ThrowIfAnyNameEndDropped(requested, move ? "moved" : "copied");
+        ThrowIfAnyNameEndDropped([targetDirectory], move ? "moved into" : "copied into");
+        var distinct = requested
             .Distinct(StringComparer.OrdinalIgnoreCase)
-
-            // Into the folder it is already in: nothing to do, and the Shell
-            // would only say that the source and the destination are the same.
-            .Where(source => !PathsEqual(source, Path.Combine(targetDirectory, Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar)))))
             .ToArray();
+
+        // Into the folder it is already in.  Moved, there is nothing to do,
+        // and the Shell would only say that the source and the destination
+        // are the same.  Copied, it is copied beside itself - "report -
+        // Copy.docx" - as Explorer's paste does: in an operation of its own
+        // that names the copies, so a clash of anything else is still asked
+        // about rather than renamed.
+        bool InTarget(string source) =>
+            PathsEqual(source, Path.Combine(targetDirectory, Path.GetFileName(source.TrimEnd(Path.DirectorySeparatorChar))));
+        var sourceArray = distinct.Where(source => !InTarget(source)).ToArray();
+        string[] beside = move ? [] : [.. distinct.Where(InTarget)];
 
         // Moved, an item inside another one moved with it is gone by the time
         // the Shell comes to it (see WithoutNested).
@@ -246,20 +266,37 @@ public sealed class NativeShellService
             sourceArray = WithoutNested(sourceArray);
         }
 
-        if (sourceArray.Length == 0)
+        if (sourceArray.Length == 0 && beside.Length == 0)
         {
             return Task.CompletedTask;
         }
 
-        ThrowIfAnyRoot(sourceArray, move ? "moved" : "copied");
-        Directory.CreateDirectory(targetDirectory);
+        ThrowIfAnyRoot([.. sourceArray, .. beside], move ? "moved" : "copied");
         var owner = OwnerWindowHandle();
-        return RunStaAsync(() => RunShellOperation(
-            owner,
-            move ? FileOperation.Move : FileOperation.Copy,
-            sourceArray,
-            targetDirectory,
-            FileOperationFlags.AllowUndo | FileOperationFlags.NoConnectedElements));
+        const FileOperationFlags flags = FileOperationFlags.AllowUndo | FileOperationFlags.NoConnectedElements;
+
+        // What asks the disk - each item still there, the target made - on
+        // the operation's own thread (see OperationItemExists).
+        return RunStaAsync(() =>
+        {
+            var present = sourceArray.Where(OperationItemExists).ToArray();
+            var presentBeside = beside.Where(OperationItemExists).ToArray();
+            if (present.Length == 0 && presentBeside.Length == 0)
+            {
+                return;
+            }
+
+            Directory.CreateDirectory(targetDirectory);
+            if (present.Length > 0)
+            {
+                RunShellOperation(owner, move ? FileOperation.Move : FileOperation.Copy, present, targetDirectory, flags);
+            }
+
+            if (presentBeside.Length > 0)
+            {
+                RunShellOperation(owner, FileOperation.Copy, presentBeside, targetDirectory, flags | FileOperationFlags.RenameOnCollision);
+            }
+        });
     }
 
     /// <summary>
@@ -271,7 +308,9 @@ public sealed class NativeShellService
     /// </summary>
     public Task DeleteAsync(IEnumerable<string> paths, bool permanently)
     {
-        var pathArray = WithoutNested(paths.Where(PathExists).Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
+        var requested = paths.ToArray();
+        ThrowIfAnyNameEndDropped(requested, "deleted");
+        var pathArray = WithoutNested(requested.Distinct(StringComparer.OrdinalIgnoreCase).ToArray());
         if (pathArray.Length == 0)
         {
             return Task.CompletedTask;
@@ -283,11 +322,23 @@ public sealed class NativeShellService
                 ? FileOperationFlags.NoConfirmation
                 : FileOperationFlags.AllowUndo | FileOperationFlags.WantNukeWarning);
         var owner = OwnerWindowHandle();
-        return RunStaAsync(() => RunShellOperation(owner, FileOperation.Delete, pathArray, null, flags));
+
+        // Whether each item is still there is asked on the operation's own
+        // thread (see OperationItemExists).
+        return RunStaAsync(() =>
+        {
+            var present = pathArray.Where(OperationItemExists).ToArray();
+            if (present.Length > 0)
+            {
+                RunShellOperation(owner, FileOperation.Delete, present, null, flags);
+            }
+        });
     }
 
     public Task<string> DuplicateAsync(string path)
-        => RunStaAsync(() =>
+    {
+        ThrowIfAnyNameEndDropped([path], "duplicated");
+        return RunStaAsync(() =>
         {
             var target = GetDuplicatePath(path);
             if (Directory.Exists(path))
@@ -301,6 +352,7 @@ public sealed class NativeShellService
 
             return target;
         });
+    }
 
     public static string Rename(string path, string newName)
     {
@@ -309,6 +361,7 @@ public sealed class NativeShellService
             throw new ArgumentException("The name contains characters that Windows does not allow.", nameof(newName));
         }
 
+        ThrowIfAnyNameEndDropped([path], "renamed");
         var parent = Path.GetDirectoryName(path) ?? throw new InvalidOperationException("The parent folder is unavailable.");
         var target = Path.Combine(parent, newName.Trim());
 
@@ -335,6 +388,7 @@ public sealed class NativeShellService
 
     public static string CreateFolder(string parentPath, string requestedName)
     {
+        ThrowIfAnyNameEndDropped([parentPath], "added to");
         var name = string.IsNullOrWhiteSpace(requestedName) ? "New folder" : requestedName.Trim();
         if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
         {
@@ -354,8 +408,21 @@ public sealed class NativeShellService
 
     public static string CreateNoteFile(string parentPath, string requestedName)
     {
+        ThrowIfAnyNameEndDropped([parentPath], "added to");
         var name = string.IsNullOrWhiteSpace(requestedName) ? "New note.txt" : requestedName.Trim();
-        if (!Path.HasExtension(name))
+
+        // A file's name, as a folder's is: a colon would make a stream of
+        // another file, and a separator a file in another folder.
+        if (name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+        {
+            throw new ArgumentException("The file name contains invalid characters.");
+        }
+
+        // What follows the last dot is an extension only when it reads as
+        // one: "Notes 10.03" and "Plan v2. draft" are names, and get .txt
+        // like a name without a dot, so the file opens as text.
+        var typed = Path.GetExtension(name);
+        if (typed.Length < 2 || typed.Contains(' ') || !typed.Skip(1).Any(char.IsLetter))
         {
             name += ".txt";
         }
@@ -403,6 +470,15 @@ public sealed class NativeShellService
     public sealed record ClipboardPayload(string[] Paths, bool Cut);
 
     private static bool PathExists(string path) => File.Exists(path) || Directory.Exists(path);
+
+    /// <summary>
+    /// How a copy, a move or a delete asks whether each item it was given is
+    /// still there.  Thousands of items on a share are as many questions to
+    /// the network, so they are asked on the operation's own thread, never the
+    /// UI thread every window of the process shares.  A test puts its own
+    /// answer here to see where it is asked.
+    /// </summary>
+    internal static Func<string, bool> OperationItemExists { get; set; } = PathExists;
 
     /// <summary>
     /// <paramref name="paths"/> without any that lie inside another of them.
@@ -474,6 +550,29 @@ public sealed class NativeShellService
         {
             throw new IOException($"{root} is the root of a drive and cannot be {verb}.");
         }
+    }
+
+    /// <summary>
+    /// A name ending in a dot or a space - "dup.", "notes " - which a WSL
+    /// tree, git or a share can leave.  Windows drops the dot or the space
+    /// from every name of a path it is handed, so the Shell, and .NET's own
+    /// file calls with it, would reach "dup" - another item, or none: delete
+    /// it, rename it, move it, or put something in it.  The whole operation
+    /// is refused before anything is touched, as for a root.
+    /// </summary>
+    private static void ThrowIfAnyNameEndDropped(IEnumerable<string> paths, string verb)
+    {
+        if (paths.FirstOrDefault(Models.ViewAllPath.EndsANameInDotOrSpace) is not { } path)
+        {
+            return;
+        }
+
+        var names = Path.TrimEndingDirectorySeparator(path).Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries);
+        var name = names.Length > 0 ? names[^1] : path;
+        var folder = names.SkipLast(1).FirstOrDefault(part => part[^1] is '.' or ' ');
+        throw new IOException(folder is null
+            ? $"{name} cannot be {verb}: its name ends in a dot or a space, which Windows drops, so the operation would reach another item."
+            : $"{name} cannot be {verb}: the folder {folder} on its way ends in a dot or a space, which Windows drops, so the operation would reach another item.");
     }
 
     /// <summary>
@@ -637,6 +736,7 @@ public sealed class NativeShellService
     [Flags]
     private enum FileOperationFlags : ushort
     {
+        RenameOnCollision = 0x0008,
         NoConfirmation = 0x0010,
         AllowUndo = 0x0040,
         NoConnectedElements = 0x2000,

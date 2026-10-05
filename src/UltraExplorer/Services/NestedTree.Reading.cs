@@ -247,6 +247,12 @@ public sealed partial class NestedTree
     /// <summary>A folder was dropped from the tree: gone from a refreshed listing, replaced, or its root removed.</summary>
     partial void OnForgotten(NestedFolder folder);
 
+    /// <summary>
+    /// A folder's first read was queued, on the tree's own thread: what is
+    /// heard in it from now on reaches it, even before the read is applied.
+    /// </summary>
+    partial void OnFirstReadQueued(NestedFolder folder);
+
     /// <summary>The drives and roots are about to be replaced by <paramref name="roots"/>; nothing has changed yet.</summary>
     partial void OnRootsChanging(IReadOnlyList<NestedRoot> roots);
 
@@ -272,7 +278,8 @@ public sealed partial class NestedTree
         var frame = Frame;
         folder.LastDrawnFrame = frame;
         folder.LastDrawnWidth = (float)priority;
-        if (folder.IsComputer || folder.IsReparsePoint && !folder.IsLoaded || !IsReadingOnDemand || _disposed)
+        if (folder.IsComputer || folder.IsReparsePoint && !folder.IsLoaded || !IsReadingOnDemand || _disposed
+            || folder.HasPartialListing && PartialListingReadAllowed?.Invoke(folder) == false)
         {
             return;
         }
@@ -292,11 +299,16 @@ public sealed partial class NestedTree
 
             case NestedLoadState.NotLoaded:
                 Enqueue(folder, ReadKind.Load);
+                OnFirstReadQueued(folder);
                 break;
 
             // A share that did not answer, a drive that was not ready: worth
             // another try once in a while.  Access denied is not.
-            case NestedLoadState.Failed when folder.IsRetryable && Stopwatch.GetElapsedTime(folder.FailedAt).TotalSeconds > 20:
+            // A real change received after the failure is new evidence: a
+            // removed folder may have been recreated, or a device returned.
+            // Without one, transient failures retain the normal retry delay.
+            case NestedLoadState.Failed when folder.NeedsRefresh
+                || folder.IsRetryable && Stopwatch.GetElapsedTime(folder.FailedAt).TotalSeconds > 20:
                 Enqueue(folder, ReadKind.Load);
                 break;
         }
@@ -331,8 +343,14 @@ public sealed partial class NestedTree
             foreach (var segment in target[current.FullPath.Length..].Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries))
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                await LoadAsync(current, cancellationToken);
                 var next = FindChild(current, segment);
+                // A named path can already exist as a sparse physical chain.
+                // Resolving beacons/selection must not enumerate its ancestors.
+                if (next is null)
+                {
+                    await LoadAsync(current, cancellationToken);
+                    next = FindChild(current, segment);
+                }
                 if (next is null && !refreshed && current.IsLoaded)
                 {
                     // Asked for a folder the listing does not have: it may
@@ -363,10 +381,12 @@ public sealed partial class NestedTree
     /// <summary>
     /// Reads one folder now, unless it already has been, and completes when
     /// the read is applied: queued ahead of whatever the canvas asks for, or
-    /// joined if a read of it is already on its way.  Cancelled, a read that
-    /// has not started is taken off the queue, and one under way is left to
-    /// finish unapplied - the folder is unread again at once, as before it was
-    /// asked for.
+    /// joined if a read of it is already on its way.  A folder whose read
+    /// failed is read again only once something changed in it or around it
+    /// (<see cref="NestedFolder.NeedsRefresh"/>), as when it is drawn.
+    /// Cancelled, a read that has not started is taken off the queue, and one
+    /// under way is left to finish unapplied - the folder is unread again at
+    /// once, as before it was asked for.
     /// </summary>
     public Task LoadAsync(NestedFolder folder, CancellationToken cancellationToken = default)
     {
@@ -385,7 +405,8 @@ public sealed partial class NestedTree
         ReadWaiter waiter;
         lock (_gate)
         {
-            if (folder.LoadState is NestedLoadState.Loaded or NestedLoadState.Failed)
+            if (folder.LoadState is NestedLoadState.Loaded
+                || folder.LoadState is NestedLoadState.Failed && !folder.NeedsRefresh)
             {
                 return Task.CompletedTask;
             }
@@ -397,6 +418,7 @@ public sealed partial class NestedTree
         }
 
         waiter.Listen();
+        OnFirstReadQueued(folder);
         return waiter.Task;
     }
 
@@ -889,6 +911,54 @@ public sealed partial class NestedTree
         return (children, removed);
     }
 
+    /// <summary>
+    /// Of the sub-folders a listing matched again does not name, the ones
+    /// named after its read began - a navigation to a folder just made,
+    /// described by name while its parent was being read.  The listing was
+    /// taken before they were there, and cannot say they have gone: they are
+    /// kept, with whatever was found below them, until a read that began
+    /// after them says otherwise.
+    /// </summary>
+    /// <param name="basis">The sub-folders as the read began.</param>
+    /// <param name="children">The sub-folders the listing names.</param>
+    /// <param name="removed">The sub-folders the listing dropped or replaced.</param>
+    private static NestedFolder[] NamedSince(NestedFolder[] basis, NestedFolder[] children, NestedFolder[] removed)
+    {
+        List<NestedFolder>? named = null;
+        HashSet<NestedFolder>? before = null;
+        HashSet<string>? listed = null;
+        foreach (var child in removed)
+        {
+            before ??= [.. basis];
+            if (before.Contains(child))
+            {
+                continue;
+            }
+
+            // One the listing names as something else - a link now, or
+            // hidden - is replaced by what the listing says, as ever.
+            listed ??= new HashSet<string>(children.Select(listedChild => listedChild.Name), StringComparer.Ordinal);
+            if (!listed.Contains(child.Name))
+            {
+                (named ??= []).Add(child);
+            }
+        }
+
+        return named is null ? [] : [.. named];
+    }
+
+    /// <summary>The sub-folders a listing names with the ones named since its read began, in the listing's order.</summary>
+    private static NestedFolder[] WithNamedSince(NestedFolder[] children, NestedFolder[] namedSince)
+    {
+        NestedFolder[] all = [.. children, .. namedSince];
+        Array.Sort(all, static (left, right) =>
+        {
+            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
+            return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
+        });
+        return all;
+    }
+
     // ---- applying --------------------------------------------------------------
 
     /// <summary>
@@ -996,9 +1066,16 @@ public sealed partial class NestedTree
         // The listing was matched against the children as they were when the
         // read started.  If something replaced them meanwhile, match again
         // against what is there now; it is rare, and correctness beats speed.
+        NestedFolder[] namedSince = [];
         if (!ReferenceEquals(read.Basis, folder.AllChildren))
         {
             var (children, removed) = Prepare(folder, folder.AllChildren, listing);
+            namedSince = NamedSince(read.Basis, children, removed);
+            if (namedSince.Length > 0)
+            {
+                removed = [.. removed.Where(child => Array.IndexOf(namedSince, child) < 0)];
+            }
+
             read = read with { Children = children, Removed = removed, Basis = folder.AllChildren };
         }
 
@@ -1008,24 +1085,34 @@ public sealed partial class NestedTree
             Forget(removed);
         }
 
-        _knownCount += read.Children.Length - read.Basis.Length;
+        _knownCount += read.Children.Length + namedSince.Length - read.Basis.Length;
 
         // A folder still there keeps its object, with everything read below
         // it, but its date is whatever the new listing says.  Set here on the
         // UI thread, which owns the folders, rather than while preparing.
+        // One whose own read failed - gone when it was read, as a build tool
+        // deletes and makes again its output - is named by the listing again:
+        // whatever made it fail may have passed, and it is read again when
+        // it is next drawn or asked for, as after any change seen in it.
         var entries = listing.Folders;
         for (var index = 0; index < read.Children.Length; index++)
         {
-            read.Children[index].ModifiedTicks = entries[index].ModifiedTicks;
+            var child = read.Children[index];
+            child.ModifiedTicks = entries[index].ModifiedTicks;
+            if (child.LoadState == NestedLoadState.Failed)
+            {
+                child.IsStale = true;
+            }
         }
 
-        folder.AllChildren = read.Children;
+        folder.AllChildren = namedSince.Length == 0 ? read.Children : WithNamedSince(read.Children, namedSince);
         folder.AllFiles = listing.Files as NestedFile[] ?? [.. listing.Files];
         folder.FileCount = listing.FileCount;
         folder.HiddenFileCount = listing.HiddenFileCount;
         folder.IsTruncated = listing.IsTruncated;
         folder.ErrorMessage = string.Empty;
         folder.LoadState = NestedLoadState.Loaded;
+        folder.HasPartialListing = false;
         ApplyVisibleChildren(folder);
         AfterApply(folder, read);
 

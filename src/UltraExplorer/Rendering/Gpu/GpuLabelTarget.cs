@@ -23,9 +23,9 @@ namespace UltraExplorer.Rendering.Gpu;
 /// distance field in the <see cref="GlyphAtlas"/>.  Width, height and the
 /// point where a long name is cut are the ones WPF's FormattedText gives -
 /// the same fonts, the same kerning, CharacterEllipsis at the same character,
-/// even the same coarse steps of room the WPF path lays its trimmed texts out
-/// in - so the canvas's layout decisions, which read those numbers, are the
-/// same whichever target draws.  A name the shaper has not finished - a
+/// with the actual available width at every scale. The shaped run stays
+/// cached in em units; changing the camera never reshapes it. A name the
+/// shaper has not finished - a
 /// script the UI font lacks, or one past the frame's budget of new names
 /// while the camera moves (<see cref="MotionShapeBudget"/>) - is left out
 /// for the frame, as a name WPF had no layout budget for was, and drawn when
@@ -34,8 +34,8 @@ namespace UltraExplorer.Rendering.Gpu;
 /// <para><b>Icons.</b> One slice of the process's <see cref="IconAtlas"/> per
 /// file type (a program's or shortcut's own where it has one), sampled
 /// through its mips.  A type whose icon is not known yet is drawn without it,
-/// the name moved left - exactly what the WPF path does - and drawn with it
-/// when it arrives.</para>
+/// retaining its reserved slot, and drawn with it when it arrives without
+/// moving the filename.</para>
 ///
 /// <para><b>Motion.</b> While the camera moves, text and icons sit at their
 /// exact sub-pixel places and glide.  At rest (<c>snap</c>) the baseline and
@@ -179,6 +179,21 @@ internal sealed class GpuLabelTarget : LabelTarget
         _sink = default;
     }
 
+    /// <summary>
+    /// Whether <paramref name="frame"/>'s names were drawn by this target on
+    /// its card with atlas views that are no longer the textures' own: the
+    /// glyph and icon arrays are shared by every canvas on the card, and when
+    /// another one's frame grew one, the old view was let go.  A frame that
+    /// presented only its scene with it would bind nothing in its place, and
+    /// every name and icon would vanish; the names are drawn again first,
+    /// which hands the frame the views there are now.
+    /// </summary>
+    public bool ViewsOutOfDate(NestedGpuFrame frame) =>
+        _devices is not null
+        && ReferenceEquals(frame.LabelDevices, _devices)
+        && (_glyphTexture is { } glyphs && frame.GlyphView is not null && !ReferenceEquals(frame.GlyphView, glyphs.View)
+            || _iconTexture is { } icons && frame.IconView is not null && !ReferenceEquals(frame.IconView, icons.View));
+
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public override LabelText Text(string text, double size, Color ink, double maxWidth, LabelFace face, bool scaled)
     {
@@ -199,7 +214,7 @@ internal sealed class GpuLabelTarget : LabelTarget
         var natural = shaped.Width * size;
         var cut = !(maxWidth < 10_000) || natural <= maxWidth
             ? shaped.Whole
-            : shaped.Trim((float)(TrimRoom(size, maxWidth, scaled) / size));
+            : shaped.Trim((float)(maxWidth / size));
         return new LabelText(
             shaped,
             cut.Width * size,
@@ -314,24 +329,6 @@ internal sealed class GpuLabelTarget : LabelTarget
 
         _frame = null;
         _sink = default;
-    }
-
-    /// <summary>
-    /// The room a trimmed name is cut to: what the WPF path's layout of it
-    /// actually has.  That path lays names out at a ladder of sizes, four to
-    /// an octave, and keeps trimmed layouts by their room in steps of 8 DIPs
-    /// at the ladder size (6 for names of a fixed size), rounded down - so a
-    /// name is cut where WPF cuts it, not a character later.
-    /// </summary>
-    private static double TrimRoom(double size, double maxWidth, bool scaled)
-    {
-        var level = scaled
-            ? Math.Pow(2, Math.Round(Math.Log2(size) * 4) / 4)
-            : Math.Round(size * 4) / 4;
-        var scale = scaled ? size / level : 1;
-        var step = scaled ? 8 : 6;
-        var steps = Math.Max(0, (int)Math.Floor(maxWidth / scale / step));
-        return Math.Max(1, steps * step) * scale;
     }
 
     private void AddRounded(Rect bounds, double radius, Color colour)

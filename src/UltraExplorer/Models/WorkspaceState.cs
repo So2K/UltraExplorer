@@ -70,6 +70,9 @@ public sealed class WorkspaceState
     /// <summary>Whether the one-time hint that left-drag now selects has been shown.</summary>
     public bool NestedLeftDragHintShown { get; set; }
 
+    /// <summary>Optional round favorite links above This PC; missing settings keep the existing view.</summary>
+    public bool ShowFavoriteLinks { get; set; }
+
     /// <summary>
     /// The canvas layers switched off, by name - "Files", "Icons", "Details",
     /// "FolderCounts", "Marks" (see <see cref="CanvasLayers"/>).  Missing or

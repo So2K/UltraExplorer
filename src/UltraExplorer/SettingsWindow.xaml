@@ -306,6 +306,15 @@
                     </Border>
                 </controls:SettingCard>
 
+                <controls:SettingCard Glyph="&#xE734;"
+                                      Header="Favorite shortcuts"
+                                      Description="Round links above This PC on the nested canvas for your standard and favorite folders. Double-click to move the camera to a folder.">
+                    <CheckBox x:Name="FavoriteLinksSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowFavoriteLinks, Mode=TwoWay}"
+                              AutomationProperties.Name="Show favorite shortcuts" />
+                </controls:SettingCard>
+
                 <controls:SettingCard Glyph="&#xF57C;"
                                       Header="Split view"
                                       Description="Two panes of the nested canvas, each at its own place on the disk. Ctrl+\ splits and unsplits, F6 goes to the other pane.">
@@ -316,12 +325,14 @@
                                              Style="{StaticResource SegmentRadio}"
                                              GroupName="SplitOrientation"
                                              Content="Side by side"
-                                             IsChecked="{Binding IsSplitSideBySide}" />
+                                             IsChecked="{Binding IsSplitSideBySide}"
+                                             Click="SplitOrientation_Click" />
                                 <RadioButton x:Name="SplitStackedChoice"
                                              Style="{StaticResource SegmentRadio}"
                                              GroupName="SplitOrientation"
                                              Content="Stacked"
-                                             IsChecked="{Binding IsSplitStacked}" />
+                                             IsChecked="{Binding IsSplitStacked}"
+                                             Click="SplitOrientation_Click" />
                             </StackPanel>
                         </Border>
                         <CheckBox x:Name="SplitSwitch"
@@ -556,6 +567,33 @@
                                          IsChecked="{Binding IsLeftDragPan}" />
                         </StackPanel>
                     </Border>
+                </controls:SettingCard>
+
+                <TextBlock Text="Windows Explorer" Style="{StaticResource SectionHeading}" />
+                <controls:SettingCard Glyph="&#xE8E5;"
+                                      Header="Use UltraExplorer throughout Windows"
+                                      Description="Open folders, show selected files, and use Open, Save, Export and folder dialogs through UltraExplorer. Browsing inside Windows Explorer stays there. Turning this off restores your previous folder-opening settings; Win+E has its own switch below."
+                                      Status="{Binding DialogIntegrationStatus}">
+                    <CheckBox x:Name="DialogReplacementChoice" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding IsDialogReplacementEnabled, Mode=TwoWay}"
+                              AutomationProperties.Name="Use UltraExplorer throughout Windows" />
+                </controls:SettingCard>
+                <controls:SettingCard Glyph="&#xE765;"
+                                      Header="Open UltraExplorer with Win+E"
+                                      Description="Press Win+E to open UltraExplorer, even when Use UltraExplorer throughout Windows is off. Turning this off returns Win+E to Windows Explorer."
+                                      Status="{Binding WinEShortcutStatus}">
+                    <CheckBox x:Name="WinEShortcutChoice" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding IsWinEShortcutEnabled, Mode=TwoWay}"
+                              AutomationProperties.Name="Open UltraExplorer with Win+E" />
+                </controls:SettingCard>
+                <controls:SettingCard Glyph="&#xE777;" Header="Restore Windows Explorer"
+                                      Description="Pause folder and dialog replacement, restore folder-opening settings and bring back any source window in progress. The Win+E shortcut keeps its own setting.">
+                    <Button Style="{StaticResource CardButton}" Content="Restore and pause"
+                            Command="{Binding RecoverDialogIntegrationCommand}" AutomationProperties.Name="Restore Windows dialogs" />
+                </controls:SettingCard>
+                <controls:SettingCard Glyph="&#xE713;" Header="Application exceptions" Description="{Binding DialogExceptionsDescription}">
+                    <Button Style="{StaticResource CardButton}" Content="Reset exceptions"
+                            Command="{Binding ResetDialogExceptionsCommand}" AutomationProperties.Name="Reset file dialog application exceptions" />
                 </controls:SettingCard>
 
                 <!-- About -->

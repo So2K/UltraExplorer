@@ -107,6 +107,7 @@ Type: files; Name: "{app}\SharpGen.Runtime*.dll"
 Source: "{#PublishDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Comment: "A file manager on a zoomable canvas"; AppUserModelID: "{#AppUserModelId}"
@@ -114,6 +115,12 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExe}"; WorkingDir: "{app
 
 [Run]
 Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+; Before the files go: any Open/Save dialog UltraExplorer is standing in for is
+; handed back to Windows, the replacement mode is switched off and its sign-in
+; start removed (docs/DIALOG_INTEGRATION.md), and its listener stops.
+Filename: "{app}\{#AppExe}"; Parameters: "--dialog-recover"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreWindowsDialogs"
 
 [Code]
 { The file-dialog classes (--register-picker) are removed with the copy they
@@ -128,11 +135,23 @@ begin
     RegDeleteKeyIncludingSubkeys(HKCU, Key);
 end;
 
+{ The sign-in start of the dialog replacement, should --dialog-recover not
+  have removed it already; again only when it starts this copy. }
+procedure RemoveDialogStart();
+var
+  Command: String;
+begin
+  if RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'UltraExplorer dialogs', Command) and
+     (Pos(Lowercase(ExpandConstant('{app}\{#AppExe}')), Lowercase(Command)) > 0) then
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'UltraExplorer dialogs');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
     RemovePickerClass('{#OpenDialogClassKey}');
     RemovePickerClass('{#SaveDialogClassKey}');
+    RemoveDialogStart();
   end;
 end;

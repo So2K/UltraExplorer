@@ -24,7 +24,8 @@ namespace UltraExplorer.Services.Watch;
 ///
 /// <para>One buffer of records at a time - a root has one watcher, and a
 /// watcher parses one buffer at a time - so the scratch buffers and the
-/// half-seen rename need no lock.  Nothing here allocates on a miss.</para>
+/// half-seen rename need no lock.  Nothing here allocates on a miss, but
+/// for a folder spelt with a short name: its long name, once per buffer.</para>
 /// </summary>
 internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChangeRecordSink
 {
@@ -36,6 +37,10 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
     private int _oldLeafLength;
     private bool _haveOld;
 
+    /// <summary>The folder of this buffer last looked up under its long name, as the records spell it, and that long name; null when there was none.</summary>
+    private string? _shortInner;
+    private string? _longInner;
+
     /// <summary>Records seen, and of those how many were for a registered folder: for tests and the bench.</summary>
     public long Records;
 
@@ -43,6 +48,9 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
 
     /// <summary>Records whose folder was found only under its long name.</summary>
     public long LongNameHits;
+
+    /// <summary>Times a long name was asked of the file system.</summary>
+    public long LongNameLookups;
 
     public void Record(in ChangeRecord record)
     {
@@ -137,7 +145,12 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
         }
     }
 
-    public void EndOfBuffer() => _haveOld = false;
+    public void EndOfBuffer()
+    {
+        _haveOld = false;
+        _shortInner = null;
+        _longInner = null;
+    }
 
     public void Overflowed(DirectoryChangeWatcher watcher) => hub.OnOverflow(root, watcher);
 
@@ -167,17 +180,44 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
     /// Looks <paramref name="inner"/> - a folder relative to the watched
     /// directory - up again under its long name, when some part of it looks
     /// like a short 8.3 name: a tilde and a digit in a part of at most twelve
-    /// characters.  Asks the file system, so only then.
+    /// characters.  Asks the file system, so only then, and once for a run of
+    /// records in the same folder: on a share the question is a round trip,
+    /// asked with the watch's lock held, and asked for every record of a
+    /// burst it held the share's changes up for hundreds of round trips.
     /// </summary>
     private bool TryLongName(ReadOnlySpan<char> inner, [NotNullWhen(true)] out object? keys)
     {
         keys = null;
-        if (!HasShortName(inner) || !root.Aliases[0].Compose(inner, ref _path, out var length))
+        if (!HasShortName(inner))
         {
             return false;
         }
 
+        if (_shortInner is null || !inner.Equals(_shortInner, StringComparison.Ordinal))
+        {
+            _shortInner = inner.ToString();
+            _longInner = LongInnerOf(inner);
+        }
+
+        if (_longInner is null || !root.TryFindInterest(_longInner, out keys))
+        {
+            return false;
+        }
+
+        LongNameHits++;
+        return true;
+    }
+
+    /// <summary>Where <paramref name="inner"/> is under the watched directory by its long name, asked of the file system; null when that cannot be told.</summary>
+    private string? LongInnerOf(ReadOnlySpan<char> inner)
+    {
+        if (!root.Aliases[0].Compose(inner, ref _path, out var length))
+        {
+            return null;
+        }
+
         _path[length] = '\0';
+        LongNameLookups++;
         uint found;
         fixed (char* shortPath = _path)
         fixed (char* longPath = _longPath)
@@ -198,18 +238,13 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
         var watched = root.WatchedPath;
         if (found == 0 || found >= _longPath.Length || found <= watched.Length)
         {
-            return false;
+            return null;
         }
 
         var longName = _longPath.AsSpan(0, (int)found);
-        if (!longName.StartsWith(watched, StringComparison.OrdinalIgnoreCase)
-            || !root.TryFindInterest(longName[watched.Length..].TrimEnd('\\'), out keys))
-        {
-            return false;
-        }
-
-        LongNameHits++;
-        return true;
+        return longName.StartsWith(watched, StringComparison.OrdinalIgnoreCase)
+            ? longName[watched.Length..].TrimEnd('\\').ToString()
+            : null;
     }
 
     /// <summary>Whether some part of <paramref name="path"/> looks like a short 8.3 name: NAME~1, PROGRA~2.TXT.</summary>

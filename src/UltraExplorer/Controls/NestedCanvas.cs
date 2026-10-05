@@ -420,6 +420,20 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     /// <summary>The camera moved.  Raised often; listeners debounce.</summary>
     public event Action? CameraChanged;
 
+    /// <summary>Pickers list all drives without reading their contents in the
+    /// overview. A root is read when the camera enters it or navigation opens it.</summary>
+    private bool _loadUnfocusedRoots = true;
+    public bool LoadUnfocusedRoots
+    {
+        get => _loadUnfocusedRoots;
+        set
+        {
+            if (_loadUnfocusedRoots == value) return;
+            _loadUnfocusedRoots = value;
+            RequestFrame(Layers.Scene);
+        }
+    }
+
     public NestedTree? Tree
     {
         get => _tree;
@@ -449,6 +463,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             // over or went down on.  Any of them would take the camera, or a
             // frame's walk, into a tree it is no longer drawing, whose This
             // PC is not the one the walk starts from.
+            _cameraRequest++;
             StopFlight();
             CancelMarquee();
             _anchor = null;

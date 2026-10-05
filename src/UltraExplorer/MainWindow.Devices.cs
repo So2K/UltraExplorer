@@ -24,6 +24,9 @@ public partial class MainWindow
     private bool _driveRescanRunning;
     private bool _driveRescanAgain;
 
+    /// <summary>Set when the drives changed before the nested canvas was ready: they are listed again once it is.</summary>
+    private bool _nestedDrivesMissed;
+
     /// <summary>Starts listening for volumes: called with the rest of the nested canvas's wiring, before the window has a handle.</summary>
     private void AttachDevices()
     {
@@ -93,6 +96,7 @@ public partial class MainWindow
     /// </summary>
     private async Task RescanDrivesAsync()
     {
+        if (_closeRequested) return;
         if (_driveRescanRunning)
         {
             _driveRescanAgain = true;
@@ -108,12 +112,17 @@ public partial class MainWindow
                 VolumeKinds.Invalidate();
                 _viewModel.Changes.InvalidateVolumes();
                 await _viewModel.RefreshDrivesAsync();
+                if (_closeRequested) return;
                 if (!_nestedReady)
                 {
+                    // The canvas copies the drives as it starts, maybe before
+                    // this change: it is listed again for once it is ready.
+                    _nestedDrivesMissed = true;
                     continue;
                 }
 
                 var roots = await new ViewAllFileSystemService().GetDriveRootsAsync();
+                if (_closeRequested) return;
                 _nestedDrives.Clear();
                 _nestedDrives.AddRange(roots.Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
                 SyncNestedRoots();
@@ -162,8 +171,11 @@ internal enum DeviceChange
 /// (DBT_DEVICEQUERYREMOVEFAILED) it is armed again; when the drive has gone
 /// (DBT_DEVICEREMOVECOMPLETE) the watch is dropped.  FileSystemWatcher never
 /// did the first of these, which is why "Safely remove" failed with a folder
-/// of the drive on screen.  Watches are armed on any thread; the
-/// notifications are registered on the window's.
+/// of the drive on screen.  A volume being locked or dismounted - Format,
+/// chkdsk /f, Eject on a card - is told on the same handle (DBT_CUSTOMEVENT),
+/// and the watch is suspended until the lock goes or the volume is mounted
+/// again.  Watches are armed on any thread; the notifications are registered
+/// on the window's.
 /// </summary>
 internal sealed class VolumeNotifications : IDisposable
 {
@@ -171,9 +183,18 @@ internal sealed class VolumeNotifications : IDisposable
     private const int DbtDeviceQueryRemove = 0x8001;
     private const int DbtDeviceQueryRemoveFailed = 0x8002;
     private const int DbtDeviceRemoveComplete = 0x8004;
+    private const int DbtCustomEvent = 0x8006;
     private const int DbtDevTypeVolume = 2;
     private const int DbtDevTypeHandle = 6;
     private const int DeviceNotifyWindowHandle = 0;
+
+    // What locking, dismounting and mounting a volume tell those holding it (ioevent.h).
+    private static readonly Guid VolumeLock = new("50708874-c9af-11d1-8fef-00a0c9a06d32");
+    private static readonly Guid VolumeLockFailed = new("ae2eed10-0ba8-11d2-8ffb-00a0c9a06d32");
+    private static readonly Guid VolumeUnlock = new("9a8c3d68-d0cb-11d1-8fef-00a0c9a06d32");
+    private static readonly Guid VolumeDismount = new("d16a55e8-1059-11d2-8ffd-00a0c9a06d32");
+    private static readonly Guid VolumeDismountFailed = new("e3c5b178-105d-11d2-8ffd-00a0c9a06d32");
+    private static readonly Guid VolumeMount = new("b5804878-1a96-11d2-8ffd-00a0c9a06d32");
 
     private readonly ChangeHub _hub;
     private readonly Dispatcher _dispatcher;
@@ -269,6 +290,38 @@ internal sealed class VolumeNotifications : IDisposable
                 Unregister(root);
                 _hub.Drop(root);
                 return DeviceChange.WatchDropped;
+
+            case DbtCustomEvent:
+                return OnVolumeEvent(root, handle.EventGuid);
+        }
+
+        return DeviceChange.None;
+    }
+
+    /// <summary>
+    /// A custom event about a watched volume.  Locking a volume - Format,
+    /// chkdsk /f, Eject on a card, BitLocker - or dismounting it tells those
+    /// holding it first, and fails with "in use" while anything still does:
+    /// the watch is suspended, which closes its handle before this returns,
+    /// and the notification stays for what follows.  The lock failing or let
+    /// go, the dismount failing, or the volume mounted again arms it again on
+    /// a new handle - a watch suspended so, and no other: one that is up keeps
+    /// its handle and its notification.
+    /// </summary>
+    private DeviceChange OnVolumeEvent(WatchRoot root, Guid kind)
+    {
+        if (kind == VolumeLock || kind == VolumeDismount)
+        {
+            _hub.Suspend(root);
+            return DeviceChange.WatchSuspended;
+        }
+
+        if ((kind == VolumeLockFailed || kind == VolumeUnlock || kind == VolumeDismountFailed || kind == VolumeMount)
+            && root.State == WatchState.Suspended)
+        {
+            Unregister(root);
+            _hub.Rearm(root);
+            return DeviceChange.WatchRearmed;
         }
 
         return DeviceChange.None;
@@ -322,7 +375,15 @@ internal sealed class VolumeNotifications : IDisposable
         }
         else
         {
-            _dispatcher.BeginInvoke(() => Unregister(root));
+            // Asked again when it runs: Windows may have asked whether the
+            // drive can go meanwhile, and the notification brings the answer.
+            _dispatcher.BeginInvoke(() =>
+            {
+                if (root.State != WatchState.Suspended)
+                {
+                    Unregister(root);
+                }
+            });
         }
     }
 

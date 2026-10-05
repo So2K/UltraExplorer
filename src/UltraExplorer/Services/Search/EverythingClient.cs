@@ -50,6 +50,9 @@ internal sealed class EverythingClient
     private const uint WmClose = 0x0010;
     private const uint WmDestroy = 0x0002;
 
+    /// <summary><c>MSGFLT_ALLOW</c>: a window's message filter lets the message through from a lower integrity level.</summary>
+    private const uint MessageFilterAllow = 1;
+
     /// <summary><c>EVERYTHING_IPC_COPYDATA_QUERY2W</c>: a Unicode query with the reply as a list of requested columns.</summary>
     private const nint CopyDataQuery2 = 18;
 
@@ -514,6 +517,15 @@ internal sealed class EverythingClient
             _window = CreateWindowExW(0, name, name, 0, 0, 0, 0, 0, -3, 0, instance, 0);
         }
 
+        // Run as administrator, this process is above an Everything running
+        // as the user, and Windows drops a message sent up from below unless
+        // the window takes it: every reply would be lost, every query wait
+        // its five seconds and then walk.  As Everything's own SDK does.
+        if (_window != 0)
+        {
+            ChangeWindowMessageFilterEx(_window, WmCopyData, MessageFilterAllow, 0);
+        }
+
         ready.Set();
         if (_window == 0)
         {
@@ -675,6 +687,9 @@ internal sealed class EverythingClient
 
     [DllImport("user32.dll")]
     private static extern int DestroyWindow(nint window);
+
+    [DllImport("user32.dll")]
+    private static extern int ChangeWindowMessageFilterEx(nint window, uint message, uint action, nint changeFilter);
 
     [DllImport("user32.dll")]
     private static extern void PostQuitMessage(int exitCode);

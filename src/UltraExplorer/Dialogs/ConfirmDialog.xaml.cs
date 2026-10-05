@@ -5,12 +5,21 @@ namespace UltraExplorer.Dialogs;
 
 public partial class ConfirmDialog : Window
 {
-    public ConfirmDialog(string title, string message, string confirmLabel = "Delete")
+    /// <param name="danger">
+    /// Whether the confirming button is drawn red, for what destroys
+    /// something; otherwise it is the usual accent button, as opening files is.
+    /// </param>
+    public ConfirmDialog(string title, string message, string confirmLabel = "Delete", bool danger = true)
     {
         InitializeComponent();
         TitleText.Text = title;
         MessageText.Text = message;
         ConfirmButton.Content = confirmLabel;
+        if (!danger)
+        {
+            ConfirmButton.ClearValue(BackgroundProperty);
+            ConfirmButton.ClearValue(ForegroundProperty);
+        }
     }
 
     /// <summary>

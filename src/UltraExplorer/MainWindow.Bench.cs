@@ -151,6 +151,28 @@ public partial class MainWindow
         SwitchValue("--nested-bench") is not null || SwitchValue("--nested-snapshots") is not null;
 
     /// <summary>
+    /// A benchmark or snapshot run started without <c>ULTRAEXPLORER_STATE_DIR</c>
+    /// is given a new state folder of its own, as if it had been started with
+    /// one.  On the user's own it saved what it forces - the nested canvas,
+    /// the folder list hidden, names from A in every folder - over the user's
+    /// layout, default order and every folder's own, and the next start
+    /// showed everything sorted by name.  Run as the module loads, before
+    /// anything asks where the state is: <see cref="Infrastructure.AppPaths"/>
+    /// settles that once, and the application's start asks long before this
+    /// window exists.
+    /// </summary>
+    [System.Runtime.CompilerServices.ModuleInitializer]
+    internal static void IsolateDiagnosticsState()
+    {
+        if (IsDiagnosticsRun && Environment.GetEnvironmentVariable(Infrastructure.AppPaths.StateDirectoryVariable) is null)
+        {
+            Environment.SetEnvironmentVariable(
+                Infrastructure.AppPaths.StateDirectoryVariable,
+                Path.Combine(Path.GetTempPath(), "UltraExplorer-isolated-" + Guid.NewGuid().ToString("N")));
+        }
+    }
+
+    /// <summary>
     /// True for a copy started beside the everyday one to try a build
     /// (<c>ULTRAEXPLORER_TEST_WINDOW=1</c>): it opens where a diagnostics run
     /// would and, like it, never becomes the active window - the start-up path

@@ -15,13 +15,18 @@ public sealed class WorkspaceStore
     private readonly string _statePath;
 
     /// <summary>
-    /// One save at a time.  Every save goes through the same temporary file,
-    /// and two in flight at once - a save put off until the window is idle,
-    /// and the one made on closing - would have the second fail on the first's
-    /// open file and be dropped, although it holds the newer state.  Taking
-    /// turns, the one started last is also the one written last.
+    /// One save at a time.  Two in flight at once - a save put off until the
+    /// window is idle, and the one made on closing - could land in either
+    /// order; taking turns, the one started last is also the one written last.
     /// </summary>
     private readonly SemaphoreSlim _saving = new(1, 1);
+
+    /// <summary>
+    /// The file's turn among every store over it, in this process and in
+    /// others: the same name for the same file.  Two saves moved onto one
+    /// name at the same moment fail, one of them, with access denied.
+    /// </summary>
+    private readonly string _turnName;
 
     /// <param name="statePath">Where the workspace is kept; the user's state folder unless a test says otherwise.</param>
     /// <remarks>
@@ -33,6 +38,8 @@ public sealed class WorkspaceStore
     public WorkspaceStore(string? statePath = null)
     {
         _statePath = statePath ?? AppPaths.State("workspace.json");
+        _turnName = @"Local\UltraExplorer.Workspace." + Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(_statePath.ToUpperInvariant())));
     }
 
     /// <summary>
@@ -78,6 +85,7 @@ public sealed class WorkspaceStore
 
     public async Task<WorkspaceState?> LoadAsync(CancellationToken cancellationToken = default)
     {
+        StateFiles.SweepTemporaries(_statePath, hidden: false);
         if (!File.Exists(_statePath))
         {
             return null;
@@ -105,7 +113,13 @@ public sealed class WorkspaceStore
     public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
     {
         await _saving.WaitAsync(cancellationToken);
-        var tempPath = _statePath + ".tmp";
+
+        // A temporary file of this save's own: another store over the same
+        // workspace - a picker's in this process, another process's - saves
+        // at the same moment too, and through one shared name the second
+        // failed on the first's open file, or deleted it on the way out, and
+        // both saves were lost.
+        var tempPath = _statePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
@@ -123,7 +137,7 @@ public sealed class WorkspaceStore
                 await Task.Run(() => stream.Flush(flushToDisk: true), cancellationToken);
             }
 
-            File.Move(tempPath, _statePath, true);
+            Replace(tempPath);
         }
         catch
         {
@@ -141,6 +155,147 @@ public sealed class WorkspaceStore
         finally
         {
             _saving.Release();
+        }
+    }
+
+    /// <summary>
+    /// Reads the workspace as it is now, hands it to <paramref name="merge"/>
+    /// and writes what that gives back, all in the file's turn among every
+    /// store over it, in this process and in others: another window's save
+    /// cannot land between this one's reading and its writing, to be written
+    /// over with the file as it was before it.  <paramref name="merge"/> is
+    /// given null for a workspace that is not there or cannot be read, and
+    /// gives back null to write nothing.  It runs on a thread of its own -
+    /// the turn is a mutex, which belongs to the thread that took it - so it
+    /// must touch nothing of the window's.  A turn not had within three
+    /// seconds is gone ahead without, as a save does (see <see cref="Replace"/>).
+    /// </summary>
+    public async Task UpdateAsync(Func<WorkspaceState?, WorkspaceState?> merge, CancellationToken cancellationToken = default)
+    {
+        await _saving.WaitAsync(cancellationToken);
+        try
+        {
+            await Task.Run(() => Update(merge), cancellationToken);
+        }
+        finally
+        {
+            _saving.Release();
+        }
+    }
+
+    private void Update(Func<WorkspaceState?, WorkspaceState?> merge)
+    {
+        Mutex? turn = null;
+        var entered = false;
+        try
+        {
+            try
+            {
+                turn = new Mutex(false, _turnName);
+                entered = turn.WaitOne(TimeSpan.FromSeconds(3));
+            }
+            catch (AbandonedMutexException) { entered = true; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException) { }
+
+            if (merge(Read()) is not { } state)
+            {
+                return;
+            }
+
+            var tempPath = _statePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
+
+                // On disk before the move, as a save is (see SaveAsync).
+                using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 16 * 1024))
+                {
+                    JsonSerializer.Serialize(stream, state, JsonOptions);
+                    stream.Flush(flushToDisk: true);
+                }
+
+                File.Move(tempPath, _statePath, true);
+            }
+            catch
+            {
+                try
+                {
+                    File.Delete(tempPath);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // The next save writes over it.
+                }
+
+                throw;
+            }
+        }
+        finally
+        {
+            if (entered)
+            {
+                turn!.ReleaseMutex();
+            }
+
+            turn?.Dispose();
+        }
+    }
+
+    /// <summary>The workspace as it is now, for <see cref="Update"/>; null as <see cref="LoadAsync"/> gives it.</summary>
+    private WorkspaceState? Read()
+    {
+        if (!File.Exists(_statePath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(_statePath);
+            return JsonSerializer.Deserialize<WorkspaceState>(stream, JsonOptions);
+        }
+        catch (JsonException)
+        {
+            StateFiles.Quarantine(_statePath);
+            return null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Moves a written save onto the workspace in the file's turn.  The turn
+    /// is held only for the move; a store that hangs while it holds it is
+    /// waited for three seconds at most, and one made by an elevated copy
+    /// cannot be opened from here - either way the move then goes ahead as
+    /// it always did.
+    /// </summary>
+    private void Replace(string tempPath)
+    {
+        Mutex? turn = null;
+        var entered = false;
+        try
+        {
+            try
+            {
+                turn = new Mutex(false, _turnName);
+                entered = turn.WaitOne(TimeSpan.FromSeconds(3));
+            }
+            catch (AbandonedMutexException) { entered = true; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException) { }
+
+            File.Move(tempPath, _statePath, true);
+        }
+        finally
+        {
+            if (entered)
+            {
+                turn!.ReleaseMutex();
+            }
+
+            turn?.Dispose();
         }
     }
 }

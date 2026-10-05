@@ -25,7 +25,16 @@ internal sealed record SearchSnapshot(
     SearchSource Source,
     bool IsFinal,
     string Status,
-    double ElapsedMilliseconds);
+    double ElapsedMilliseconds)
+{
+    /// <summary>
+    /// A walk that stands in for an Everything that had its index loaded and
+    /// still did not answer - a query too slow for it, a reply that never
+    /// came.  Waiting for it to be ready would only ask it again, fail again
+    /// and walk every drive again, for as long as the panel is open.
+    /// </summary>
+    public bool EverythingFailed { get; init; }
+}
 
 /// <summary>
 /// Runs a search over every drive, the folder it is made from first
@@ -94,6 +103,7 @@ internal sealed class SearchEngine
         }
 
         here = SearchRanking.Normalize(here);
+        var failed = false;
         if (EverythingClient.IsDatabaseLoaded)
         {
             var answered = await AskEverythingAsync(query, here, publish, cancellationToken).ConfigureAwait(false);
@@ -101,10 +111,16 @@ internal sealed class SearchEngine
             {
                 return;
             }
+
+            failed = true;
         }
 
         string reason;
-        if (EverythingClient.IsRunning)
+        if (failed)
+        {
+            reason = "Everything did not answer - walking folders.";
+        }
+        else if (EverythingClient.IsRunning)
         {
             reason = "Everything is still reading the drives - walking folders meanwhile.";
         }
@@ -121,7 +137,7 @@ internal sealed class SearchEngine
             reason = "Walking folders. Install Everything (voidtools.com) for instant results.";
         }
 
-        await WalkAsync(query, here, reason, publish, cancellationToken).ConfigureAwait(false);
+        await WalkAsync(query, here, reason, failed, publish, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<bool> AskEverythingAsync(SearchQuery query, string? here, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
@@ -195,24 +211,16 @@ internal sealed class SearchEngine
         return true;
     }
 
-    private async Task WalkAsync(SearchQuery query, string? here, string reason, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
+    private async Task WalkAsync(SearchQuery query, string? here, string reason, bool everythingFailed, Action<SearchSnapshot> publish, CancellationToken cancellationToken)
     {
         var clock = Stopwatch.StartNew();
         var substs = Substs();
-        var roots = DriveInfo.GetDrives()
-            .Where(drive => drive.DriveType == DriveType.Fixed && drive.IsReady)
-            .Select(drive => drive.RootDirectory.FullName)
-            .Where(root => !substs.Any(subst => root.StartsWith(subst.Letter, StringComparison.OrdinalIgnoreCase)))
-            .ToArray();
-
-        // What the folder searched from stands for, when it is on a subst
-        // letter: its files are walked under that spelling, not again under
-        // the other.
-        var skip = new List<string>();
-        if (here is not null && SubstTargetOf(here, substs) is { } target)
-        {
-            skip.Add(target);
-        }
+        var (roots, skip) = WalkPlan(
+            here,
+            DriveInfo.GetDrives()
+                .Where(drive => drive.DriveType == DriveType.Fixed && drive.IsReady)
+                .Select(drive => drive.RootDirectory.FullName),
+            substs);
 
         var walk = new FolderWalk(query, WalkLimit);
         var running = walk.RunAsync(here, roots, skip, cancellationToken);
@@ -240,7 +248,10 @@ internal sealed class SearchEngine
                 var status = finished
                     ? $"{hits.Count:N0} found{(walk.IsFull ? " (stopped at the limit)" : string.Empty)} · {walk.FoldersRead:N0} folders in {clock.Elapsed.TotalSeconds:0.0} s · {reason}"
                     : $"Searching… {walk.FoldersRead:N0} folders read · {reason}";
-                publish(new SearchSnapshot([.. hits], hereTotal, hits.Count - hereTotal, SearchSource.Walk, finished, status, clock.Elapsed.TotalMilliseconds));
+                publish(new SearchSnapshot([.. hits], hereTotal, hits.Count - hereTotal, SearchSource.Walk, finished, status, clock.Elapsed.TotalMilliseconds)
+                {
+                    EverythingFailed = everythingFailed,
+                });
             }
 
             if (finished)
@@ -248,6 +259,29 @@ internal sealed class SearchEngine
                 return;
             }
         }
+    }
+
+    /// <summary>
+    /// Where a walk goes: every drive in <paramref name="drives"/> but the
+    /// subst letters, which show the same files as the folders they stand
+    /// for - except the letter the search is made from under.  That one is
+    /// walked, all of it, under the spelling the search was made in, and the
+    /// folder it stands for is left out (<c>Skip</c>) instead: taking out
+    /// both, the rest of the letter was walked under neither.
+    /// </summary>
+    internal static (string[] Roots, string[] Skip) WalkPlan(string? here, IEnumerable<string> drives, IReadOnlyList<(string Letter, string Target)> substs)
+    {
+        var hereLetter = here is null ? null : substs.FirstOrDefault(subst => here.StartsWith(subst.Letter, StringComparison.OrdinalIgnoreCase)).Letter;
+        var roots = drives
+            .Where(root => !substs.Any(subst => root.StartsWith(subst.Letter, StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(subst.Letter, hereLetter, StringComparison.OrdinalIgnoreCase)))
+            .ToArray();
+
+        // What the folder searched from stands for, when it is on a subst
+        // letter: its files are walked under that spelling, not again under
+        // the other.
+        string[] skip = here is not null && SubstTargetOf(here, substs) is { } target ? [target] : [];
+        return (roots, skip);
     }
 
     /// <summary>

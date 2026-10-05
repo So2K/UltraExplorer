@@ -2104,13 +2104,32 @@ internal static partial class Program
             // ---- a slice shares its allowance with placing on demand ----
             tree.SetSort(new ItemSort(SortColumn.Size, false));
             var drive = tree.Find(@"P:\")!;
-            var placing = Stopwatch.StartNew();
+            var placingTicks = 0L;
+            var realPlacings = 0;
+            var wantedTicks = Stopwatch.Frequency * 12 / 1000;
             var next = byLevel.Count - 1;
-            while (placing.Elapsed.TotalMilliseconds < 12 && next > 0)
+            while (placingTicks < wantedTicks && next > 1)
             {
-                tree.EnsureLayout(byLevel[next--]);
+                var folder = byLevel[next--];
+                // A loop's wall time includes stamp-only folders, collection
+                // pauses between calls and scheduling. None of that consumes
+                // the pass's shared allowance. Count only calls that must
+                // really reorder at least two files for the changed sort.
+                var reordersFiles = folder.Files.Count >= 2
+                    && folder.LayoutSortGeneration != tree.SortGeneration
+                    && folder.PlacedSort != tree.SortOf(folder);
+                var started = reordersFiles ? Stopwatch.GetTimestamp() : 0;
+                tree.EnsureLayout(folder);
+                if (reordersFiles)
+                {
+                    placingTicks += Stopwatch.GetTimestamp() - started;
+                    realPlacings++;
+                }
             }
 
+            var placedMilliseconds = placingTicks * 1000.0 / Stopwatch.Frequency;
+            Check($"the shared-budget fixture performs more than a 4 ms slice of real file placing ({placedMilliseconds:0.0} ms, {realPlacings:N0} folders)",
+                placedMilliseconds > 4 && drive.LayoutSortGeneration != tree.SortGeneration);
             queue.Dequeue()();
             Check("after more than a slice's worth of placing on demand, the next slice places nothing and waits a frame",
                 drive.LayoutSortGeneration != tree.SortGeneration && tree.IsSorting && queue.Count == 1);
@@ -2118,6 +2137,12 @@ internal static partial class Program
             Check("and the slice after it goes on as usual", drive.LayoutSortGeneration == tree.SortGeneration);
 
             // ---- one announcement, at the end ----
+            // The shared-budget fixture has already placed many folders and
+            // consumed two slices. Its remainder can fit in one slice after
+            // the runtime warms up. Observe a complete new pass, including
+            // its first slice, rather than depending on that remainder's size.
+            tree.FlushSortWork();
+            RunSlices(queue);
             var changes = 0;
             var early = false;
             void Changed(object? sender, EventArgs e)
@@ -2127,6 +2152,7 @@ internal static partial class Program
             }
 
             tree.Changed += Changed;
+            tree.SetSort(new ItemSort(SortColumn.Type, true));
             var slices = RunSlices(queue);
 
             tree.Changed -= Changed;

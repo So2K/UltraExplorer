@@ -197,6 +197,12 @@ internal static partial class Program
             slots.All(folder => folder.LoadState == NestedLoadState.Loading)
             && new[] { a, b, c, d }.All(folder => folder.LoadState == NestedLoadState.Queued));
 
+        // Loading reserves a slot before its pool thread has entered the
+        // reader. Wait for those readers before resetting their log, or a
+        // delayed busy read is mistaken for the next queue choice.
+        await WaitUntil(() => slots.All(folder => disk.ReadsOf(folder.FullPath) > 0), 3_000);
+        Check("the order fixture has every reserved worker waiting in the reader",
+            slots.All(folder => disk.ReadsOf(folder.FullPath) > 0));
         disk.ClearOrder();
         var picked = new List<string>();
         for (var step = 1; step <= 4; step++)
@@ -253,6 +259,9 @@ internal static partial class Program
         tree.BeginFrame();
         tree.BeginFrame();
         tree.BeginFrame();
+        await WaitUntil(() => folders[..busy.Length].All(folder => disk.ReadsOf(folder.FullPath) > 0), 3_000);
+        Check("the expiry fixture has every reserved worker waiting in the reader",
+            folders[..busy.Length].All(folder => disk.ReadsOf(folder.FullPath) > 0));
         disk.ClearOrder();
         disk.Gate.Release(1);
         await WaitUntil(() => disk.Order.Length >= 1, 3_000);

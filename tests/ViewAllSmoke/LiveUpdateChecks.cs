@@ -360,9 +360,13 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(goneList, "x.txt"), "x");
             await tree.FolderList.NavigateAsync(goneList);
             await LiveWait(() => !tree.FolderList.IsLoading && tree.FolderList.Items.Count == 1, 2_000);
+            // Where the list ends up is what counts: the tree may take it there
+            // first - the selected folder gone, the focus moves up - before the
+            // list's own look for the folder above (counted in
+            // ListSearchReviewChecks, where nothing else can move the list).
             Directory.Delete(goneList, recursive: true);
             times = await LiveTimes(3_000, () => tree.FolderList.FolderPath.Equals(other, StringComparison.OrdinalIgnoreCase));
-            Check($"the list's folder deleted, the list goes to the folder above in {times[0]} ms", times[0] is >= 0 and <= 1_500 && tree.FolderList.LeftGoneFolders >= 1);
+            Check($"the list's folder deleted, the list goes to the folder above in {times[0]} ms ({tree.FolderList.LeftGoneFolders} by its own look)", times[0] is >= 0 and <= 1_500);
 
             // ---- the list merges: rows kept are the same rows, new ones fade in ----------------
             await tree.FolderList.NavigateAsync(clamp);

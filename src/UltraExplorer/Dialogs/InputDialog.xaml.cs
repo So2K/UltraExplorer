@@ -5,7 +5,13 @@ namespace UltraExplorer.Dialogs;
 
 public partial class InputDialog : Window
 {
-    public InputDialog(string title, string prompt, string initialValue)
+    /// <param name="selectStem">
+    /// Picks out the text before its last dot, so typing replaces a file's
+    /// name and keeps its extension.  Off, the whole text is picked out - for
+    /// a folder's name or a note, where what follows a dot is no extension:
+    /// "Photos 2024.06" renamed by typing "Archive" is "Archive".
+    /// </param>
+    public InputDialog(string title, string prompt, string initialValue, bool selectStem = true)
     {
         InitializeComponent();
         TitleText.Text = title;
@@ -14,7 +20,7 @@ public partial class InputDialog : Window
         Loaded += (_, _) =>
         {
             ValueTextBox.Focus();
-            var extensionIndex = initialValue.LastIndexOf('.');
+            var extensionIndex = selectStem ? initialValue.LastIndexOf('.') : -1;
             ValueTextBox.Select(0, extensionIndex > 0 ? extensionIndex : initialValue.Length);
         };
     }

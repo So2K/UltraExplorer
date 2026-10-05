@@ -31,6 +31,7 @@ public partial class MainWindow
 {
     private bool _applyingListSelection;
     private bool _listUserInput;
+    private bool _listSelectAll;
 
     private void AttachSelection()
     {
@@ -75,7 +76,19 @@ public partial class MainWindow
     /// selection it is, takes it in - its headers, and its canvas unless the
     /// change is the canvas's own or the canvas is not the picture on show.
     /// </summary>
-    private void OnSharedSelectionChanged(ItemSelection selection) => ActivePane.OnSharedSelectionChanged(selection);
+    private void OnSharedSelectionChanged(ItemSelection selection)
+    {
+        ActivePane.OnSharedSelectionChanged(selection);
+        if (IsPickerMode && IsNested && _picker is { } session)
+        {
+            if (selection.Focus is { } focus && selection.TryGetItem(focus, out var item))
+            {
+                if (!item.IsDirectory) session.CurrentFolder = Path.GetDirectoryName(item.Path) ?? session.CurrentFolder;
+                else if (selection.LastSource == SelectionSource.Navigation) session.CurrentFolder = item.Path;
+            }
+            session.ReportSelection(selection.Items);
+        }
+    }
 
     private void OnShellPropertyChangedForSelection(object? sender, PropertyChangedEventArgs e)
     {
@@ -140,34 +153,116 @@ public partial class MainWindow
             return;
         }
 
-        var anchor = (FolderListItems.AnchorRow as FolderListItem)?.FullPath;
-        var focus = FocusedListRow()?.FullPath
-            ?? (e.AddedItems.Count > 0 ? (e.AddedItems[e.AddedItems.Count - 1] as FolderListItem)?.FullPath : null)
-            ?? anchor;
-        var edit = (Keyboard.Modifiers & ModifierKeys.Control) != 0
-            ? new SelectionEdit
-            {
-                Container = folder,
-                Added = ItemsOf(e.AddedItems),
-                Removed = [.. e.RemovedItems.OfType<FolderListItem>().Select(row => row.FullPath)],
-                Anchor = anchor,
-                Focus = focus,
-                Source = SelectionSource.List
-            }
-            : new SelectionEdit
-            {
-                Clear = true,
-                Container = folder,
-                Added = ItemsOf(FolderListItems.SelectedItems),
-                Anchor = anchor,
-                Focus = focus,
-                Source = SelectionSource.List
-            };
+        var edit = ListEdit(
+            _viewModel.Tree.Selection,
+            folder,
+            e.AddedItems,
+            e.RemovedItems,
+            FolderListItems.SelectedItems,
+            FolderListItems.AnchorRow as FolderListItem,
+            FocusedListRow(),
+            Keyboard.Modifiers,
+            _listSelectAll);
 
         using (list.HoldFolder())
         {
             _viewModel.Tree.Selection.Apply(edit);
         }
+    }
+
+    /// <summary>
+    /// The edit one change of the list box's selection makes of the shared
+    /// <paramref name="selection"/>: the rows selected, with Ctrl only what
+    /// was added and removed.  Select-all is every row in place of what was
+    /// selected, Ctrl or not.
+    ///
+    /// <para>The rows are counted in <paramref name="folder"/>, the list's,
+    /// only while they are in it: the next folder's name is up before its
+    /// rows are read, and a row of the one before picked meanwhile is in its
+    /// own folder.</para>
+    /// </summary>
+    internal static SelectionEdit ListEdit(
+        ItemSelection selection,
+        string folder,
+        IList added,
+        IList removed,
+        IList selected,
+        FolderListItem? anchorRow,
+        FolderListItem? focusedRow,
+        ModifierKeys modifiers,
+        bool selectAll)
+    {
+        // The list box moves its anchor only once the click or the key has
+        // been handled, after it has told of the change: a click, a
+        // Ctrl+click or an arrow puts it on the row with the focus, while
+        // Shift and Select-all leave it where it is.
+        var keepsAnchor = (modifiers & ModifierKeys.Shift) != 0 || selectAll;
+        var anchor = (keepsAnchor ? anchorRow : focusedRow ?? anchorRow)?.FullPath;
+        var focus = focusedRow?.FullPath
+            ?? (added.Count > 0 ? (added[added.Count - 1] as FolderListItem)?.FullPath : null)
+            ?? anchor;
+        if ((modifiers & ModifierKeys.Control) == 0 || selectAll)
+        {
+            return new SelectionEdit
+            {
+                Clear = true,
+                Container = RowsAreIn(folder, selected) ? folder : null,
+                Added = ItemsOf(selected),
+                Anchor = anchor,
+                Focus = focus,
+                Source = SelectionSource.List
+            };
+        }
+
+        // Rows added inside a folder that is selected itself - the folder
+        // gone into, which going there selects - take that folder and every
+        // selected folder above it out: kept, a Delete or a Move would act on
+        // the whole folder rather than on what was picked in it.
+        List<string> taken = [.. removed.OfType<FolderListItem>().Select(row => row.FullPath)];
+        var above = added.Count > 0 && TakeFoldersAbove(selection, folder, taken);
+        return new SelectionEdit
+        {
+            Container = !above && RowsAreIn(folder, added) && RowsAreIn(folder, removed) ? folder : null,
+            Added = ItemsOf(added),
+            Removed = taken,
+            Anchor = anchor,
+            Focus = focus,
+            Source = SelectionSource.List
+        };
+    }
+
+    /// <summary>
+    /// Adds <paramref name="folder"/> and every folder above it that
+    /// <paramref name="selection"/> holds to <paramref name="removed"/>;
+    /// true when it held any.
+    /// </summary>
+    private static bool TakeFoldersAbove(ItemSelection selection, string folder, List<string> removed)
+    {
+        var any = false;
+        for (var at = folder; at.Length > 0; at = ItemSelection.ParentOf(at).ToString())
+        {
+            if (selection.Contains(at))
+            {
+                removed.Add(at);
+                any = true;
+            }
+        }
+
+        return any;
+    }
+
+    /// <summary>Whether every row is directly inside <paramref name="folder"/>.</summary>
+    private static bool RowsAreIn(string folder, IList rows)
+    {
+        foreach (var row in rows)
+        {
+            if (row is FolderListItem item && !ItemSelection.ParentOf(item.FullPath).Equals(folder, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     private static SelectionItem[] ItemsOf(IList rows)
@@ -226,10 +321,15 @@ public partial class MainWindow
     private void NoteListInput()
     {
         _listUserInput = true;
-        Dispatcher.InvokeAsync(() => _listUserInput = false, DispatcherPriority.Input);
+        Dispatcher.InvokeAsync(() => _listUserInput = _listSelectAll = false, DispatcherPriority.Input);
     }
 
-    private void OnFolderListPreviewKeyDown(object sender, KeyEventArgs e) => NoteListInput();
+    /// <summary>A key on the list, noted as the user's; Ctrl+A is the list box's Select-all.</summary>
+    private void OnFolderListPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        NoteListInput();
+        _listSelectAll = e.Key == Key.A && Keyboard.Modifiers == ModifierKeys.Control;
+    }
 
     private void OnFolderListPreviewMouseDown(object sender, MouseButtonEventArgs e) => NoteListInput();
 

@@ -21,6 +21,9 @@ internal static partial class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        if (args.Contains("--folder-router-fixture")) return FolderRouterFixture.Run(args);
+        if (args.Contains("--explorer-observer-probe")) return ExplorerObserverReadOnlyProbe(args).GetAwaiter().GetResult();
+        if (args.Contains("--native-dialog-fixture")) return NativeDialogFixture.Run(args);
         // The COM client is a separate job: it talks to a running UltraExplorer
         // through the dialog interfaces rather than exercising them in-process.
         if (args.Any(argument => argument.Equals("--com-client", StringComparison.OrdinalIgnoreCase)))
@@ -73,15 +76,34 @@ internal static partial class Program
         await Group(() => Marks(fixtureRoot));
         await Group(PickerFilters);
         await Group(PickerCommandLine);
+        await Group(() => FolderInvocationChecks(fixtureRoot));
+        await Group(FolderRouterChecks);
+        await Group(FolderRouteCacheChecks);
         await Group(PickerNames);
+        await Group(DialogIntegrationChecks);
+        await Group(DialogReadFixChecks);
+        await Group(WinEShortcutChecks);
+        await Group(KnownFolderNavigationChecks);
+        await Group(FavoriteLinkChecks);
+        await Group(LabelZoomChecks);
+        await Group(DeferredViewportReadChecks);
+        await Group(() => SparseLiveChecks(fixtureRoot));
+        await Group(TreeWatchStabilityChecks);
+        await Group(PickerFavoritePreferencesChecks);
+        await Group(ExplorerObserverChecks);
+        await Group(PickerTileChecks);
         await Group(() => PickerSessionRules(fixtureRoot));
         await Group(() => PickerValidation(fixtureRoot));
         await Group(() => PickerGraphRules(fixtureRoot));
+        await Group(() => PickerSessionComChecks(fixtureRoot));
         await Group(() => HiddenBranches(fixtureRoot));
         await Group(() => TidyLayout(fixtureRoot));
         await Group(() => Harness(fixtureRoot));
         await Group(TidyTree);
         await Group(FolderList);
+        await Group(FolderListStabilityChecks);
+        await Group(ViewModelLifetimeChecks);
+        await Group(MainSaveOrderingChecks);
         await Group(AddressBar);
         await Group(() => FolderColours(fixtureRoot));
         await Group(SearchChecks);
@@ -94,6 +116,7 @@ internal static partial class Program
         await Group(() => LightReveal(fixtureRoot));
         await Group(GpuIconAtlasChecks);
         await Group(GpuTextChecks);
+        await Group(GlyphDisposalChecks);
         await Group(GpuRectChecks);
         await Group(GpuLabelChecks);
         await Group(FrameWorkChecks);
@@ -107,20 +130,47 @@ internal static partial class Program
         await Group(WatchChecks);
         await Group(HubCoalesceChecks);
         await Group(LiveUpdateChecks);
+        await Group(TreeLiveWatchChecks);
         await Group(CameraMotionChecks);
         await Group(NestedCameraChecks);
         await Group(TransitionChecks);
         await Group(NestedSelectionChecks);
         await Group(ItemSelectionChecks);
+        await Group(SelectionSafetyChecks);
         await Group(FolderOrderChecks);
         await Group(LayerChecks);
         await Group(ShellMenuChecks);
         await Group(ReviewFixChecks);
+        await Group(DialogRuntimeReviewChecks);
+        await Group(ViewAllServiceChecks);
+        await Group(TreeCoreReviewChecks);
+        await Group(CanvasMiscReviewChecks);
         await Group(SplitPaneChecks);
+        await Group(MarksPersistenceChecks);
+        await Group(WorkspaceSaveRaceChecks);
+        await Group(DiagnosticsStateChecks);
+        await Group(ViewModelReviewChecks);
+        await Group(LoadMoreRefreshChecks);
+        await Group(AddressReviewChecks);
+        await Group(IconReviewFixChecks);
+        await Group(ExplorerObserverRegReviewChecks);
+        await Group(MenuFileOpsReviewChecks);
+        await Group(ArchiveDropChecks);
+        await Group(MainViewModelReviewChecks);
+        await Group(MainWindowReviewChecks);
+        await Group(TextGlyphReviewChecks);
+        await Group(ExplorerRoutingReviewChecks);
+        await Group(ListSearchReviewChecks);
+        await Group(CrossClusterRound2Checks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.
         await Group(SettingsChecks);
+        await Group(PickerSessionComWindowChecks);
+        await Group(ProxyPaneChecks);
+        await Group(CrossClusterReviewChecks);
+        await Group(TopReviewFixChecks);
+        await Group(DriveGateChecks);
     }
 
     /// <summary>

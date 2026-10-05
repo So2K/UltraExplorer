@@ -168,6 +168,9 @@ public sealed partial class NestedCanvas
                 MarkSelected(up.FullPath);
                 SelectRequested?.Invoke(up.FullPath, false);
                 FlyTo(up);
+
+                // The view is on the folder gone up to now: Ctrl+A fills it.
+                _selection.CurrentFolder = up;
                 return true;
             case Key.Left or Key.Right or Key.Up or Key.Down:
                 if (Neighbour(active, key) is not { } next)
@@ -353,12 +356,18 @@ public sealed partial class NestedCanvas
     {
         if (clickCount == 2 && !IsSpacePanArmed)
         {
-            if (HotspotAt(point) is not null)
+            if (HotspotAt(point) is { } shortcut)
             {
+                shortcut.DoubleClick?.Invoke();
                 return;
             }
 
-            if (PointerHit(point) is { } hit && !hit.Folder.IsComputer)
+            // Opened only when the first press was on it too: a first click
+            // on a beacon or a circle flies the view, and whatever has slid
+            // under the pointer since is not what was double-clicked.
+            if (_pressHotspot is null
+                && PointerHit(point) is { } hit && !hit.Folder.IsComputer
+                && _pressHit is { } first && ReferenceEquals(first.Folder, hit.Folder) && first.FileName == hit.FileName)
             {
                 OpenRequested?.Invoke(hit);
                 if (!hit.IsFile)
@@ -528,6 +537,7 @@ public sealed partial class NestedCanvas
         {
             Pan(point - _panLast);
             _panLast = point;
+            UserCameraMoved?.Invoke();
         }
 
         return true;
@@ -654,7 +664,23 @@ public sealed partial class NestedCanvas
             Pan(new Vector(0, delta * 0.8));
         }
 
+        UserCameraMoved?.Invoke();
         UpdateHover(point);
+    }
+
+    /// <summary>
+    /// The camera was moved by the user's own hand - the wheel, a drag that
+    /// pans, a zoom key - and not by a flight, a camera put back or a change
+    /// of size.  Raised after <see cref="CameraChanged"/> for the same move.
+    /// A file dialog takes the folder the user brings it to for where it is.
+    /// </summary>
+    public event Action? UserCameraMoved;
+
+    /// <summary>A zoom key or the window's zoom buttons: a step in or out about the middle of the view.</summary>
+    internal void ZoomStep(bool zoomIn)
+    {
+        ZoomBy(zoomIn ? 1.5 : 1 / 1.5);
+        UserCameraMoved?.Invoke();
     }
 
     /// <summary>For tests: what the press under way is, in words.</summary>
@@ -902,13 +928,19 @@ public sealed partial class NestedCanvas
         if (active is not { } current || current.FileIndex < 0 && (current.Folder.Parent is null || current.Folder.Index < 0))
         {
             // Nothing selected yet: start at the first folder in the one in
-            // view, or its first file if it holds only files.
-            if (_anchor is not null)
+            // view, or its first file if it holds only files.  The focus on
+            // an item that went - deleted, moved away - starts in the folder
+            // it was in instead, wherever the view is.
+            var start = active is null && _selection.Active is { Container: var left }
+                && !NestedTree.IsDetached(left) && NestedTree.IsOnCanvas(left)
+                ? left
+                : _anchor;
+            if (start is not null)
             {
-                Ensure(_anchor);
+                Ensure(start);
             }
 
-            return _anchor switch
+            return start switch
             {
                 { Children.Count: > 0 } anchor => (anchor.Children[0], -1),
                 { Files.Count: > 0 } anchor => (anchor, 0),

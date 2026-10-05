@@ -197,6 +197,7 @@ internal static partial class Program
             await SelectionGoneChecks(canvas, tree, disk);
             SelectionPendingChecks(tree);
             SelectionShareRootChecks();
+            await SelectionVisibilityRestoreChecks();
         }
         finally
         {
@@ -1322,6 +1323,90 @@ internal static partial class Program
     }
 
     // ---- waiting for a folder ----------------------------------------------------------------
+
+    /// <summary>A file type can hide every selected tile while retaining
+    /// the exact shared paths. Restoring matching tiles must restore their
+    /// highlights from the cached listing, without a read or a new edit.</summary>
+    private static async Task SelectionVisibilityRestoreChecks()
+    {
+        Section("nested selection: selected tiles returning from cached filters");
+        const string root = @"Q:\selection-filter";
+        var disk = new FakeDisk();
+        disk.AddFile(root, "alpha.txt", 1);
+        disk.AddFile(root, "beta.png", 2);
+        disk.AddFile(root, "hidden.txt", 3, hidden: true);
+        using var tree = new NestedTree(disk.Read) { IsReadingOnDemand = false };
+        tree.SetRoots([new NestedRoot(root, "filter", NestedFolderKind.Folder)]);
+        var folder = tree.Find(root)!;
+        await tree.LoadAsync(folder);
+        var canvas = new NestedCanvas { Tree = tree, FramesByHandForTests = true };
+        canvas.Measure(new Size(ViewWidth, ViewHeight));
+        canvas.Arrange(new Rect(0, 0, ViewWidth, ViewHeight));
+        canvas.UpdateLayout();
+        canvas.FlyTo(folder, 0.9, animated: false);
+        var shared = new ItemSelection();
+        var alpha = Path.Combine(root, "alpha.txt");
+        var beta = Path.Combine(root, "beta.png");
+        var hidden = Path.Combine(root, "hidden.txt");
+        var edits = 0;
+        canvas.SelectionCommitted += _ => edits++;
+        var reads = disk.Reads;
+        var changes = 0;
+        tree.Changed += (_, _) => changes++;
+        try
+        {
+            shared.ReplaceSingle(alpha, false, 1, SelectionSource.List);
+            canvas.LoadSelection(shared);
+            canvas.RecordSelectionForTests();
+            tree.FileNameFilter = name => name.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
+            canvas.RecordSelectionForTests();
+            Check("a file-type filter hides the selected tile and keeps its exact shared path waiting",
+                canvas.SelectedCount == 0 && canvas.SelectionState.HasPending
+                && shared.Paths.SequenceEqual([alpha]));
+            tree.FileNameFilter = name => name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
+            canvas.RecordSelectionForTests();
+            Check("returning to a matching type restores a lone selected highlight from cache",
+                Picked(canvas).SetEquals([alpha]) && !canvas.SelectionState.HasPending);
+
+            tree.FileNameFilter = null;
+            shared.Apply(new SelectionEdit
+            {
+                Clear = true,
+                Added = [new SelectionItem(alpha, false, 1), new SelectionItem(beta, false, 2)],
+                Anchor = alpha,
+                Focus = beta,
+                Source = SelectionSource.List
+            });
+            canvas.LoadSelection(shared);
+            tree.FileNameFilter = name => name.EndsWith(".txt", StringComparison.OrdinalIgnoreCase);
+            canvas.RecordSelectionForTests();
+            tree.FileNameFilter = name => name.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
+            canvas.RecordSelectionForTests();
+            Check("changing between types restores the newly matching part of a mixed selection",
+                Picked(canvas).SetEquals([beta]) && canvas.SelectionState.HasPending);
+            tree.FileNameFilter = null;
+            canvas.RecordSelectionForTests();
+            Check("All Files restores every selected tile and preserves the focus and anchor",
+                Picked(canvas).SetEquals([alpha, beta]) && !canvas.SelectionState.HasPending
+                && canvas.SelectionState.Anchor?.Path == alpha && canvas.SelectionState.Active?.Path == beta);
+
+            tree.IncludeHidden = true;
+            shared.ReplaceSingle(hidden, false, 3, SelectionSource.List);
+            canvas.LoadSelection(shared);
+            tree.IncludeHidden = false;
+            canvas.RecordSelectionForTests();
+            tree.IncludeHidden = true;
+            canvas.RecordSelectionForTests();
+            Check("a selected hidden tile returns when hidden entries are included again",
+                Picked(canvas).SetEquals([hidden]) && !canvas.SelectionState.HasPending);
+            Check("restoring selected visibility does not reread, alter shared paths, or emit recursive tree changes",
+                disk.Reads == reads && edits == 0 && changes == 9 && shared.Paths.SequenceEqual([hidden]));
+        }
+        finally
+        {
+            canvas.Tree = null;
+        }
+    }
 
     /// <summary>
     /// A selection the canvas holds only as items waiting for a folder it has

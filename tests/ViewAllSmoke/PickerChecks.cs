@@ -546,8 +546,12 @@ internal static partial class Program
                 FileFilter: FileDialogFilter.Parse("*.txt")));
             await graph.InitializeAsync();
 
-            var node = await Reveal(graph, root);
+            // TEMP is normally below hidden AppData. This check concerns
+            // picker filtering, not whether a hidden ancestor can be listed.
+            var node = await graph.AddRootAsync(root);
+            if (node is not null) await graph.ExpandAsync(node);
             Check("the folder opened", node is not null);
+            if (node is null) { graph.Dispose(); return; }
 
             var names = node!.Children.Select(child => child.DisplayName).ToArray();
             Check("a file the type matches is shown", names.Contains("readme.txt"));
