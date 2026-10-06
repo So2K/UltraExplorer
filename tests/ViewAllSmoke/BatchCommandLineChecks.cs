@@ -187,6 +187,17 @@ internal static partial class Program
             catch (Exception failure) when (failure is IOException or UnauthorizedAccessException)
             { error = failure; return false; }
         }
+        async Task<bool> Drop(string[] sources, string target, bool move)
+        {
+            Task<bool>? transfer = null;
+            var accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher,
+                () => Transfer(sources, target, move), pending => transfer = pending);
+            // Drop releases the source as soon as the actual Shell task ends,
+            // before the caller's error/refresh continuation. Observe that
+            // retained transfer too before inspecting its error in this fixture.
+            if (transfer is not null) await transfer;
+            return accepted;
+        }
         try
         {
             NativeShellService.OperationItemExists = path =>
@@ -196,24 +207,24 @@ internal static partial class Program
                 if (path == inaccessible) throw new UnauthorizedAccessException("Owned unavailable-source fixture");
                 return File.Exists(path) || Directory.Exists(path);
             };
-            var accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, () => Transfer([missing], destination, false));
+            var accepted = await Drop([missing], destination, false);
             Check("a disappeared sole source returns failed Drop without creating its target", !accepted
                 && error is FileNotFoundException && !Directory.Exists(destination));
             error = null;
-            accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, () => Transfer([present, missing], destination, false));
+            accepted = await Drop([present, missing], destination, false);
             Check("a mixed existing/missing batch fails before copying any existing source", !accepted
                 && error is FileNotFoundException && !Directory.Exists(destination) && File.ReadAllText(present) == "keep this source");
             error = null;
-            accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, () => Transfer([present, inaccessible], destination, true));
+            accepted = await Drop([present, inaccessible], destination, true);
             Check("an inaccessible source cannot become successful Move completion", !accepted
                 && error is UnauthorizedAccessException && !Directory.Exists(destination) && File.Exists(present));
             error = null;
             var before = probes;
-            accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, () => Transfer([present], folder, true));
+            accepted = await Drop([present], folder, true);
             Check("a same-target move remains an intentional validated no-op", accepted && error is null
                 && probes > before && File.ReadAllText(present) == "keep this source");
             error = null;
-            accepted = ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, () => Transfer([missing], folder, true));
+            accepted = await Drop([missing], folder, true);
             Check("a missing same-target move is not mistaken for that intentional no-op", !accepted && error is FileNotFoundException);
             Check("requested-source availability is checked off the caller's dispatcher", probes >= 7 && !onUi);
         }
