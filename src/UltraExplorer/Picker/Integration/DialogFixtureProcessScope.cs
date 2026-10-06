@@ -49,10 +49,19 @@ internal sealed class DialogFixtureProcessScope
     {
         var state = Environment.GetEnvironmentVariable("ULTRAEXPLORER_STATE_DIR");
         if (string.IsNullOrWhiteSpace(state)) return false;
+        // AppPaths already expands variables, strips quotes and rejects an
+        // unusable override. Comparing the raw environment spelling admitted
+        // "%LOCALAPPDATA%\\UltraExplorer" even while the app used real state.
+        return IsIsolatedDirectory(UltraExplorer.Infrastructure.AppPaths.StateDirectory);
+    }
+
+    internal static bool IsIsolatedDirectory(string resolvedState)
+    {
         try
         {
-            var path = Path.GetFullPath(state).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-            var real = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UltraExplorer"));
+            var path = Path.GetFullPath(resolvedState).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var real = Path.GetFullPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UltraExplorer"))
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
             return !path.Equals(real, StringComparison.OrdinalIgnoreCase)
                 && !path.StartsWith(real + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
         }

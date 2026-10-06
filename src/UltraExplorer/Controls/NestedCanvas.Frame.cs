@@ -645,6 +645,11 @@ public sealed partial class NestedCanvas
             // 7. The events the intake held back.
             FlushFrameEvents();
 
+            // A precise F flight can reach its old endpoint in phase 2 while
+            // phases 3 or 5 move that file's tile. Validate once more after
+            // all tree intake, before this frame is allowed to settle.
+            FinishPreciseFlightAfterIntake();
+
             // 8. Settle, and draw what is out of date.
             var moving = IsMoving();
             var retryCameraReads = !moving && _cameraReadDeferred;
@@ -731,6 +736,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void AdvanceCamera()
     {
+        _completedPreciseFlight = null;
         if (_flight is not { } flight)
         {
             var active = false;
@@ -745,6 +751,11 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        if (!PreparePreciseFlight(flight, out flight))
+        {
+            return;
+        }
+
         var done = flight.Sample(_viewWidth, _viewHeight, out var x, out var y, out var w);
         _anchor = flight.Target;
         _ax = x;
@@ -754,10 +765,41 @@ public sealed partial class NestedCanvas
         Normalize();
         if (done)
         {
-            StopFlight();
+            if (flight.PreciseFile is not null)
+            {
+                // Keep its metadata until the change/read intake later in this
+                // frame has had its chance to move the exact file tile.
+                _completedPreciseFlight = flight;
+            }
+            else
+            {
+                StopFlight();
+            }
         }
 
         AfterCameraMove();
+    }
+
+    private Flight? _completedPreciseFlight;
+
+    private void FinishPreciseFlightAfterIntake()
+    {
+        var completed = _completedPreciseFlight;
+        _completedPreciseFlight = null;
+        if (completed is null || !ReferenceEquals(_flight, completed))
+        {
+            return;
+        }
+
+        if (!PreparePreciseFlight(completed, out var prepared))
+        {
+            return;
+        }
+
+        if (ReferenceEquals(completed, prepared))
+        {
+            StopFlight();
+        }
     }
 
     /// <summary>How long the camera has to be still before names are drawn crisp again.</summary>

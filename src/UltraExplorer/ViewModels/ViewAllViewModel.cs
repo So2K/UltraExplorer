@@ -1219,28 +1219,34 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     public async Task HideSelectedAsync()
     {
         var folders = Selection.Items.Where(item => item.IsDirectory).Select(item => item.Path).ToArray();
-        var targets = new List<ViewAllNodeViewModel>(folders.Length);
+        var resolved = new List<string>(folders.Length);
         foreach (var path in folders)
         {
-            if (TryGetNode(path, out var known))
+            if (TryGetNode(path, out var known) && known.IsDirectory)
             {
-                targets.Add(known);
+                resolved.Add(known.FullPath);
             }
             else if (await MaterializeAsync(path) is { IsDirectory: true } made)
             {
-                targets.Add(made);
+                resolved.Add(made.FullPath);
             }
         }
+
+        if (_isDisposed) return;
+        // A later materialization may have yielded while an ancestor refresh
+        // replaced an earlier object. Only current graph objects may be hidden.
+        var targets = new List<ViewAllNodeViewModel>(resolved.Count);
+        foreach (var path in resolved)
+            if (TryGetNode(path, out var live) && live.IsDirectory)
+            {
+                _graph.Hide(live);
+                targets.Add(live);
+            }
 
         if (targets.Count == 0)
         {
             MessageRequested?.Invoke("Select a folder to hide.", false);
             return;
-        }
-
-        foreach (var node in targets)
-        {
-            _graph.Hide(node);
         }
 
         var parent = targets[0].Parent;
@@ -1945,7 +1951,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     }
 
     /// <summary>Makes sure a path has a node, without selecting it or moving the canvas.</summary>
-    public Task<ViewAllNodeViewModel?> MaterializeAsync(string path) => MaterializeAsync(path, holdGone: null);
+    public Task<ViewAllNodeViewModel?> MaterializeAsync(string path) => MaterializeBarrierForChecks is { } barrier
+        ? MaterializeAfterBarrierAsync(path, barrier) : MaterializeAsync(path, holdGone: null);
+
+    /// <summary>Owned deterministic concurrency checks only; absent in ordinary use.</summary>
+    internal Func<string, Task>? MaterializeBarrierForChecks { get; set; }
+    private async Task<ViewAllNodeViewModel?> MaterializeAfterBarrierAsync(string path, Func<string, Task> barrier)
+    {
+        await barrier(path);
+        return await MaterializeAsync(path, holdGone: null);
+    }
 
     /// <param name="path">The path to give a node.</param>
     /// <param name="holdGone">Handed the message that the path is gone instead of the toast (see <see cref="RevealAsync"/>).</param>

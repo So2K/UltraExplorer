@@ -220,14 +220,35 @@ public sealed partial class NestedCanvas
             UpdateLayout();
             if (ActualWidth > 0 && ActualHeight > 0) { _viewWidth = ActualWidth; _viewHeight = ActualHeight; }
             if (!(_viewWidth > 0 && _viewHeight > 0)) return false;
-            if (directory == true) return FlyTo(folder, 0.88, animated);
+            if (directory == true)
+            {
+                var moved = FlyTo(folder, 0.88, animated);
+                AttachFocusGuard(moved, animated, tree, requestCurrent);
+                return moved;
+            }
 
-            var files = folder.FileGrid;
-            if (files.IsEmpty || index >= folder.Files.Count || !(files.TileWidth > 0 && files.TileHeight > 0)) return false;
-            var width = Math.Min(_viewWidth * 0.75 / files.TileWidth, _viewHeight * 0.75 / files.TileHeight);
-            var (x, y) = files.Origin(index);
-            return FlyToRect(folder, (_viewWidth / 2 - (x + files.TileWidth / 2) * width,
-                _viewHeight / 2 - (y + files.TileHeight / 2) * width, width), animated);
+            if (!TryFileFocusEnd(folder, index, out var end)) return false;
+            var moved = FlyToRect(folder, end, animated);
+            if (moved && animated && _flight is { } flight)
+            {
+                // Unlike a folder flight, a file flight aims at one tile inside
+                // its folder. A sort, filter or live listing can move that tile
+                // while the smooth flight is under way, and the selection or
+                // active pane can change after FocusPathAsync has returned.
+                // Remember just enough to validate or retarget on a later frame;
+                // generic folder, tag and arrow flights keep their old path.
+                flight.FocusGuard = new FocusFlightGuard(tree, _cameraRequest, requestCurrent);
+                flight.PreciseFile = new PreciseFileFlight(
+                    Path.GetFileName(path),
+                    folder.Files,
+                    folder.FileGrid,
+                    folder.LayoutSortGeneration,
+                    index,
+                    _viewWidth,
+                    _viewHeight);
+            }
+
+            return moved;
         }
         catch (Exception error) when (error is OperationCanceledException or IOException or UnauthorizedAccessException
             or ArgumentException or NotSupportedException or ObjectDisposedException)
@@ -238,6 +259,109 @@ public sealed partial class NestedCanvas
         {
             if (ReferenceEquals(_cameraReads, reads)) _cameraReads = null;
         }
+    }
+
+    private void AttachFocusGuard(bool moved, bool animated, NestedTree tree, Func<bool>? requestCurrent)
+    {
+        if (moved && animated && _flight is { } flight)
+        {
+            flight.FocusGuard = new FocusFlightGuard(tree, _cameraRequest, requestCurrent);
+        }
+    }
+
+    private bool TryFileFocusEnd(NestedFolder folder, int index, out (double X, double Y, double W) end)
+    {
+        var files = folder.FileGrid;
+        if (files.IsEmpty || index < 0 || index >= folder.Files.Count
+            || !(files.TileWidth > 0 && files.TileHeight > 0))
+        {
+            end = default;
+            return false;
+        }
+
+        var width = Math.Min(_viewWidth * 0.75 / files.TileWidth, _viewHeight * 0.75 / files.TileHeight);
+        var (x, y) = files.Origin(index);
+        end = (_viewWidth / 2 - (x + files.TileWidth / 2) * width,
+            _viewHeight / 2 - (y + files.TileHeight / 2) * width,
+            width);
+        return double.IsFinite(end.X) && double.IsFinite(end.Y) && double.IsFinite(end.W) && end.W > 0;
+    }
+
+    /// <summary>
+    /// Keeps an F flight aimed at its exact file without making every flight
+    /// resolve a path every frame. The common case is only reference and stamp
+    /// comparisons. A changed placement does one indexed lookup and restarts
+    /// the remaining smooth journey from the camera's current rectangle.
+    /// </summary>
+    private bool PreparePreciseFlight(Flight flight, out Flight prepared)
+    {
+        prepared = flight;
+        var guard = flight.FocusGuard;
+        if (guard is not null
+            && (!ReferenceEquals(_tree, guard.Tree)
+                || guard.CameraRequest != _cameraRequest
+                || guard.RequestCurrent?.Invoke() == false))
+        {
+            StopFlight();
+            return false;
+        }
+
+        if (flight.PreciseFile is not { } precise)
+        {
+            return true;
+        }
+
+        if (guard is null)
+        {
+            StopFlight();
+            return false;
+        }
+
+        var folder = flight.Target;
+        var tree = guard.Tree;
+        if (tree.SortGeneration != folder.LayoutSortGeneration)
+        {
+            tree.EnsureLayout(folder);
+        }
+
+        if (ReferenceEquals(precise.Files, folder.Files)
+            && precise.Grid == folder.FileGrid
+            && precise.LayoutSortGeneration == folder.LayoutSortGeneration
+            && precise.ViewWidth == _viewWidth
+            && precise.ViewHeight == _viewHeight)
+        {
+            return true;
+        }
+
+        var index = tree.FindFileIndex(folder, precise.Name);
+        if (index < 0 || !TryFileFocusEnd(folder, index, out var end))
+        {
+            StopFlight();
+            return false;
+        }
+
+        // A metadata-only refresh often replaces the file array without
+        // moving this tile. Acknowledge it without restarting the animation.
+        if (index == precise.Index && precise.Grid == folder.FileGrid
+            && precise.ViewWidth == _viewWidth && precise.ViewHeight == _viewHeight)
+        {
+            precise.Capture(folder, index, _viewWidth, _viewHeight);
+            return true;
+        }
+
+        if (ScreenRectOf(folder) is not { } current)
+        {
+            StopFlight();
+            return false;
+        }
+
+        var replacement = Flight.Create(folder, current, end, _viewWidth, _viewHeight);
+        precise.Capture(folder, index, _viewWidth, _viewHeight);
+        replacement.FocusGuard = guard;
+        replacement.PreciseFile = precise;
+        _flight = replacement;
+        prepared = replacement;
+        return true;
     }
 
     /// <summary>Reads everything on the way to <paramref name="path"/>, then flies to it.</summary>
@@ -924,12 +1048,22 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        StopFlight();
         if (NestedTree.IsDetached(flight.Target) || !NestedTree.IsOnCanvas(flight.Target))
+        {
+            StopFlight();
+            return;
+        }
+
+        // Arrow navigation lands a flight before it brings the next item into
+        // view. An F flight must first honour the same stale-request guard and
+        // precise file endpoint as an ordinary animation frame; otherwise the
+        // arrow would cut to the old selection, or a sort/resize's old tile.
+        if (!PreparePreciseFlight(flight, out flight))
         {
             return;
         }
 
+        StopFlight();
         flight.End(_viewWidth, _viewHeight, out var x, out var y, out var w);
         _anchor = flight.Target;
         _ax = x;
@@ -955,6 +1089,19 @@ public sealed partial class NestedCanvas
         private double _duration;
 
         public required NestedFolder Target { get; init; }
+
+        /// <summary>
+        /// Present only for plain-F focus, so a later selection or pane wins
+        /// after the asynchronous command has already started the animation.
+        /// </summary>
+        public FocusFlightGuard? FocusGuard { get; set; }
+
+        /// <summary>
+        /// Present only for plain-F file focus. Folder, tag, favourite and
+        /// keyboard-navigation flights deliberately retain their original
+        /// fixed-end behaviour.
+        /// </summary>
+        public PreciseFileFlight? PreciseFile { get; set; }
 
         public static Flight Create(
             NestedFolder target,
@@ -1065,6 +1212,39 @@ public sealed partial class NestedCanvas
             w = viewWidth / _w1;
             x = viewWidth / 2 - _c1x * w;
             y = viewHeight / 2 - _c1y * w;
+        }
+    }
+
+    private sealed record FocusFlightGuard(
+        NestedTree Tree,
+        long CameraRequest,
+        Func<bool>? RequestCurrent);
+
+    private sealed class PreciseFileFlight(
+        string name,
+        IReadOnlyList<NestedFile> files,
+        NestedFileGrid grid,
+        int layoutSortGeneration,
+        int index,
+        double viewWidth,
+        double viewHeight)
+    {
+        public string Name { get; } = name;
+        public IReadOnlyList<NestedFile> Files { get; private set; } = files;
+        public NestedFileGrid Grid { get; private set; } = grid;
+        public int LayoutSortGeneration { get; private set; } = layoutSortGeneration;
+        public int Index { get; private set; } = index;
+        public double ViewWidth { get; private set; } = viewWidth;
+        public double ViewHeight { get; private set; } = viewHeight;
+
+        public void Capture(NestedFolder folder, int fileIndex, double width, double height)
+        {
+            Files = folder.Files;
+            Grid = folder.FileGrid;
+            LayoutSortGeneration = folder.LayoutSortGeneration;
+            Index = fileIndex;
+            ViewWidth = width;
+            ViewHeight = height;
         }
     }
 

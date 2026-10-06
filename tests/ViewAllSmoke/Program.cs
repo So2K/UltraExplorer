@@ -202,6 +202,9 @@ internal static partial class Program
         await Group(FileCommandReview2Checks);
         await Group(NestedVisibilityRenameIntegrationChecks);
         await Group(FocusSelectionChecks);
+        await Group(BatchCommandLineChecks);
+        await Group(PublicationLifecycleChecks);
+        await Group(RefreshIdentityConsumerChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

@@ -163,6 +163,8 @@ internal static partial class Program
 
         tree.FileNameFilter = name => name.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
         var filteredOther = Path.Combine(docsPath, "other.txt");
+        Check("focusing an already visible ordinary file does not leave a permanent override for a later type filter",
+            tree.FindFileIndex(docs, "selected.txt") < 0);
         Check("explicit focus overrides the file-type filter for exactly the requested file",
             await canvas.FocusPathAsync(selected, false, animated: false)
             && tree.FindFileIndex(docs, "selected.txt") >= 0 && tree.FindFileIndex(docs, "other.txt") < 0);
@@ -170,6 +172,79 @@ internal static partial class Program
             FocusFileRect(canvas, tree, selected) is { } filteredRect && FocusCentred(filteredRect, canvas, 0.75)
             && FocusFileRect(canvas, tree, filteredOther) is null);
         tree.FileNameFilter = null;
+
+        tree.SetSort(ItemSort.Default);
+        tree.EnsureLayout(docs);
+        canvas.FitAll(animated: false);
+        var reorderedPath = filteredOther;
+        var indexBeforeSort = tree.FindFileIndex(docs, "other.txt");
+        Check("a smooth exact-file focus starts a precise flight",
+            await canvas.FocusPathAsync(reorderedPath, false, animated: true) && FocusFlightOf(canvas) is not null);
+        var frameTime = TimeSpan.FromSeconds(20);
+        SetFocusFlightProgress(canvas, 0.5);
+        canvas.RunFrameForTests(frameTime);
+        tree.SetSort(new ItemSort(SortColumn.Name, true));
+        var flightBeforeRetarget = FocusFlightOf(canvas);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        var retargeted = FocusFlightOf(canvas);
+        var indexAfterSort = tree.FindFileIndex(docs, "other.txt");
+        SetFocusFlightProgress(canvas, 2);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("a file reordered midway through smooth F retargets the flight and still settles on that exact tile",
+            indexBeforeSort != indexAfterSort && flightBeforeRetarget is not null && retargeted is not null
+            && !ReferenceEquals(flightBeforeRetarget, retargeted) && FocusFlightOf(canvas) is null
+            && FocusFileRect(canvas, tree, reorderedPath) is { } sortedRect && FocusCentred(sortedRect, canvas, 0.75));
+        tree.SetSort(ItemSort.Default);
+        tree.EnsureLayout(docs);
+
+        canvas.FitAll(animated: false);
+        await canvas.FocusPathAsync(selected, false, animated: true);
+        SetFocusFlightProgress(canvas, 0.5);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        var flightBeforeResize = FocusFlightOf(canvas);
+        canvas.Measure(new Size(520, 1000));
+        canvas.Arrange(new Rect(0, 0, 520, 1000));
+        canvas.UpdateLayout();
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        var resizedFlight = FocusFlightOf(canvas);
+        SetFocusFlightProgress(canvas, 2);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("a viewport aspect change midway through smooth F recomputes the 75% constraint and still lands on the exact file",
+            flightBeforeResize is not null && resizedFlight is not null && !ReferenceEquals(flightBeforeResize, resizedFlight)
+            && FocusFlightOf(canvas) is null
+            && FocusFileRect(canvas, tree, selected) is { } resizedRect && FocusCentred(resizedRect, canvas, 0.75));
+        canvas.Measure(new Size(1200, 800));
+        canvas.Arrange(new Rect(0, 0, 1200, 800));
+        canvas.UpdateLayout();
+
+        var landingCurrent = true;
+        canvas.FitAll(animated: false);
+        var staleLandingStarted = await canvas.FocusPathAsync(selected, false, () => landingCurrent, animated: true)
+            && FocusFlightOf(canvas) is not null;
+        SetFocusFlightProgress(canvas, 0.5);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        landingCurrent = false;
+        var beforeStaleLanding = canvas.CaptureCamera();
+        LandFocusFlight(canvas);
+        Check("an arrow-style forced landing honours a superseded F request instead of cutting to its stale endpoint",
+            staleLandingStarted && FocusFlightOf(canvas) is null && canvas.CaptureCamera() == beforeStaleLanding);
+
+        canvas.FitAll(animated: false);
+        await canvas.FocusPathAsync(selected, false, animated: true);
+        var flightBeforeFinalRead = FocusFlightOf(canvas);
+        SetFocusFlightProgress(canvas, 2);
+        disk.AddFile(docsPath, "aardvark.txt", 45);
+        var refreshAtLanding = tree.RefreshAsync(docs);
+        await WaitUntil(() => tree.HasWork, 3_000);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        var flightAfterFinalRead = FocusFlightOf(canvas);
+        await refreshAtLanding;
+        SetFocusFlightProgress(canvas, 2);
+        canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("a read applied after F reaches its old endpoint in the same frame retargets before the flight settles",
+            flightBeforeFinalRead is not null && flightAfterFinalRead is not null
+            && !ReferenceEquals(flightBeforeFinalRead, flightAfterFinalRead) && FocusFlightOf(canvas) is null
+            && FocusFileRect(canvas, tree, selected) is { } finalReadRect && FocusCentred(finalReadRect, canvas, 0.75));
 
         canvas.FlyTo(other, 0.88, animated: false);
         var beforeMissing = canvas.CaptureCamera();
@@ -356,6 +431,10 @@ internal static partial class Program
                 !shell.Layers.HasFlag(CanvasLayer.Files) && await main.FocusSelectionAsync(animated: false)
                 && first.Canvas.ShownLayers.HasFlag(CanvasLayer.Files) && !shell.Layers.HasFlag(CanvasLayer.Files)
                 && FocusFileRect(first.Canvas, first.Tree, focusedPath) is { } layerRect && FocusCentred(layerRect, first.Canvas, 0.75));
+            first.Tree.FileNameFilter = name => name.EndsWith(".png", StringComparison.OrdinalIgnoreCase);
+            Check("an ordinary file focused while Files was off does not become a permanent override for a later type filter",
+                first.Tree.FindFileIndex(first.Tree.Find(left)!, Path.GetFileName(focusedPath)) < 0);
+            first.Tree.FileNameFilter = null;
 
             shell.IsSplit = true;
             var second = main.SecondPane;
@@ -373,6 +452,7 @@ internal static partial class Program
                 && FocusFileRect(second.Canvas, second.Tree, rightPath) is { } rightRect && FocusCentred(rightRect, second.Canvas, 0.75));
 
             await FocusWindowStaleChecksAsync(main, shell, first, second, right);
+            await FocusWindowFlightCancellationChecksAsync(main, shell, first, second, focusedPath, firstPath);
             await FocusKeyboardChecksAsync(main, shell, first, focusedPath);
         }
         finally
@@ -421,6 +501,68 @@ internal static partial class Program
             !await focusing && ReferenceEquals(main.ActivePane, first) && second.Canvas.CaptureCamera() == before
             && !NestedTree.HoldsFile(parent, "pane-changed.txt"));
         second.Tree.NamedFileDescribeForChecks = null;
+    }
+
+    private static async Task FocusWindowFlightCancellationChecksAsync(MainWindow main, MainViewModel shell,
+        NestedPane first, NestedPane second, string focusedPath, string replacementPath)
+    {
+        var selection = shell.Tree.Selection;
+        var frameTime = TimeSpan.FromSeconds(60);
+        first.Canvas.FramesByHandForTests = true;
+
+        main.ActivatePane(first);
+        selection.ReplaceSingle(focusedPath, false, 7, SelectionSource.Canvas);
+        first.SyncSelection();
+        first.Canvas.FitAll(animated: false);
+        Check("smooth F begins before a later selection can supersede it", await main.FocusSelectionAsync());
+        SetFocusFlightProgress(first.Canvas, 0.5);
+        first.Canvas.RunFrameForTests(frameTime);
+        selection.ReplaceSingle(replacementPath, false, 5, SelectionSource.Canvas);
+        first.SyncSelection();
+        var selectionCamera = first.Canvas.CaptureCamera();
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("changing the selection after smooth F has started cancels its old-file flight",
+            FocusFlightOf(first.Canvas) is null && first.Canvas.CaptureCamera() == selectionCamera);
+
+        var folderPath = Path.GetDirectoryName(focusedPath)!;
+        selection.ReplaceSingle(folderPath, true, 0, SelectionSource.Canvas);
+        first.SyncSelection();
+        first.Canvas.FitAll(animated: false);
+        Check("smooth folder F begins before a later selection can supersede it", await main.FocusSelectionAsync());
+        SetFocusFlightProgress(first.Canvas, 0.5);
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        selection.ReplaceSingle(replacementPath, false, 5, SelectionSource.Canvas);
+        first.SyncSelection();
+        var folderCamera = first.Canvas.CaptureCamera();
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("changing the selection after smooth folder F has started cancels that folder flight too",
+            FocusFlightOf(first.Canvas) is null && first.Canvas.CaptureCamera() == folderCamera);
+
+        selection.ReplaceSingle(focusedPath, false, 7, SelectionSource.Canvas);
+        first.SyncSelection();
+        first.Canvas.FitAll(animated: false);
+        Check("smooth F begins before a later pane activation can supersede it", await main.FocusSelectionAsync());
+        SetFocusFlightProgress(first.Canvas, 0.5);
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        main.ActivatePane(second);
+        var paneCamera = first.Canvas.CaptureCamera();
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("switching panes after smooth F has started stops the inactive pane at its current camera",
+            ReferenceEquals(main.ActivePane, second) && FocusFlightOf(first.Canvas) is null
+            && first.Canvas.CaptureCamera() == paneCamera);
+
+        main.ActivatePane(first);
+        selection.ReplaceSingle(focusedPath, false, 7, SelectionSource.Canvas);
+        first.SyncSelection();
+        first.Canvas.FitAll(animated: false);
+        Check("smooth F begins before a direct user pan", await main.FocusSelectionAsync());
+        SetFocusFlightProgress(first.Canvas, 0.5);
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        first.Canvas.Pan(new Vector(19, -13));
+        var panned = first.Canvas.CaptureCamera();
+        first.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("a user pan after smooth F has started cancels the flight and keeps the hand-moved camera",
+            FocusFlightOf(first.Canvas) is null && first.Canvas.CaptureCamera() == panned);
     }
 
     private static async Task FocusKeyboardChecksAsync(MainWindow main, MainViewModel shell, NestedPane pane, string selectedPath)
@@ -535,6 +677,26 @@ internal static partial class Program
             && Math.Abs(centre.Y - canvas.ActualHeight / 2) < 0.05
             && Math.Abs(extent - fill) < 0.005;
     }
+
+    private static object? FocusFlightOf(NestedCanvas canvas) =>
+        typeof(NestedCanvas).GetField("_flight", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(canvas);
+
+    private static void SetFocusFlightProgress(NestedCanvas canvas, double fraction)
+    {
+        if (FocusFlightOf(canvas) is not { } flight)
+        {
+            return;
+        }
+
+        var type = flight.GetType();
+        var duration = (double)type.GetField("_duration", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(flight)!;
+        type.GetField("_started", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(
+            flight,
+            Stopwatch.GetTimestamp() - (long)(Stopwatch.Frequency * duration * fraction));
+    }
+
+    private static void LandFocusFlight(NestedCanvas canvas) =>
+        typeof(NestedCanvas).GetMethod("LandFlight", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(canvas, null);
 
     private static ViewAllEntryDescriptor FocusDescriptor(string path, long size) => new(
         path, Path.GetFileName(path), ViewAllEntryKind.File, false, false, size,

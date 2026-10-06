@@ -36,7 +36,16 @@ public sealed partial class NestedTree
             if (HoldsFile(folder, name))
             {
                 var wasShown = FileIndexAsPlaced(folder, name) >= 0;
-                if (!_forcedVisible.Contains(Key(path))) ForceVisible([path]);
+                // An ordinary visible F target needs no permanent visibility
+                // override. Judge that independently of the Files layer: F
+                // resolves the leaf before it locally turns that layer on, so
+                // an ordinary file has no placed index at that moment. Hidden
+                // and file-type-filtered targets still get the explicit reveal.
+                var key = Key(path);
+                var file = folder.AllFiles[SearchFiles(folder.AllFiles, name)];
+                var needsOverride = (_fileNameFilter?.Invoke(file.Name) ?? true) == false
+                    || !_includeHidden && file.IsHidden;
+                if (needsOverride && !_forcedVisible.Contains(key)) ForceVisible([path]);
                 if (!Current()) return false;
                 if (!wasShown)
                 {
