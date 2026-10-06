@@ -222,9 +222,9 @@ public sealed partial class NestedCanvas
             if (!(_viewWidth > 0 && _viewHeight > 0)) return false;
             if (directory == true)
             {
-                var moved = FlyTo(folder, 0.88, animated);
-                AttachFocusGuard(moved, animated, tree, requestCurrent);
-                return moved;
+                var folderMoved = FlyTo(folder, 0.88, animated);
+                AttachFocusGuard(folderMoved, animated, tree, requestCurrent);
+                return folderMoved;
             }
 
             if (!TryFileFocusEnd(folder, index, out var end)) return false;
