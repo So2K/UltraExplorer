@@ -471,20 +471,24 @@ internal static partial class Program
     /// The Shell's own copy, move and delete ask whether each item they were
     /// given is still there on their own thread: on the UI thread, thousands
     /// of items on a share held up every window of the process for seconds,
-    /// minutes over a VPN.  Every item is answered gone here, so the Shell is
-    /// never asked to do anything, and no folder is made for a copy of
-    /// nothing.
+    /// minutes over a VPN. Copy/move's last source is answered gone, so all
+    /// three are probed but validation fails before any Shell call. Delete's
+    /// sources are all gone and retain its existing no-op contract.
     /// </summary>
     private static async Task Round2OperationExistsChecksAsync(string root)
     {
         Section("cross-cluster round 2: a copy, a move or a delete asks whether its items are there off the UI thread (I030)");
         var ui = Thread.CurrentThread;
         var asked = new System.Collections.Concurrent.ConcurrentQueue<bool>();
+        var askedPaths = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var missing = Path.Combine(root, "operations", "item2.txt");
+        var deleting = false;
         var exists = NativeShellService.OperationItemExists;
-        NativeShellService.OperationItemExists = _ =>
+        NativeShellService.OperationItemExists = path =>
         {
             asked.Enqueue(Thread.CurrentThread == ui);
-            return false;
+            askedPaths.Enqueue(path);
+            return !deleting && !ViewAllPath.Equals(path, missing);
         };
         try
         {
@@ -492,10 +496,21 @@ internal static partial class Program
             var target = Path.Combine(folder, "target");
             var items = Enumerable.Range(0, 3).Select(index => Path.Combine(folder, $"item{index}.txt")).ToArray();
             var shell = new NativeShellService();
-            await shell.CopyOrMoveAsync(items, target, move: false).WaitAsync(TimeSpan.FromSeconds(10));
-            await shell.CopyOrMoveAsync(items, target, move: true).WaitAsync(TimeSpan.FromSeconds(10));
+            FileNotFoundException? copyFailure = null;
+            try { await shell.CopyOrMoveAsync(items, target, move: false).WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (FileNotFoundException failure) { copyFailure = failure; }
+            Check("copy rejects the unavailable requested source before reporting success", copyFailure?.FileName is { } failedCopy
+                && ViewAllPath.Equals(failedCopy, missing));
+            FileNotFoundException? moveFailure = null;
+            try { await shell.CopyOrMoveAsync(items, target, move: true).WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (FileNotFoundException failure) { moveFailure = failure; }
+            Check("move rejects the unavailable requested source before reporting success", moveFailure?.FileName is { } failedMove
+                && ViewAllPath.Equals(failedMove, missing));
+            deleting = true;
             await shell.DeleteAsync(items, permanently: true).WaitAsync(TimeSpan.FromSeconds(10));
             Check($"each item was asked about by copy, move and delete ({asked.Count} asked)", asked.Count == 9);
+            Check("all three exact requested names are probed once for each operation", items.All(item =>
+                askedPaths.Count(path => ViewAllPath.Equals(path, item)) == 3));
             Check($"none on the UI thread ({asked.Count(onUi => onUi)} on it)", asked.All(onUi => !onUi));
             Check("a copy of nothing makes no folder for it", !Directory.Exists(target));
         }
