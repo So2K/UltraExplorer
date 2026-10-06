@@ -220,7 +220,7 @@ public partial class MainWindow
                 return;
             }
 
-            NativeShellService.OpenWithProgram(target.FullPath, paths);
+            await NativeShellService.OpenWithProgramAsync(target.FullPath, paths, () => !_closeRequested);
             await _viewModel.Toast.ShowSuccessAsync($"Opened with {target.DisplayName}");
         }
         catch (Exception exception)

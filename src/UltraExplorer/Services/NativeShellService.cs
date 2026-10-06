@@ -62,20 +62,199 @@ public sealed class NativeShellService
 
     /// <summary>
     /// Hands files to a program, the way dropping them on its icon does in
-    /// Explorer.  Shell execution is required: a .lnk or a .cmd cannot be
-    /// started any other way.
+    /// Explorer. Ordinary executables keep Shell execution; batch files use
+    /// a separate literal-data cmd transport and shortcuts are classified first.
     /// </summary>
     public static void OpenWithProgram(string programPath, IReadOnlyList<string> arguments)
     {
-        var start = new ProcessStartInfo(programPath)
+        // Legacy bounded synchronous API: builder continuations never require
+        // this UI context. Production drag callers use the asynchronous API.
+        var start = CreateProgramDropStartInfoAsync(programPath, arguments).GetAwaiter().GetResult();
+        using var process = StartProgramDrop(start);
+    }
+
+    /// <summary>Reads shortcut/association metadata off the dispatcher, then launches only if the caller still owns the request.</summary>
+    public static async Task OpenWithProgramAsync(string programPath, IReadOnlyList<string> arguments, Func<bool>? requestCurrent = null)
+    {
+        var start = await CreateProgramDropStartInfoAsync(programPath, arguments);
+        if (requestCurrent?.Invoke() == false) return;
+        using var process = StartProgramDrop(start);
+    }
+
+    internal static async Task<ProcessStartInfo> CreateProgramDropStartInfoAsync(string programPath, IReadOnlyList<string> arguments)
+    {
+        var paths = arguments.ToArray();
+        var launch = new ProgramShortcut(programPath, "", Path.GetDirectoryName(programPath) ?? "");
+        var extension = Path.GetExtension(programPath);
+        if (extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase))
+            launch = await ReadProgramMetadataAsync(programPath, shortcut: true).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        var targetExtension = Path.GetExtension(launch.Target);
+        var associatedScript = !IsBatchProgram(launch.Target) && !targetExtension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+            && !targetExtension.Equals(".com", StringComparison.OrdinalIgnoreCase);
+        if (associatedScript)
+        {
+            var association = await ReadProgramMetadataAsync(launch.Target, shortcut: false).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            if (IsCommandTextHost(association.Target) && !IsLiteralPowerShellFileAssociation(association))
+                throw new IOException("This script association uses a command shell and cannot safely receive dropped file names. Use its .cmd/.bat file directly.");
+        }
+        var start = CreateProgramDropStartInfo(launch, paths);
+        // Inspection used the explicit open verb. An empty launch verb could
+        // select a different registered default and bypass that host check.
+        if (associatedScript) start.Verb = "open";
+        return start;
+    }
+
+    internal sealed record ProgramShortcut(string Target, string Arguments, string WorkingDirectory);
+    internal static Func<ProcessStartInfo, Process?>? ProgramDropLauncherForChecks { get; set; }
+    private static Process? StartProgramDrop(ProcessStartInfo start)
+        => ProgramDropLauncherForChecks is { } launcher ? launcher(start) : Process.Start(start);
+
+    internal static ProcessStartInfo CreateProgramDropStartInfo(ProgramShortcut launch, IReadOnlyList<string> paths)
+    {
+        if (IsBatchProgram(launch.Target))
+        {
+            if (!string.IsNullOrWhiteSpace(launch.Arguments))
+                throw new IOException("A batch shortcut with preset arguments cannot safely receive dropped file names. Drop onto its .cmd/.bat file instead.");
+            return CreateBatchDropStartInfo(launch.Target, paths, launch.WorkingDirectory);
+        }
+        if (!string.IsNullOrWhiteSpace(launch.Arguments) && IsCommandScriptHost(launch.Target))
+            throw new IOException("This script-host shortcut has preset commands. Drop onto the script itself instead of passing file names through that command prefix.");
+        if (IsCommandTextHost(launch.Target))
+            throw new IOException("This program interprets command text and cannot safely receive dropped file names. Use its script file or a program with literal file arguments instead.");
+        return new ProcessStartInfo(launch.Target)
         {
             UseShellExecute = true,
-            WorkingDirectory = Path.GetDirectoryName(programPath) ?? string.Empty,
-            Arguments = BuildCommandLine(arguments)
+            WorkingDirectory = launch.WorkingDirectory,
+            Arguments = (string.IsNullOrWhiteSpace(launch.Arguments) ? "" : launch.Arguments.TrimEnd() + " ") + BuildCommandLine(paths)
         };
-
-        using var process = Process.Start(start);
     }
+
+    private static bool IsBatchProgram(string path) => Path.GetExtension(path).Equals(".cmd", StringComparison.OrdinalIgnoreCase)
+        || Path.GetExtension(path).Equals(".bat", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsCommandScriptHost(string path) => Path.GetFileNameWithoutExtension(path).ToLowerInvariant()
+        is "cmd" or "powershell" or "pwsh" or "wscript" or "cscript" or "mshta" or "bash" or "sh";
+
+    private static bool IsCommandTextHost(string path) => Path.GetFileNameWithoutExtension(path).ToLowerInvariant()
+        is "cmd" or "powershell" or "pwsh" or "mshta" or "bash" or "sh";
+
+    private static bool IsLiteralPowerShellFileAssociation(ProgramShortcut association)
+    {
+        var host = Path.GetFileNameWithoutExtension(association.Target);
+        return (host.Equals("powershell", StringComparison.OrdinalIgnoreCase) || host.Equals("pwsh", StringComparison.OrdinalIgnoreCase))
+            // Full fail-closed grammar, not a blacklist of abbreviated code
+            // switches. Only these literal File templates are accepted.
+            && System.Text.RegularExpressions.Regex.IsMatch(association.Arguments,
+                """^\s*(?:"[^"]+"|[^\s"]+)\s+(?:(?:"?-NoProfile"?|"?-NonInteractive"?)\s+)*"?-File"?\s+"%[1lL]"\s+%\*\s*$""",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    }
+
+    internal static ProcessStartInfo CreateBatchDropStartInfo(string script, IReadOnlyList<string> paths, string? workingDirectory = null)
+    {
+        // cmd syntax is not the C-runtime quoting used by EXEs/IPC. Only fixed
+        // quoted variable tokens enter the command line; % values introduced
+        // by that expansion are not rescanned. /v:off keeps ! literal as well.
+        static void ValidFileArgument(string value)
+        {
+            if (value.Length == 0 || value.Any(character => character == '"' || character < ' '))
+                throw new ArgumentException("A batch file cannot safely receive an empty file name or one containing quotes/control characters.");
+        }
+        ValidFileArgument(script);
+        var start = new ProcessStartInfo(Path.Combine(Environment.SystemDirectory, "cmd.exe"))
+        {
+            UseShellExecute = false,
+            WorkingDirectory = workingDirectory ?? Path.GetDirectoryName(script) ?? ""
+        };
+        var prefix = "UE_DROP_" + Guid.NewGuid().ToString("N") + "_";
+        start.Environment[prefix + "SCRIPT"] = script;
+        var command = new System.Text.StringBuilder("/d /v:off /s /c \"\"%").Append(prefix).Append("SCRIPT%\"");
+        for (var index = 0; index < paths.Count; index++)
+        {
+            ValidFileArgument(paths[index]);
+            var key = prefix + index;
+            start.Environment[key] = paths[index];
+            command.Append(" \"%").Append(key).Append("%\"");
+        }
+        start.Arguments = command.Append('"').ToString();
+        return start;
+    }
+
+    private static readonly object ProgramMetadataGate = new();
+    private static readonly Dictionary<string, Task<ProgramShortcut>> ProgramMetadataReads = new(StringComparer.OrdinalIgnoreCase);
+    internal static Func<string, bool, ProgramShortcut>? ProgramMetadataReaderForChecks { get; set; }
+    internal static int ProgramMetadataPendingForChecks { get { lock (ProgramMetadataGate) return ProgramMetadataReads.Count; } }
+
+    private static Task<ProgramShortcut> ReadProgramMetadataAsync(string path, bool shortcut)
+    {
+        var key = (shortcut ? "link|" : "association|") + path;
+        lock (ProgramMetadataGate)
+        {
+            if (ProgramMetadataReads.TryGetValue(key, out var pending)) return pending;
+            if (ProgramMetadataReads.Count >= 2)
+                throw new IOException("Shortcut metadata is still being read. Try again after that request finishes.");
+            var answer = new TaskCompletionSource<ProgramShortcut>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _ = answer.Task.ContinueWith(failed => { _ = failed.Exception; }, CancellationToken.None,
+                TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            ProgramMetadataReads.Add(key, answer.Task);
+            var thread = new Thread(() =>
+            {
+                ProgramShortcut? metadata = null;
+                Exception? failure = null;
+                try { metadata = ProgramMetadataReaderForChecks?.Invoke(path, shortcut)
+                    ?? (shortcut ? ReadProgramShortcut(path) : ReadProgramAssociation(path)); }
+                catch (Exception error) { failure = error; }
+                // Finished metadata must stop being "in flight" before its
+                // continuation can prepare a second launch of the same link.
+                lock (ProgramMetadataGate) ProgramMetadataReads.Remove(key);
+                if (failure is not null) answer.TrySetException(failure);
+                else answer.TrySetResult(metadata!);
+            }) { IsBackground = true, Name = "UltraExplorer program metadata" };
+            thread.SetApartmentState(ApartmentState.STA);
+            try { thread.Start(); }
+            catch { ProgramMetadataReads.Remove(key); throw; }
+            return answer.Task;
+        }
+    }
+
+    private static ProgramShortcut ReadProgramShortcut(string path)
+    {
+        object? shell = null;
+        object? shortcut = null;
+        try
+        {
+            if (!File.Exists(path)) throw new FileNotFoundException("The shortcut is no longer available.", path);
+            shell = Activator.CreateInstance(Type.GetTypeFromProgID("WScript.Shell")
+                ?? throw new IOException("Windows shortcut metadata is unavailable."));
+            dynamic source = shell!;
+            shortcut = source.CreateShortcut(path);
+            dynamic link = shortcut;
+            var target = Environment.ExpandEnvironmentVariables((string)link.TargetPath);
+            if (string.IsNullOrWhiteSpace(target)) throw new IOException("This shortcut has no filesystem program target for dropped files.");
+            var directory = (string)link.WorkingDirectory;
+            return new(target, (string)link.Arguments, string.IsNullOrWhiteSpace(directory) ? Path.GetDirectoryName(path) ?? "" : directory);
+        }
+        finally
+        {
+            if (shortcut is not null && Marshal.IsComObject(shortcut)) Marshal.FinalReleaseComObject(shortcut);
+            if (shell is not null && Marshal.IsComObject(shell)) Marshal.FinalReleaseComObject(shell);
+        }
+    }
+
+    private static ProgramShortcut ReadProgramAssociation(string path)
+    {
+        uint length = 32768;
+        var executable = new System.Text.StringBuilder((int)length);
+        if (AssocQueryString(0, 2, Path.GetExtension(path), "open", executable, ref length) != 0)
+            throw new IOException("Windows could not identify this program's file association safely.");
+        length = 32768;
+        var command = new System.Text.StringBuilder((int)length);
+        if (AssocQueryString(0, 1, Path.GetExtension(path), "open", command, ref length) != 0)
+            throw new IOException("Windows could not identify this script association's command safely.");
+        return new(executable.ToString(), command.ToString(), "");
+    }
+
+    [DllImport("shlwapi.dll", CharSet = CharSet.Unicode, EntryPoint = "AssocQueryStringW")]
+    private static extern int AssocQueryString(uint flags, uint query, string association, string extra, System.Text.StringBuilder output, ref uint characters);
 
     /// <summary>
     /// Quotes arguments the way the C runtime parses them back.  A naive pair of
@@ -299,7 +478,7 @@ public sealed class NativeShellService
             sourceArray = WithoutNested(sourceArray);
         }
 
-        if (sourceArray.Length == 0 && beside.Length == 0)
+        if (distinct.Length == 0)
         {
             return Started(Task.CompletedTask);
         }
@@ -312,22 +491,29 @@ public sealed class NativeShellService
         // the operation's own thread (see OperationItemExists).
         return Started(RunStaAsync(() =>
         {
-            var present = sourceArray.Where(OperationItemExists).ToArray();
-            var presentBeside = beside.Where(OperationItemExists).ToArray();
-            if (present.Length == 0 && presentBeside.Length == 0)
+            // Validate the complete requested batch before creating a target or
+            // starting its first copy. A disappearing/inaccessible item is not
+            // successful copying: external OLE sources rely on this result to
+            // decide whether the drop transferred their data.
+            foreach (var source in distinct)
+                if (!OperationItemExists(source))
+                    throw new FileNotFoundException("The source is no longer available; no files were copied or moved.", source);
+
+            // A validated move into the same directory is intentionally a no-op.
+            if (sourceArray.Length == 0 && beside.Length == 0)
             {
                 return;
             }
 
             Directory.CreateDirectory(targetDirectory);
-            if (present.Length > 0)
+            if (sourceArray.Length > 0)
             {
-                RunShellOperation(owner, move ? ShellFileOperationKind.Move : ShellFileOperationKind.Copy, present, targetDirectory, flags);
+                RunShellOperation(owner, move ? ShellFileOperationKind.Move : ShellFileOperationKind.Copy, sourceArray, targetDirectory, flags);
             }
 
-            if (presentBeside.Length > 0)
+            if (beside.Length > 0)
             {
-                RunShellOperation(owner, ShellFileOperationKind.Copy, presentBeside, targetDirectory,
+                RunShellOperation(owner, ShellFileOperationKind.Copy, beside, targetDirectory,
                     ShellFileOperation.TransferFlags(renameOnCollision: true));
             }
         }));

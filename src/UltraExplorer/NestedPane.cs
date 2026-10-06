@@ -898,6 +898,34 @@ internal sealed class NestedPane
         }
     }
 
+    /// <summary>Precise F focus in this active pane; no selection, navigation history or other pane is changed.</summary>
+    public async Task<bool> FocusSelectionPathAsync(string path, bool? isDirectory = null,
+        Func<bool>? requestCurrent = null, bool animated = false)
+    {
+        if (_detached || !IsActive || string.IsNullOrWhiteSpace(path) || requestCurrent?.Invoke() == false) return false;
+        var ticket = ++_flightTicket;
+        var tree = Tree;
+        bool Current() => !_detached && IsActive && ticket == _flightTicket
+            && ReferenceEquals(Canvas.Tree, tree) && requestCurrent?.Invoke() != false;
+        FlightsUnderWay++;
+        try
+        {
+            if (tree.Chain(path).Count == 0 && Current())
+                _host.EnsureNestedLocation(this, isDirectory == false ? Path.GetDirectoryName(path) ?? path : path);
+            if (!Current()) return false;
+            // A previous hand-adjusted sparse view is no longer the requested
+            // camera; its deferred keep-in-view correction must not cancel F.
+            _movedByHand = false;
+            return await Canvas.FocusPathAsync(path, isDirectory, Current, animated);
+        }
+        catch (Exception error) when (error is OperationCanceledException or IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException or ObjectDisposedException)
+        {
+            return false;
+        }
+        finally { FlightsUnderWay--; }
+    }
+
     /// <summary>
     /// Open in other pane: this pane goes to <paramref name="folder"/> as the
     /// pane being worked with goes to a place typed in the address bar - the

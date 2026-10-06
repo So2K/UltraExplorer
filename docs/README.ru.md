@@ -119,11 +119,11 @@ Tags, сохраняя заметку. Работают `Shift+F10` и клав�
 
 ## Установка
 
-Текущий выпуск стабильного канала — **v1.2.0 для Windows x64**:
-[v1.2.0](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0).
+Текущий выпуск стабильного канала — **v1.2.1 для Windows x64**:
+[последний выпуск](https://github.com/So2K/UltraExplorer/releases/latest).
 
-- [UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0/UltraExplorer-Setup-x64.exe) устанавливает приложение в `%LOCALAPPDATA%\Programs\UltraExplorer`, добавляет пункт в меню «Пуск» и деинсталлятор.
-- [UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0/UltraExplorer-win-x64.zip): распакуйте и запустите `UltraExplorer.exe`.
+- [UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/latest/download/UltraExplorer-Setup-x64.exe) устанавливает приложение в `%LOCALAPPDATA%\Programs\UltraExplorer`, добавляет пункт в меню «Пуск» и деинсталлятор.
+- [UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/latest/download/UltraExplorer-win-x64.zip): распакуйте и запустите `UltraExplorer.exe`.
 
 Оба варианта включают .NET. Настройки, избранное, цвета и заметки хранятся в
 `%LOCALAPPDATA%\UltraExplorer`.
@@ -131,7 +131,18 @@ Tags, сохраняя заметку. Работают `Shift+F10` и клав�
 Windows 11, x64.
 [Все выпуски](https://github.com/So2K/UltraExplorer/releases).
 
-[Заметки о выпуске и границы проверок](RELEASE_NOTES_v1.2.0.md).
+[Заметки о выпуске и границы проверок](RELEASE_NOTES_v1.2.1.md).
+
+## Что изменилось в v1.2.1
+
+Потеряли выделенный файл после отдаления? Нажмите **`F`**: камера плавно
+приблизится к его крупной карточке. Сортировка, обновление папки и изменение
+размера окна не сбивают цель; выделение и история остаются прежними.
+
+Ревью также усилило безопасность запуска скриптов, результаты переноса файлов,
+переходы при закрытии окна, работу с обновлёнными узлами графа и обновление
+программы без удаления посторонних файлов.
+[Результаты ревью и точные границы проверок](REVIEW_v1.2.1.md).
 
 ## Что изменилось в v1.2.0
 
@@ -156,6 +167,7 @@ Windows 11, x64.
 | Панорама | Средняя/правая кнопка с перетаскиванием, `Space+перетаскивание`, колесо / `Shift+колесо` |
 | Войти в папку / открыть файл | Двойной клик |
 | Вся карта / выделенный объект | `Shift+1` / `Shift+2` |
+| Плавно приблизить выбранный файл или папку | `F` |
 | Ввести путь | `Ctrl+L` или `Alt+D` |
 | Поиск по дискам | `Ctrl+F` |
 | Показать / открыть результат | `Enter` / `Ctrl+Enter` |

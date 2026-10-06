@@ -81,6 +81,12 @@ jobs:
           & tests/FolderTagsSmoke/bin/Release/net10.0-windows/win-x64/FolderTagsSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Folder Tags checks failed with exit code $LASTEXITCODE." }
 
+      - name: Check manifest-safe local update and rollback
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File tests/InstallPayloadChecks.ps1
+          if ($LASTEXITCODE -ne 0) { throw "Installer payload checks failed with exit code $LASTEXITCODE." }
+
       - name: Check file-dialog contracts
         shell: pwsh
         run: |
@@ -101,6 +107,17 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
           & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only ReleasePackagingChecks,ReadLaneIntegrationChecks,ShellMenuReview2IntegrationChecks,NestedVisibilityRenameIntegrationChecks,FileCommandReview2Checks
           if ($LASTEXITCODE -ne 0) { throw "Review integration checks failed with exit code $LASTEXITCODE." }
+
+      - name: Check selected-item focus and publication regressions
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-focus-checks'
+          $env:TEMP = Join-Path $env:RUNNER_TEMP 'ue-focus-t'
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only FocusSelectionChecks,BatchCommandLineChecks,PublicationLifecycleChecks,RefreshIdentityConsumerChecks
+          if ($LASTEXITCODE -ne 0) { throw "Focus and publication regression checks failed with exit code $LASTEXITCODE." }
 
       - name: Publish with the .NET and WPF runtime beside the app
         shell: pwsh
@@ -198,9 +215,9 @@ jobs:
           path: packages
 
       - name: Check planned release notes
-        if: github.ref_name == 'v1.2.0' || github.ref_name == 'v1.2.0-beta.1'
+        if: github.ref_name == 'v1.2.1' || github.ref_name == 'v1.2.0' || github.ref_name == 'v1.2.0-beta.1'
         env:
-          NOTES_PATH: ${{ github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' }}
+          NOTES_PATH: ${{ github.ref_name == 'v1.2.1' && 'docs/RELEASE_NOTES_v1.2.1.md' || github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' }}
         run: test -s "$NOTES_PATH"
 
       - name: Create the release
@@ -213,7 +230,7 @@ jobs:
           make_latest: ${{ needs.build.outputs.prerelease == 'false' }}
           # action-gh-release reads body_path first; body is only a fallback
           # for other tags. The planned tag notes must exist before this step.
-          body_path: ${{ github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || github.ref_name == 'v1.2.0-beta.1' && 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' || '' }}
+          body_path: ${{ github.ref_name == 'v1.2.1' && 'docs/RELEASE_NOTES_v1.2.1.md' || github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || github.ref_name == 'v1.2.0-beta.1' && 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' || '' }}
           body: |
             ## Download
 

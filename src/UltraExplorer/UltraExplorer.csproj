@@ -9,6 +9,7 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>UltraExplorer</AssemblyName>
     <RootNamespace>UltraExplorer</RootNamespace>
+    <VersionPrefix>1.2.1</VersionPrefix>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\UltraExplorer.ico</ApplicationIcon>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>

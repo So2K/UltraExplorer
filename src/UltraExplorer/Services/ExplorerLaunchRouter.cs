@@ -48,10 +48,21 @@ internal static class ExplorerLaunchRouter
         && FolderCommandLine.TryReveal(paths, out var request, out _) && Launch(request with { OriginIsShell = true });
     private static bool Launch(FolderInvocation invocation)
     {
-        if (Application.Current?.MainWindow is MainWindow window && !window.IsPickerMode)
+        if (ChooseDirectLaunchWindow(Application.Current?.MainWindow as MainWindow, Windows) is { } window)
         { _ = ObserveAsync(window.ApplyFolderInvocationAsync(invocation)); return true; }
-        try { using var process = DialogSelfProcess.Start(FolderCommandLine.BuildArguments(invocation)); return true; }
+        try { using var process = StartSelf(FolderCommandLine.BuildArguments(invocation)); return true; }
         catch (Exception ex) when (Failure(ex)) { DialogIntegrationStore.Log("The folder could not be opened", ex); return false; }
+    }
+
+    /// <summary>A closing or occupied main window cannot accept an in-process
+    /// native folder action. Use another live normal window or the usual launcher.</summary>
+    internal static MainWindow? ChooseDirectLaunchWindow(MainWindow? main, IEnumerable<MainWindow> windows)
+    {
+        static bool Free(MainWindow window) => !window.IsPickerMode && !window.IsFolderWindowClosing
+            && !window.IsFolderInvocationPending;
+        if (main is not null && Free(main)) return main;
+        var candidates = windows.Where(Free).ToArray();
+        return candidates.FirstOrDefault(window => window.IsFolderWindowReady) ?? candidates.FirstOrDefault();
     }
 
     internal static bool TryHandleShellFallback(string[] arguments)

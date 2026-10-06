@@ -595,7 +595,8 @@ public sealed partial class NestedTree
 
         // A hidden file someone marked or searched for is shown like a hidden
         // folder on the way to one: asking for it by name outranks the filter.
-        bool IsShown(NestedFile file) => (_fileNameFilter?.Invoke(file.Name) ?? true)
+        bool IsShown(NestedFile file) => ((_fileNameFilter?.Invoke(file.Name) ?? true)
+                || hasRules && _forcedVisible.Contains(folder.PathOf(file)))
             && (_includeHidden || !file.IsHidden || hasRules && _forcedVisible.Contains(folder.PathOf(file)));
 
         // This PC's drives keep the order they were given in; everywhere else

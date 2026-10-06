@@ -41,17 +41,24 @@ internal static class FolderInvocationNavigation
             return true;
         }
 
-        var items = new List<SelectionItem>(invocation.SelectedPaths.Count);
-        ViewAllNodeViewModel? focus = null;
         foreach (var path in invocation.SelectedPaths)
         {
             var node = await tree.MaterializeAsync(path);
             if (node is null || !IsCurrent()) return false;
-            focus ??= node;
-            items.Add(new(node.FullPath, node.IsDirectory, node.Entry.SizeBytes ?? 0));
         }
 
-        if (focus is null || !IsCurrent()) return false;
+        if (!IsCurrent()) return false;
+        // Do not retain the first node across later awaits: refresh can replace
+        // it with a same-path object. Re-read both list focus and item metadata.
+        var items = new List<SelectionItem>(invocation.SelectedPaths.Count);
+        ViewAllNodeViewModel? focus = null;
+        foreach (var path in invocation.SelectedPaths)
+        {
+            if (!tree.TryGetNode(path, out var live)) return false;
+            focus ??= live;
+            items.Add(new(live.FullPath, live.IsDirectory, live.Entry.SizeBytes ?? 0));
+        }
+        if (focus is null) return false;
         tree.FolderList.SetTarget(invocation.FolderPath, focus);
         // Selecting a directory lights its tile in the parent. It must not
         // immediately navigate the folder list into the selected directory.

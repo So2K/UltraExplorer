@@ -4,7 +4,7 @@
     Start, Windows Search and launchers such as PowerToys Run find it by name.
 
 .DESCRIPTION
-    Publishes src/UltraExplorer framework-dependent for win-x64 into
+    Publishes src/UltraExplorer self-contained for win-x64 into
     %LOCALAPPDATA%\Programs\UltraExplorer and puts an "UltraExplorer" shortcut
     in the Start menu.  Running it again updates the installed copy in place:
     installed dialog integration is recovered and stopped first, and ordinary
@@ -24,6 +24,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'InstallPayload.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $repository 'src\UltraExplorer\UltraExplorer.csproj'
 $programsRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
@@ -204,8 +205,7 @@ function Use-IntegrationPreference([object]$restore = $null) {
 Write-Host "Building UltraExplorer (Release)..."
 $preference = $null
 $recovered = $false
-$replacing = $false
-$copying = $false
+$payloadUpdate = $null
 $installed = $false
 $oldRunValue = $null
 $oldShortcutRunValue = $null
@@ -217,9 +217,12 @@ try {
     $buildArtifacts = Join-Path $staging '.artifacts'
     if (Test-Path -LiteralPath $buildArtifacts) { Assert-UpdatePath $buildArtifacts $staging; Remove-Item -Recurse -Force -LiteralPath $buildArtifacts }
     Assert-UpdatePath $staging $temporaryRoot
+    # Retain the existing conservative link preflight: any installed junction
+    # aborts before recovery or replacement, including an unmanaged addition.
     Assert-UpdatePath $destination $programsRoot
     Assert-UpdatePath $backup $programsRoot
     if (-not (Test-Path -LiteralPath (Join-Path $staging 'UltraExplorer.exe') -PathType Leaf)) { throw 'Publish produced no UltraExplorer executable.' }
+    New-UltraExplorerPayloadManifest $staging
     $preference = Use-IntegrationPreference
     # Get-ItemPropertyValue throws for an absent value even with
     # SilentlyContinue. Reading the optional property from the key does not.
@@ -294,33 +297,11 @@ try {
     }
     if (@(Get-InstalledCopies).Count -gt 0) { throw 'An installed copy started during the update; no application files were replaced.' }
 
-    New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    New-Item -ItemType Directory -Force -Path $backup | Out-Null
-    $replacing = $true
-    # Keep Setup's uninstaller in place; retain old application files until the
-    # staged copy succeeds, so a failed copy can be rolled back.
-    foreach ($item in Get-ChildItem -LiteralPath $destination -Force | Where-Object { $_.Name -notlike 'unins*' }) {
-        Assert-UpdatePath $item.FullName $destination
-        Move-Item -LiteralPath $item.FullName -Destination $backup
-    }
-    $copying = $true
-    foreach ($item in Get-ChildItem -LiteralPath $staging -Force) { Copy-Item -LiteralPath $item.FullName -Destination $destination -Recurse -Force }
+    # The old manifest plus current staged paths identify owned files. Unknown
+    # files, including additions in runtime/locale folders, stay in place.
+    # The helper backs up and rolls back individual files, never directories.
+    $payloadUpdate = Invoke-UltraExplorerPayloadUpdate -StagingRoot $staging -DestinationRoot $destination -BackupRoot $backup
     $installed = $true
-} catch {
-    if ($replacing -and -not $installed) {
-        Write-Host 'Restoring the previous installed application...'
-        if ($copying) {
-            foreach ($item in Get-ChildItem -LiteralPath $destination -Force | Where-Object { $_.Name -notlike 'unins*' }) {
-                Assert-UpdatePath $item.FullName $destination
-                Remove-Item -LiteralPath $item.FullName -Recurse -Force
-            }
-        }
-        foreach ($item in Get-ChildItem -LiteralPath $backup -Force) {
-            Assert-UpdatePath $item.FullName $backup
-            Move-Item -LiteralPath $item.FullName -Destination $destination
-        }
-    }
-    throw
 } finally {
     if ($recovered -and $null -ne $preference) {
         Use-IntegrationPreference $preference
@@ -341,12 +322,7 @@ try {
         $shortcut.Dispose()
     }
     if (Test-Path -LiteralPath $staging) { Assert-UpdatePath $staging $temporaryRoot; Remove-Item -LiteralPath $staging -Recurse -Force }
-    if (Test-Path -LiteralPath $backup) {
-        if ($installed -or @(Get-ChildItem -LiteralPath $backup -Force).Count -eq 0) {
-            Assert-UpdatePath $backup $programsRoot
-            Remove-Item -LiteralPath $backup -Recurse -Force
-        } else { Write-Warning "Previous application files remain available at $backup" }
-    }
+    if ($installed -and $null -ne $payloadUpdate) { Complete-UltraExplorerPayloadUpdate $payloadUpdate }
 }
 
 # The app sets this taskbar id on itself (App.AppUserModelId); a shortcut that
