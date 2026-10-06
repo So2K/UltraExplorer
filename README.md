@@ -12,7 +12,7 @@ See the structure, fly into a folder, and keep your bearings.
 [![C# · .NET 10](https://img.shields.io/badge/C%23-.NET%2010-512BD4)](src/UltraExplorer/UltraExplorer.csproj)
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[Download for Windows](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0-beta.1) ·
+[Download for Windows](https://github.com/So2K/UltraExplorer/releases/latest) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -129,17 +129,33 @@ which folder occupies the most bytes.
 
 ## Download
 
-The current release is a **Windows x64 prerelease**. Get the assets from
-[v1.2.0-beta.1](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0-beta.1):
+The current stable-channel release is **v1.2.0 for Windows x64**. Get the assets from
+[v1.2.0](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0):
 
-- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0-beta.1/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
-- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0-beta.1/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
+- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
+- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
 
 Both include the .NET runtime. Settings, favorites, colors and notes are stored
 in `%LOCALAPPDATA%\UltraExplorer`.
 
 Windows 11, x64. For earlier and newer builds, see
 [all releases](https://github.com/So2K/UltraExplorer/releases).
+
+[Release notes and validation limits](docs/RELEASE_NOTES_v1.2.0.md).
+
+## What changed in v1.2.0
+
+This release integrates all 18 saved review work packages and additional
+cross-file corrections. The focus is predictable navigation and file actions:
+
+- Safer drag-and-drop handoffs and selection when a folder disappears outside the app.
+- Earlier folder-window restoration, guarded Explorer handoffs and steadier arrow-key navigation.
+- Shared Tags and notes, camera continuity through renames, and filters that follow visibility changes.
+- Independent split-pane transfers, stale-row interaction guards and prompts that disable only their owner.
+- Background file-command preparation, streamed search-row reuse and cached visual landmarks.
+
+The release-channel label does not mean every review finding or regression
+check is closed. The notes record the tested scope and remaining failures.
 
 ## A few keys to get started
 
@@ -181,6 +197,9 @@ See [Explorer integration](docs/EXPLORER_REPLACEMENT.md),
 - The name filter covers loaded branches. Use global search for an unvisited path.
 - Large directories can use capped canvas listings. The canvas is not a complete disk index.
 - Open/Save integration does not support every application or Shell namespace.
+- Windows Shell can reject a recursive folder duplicate whose destination tree is too long. The app reports a clear error; shorten names or move the tree closer to a drive root.
+- The tree canvas rebuilds node objects on refresh. A concurrent reveal's returned reference can become stale after an ancestor refresh; its exact return-time validity remains under investigation.
+- GPU presentation still waits for completion on the shared UI thread. A nonblocking presentation pipeline remains a separate renderer task.
 
 ## Build and contribute
 

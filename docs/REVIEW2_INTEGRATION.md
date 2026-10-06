@@ -1,6 +1,8 @@
 # Saved review2 integration
 
-This is an engineering checkpoint, not a stable-release certification.
+This records the engineering checkpoint used for the v1.2.0 release.
+Qualification facts below are preserved; a release-channel label does not
+turn known failures or unimplemented follow-ups into successful checks.
 
 The latest saved Claude review2 work has been combined with the published
 Windows product: 90 original commits across 18 work packages, plus nine scoped
@@ -69,6 +71,9 @@ The two retained failures are:
    return needs an owning-dispatcher diagnostic. This intermittent failure is
    retained, not waived or presented as fixed.
 
-This checkpoint is not a fully green broad suite or stable-release approval.
-The saved work and additional tested corrections are committed for continuation;
-no release tag, installer replacement or stable promotion follows from it.
+This checkpoint is not a fully green broad suite. The owner subsequently
+requested publication as **v1.2.0**, out of beta. The stable release channel is
+therefore an explicit release decision, not a claim that all 170 findings or
+every Windows edge case are resolved. Release packaging/CI gates are verified
+separately, and the retained limits are included in the
+[v1.2.0 release notes](RELEASE_NOTES_v1.2.0.md).
