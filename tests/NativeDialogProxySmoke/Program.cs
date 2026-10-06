@@ -532,13 +532,16 @@ internal static class Program
         lease = visibility.Record;
         Check("the unfinished native request already has an exact recovery lease", lease is not null && DialogLease.BelongsToWindow(lease)
             && lease.NativeProcess == fixture.Id && lease.ProxyWindow == proxy.ToInt64());
-        var transparency = DialogNative.Transparency(original);
-        Check("the source is alpha-zero before provider completion", transparency.Layered && transparency.Alpha == 0 && (transparency.Flags & 2) != 0);
-        WaitQuietly(() => visibility.FirstVisible != 0, 500);
-        Console.WriteLine($"  visibility hidden={visibility.FirstHidden} proxyVisible={visibility.FirstVisible} hiddenProxySeen={visibility.SawHiddenProxy} opaqueSamples={visibility.OpaqueWhileProxyVisible}");
-        Check("source alpha-zero is observed before the first visible UE sample", visibility.FirstHidden != 0
-            && visibility.FirstVisible > visibility.FirstHidden && visibility.SawHiddenProxy);
-        Check("no sampled UE-visible interval exposes the original", visibility.OpaqueWhileProxyVisible == 0);
+        WaitQuietly(() => DialogNative.IsHidden(original) && visibility.FirstHidden != 0 && visibility.FirstVisible != 0, 500);
+        Check("the source is observed hidden (DWM cloak or alpha-zero) before provider completion", DialogNative.IsHidden(original));
+        Console.WriteLine($"  visibility hidden={visibility.FirstHidden} proxyVisible={visibility.FirstVisible} hiddenProxySeen={visibility.SawHiddenProxy} "
+            + $"preHideOpaque={visibility.PreHideOpaque} preHideMs={visibility.PreHideMilliseconds:F3} preHideLeaseOrOrderViolations={visibility.PreHideViolations} postHideOpaque={visibility.PostHideOpaque}");
+        Check("the leased handoff has both a cloaked/prepared proxy and a true hidden-source observation",
+            visibility.FirstHidden != 0 && visibility.FirstVisible != 0 && visibility.SawHiddenProxy);
+        Check("each observed pre-hide overlap keeps the exact recovery identity and UE above the original",
+            visibility.PreHideViolations == 0);
+        visibility.BeginStrictHiddenObservation();
+        Check("after observed source hide, no sampled visible-proxy interval re-exposes the original", visibility.PostHideOpaque == 0);
         var pending = thread.Run(() => !Required(window!.FindFirstDescendant("PickerAcceptButton")).IsEnabled).GetAwaiter().GetResult();
         Check("OK is disabled while the native contract is still being read", pending);
         if (!pending) throw new InvalidOperationException("The provisional contract finished before the early-input test could act.");
@@ -547,13 +550,17 @@ internal static class Program
             // The application bringing its dialog forward over the provisional
             // picker: reorder only our two exact fixture windows, without
             // activation. The original must stay transparent even while above.
+            var originalWasHidden = DialogNative.IsHidden(original);
+            var exactLeaseBefore = DialogLease.BelongsToWindow(lease!) && lease!.NativeProcess == fixture.Id
+                && DialogNative.ProcessId(proxy) == lease.WorkerProcess;
             SetWindowPos(proxy, original, 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0200); // no move, no size, no activation, not the owner
             var lowered = IsAbove(original, proxy);
             Check("the original can be reordered above UE without activation", lowered);
             Thread.Sleep(80);
-            var reordered = DialogNative.Transparency(original);
-            Check("reordering the original above UE does not reveal it", reordered.Layered && reordered.Alpha == 0
-                && DialogLease.BelongsToWindow(lease!) && visibility.OpaqueWhileProxyVisible == 0);
+            Check("reordering the original above UE preserves direct hidden state and exact lease/PID",
+                originalWasHidden && exactLeaseBefore && DialogNative.IsHidden(original)
+                && DialogLease.BelongsToWindow(lease!) && lease!.NativeProcess == fixture.Id
+                && DialogNative.ProcessId(proxy) == lease.WorkerProcess && visibility.PostHideOpaque == 0);
         }
         Check("the source request remains alive and protected before its contract is confirmed",
             !fixture.HasExited && DialogNative.IsWindow(original) && DialogNative.IsHidden(original));
@@ -674,7 +681,8 @@ internal static class Program
     }
 
     /// <summary>Read-only sampling begins before the agent starts. It records
-    /// source alpha and the exact leased proxy independently of UIA capture.</summary>
+    /// source hide and the exact leased proxy independently of UIA capture.
+    /// Reads are observations, not an atomic composition/pixel snapshot.</summary>
     private sealed class EarlyVisibilityWatch : IDisposable
     {
         private readonly ManualResetEvent _stop = new(false);
@@ -684,14 +692,19 @@ internal static class Program
         private readonly string _sessions;
         private DialogLeaseRecord? _record;
         private long _hidden, _visible;
-        private int _sawHiddenProxy, _opaque, _cancelStarted, _cancelOpaque;
+        private int _sawHiddenProxy, _preHideOpaque, _preHideViolations, _postHideOpaque, _strictHidden, _cancelStarted, _cancelOpaque;
         internal DialogLeaseRecord? Record => Volatile.Read(ref _record);
         internal long FirstHidden => Interlocked.Read(ref _hidden);
         internal long FirstVisible => Interlocked.Read(ref _visible);
         internal bool SawHiddenProxy => Volatile.Read(ref _sawHiddenProxy) != 0;
-        internal int OpaqueWhileProxyVisible => Volatile.Read(ref _opaque);
+        internal int PreHideOpaque => Volatile.Read(ref _preHideOpaque);
+        internal int PreHideViolations => Volatile.Read(ref _preHideViolations);
+        internal int PostHideOpaque => Volatile.Read(ref _postHideOpaque);
+        internal double PreHideMilliseconds => FirstHidden > FirstVisible && FirstVisible != 0
+            ? Stopwatch.GetElapsedTime(FirstVisible, FirstHidden).TotalMilliseconds : 0;
         internal int OpaqueAfterCancel => Volatile.Read(ref _cancelOpaque);
         internal void BeginCancel() => Interlocked.Exchange(ref _cancelStarted, 1);
+        internal void BeginStrictHiddenObservation() => Interlocked.Exchange(ref _strictHidden, 1);
         internal EarlyVisibilityWatch(nint original, uint process, string sessions)
         {
             _original = original; _process = process; _sessions = sessions;
@@ -704,22 +717,41 @@ internal static class Program
                 try
                 {
                     if (!DialogNative.IsWindow(_original) || DialogNative.ProcessId(_original) != _process) continue;
-                    var native = DialogNative.Transparency(_original);
-                    var alphaZero = native.Layered && native.Alpha == 0 && (native.Flags & 2) != 0;
-                    if (Volatile.Read(ref _cancelStarted) != 0 && DialogNative.IsWindowVisible(_original) && !alphaZero && !DialogNative.IsCloaked(_original))
+                    var hidden = DialogNative.IsHidden(_original);
+                    if (Volatile.Read(ref _cancelStarted) != 0 && DialogNative.IsWindowVisible(_original) && !hidden)
                         Interlocked.Increment(ref _cancelOpaque);
-                    if (alphaZero) Interlocked.CompareExchange(ref _hidden, Stopwatch.GetTimestamp(), 0);
+                    if (hidden) Interlocked.CompareExchange(ref _hidden, Stopwatch.GetTimestamp(), 0);
                     if (Record is null && Directory.Exists(_sessions))
                         foreach (var file in Directory.EnumerateFiles(_sessions, "*.json"))
                             if (DialogLease.ReadRecord(file) is { ProxyWindow: not 0 } record && record.NativeProcess == _process && record.NativeWindow == _original.ToInt64())
                             { Volatile.Write(ref _record, record); break; }
-                    if (Record is not { } lease || DialogNative.ProcessId((nint)lease.ProxyWindow) != lease.WorkerProcess) continue;
+                    if (Record is not { } lease) continue;
                     var visible = DialogNative.IsWindowVisible((nint)lease.ProxyWindow) && !DialogNative.IsHidden((nint)lease.ProxyWindow);
                     if (!visible) Interlocked.Exchange(ref _sawHiddenProxy, 1);
                     else
                     {
                         Interlocked.CompareExchange(ref _visible, Stopwatch.GetTimestamp(), 0);
-                        if (!alphaZero) Interlocked.Increment(ref _opaque);
+                        // The source may have been hidden between the first
+                        // read and observing an uncloaked proxy. Re-read it now;
+                        // a cached pre-uncloak alpha value is not exposure proof.
+                        hidden = DialogNative.IsHidden(_original);
+                        if (hidden) Interlocked.CompareExchange(ref _hidden, Stopwatch.GetTimestamp(), 0);
+                        else if (DialogNative.IsWindowVisible(_original))
+                        {
+                            if (FirstHidden != 0 || Volatile.Read(ref _strictHidden) != 0)
+                                Interlocked.Increment(ref _postHideOpaque);
+                            else
+                            {
+                                Interlocked.Increment(ref _preHideOpaque);
+                                // Raise/uncloak/compose/hide intentionally
+                                // overlaps under the already-raised proxy. It
+                                // has no universal millisecond/pixel guarantee.
+                                if (!DialogLease.BelongsToWindow(lease) || lease.NativeProcess != _process
+                                    || DialogNative.ProcessId((nint)lease.ProxyWindow) != lease.WorkerProcess
+                                    || !IsAbove((nint)lease.ProxyWindow, _original))
+                                    Interlocked.Increment(ref _preHideViolations);
+                            }
+                        }
                     }
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
