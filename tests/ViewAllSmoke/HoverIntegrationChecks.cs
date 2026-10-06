@@ -51,7 +51,7 @@ internal static partial class Program
             foreach (var source in new[] { "/Nodify;component/Themes/Dark.xaml", "/UltraExplorer;component/Themes/UltraTheme.xaml", "/UltraExplorer;component/Themes/PickerControls.xaml" })
                 application.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri(source, UriKind.Relative) });
         }
-        var app = Application.Current;
+        var app = Application.Current ?? throw new InvalidOperationException("The owned preview Application was not initialized.");
         var priorShutdown = app.ShutdownMode;
         var priorMain = app.MainWindow;
         app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
