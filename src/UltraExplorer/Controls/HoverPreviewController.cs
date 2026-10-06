@@ -28,7 +28,7 @@ internal sealed class HoverPreviewController : IDisposable
 
     internal void Hover(string? path)
     {
-        if (_disposed || string.Equals(Path, path, StringComparison.OrdinalIgnoreCase)) return;
+        if (_disposed || string.Equals(Path, path, StringComparison.Ordinal)) return;
         Clear();
         Path = path;
         if (!string.IsNullOrEmpty(path)) _dwell.Start();

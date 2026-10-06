@@ -26,7 +26,8 @@ information tooltip.
   target. A loading card times out after 3 seconds.
 - Frozen, detached 32-bit thumbnails are at most 512 pixels on their longest
   edge. The LRU holds at most 96 entries and 32 MiB of image pixels, including
-  negative entries with a 5-second retry interval. File length, write time and
+  negative entries with a 5-second retry interval. Positive entries expire
+  after 30 seconds. File length, write time and
   attributes are revalidated in the background, including cache hits.
 - WPF/WIC decodes common images, with all eight EXIF rotations/reflections.
   Other formats use Windows' content thumbnail cache with
@@ -37,6 +38,15 @@ information tooltip.
   skipped. Merely hovering does not hydrate cloud placeholders or follow a
   leaf symlink. Missing, locked or corrupt files yield no preview.
 - Disposal cancels waiters without joining a blocked disk/native worker.
+
+Hover identities are case-exact, including Windows case-sensitive directories.
+Leaf and parent names with trailing dots/spaces use their literal Windows
+representation; the service does not silently preview a similarly named file.
+The bounded cache describes retained thumbnail pixels, not a universal bound
+on a codec's internal decoding memory. Some non-JPEG/PNG WIC codecs can decode
+the full source before scaling. Shell thumbnails also depend on Windows'
+cache/providers; freshness after a replacement with identical metadata is not
+guaranteed by the service's own expiry alone.
 
 API references: [Windows thumbnail cache flags](https://learn.microsoft.com/en-us/windows/win32/api/thumbcache/ne-thumbcache-wts_flags),
 [IThumbnailCache](https://learn.microsoft.com/en-us/windows/win32/api/thumbcache/nn-thumbcache-ithumbnailcache),
@@ -53,6 +63,7 @@ $env:ULTRAEXPLORER_STATE_DIR = 'C:\temp\UltraExplorer-hover-test'
 $env:ULTRAEXPLORER_TEST_WINDOW = '1'
 ViewAllSmoke.exe --only ThumbnailServiceChecks,HoverPreviewChecks
 ViewAllSmoke.exe --only HoverPreviewPreferenceChecks
+ViewAllSmoke.exe --only HoverIntegrationChecks
 ViewAllSmoke.exe --only SettingsChecks
 ```
 
@@ -71,5 +82,7 @@ pointer automation.
 Release build and focused checks are recorded in the feature's coordination
 handoff. Two old selection timing budgets also fail on unchanged base
 `6c0f738` on this machine; neither source nor thresholds were changed for this
-feature. This isolated feature does not replace the separate review2 candidate
-or authorize an unqualified combined release.
+feature. The current deployment candidate is based on the qualified v1.2.1
+product and preserves its smooth F, Tags, selection, picker and file-operation
+fixes. Its new combined checks must pass before replacing the installed copy;
+historical isolated-feature totals are not a claim about this later candidate.

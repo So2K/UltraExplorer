@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -56,9 +57,9 @@ internal static partial class Program
             controller.Hover("a.png");
             Check("a settled target starts exactly its load", await HoverWait(() => asked.Count == 1)
                 && asked[0] == "a.png" && controller.IsLoading);
-            controller.Hover("A.PNG");
+            controller.Hover("a.png");
             await Task.Delay(80);
-            Check("moving within the same Windows path does not restart extraction", asked.Count == 1 && !tokens[0].IsCancellationRequested);
+            Check("moving within the same literal path does not restart extraction", asked.Count == 1 && !tokens[0].IsCancellationRequested);
             controller.Hover("b.png");
             Check("moving to another file cancels the old waiter", tokens[0].IsCancellationRequested
                 && controller.Path == "b.png" && controller.Result is null);
@@ -76,6 +77,26 @@ internal static partial class Program
             controller.Clear();
             Check("clear removes every visible preview field immediately", controller.Path is null
                 && controller.Result is null && !controller.IsLoading && tokens[1].IsCancellationRequested);
+        }
+
+        var casePaths = new List<string>();
+        var caseTokens = new List<CancellationToken>();
+        using (var controller = new HoverPreviewController(dispatcher, (path, token) =>
+               {
+                   casePaths.Add(path);
+                   caseTokens.Add(token);
+                   return Task.FromResult<ThumbnailResult?>(new(path == "Build.png" ? imageA : imageB));
+               }, TimeSpan.FromMilliseconds(25)))
+        {
+            controller.Hover("Build.png");
+            Check("the first literal-case hover displays its own image", await HoverWait(() => controller.Result is not null)
+                && controller.Path == "Build.png" && ReferenceEquals(controller.Result?.Image, imageA));
+            controller.Hover("build.png");
+            Check("moving between case twins immediately clears the prior image and cancels its waiter",
+                controller.Path == "build.png" && controller.Result is null && caseTokens[0].IsCancellationRequested);
+            Check("the second literal-case hover loads its own image instead of retaining its twin",
+                await HoverWait(() => controller.Result is not null) && ReferenceEquals(controller.Result?.Image, imageB)
+                && casePaths.SequenceEqual(new[] { "Build.png", "build.png" }));
         }
 
         var failedLoads = 0;
@@ -142,12 +163,37 @@ internal static partial class Program
         card.Show("loading.png", null, 1200, 700);
         Check("a loading card never carries a previous file image", HoverVisuals<Image>(card).Single().Source is null
             && HoverVisuals<TextBlock>(card).Any(text => text.Text == "Loading preview…" && text.Visibility == Visibility.Visible));
+
+        Section("hover preview: retained rows while a new folder is read");
+        using var icons = new ShellIconService((_, _) => null, dispatcher);
+        var root = Path.Combine(Path.GetTempPath(), "UltraExplorerHoverRow", Guid.NewGuid().ToString("N"));
+        var previousFolder = Path.Combine(root, "previous");
+        var nextFolder = Path.Combine(root, "next");
+        var nextRead = new TaskCompletionSource<ViewAllDirectorySnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var list = new FolderListViewModel(
+            (path, _, _) => path == nextFolder ? nextRead.Task : Task.FromResult(ReviewSnapshot(path, false, "previous.png", "sub")),
+            (_, _) => Task.CompletedTask, _ => false, icons) { IsVisible = true };
+        await list.NavigateAsync(previousFolder);
+        var previousRow = list.Items.First(row => !row.IsDirectory);
+        Check("a current row resolves its own exact preview path", MainWindow.HoverPreviewListTarget(list, previousRow) == previousRow.FullPath);
+        var navigating = list.NavigateAsync(nextFolder);
+        Check("the blocked next-folder fixture actually retains a previous row under its new folder name", !list.HasCurrentRows
+            && list.IsLoading && list.Items.Contains(previousRow) && list.FolderPath == nextFolder);
+        Check("a retained row from the previous folder cannot become a hover target", MainWindow.HoverPreviewListTarget(list, previousRow) is null);
+        nextRead.SetResult(ReviewSnapshot(nextFolder, false, "next.png", "sub"));
+        await navigating;
+        var nextRow = list.Items.First(row => !row.IsDirectory);
+        Check("the completed next-folder row resolves its exact new path", list.HasCurrentRows
+            && MainWindow.HoverPreviewListTarget(list, nextRow) == Path.Combine(nextFolder, "next.png"));
+        Check("a removed container's old row is still rejected after the next read completes", MainWindow.HoverPreviewListTarget(list, previousRow) is null);
+        Check("a current directory row requests no file preview", MainWindow.HoverPreviewListTarget(list, list.Items.First(row => row.IsDirectory)) is null);
     }
 
     private static async Task HoverPreviewWindowChecks()
     {
         Section("hover preview: real WPF window, exact hovered multiselection and disable");
-        var fixture = Path.Combine(Path.GetTempPath(), "UltraExplorerHoverWindow", Guid.NewGuid().ToString("N"));
+        var fixtureRoot = Path.Combine(Path.GetTempPath(), "UltraExplorerHoverWindow", Guid.NewGuid().ToString("N"));
+        var fixture = Path.Combine(fixtureRoot, "files");
         Directory.CreateDirectory(fixture);
         var first = Path.Combine(fixture, "a-landscape.png");
         var second = Path.Combine(fixture, "b-portrait.png");
@@ -155,14 +201,16 @@ internal static partial class Program
         HoverSaveImage(HoverImage(100, 240, Colors.CornflowerBlue), second);
         MainWindow? window = null;
         MainViewModel? model = null;
+        var fixtureClosed = false;
         var app = Application.Current;
         var priorShutdown = app.ShutdownMode;
         var priorMain = app.MainWindow;
         app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
         try
         {
-            window = new MainWindow(null, Path.Combine(fixture, "workspace.json"))
+            window = new MainWindow(null, Path.Combine(fixtureRoot, "state", "workspace.json"))
             { Width = 1200, Height = 700, WindowState = WindowState.Normal };
+            window.Closed += (_, _) => fixtureClosed = true;
             model = (MainViewModel)window.DataContext;
             model.SuppressShellWrites = true;
             window.ActivePane.Tree.IsReadingOnDemand = false;
@@ -219,6 +267,50 @@ internal static partial class Program
                 && window.HoverPreviewsForChecks.Result is { OriginalWidth: 240, OriginalHeight: 120 });
             HoverLayout(content);
             HoverSaveShot(content, "window-owned-landscape-simulated-hover.png");
+
+            // Inject exact-case content rather than changing filesystem case
+            // flags or writing two names that ordinary Windows folds together.
+            var thumbnailField = typeof(MainWindow).GetField("_thumbnails", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var priorThumbnails = thumbnailField.GetValue(window);
+            var upperCasePath = Path.Combine(fixture, "Build.png");
+            var lowerCasePath = Path.Combine(fixture, "build.png");
+            var upperCaseImage = HoverImage(80, 40, Colors.Crimson);
+            var lowerCaseImage = HoverImage(40, 80, Colors.CornflowerBlue);
+            var caseCalls = new System.Collections.Concurrent.ConcurrentQueue<string>();
+            using (var caseService = new FileThumbnailService(new FileThumbnailOptions
+            {
+                WorkerCount = 1, MetadataReader = _ => ThumbnailStamp(),
+                ThumbnailReader = path =>
+                {
+                    caseCalls.Enqueue(path);
+                    return path == upperCasePath ? new(upperCaseImage, 80, 40) : new(lowerCaseImage, 40, 80);
+                }
+            }))
+            {
+                thumbnailField.SetValue(window, caseService);
+                try
+                {
+                    window.SetHoverPreviewTarget(upperCasePath, new Point(250, 200));
+                    Check("the host displays the first exact-case file from its injected provider",
+                        await HoverWait(() => window.HoverPreviewsForChecks.Result is { OriginalWidth: 80, OriginalHeight: 40 })
+                        && window.HoverPreviewsForChecks.Path == upperCasePath);
+                    HoverLayout(content);
+                    var upperCaseX = Canvas.GetLeft(card);
+                    window.SetHoverPreviewTarget(lowerCasePath, new Point(700, 200));
+                    Check("the host treats a case-only path change as a new hovered file immediately",
+                        window.HoverPreviewsForChecks.Path == lowerCasePath && window.HoverPreviewsForChecks.Result is null);
+                    Check("the host loads the case twin's own pixels and places its card at the new hover point",
+                        await HoverWait(() => window.HoverPreviewsForChecks.Result is { OriginalWidth: 40, OriginalHeight: 80 })
+                        && ThumbnailBlue(window.HoverPreviewsForChecks.Result!.Image) == Colors.CornflowerBlue.B
+                        && caseCalls.ToArray().SequenceEqual(new[] { upperCasePath, lowerCasePath })
+                        && caseService.Diagnostics.Extractions == 2 && Canvas.GetLeft(card) != upperCaseX);
+                }
+                finally
+                {
+                    window.SetHoverPreviewTarget(null, default);
+                    thumbnailField.SetValue(window, priorThumbnails);
+                }
+            }
 
             // Read-only user-provided file; opt-in only. The application service
             // loads the real PNG, but the hover target here is injected, so the
@@ -303,10 +395,60 @@ internal static partial class Program
                 Check("a routed move from the folder-list row targets its own file", ViewAllPath.Equals(window.HoverPreviewsForChecks.Path ?? string.Empty, second));
                 window.SetHoverPreviewTarget(null, default);
             }
+
+            Section("hover preview: queued releases cannot undo later input or dismissal");
+            var queued = 0;
+            window.QueueHoverPreviewAfterRelease(MouseButton.Left, () => queued++);
+            await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+            Check("an uninterrupted left release reevaluates stationary hover exactly once", queued == 1);
+            window.QueueHoverPreviewAfterRelease(MouseButton.Right, () => queued++);
+            window.QueueHoverPreviewAfterRelease(MouseButton.Middle, () => queued++);
+            await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+            Check("right menu and middle pan releases never queue a preview", queued == 1);
+            foreach (var dismiss in new[] { "PreviewHoverDeactivate", "PreviewHoverMenu", "PreviewHoverKey", "PreviewHoverLeave" })
+            {
+                window.QueueHoverPreviewAfterRelease(MouseButton.Left, () =>
+                {
+                    queued++;
+                    window.SetHoverPreviewTarget(second, new Point(600, 300));
+                });
+                // These handlers only dismiss previews, so invoking the exact
+                // subscribed handler faithfully exercises the cancellation
+                // without changing the user's physical mouse or keyboard.
+                var method = typeof(MainWindow).GetMethod(dismiss, BindingFlags.Instance | BindingFlags.NonPublic)!;
+                method.Invoke(window, [window, dismiss == "PreviewHoverDeactivate" ? EventArgs.Empty : null]);
+                await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+                Check($"{dismiss} invalidates an older queued left release", queued == 1
+                    && window.HoverPreviewsForChecks.Path is null && card.Visibility == Visibility.Collapsed);
+            }
+            using (var cameraTree = new NestedTree { IsReadingOnDemand = false })
+            {
+                var canvas = new NestedCanvas { Tree = cameraTree };
+                canvas.Measure(new Size(600, 400));
+                canvas.Arrange(new Rect(0, 0, 600, 400));
+                window.SetHoverPreviewTarget(second, new Point(600, 300), canvas);
+                window.QueueHoverPreviewAfterRelease(MouseButton.Left, () => queued++);
+                canvas.FitAll(animated: false);
+                await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+                Check("an intervening camera move invalidates an older queued release", queued == 1 && window.HoverPreviewsForChecks.Path is null);
+                canvas.Tree = null;
+            }
+            window.QueueHoverPreviewAfterRelease(MouseButton.Left, () => queued++);
+            model.ShowHoverPreviews = false;
+            await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+            Check("switching previews off invalidates an older queued release", queued == 1 && window.HoverPreviewsForChecks.Path is null);
+            model.ShowHoverPreviews = true;
+            window.QueueHoverPreviewAfterRelease(MouseButton.Left, () => queued++);
+            var closedForReleaseCheck = false;
+            window.Closed += (_, _) => closedForReleaseCheck = true;
+            window.Close();
+            Check("the owned release fixture closes before teardown", await HoverWait(() => closedForReleaseCheck, 2500));
+            await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+            Check("closing the window invalidates queued hover work", queued == 1 && window.HoverPreviewsForChecks.Path is null);
         }
         finally
         {
-            if (window is not null)
+            if (window is not null && !fixtureClosed)
             {
                 var closed = false;
                 window.Closed += (_, _) => closed = true;
@@ -316,7 +458,7 @@ internal static partial class Program
             model?.Dispose();
             app.MainWindow = priorMain;
             app.ShutdownMode = priorShutdown;
-            TryDelete(fixture);
+            TryDelete(fixtureRoot);
         }
     }
 

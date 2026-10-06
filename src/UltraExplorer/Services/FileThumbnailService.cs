@@ -20,9 +20,11 @@ internal sealed class FileThumbnailService : IDisposable
 {
     internal const int MaximumDimension = 512;
     private readonly object _gate = new();
-    private readonly Dictionary<string, Work> _pending = new(StringComparer.OrdinalIgnoreCase);
+    // Directory listings preserve literal spelling, including case twins in
+    // case-sensitive Windows folders. Distinct names must never share pixels.
+    private readonly Dictionary<string, Work> _pending = new(StringComparer.Ordinal);
     private readonly LinkedList<Work> _queue = new();
-    private readonly Dictionary<string, LinkedListNode<CacheEntry>> _cache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, LinkedListNode<CacheEntry>> _cache = new(StringComparer.Ordinal);
     private readonly LinkedList<CacheEntry> _lru = new();
     private readonly FileThumbnailOptions _options;
     private readonly Func<string, ThumbnailFileStamp?> _metadata;
@@ -50,7 +52,7 @@ internal sealed class FileThumbnailService : IDisposable
     {
         if (token.IsCancellationRequested) return Task.FromCanceled<ThumbnailResult?>(token);
         if (string.IsNullOrWhiteSpace(path)) return Task.FromResult<ThumbnailResult?>(null);
-        try { path = Path.GetFullPath(path); }
+        try { path = NormalizePath(path); }
         catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
         { return Task.FromResult<ThumbnailResult?>(null); }
 
@@ -124,11 +126,18 @@ internal sealed class FileThumbnailService : IDisposable
             if (waiter.Finished) return;
             waiter.Finished = true;
             work.Waiters.Remove(waiter);
-            if (work.Waiters.Count == 0 && work.Node is not null)
+            if (work.Waiters.Count == 0)
             {
-                _queue.Remove(work.Node);
-                work.Node = null;
-                _pending.Remove(work.Path);
+                if (work.Node is not null)
+                {
+                    _queue.Remove(work.Node);
+                    work.Node = null;
+                }
+                // An active native call cannot be interrupted. Retire its
+                // pending identity now, so a new hover cannot attach while the
+                // abandoned worker is returning null/completing its old work.
+                if (_pending.TryGetValue(work.Path, out var pending) && ReferenceEquals(pending, work))
+                    _pending.Remove(work.Path);
             }
         }
         waiter.Completion.TrySetCanceled(waiter.Token);
@@ -185,8 +194,7 @@ internal sealed class FileThumbnailService : IDisposable
             if (_disposed || work.Waiters.Count == 0) return null;
             if (_cache.TryGetValue(work.Path, out var existing))
             {
-                if (existing.Value.Stamp == stamp
-                    && (existing.Value.Result is not null || _options.TickCount() < existing.Value.Expires))
+                if (existing.Value.Stamp == stamp && _options.TickCount() < existing.Value.Expires)
                 {
                     _lru.Remove(existing);
                     _lru.AddLast(existing);
@@ -235,8 +243,9 @@ internal sealed class FileThumbnailService : IDisposable
             if (_cache.TryGetValue(work.Path, out var old)) RemoveCache(old);
             var limit = Math.Clamp(_options.MaximumCacheBytes, 4, 32L * 1024 * 1024);
             if (bytes > limit) return;
+            var lifetime = result is null ? _options.NegativeCacheMilliseconds : _options.PositiveCacheMilliseconds;
             var entry = new CacheEntry(work.Path, stamp, result, bytes,
-                _options.TickCount() + Math.Clamp(_options.NegativeCacheMilliseconds, 1, 30_000));
+                _options.TickCount() + Math.Clamp(lifetime, 1, 30_000));
             _cache.Add(work.Path, _lru.AddLast(entry));
             _cacheBytes += bytes;
             while (_cacheBytes > limit || _cache.Count > Math.Clamp(_options.MaximumCacheEntries, 1, 96))
@@ -306,9 +315,41 @@ internal sealed class FileThumbnailService : IDisposable
         return file.Exists ? new ThumbnailFileStamp(file.Length, file.LastWriteTimeUtc.Ticks, (uint)file.Attributes) : null;
     }
 
+    private static string NormalizePath(string path)
+    {
+        // Paths from the directory reader name literal entries. Win32's
+        // ordinary normalization silently redirects "image.png." or a parent
+        // "assets." to their neighbours without the dot. Match the reader's
+        // extended DOS/UNC representation before asking GetFullPath to parse.
+        // Ordinary paths retain the representation Shell providers expect.
+        if (Path.IsPathFullyQualified(path) && !path.StartsWith(@"\\?\", StringComparison.Ordinal)
+            && !path.StartsWith(@"\\.\", StringComparison.Ordinal) && HasLiteralTrailingName(path))
+        {
+            path = path.Replace('/', '\\');
+            path = path.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + path[2..] : @"\\?\" + path;
+        }
+        return Path.GetFullPath(path);
+    }
+
+    private static bool HasLiteralTrailingName(string path)
+    {
+        var start = 0;
+        for (var index = 0; index <= path.Length; index++)
+        {
+            if (index != path.Length && path[index] is not ('\\' or '/')) continue;
+            var name = path.AsSpan(start, index - start);
+            if (name.Length != 0 && name[^1] is (' ' or '.') && !name.SequenceEqual(".") && !name.SequenceEqual(".."))
+                return true;
+            start = index + 1;
+        }
+        return false;
+    }
+
     private static ThumbnailResult? ExtractThumbnail(string path)
     {
-        var extension = Path.GetExtension(path).ToLowerInvariant();
+        // Only the codec hint is trimmed. The file opened below keeps its exact
+        // literal name, including dots/spaces after an image extension.
+        var extension = Path.GetExtension(path.TrimEnd(' ', '.')).ToLowerInvariant();
         if (extension is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".tif" or ".tiff" or ".ico" or ".wdp" or ".jxr")
         {
             try
@@ -321,7 +362,7 @@ internal sealed class FileThumbnailService : IDisposable
                 var frame = decoder.Frames[0];
                 var width = frame.PixelWidth;
                 var height = frame.PixelHeight;
-                var orientation = ReadOrientation(frame.Metadata as BitmapMetadata);
+                var orientation = ReadOrientation(frame);
                 if (width <= 0 || height <= 0 || width > 100_000 || height > 100_000 || (long)width * height > 200_000_000)
                     return null;
                 stream.Position = 0;
@@ -395,8 +436,11 @@ internal sealed class FileThumbnailService : IDisposable
         if (value is not null && Marshal.IsComObject(value)) Marshal.ReleaseComObject(value);
     }
 
-    private static int ReadOrientation(BitmapMetadata? metadata)
+    private static int ReadOrientation(BitmapFrame frame)
     {
+        BitmapMetadata? metadata;
+        try { metadata = frame.Metadata as BitmapMetadata; }
+        catch (Exception) { return 1; } // Missing/unsupported metadata does not make the image unsupported.
         if (metadata is null) return 1;
         foreach (var query in new[] { "/app1/ifd/{ushort=274}", "/ifd/{ushort=274}" })
         {
@@ -555,6 +599,7 @@ internal sealed class FileThumbnailOptions
     public int MaximumCacheEntries { get; init; } = 96;
     public long MaximumCacheBytes { get; init; } = 32L * 1024 * 1024;
     public int NegativeCacheMilliseconds { get; init; } = 5_000;
+    public int PositiveCacheMilliseconds { get; init; } = 30_000;
     public Func<long> TickCount { get; init; } = () => Environment.TickCount64;
     public Func<string, ThumbnailFileStamp?>? MetadataReader { get; init; }
     public Func<string, ThumbnailResult?>? ThumbnailReader { get; init; }

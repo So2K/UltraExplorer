@@ -217,6 +217,7 @@ internal static partial class Program
         await Group(ThumbnailServiceChecks);
         await Group(HoverPreviewChecks);
         await Group(HoverPreviewPreferenceChecks);
+        await Group(HoverIntegrationChecks);
     }
 
     /// <summary>

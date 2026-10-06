@@ -16,10 +16,15 @@ internal static partial class Program
         await ThumbnailNegativeChecks();
         await ThumbnailQueueChecks();
         await ThumbnailDedupChecks();
+        await ThumbnailCaseIdentityChecks();
+        await ThumbnailAbandonedRejoinChecks();
         await ThumbnailBlockedDisposeChecks();
         await ThumbnailContentChecks();
+        await ThumbnailDetachmentChecks();
         ThumbnailOrientationChecks();
         await ThumbnailRealFileChecks();
+        await ThumbnailLiteralPathChecks();
+        await ThumbnailSameStampOverwriteChecks();
     }
 
     private static BitmapSource ThumbnailPicture(int width = 32, int height = 16, byte blue = 40)
@@ -205,6 +210,55 @@ internal static partial class Program
         finally { release.Set(); }
     }
 
+    private static async Task ThumbnailCaseIdentityChecks()
+    {
+        var upper = ThumbnailPath("Build");
+        var lower = ThumbnailPath("build");
+        var upperImage = ThumbnailPicture(blue: 40);
+        var lowerImage = ThumbnailPicture(blue: 210);
+        var calls = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        using var service = new FileThumbnailService(new FileThumbnailOptions
+        {
+            WorkerCount = 1, MetadataReader = _ => ThumbnailStamp(),
+            ThumbnailReader = path =>
+            {
+                calls.AddOrUpdate(path, 1, (_, count) => count + 1);
+                if (path == upper)
+                {
+                    started.TrySetResult();
+                    release.Wait(TimeSpan.FromSeconds(10));
+                }
+                return new(path == upper ? upperImage : lowerImage);
+            }
+        });
+        try
+        {
+            var first = service.GetAsync(upper);
+            await started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            var same = service.GetAsync(upper);
+            var twin = service.GetAsync(lower);
+            Check("case twins with identical metadata queue independent work while exact-name waiters share it",
+                service.Diagnostics.Queued == 1 && service.Diagnostics.Extractions == 1);
+            release.Set();
+            var upperResult = await ThumbnailAwait(first);
+            var sameResult = await ThumbnailAwait(same);
+            var lowerResult = await ThumbnailAwait(twin);
+            Check("case-twin pending requests receive their own pixels and exactly one provider call per literal name",
+                upperResult is not null && lowerResult is not null && ReferenceEquals(upperResult, sameResult)
+                && ThumbnailBlue(upperResult.Image) == 40 && ThumbnailBlue(lowerResult.Image) == 210
+                && calls.Count == 2 && calls[upper] == 1 && calls[lower] == 1);
+            var upperCached = await ThumbnailAwait(service.GetAsync(upper));
+            var lowerCached = await ThumbnailAwait(service.GetAsync(lower));
+            Check("case-twin cache entries remain distinct despite equal size, timestamp and attributes",
+                upperResult is not null && lowerResult is not null
+                && ReferenceEquals(upperResult, upperCached) && ReferenceEquals(lowerResult, lowerCached)
+                && service.Diagnostics.CacheEntries == 2 && service.Diagnostics.Extractions == 2);
+        }
+        finally { release.Set(); }
+    }
+
     private static async Task ThumbnailBlockedDisposeChecks()
     {
         using var release = new ManualResetEventSlim();
@@ -242,6 +296,92 @@ internal static partial class Program
             Check("requests after disposal complete with no content", await ThumbnailAwait(service.GetAsync(ThumbnailPath("after"))) is null);
         }
         finally { release.Set(); }
+    }
+
+    private static async Task ThumbnailAbandonedRejoinChecks()
+    {
+        var oldImage = ThumbnailPicture(blue: 20);
+        var newImage = ThumbnailPicture(blue: 210);
+        var calls = new ConcurrentDictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        var barriers = new ConcurrentDictionary<string, (TaskCompletionSource Started, ManualResetEventSlim Release)>(StringComparer.OrdinalIgnoreCase);
+        using var service = new FileThumbnailService(new FileThumbnailOptions
+        {
+            WorkerCount = 1, MetadataReader = _ => ThumbnailStamp(),
+            ThumbnailReader = path =>
+            {
+                var attempt = calls.AddOrUpdate(path, 1, (_, count) => count + 1);
+                if (attempt != 1) return new(newImage);
+                var barrier = barriers[path];
+                barrier.Started.TrySetResult();
+                barrier.Release.Wait(TimeSpan.FromSeconds(10));
+                return new(oldImage);
+            }
+        });
+
+        var renewed = 0;
+        var canceled = 0;
+        var bounded = true;
+        for (var iteration = 0; iteration < 32; iteration++)
+        {
+            var path = ThumbnailPath($"rejoin-{iteration}");
+            using var release = new ManualResetEventSlim();
+            using var cancellation = new CancellationTokenSource();
+            var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            barriers[path] = (started, release);
+            try
+            {
+                var abandoned = service.GetAsync(path, cancellation.Token);
+                await started.Task.WaitAsync(TimeSpan.FromSeconds(3));
+                cancellation.Cancel();
+                var fresh = service.GetAsync(path);
+                bounded &= service.Diagnostics.Queued == 1 && service.Diagnostics.WorkerCount == 1;
+                release.Set();
+                try { await ThumbnailAwait(abandoned); }
+                catch (OperationCanceledException) { canceled++; }
+                var result = await ThumbnailAwait(fresh);
+                if (result is not null && ThumbnailBlue(result.Image) == 210 && calls[path] == 2) renewed++;
+            }
+            finally
+            {
+                release.Set();
+                barriers.TryRemove(path, out _);
+            }
+        }
+        Check("canceling every active waiter retires that work, and same-path hovers receive fresh work in 32 handoffs",
+            canceled == 32 && renewed == 32 && bounded);
+    }
+
+    private static async Task ThumbnailDetachmentChecks()
+    {
+        var sources = new ConcurrentBag<WeakReference<BitmapSource>>();
+        using var service = new FileThumbnailService(new FileThumbnailOptions
+        {
+            WorkerCount = 1, MaximumCacheBytes = 1024 * 1024,
+            MetadataReader = _ => ThumbnailStamp(), ThumbnailReader = _ => ThumbnailRetentionSource(sources)
+        });
+        for (var index = 0; index < 6; index++)
+            await ThumbnailAwait(service.GetAsync(ThumbnailPath($"large-source-{index}")));
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        Check("cached thumbnails do not retain their larger provider bitmaps after bounded pixel detachment",
+            sources.Count == 6 && sources.All(source => !source.TryGetTarget(out _))
+            && service.Diagnostics.CacheBytes <= 1024 * 1024 && service.Diagnostics.CacheEntries == 2);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static ThumbnailResult ThumbnailRetentionSource(ConcurrentBag<WeakReference<BitmapSource>> sources)
+    {
+        var image = ThumbnailPicture(2048, 1024);
+        sources.Add(new WeakReference<BitmapSource>(image));
+        return new(image);
+    }
+
+    private static byte ThumbnailBlue(BitmapSource image)
+    {
+        var pixels = new byte[image.PixelWidth * image.PixelHeight * 4];
+        image.CopyPixels(pixels, image.PixelWidth * 4, 0);
+        return pixels[0];
     }
 
     private static async Task ThumbnailContentChecks()
@@ -368,5 +508,112 @@ internal static partial class Program
                 image.IsFrozen && image.PixelWidth == (orientation < 5 ? 2 : 3)
                 && Enumerable.Range(0, 6).Select(index => actual[index * 4]).SequenceEqual(expected[orientation - 1]));
         }
+    }
+
+    private static async Task ThumbnailLiteralPathChecks()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "UltraExplorerThumbnailLiteral", Guid.NewGuid().ToString("N"));
+        var files = new List<string>();
+        var folders = new List<string>();
+        Directory.CreateDirectory(directory);
+        try
+        {
+            using var service = new FileThumbnailService();
+            foreach (var suffix in new[] { "", ".", " " })
+            {
+                var path = Path.Combine(directory, "leaf.png" + suffix);
+                files.Add(path);
+                ThumbnailWritePngLiteral(path, suffix == "" ? (byte)40 : suffix == "." ? (byte)210 : (byte)110);
+            }
+            var leafResults = await Task.WhenAll(files.Select(path => service.GetAsync(path))).WaitAsync(TimeSpan.FromSeconds(5));
+            Check("literal trailing-dot and trailing-space image names show their own pixels instead of a sibling's",
+                leafResults.All(result => result is not null && result.OriginalWidth == 32)
+                && leafResults.Select(result => ThumbnailBlue(result!.Image)).SequenceEqual(new byte[] { 40, 210, 110 }));
+
+            var parentPaths = new List<string>();
+            foreach (var suffix in new[] { "", ".", " " })
+            {
+                var parent = Path.Combine(directory, "parent" + suffix);
+                folders.Add(parent);
+                Directory.CreateDirectory(ThumbnailExtendedPath(parent));
+                var path = Path.Combine(parent, "picture.png");
+                files.Add(path);
+                parentPaths.Add(path);
+                ThumbnailWritePngLiteral(path, suffix == "" ? (byte)40 : suffix == "." ? (byte)210 : (byte)110);
+            }
+            var parentResults = await Task.WhenAll(parentPaths.Select(path => service.GetAsync(path))).WaitAsync(TimeSpan.FromSeconds(5));
+            Check("literal trailing-dot and trailing-space parent names remain distinct during thumbnail IO",
+                parentResults.All(result => result is not null)
+                && parentResults.Select(result => ThumbnailBlue(result!.Image)).SequenceEqual(new byte[] { 40, 210, 110 }));
+
+            string? described = null;
+            using var unc = new FileThumbnailService(new FileThumbnailOptions
+            {
+                WorkerCount = 1, MetadataReader = path => { described = path; return null; }
+            });
+            await ThumbnailAwait(unc.GetAsync(@"\\server\share\folder.\picture.png "));
+            Check("literal UNC names use extended UNC syntax before metadata lookup without accessing a share",
+                described == @"\\?\UNC\server\share\folder.\picture.png " && unc.Diagnostics.Extractions == 0);
+        }
+        finally
+        {
+            // Delete only the exact owned entries, using extended paths even
+            // for the normal siblings. No normalizing recursive cleanup may
+            // mistake a literal folder for its neighbour.
+            foreach (var path in files) File.Delete(ThumbnailExtendedPath(path));
+            foreach (var folder in folders) Directory.Delete(ThumbnailExtendedPath(folder), recursive: false);
+            Directory.Delete(directory, recursive: false);
+        }
+    }
+
+    private static string ThumbnailExtendedPath(string path) => path.StartsWith(@"\\?\", StringComparison.Ordinal)
+        ? path : path.StartsWith(@"\\", StringComparison.Ordinal) ? @"\\?\UNC\" + path[2..] : @"\\?\" + path;
+
+    private static void ThumbnailWritePngLiteral(string path, byte blue)
+    {
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(ThumbnailPicture(blue: blue)));
+        using var output = new FileStream(ThumbnailExtendedPath(path), FileMode.CreateNew, FileAccess.Write, FileShare.None);
+        encoder.Save(output);
+    }
+
+    private static async Task ThumbnailSameStampOverwriteChecks()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "UltraExplorerThumbnailOverwrite", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "same-metadata.bmp");
+            void Write(byte blue)
+            {
+                var encoder = new BmpBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(ThumbnailPicture(blue: blue)));
+                using var output = File.Create(path);
+                encoder.Save(output);
+            }
+            Write(40);
+            var before = new FileInfo(path);
+            var length = before.Length;
+            var modified = before.LastWriteTimeUtc;
+            long clock = 0;
+            using var service = new FileThumbnailService(new FileThumbnailOptions
+            {
+                WorkerCount = 1, PositiveCacheMilliseconds = 100, TickCount = () => Interlocked.Read(ref clock)
+            });
+            var first = await ThumbnailAwait(service.GetAsync(path));
+            Write(210);
+            File.SetLastWriteTimeUtc(path, modified);
+            var after = new FileInfo(path);
+            var reused = await ThumbnailAwait(service.GetAsync(path));
+            Check("an owned overwrite fixture changes pixels while preserving file length and last-write time",
+                after.Length == length && after.LastWriteTimeUtc == modified && first is not null
+                && ThumbnailBlue(first.Image) == 40 && ReferenceEquals(first, reused));
+            Interlocked.Exchange(ref clock, 101);
+            var fresh = await ThumbnailAwait(service.GetAsync(path));
+            Check("positive cache expiry refreshes same-size same-timestamp content instead of retaining stale pixels forever",
+                fresh is not null && ThumbnailBlue(fresh.Image) == 210 && !ReferenceEquals(first, fresh)
+                && service.Diagnostics.Extractions == 2);
+        }
+        finally { TryDelete(directory); }
     }
 }

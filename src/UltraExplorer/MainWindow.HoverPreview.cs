@@ -21,6 +21,7 @@ public partial class MainWindow
     private NestedTree? _previewTree;
     private Point _previewPointer;
     private bool _previewDetached;
+    private long _previewGeneration;
 
     private void AttachHoverPreviews()
     {
@@ -77,7 +78,7 @@ public partial class MainWindow
         if (FindAncestor<ListBoxItem>(source) is { DataContext: FolderListItem row }
             && FindAncestor<SelectionListBox>(source) == FolderListItems)
         {
-            SetHoverPreviewTarget(row.IsDirectory ? null : row.FullPath, args.GetPosition(_previewOverlay));
+            SetHoverPreviewTarget(HoverPreviewListTarget(_viewModel.Tree.FolderList, row), args.GetPosition(_previewOverlay));
             return;
         }
 
@@ -94,7 +95,7 @@ public partial class MainWindow
     internal void SetHoverPreviewTarget(string? path, Point pointer, NestedCanvas? canvas = null)
     {
         if (_previewDetached || !_viewModel.ShowHoverPreviews || _closeRequested) path = null;
-        var pathChanged = !string.Equals(_hoverPreview.Path, path, StringComparison.OrdinalIgnoreCase);
+        var pathChanged = !string.Equals(_hoverPreview.Path, path, StringComparison.Ordinal);
         var canvasChanged = !ReferenceEquals(_previewCanvas, path is null ? null : canvas);
         if (pathChanged || canvasChanged)
         {
@@ -145,9 +146,13 @@ public partial class MainWindow
 
     private void ClearHoverPreview()
     {
+        _previewGeneration++;
         SetPreviewCanvas(null);
         _hoverPreview.Clear();
     }
+
+    internal static string? HoverPreviewListTarget(FolderListViewModel list, FolderListItem row) =>
+        list.IsCurrentRow(row) && !row.IsDirectory ? row.FullPath : null;
 
     private void PreviewPreferenceChanged(object? sender, PropertyChangedEventArgs args)
     {
@@ -172,13 +177,30 @@ public partial class MainWindow
     {
         // After a click, holding still over the selected item is a hover too.
         // Wait until the item's own release has finished selection/navigation.
-        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () =>
+        QueueHoverPreviewAfterRelease(args.ChangedButton, () =>
         {
-            if (_previewDetached || !IsMouseOver) return;
+            if (!IsMouseOver) return;
             PreviewHoverMove(this, new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount)
             {
                 RoutedEvent = Mouse.PreviewMouseMoveEvent, Source = Mouse.DirectlyOver
             });
+        });
+    }
+
+    /// <summary>
+    /// Only an ordinary left release may resume a stationary hover. A right
+    /// release is opening a native menu, whose nested message pump can run
+    /// dispatcher work before the menu returns. Every clear invalidates work
+    /// queued before a camera/key/menu/deactivation/close change.
+    /// </summary>
+    internal void QueueHoverPreviewAfterRelease(MouseButton button, Action reevaluate)
+    {
+        if (button != MouseButton.Left || _previewDetached || _closeRequested || !_viewModel.ShowHoverPreviews) return;
+        var generation = _previewGeneration;
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () =>
+        {
+            if (_previewDetached || _closeRequested || !_viewModel.ShowHoverPreviews || generation != _previewGeneration) return;
+            reevaluate();
         });
     }
     private void PreviewHoverWheel(object sender, MouseWheelEventArgs args) => ClearHoverPreview();
