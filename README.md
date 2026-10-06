@@ -129,11 +129,11 @@ which folder occupies the most bytes.
 
 ## Download
 
-The current stable-channel release is **v1.2.0 for Windows x64**. Get the assets from
-[v1.2.0](https://github.com/So2K/UltraExplorer/releases/tag/v1.2.0):
+The current stable-channel release is **v1.2.1 for Windows x64**. Get the assets from
+[the latest release](https://github.com/So2K/UltraExplorer/releases/latest):
 
-- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
-- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/download/v1.2.0/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
+- [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/latest/download/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
+- [Portable — UltraExplorer-win-x64.zip](https://github.com/So2K/UltraExplorer/releases/latest/download/UltraExplorer-win-x64.zip): extract it and run `UltraExplorer.exe`.
 
 Both include the .NET runtime. Settings, favorites, colors and notes are stored
 in `%LOCALAPPDATA%\UltraExplorer`.
@@ -141,7 +141,17 @@ in `%LOCALAPPDATA%\UltraExplorer`.
 Windows 11, x64. For earlier and newer builds, see
 [all releases](https://github.com/So2K/UltraExplorer/releases).
 
-[Release notes and validation limits](docs/RELEASE_NOTES_v1.2.0.md).
+[Release notes and validation limits](docs/RELEASE_NOTES_v1.2.1.md).
+
+## What changed in v1.2.1
+
+Lost a selected file after zooming out? Press **`F`** to smoothly fly back to
+its large centered card. Sorting, live updates and resizing keep that flight
+aimed at the same file; your selection and history stay intact.
+
+The review also tightened script drops, transfer outcomes, closing-window
+navigation, refreshed-node consumers and package-safe updates.
+[Review and exact qualification](docs/REVIEW_v1.2.1.md).
 
 ## What changed in v1.2.0
 
