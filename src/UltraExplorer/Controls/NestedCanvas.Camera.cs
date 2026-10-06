@@ -173,6 +173,73 @@ public sealed partial class NestedCanvas
         FlyToRect(parent, (_viewWidth / 2 - centreX * parentWidth, _viewHeight / 2 - centreY * parentWidth, parentWidth));
     }
 
+    /// <summary>Frames the requested file card tightly, or a folder whole. Unlike arrow navigation this is an explicit, normally instant focus.</summary>
+    public async Task<bool> FocusPathAsync(string path, bool? isDirectory = null,
+        Func<bool>? requestCurrent = null, bool animated = false)
+    {
+        if (_tree is not { } tree || string.IsNullOrWhiteSpace(path) || requestCurrent?.Invoke() == false) return false;
+        var request = NextCameraRequest();
+        using var reads = new CancellationTokenSource();
+        _cameraReads = reads;
+        bool Current() => ReferenceEquals(tree, _tree) && request == _cameraRequest
+            && !reads.IsCancellationRequested && requestCurrent?.Invoke() != false;
+        try
+        {
+            var directory = isDirectory;
+            if (directory is null)
+            {
+                if (tree.Find(path) is not null) directory = true;
+                else if (Path.GetDirectoryName(path) is { } knownParent && tree.Find(knownParent) is { } known
+                    && NestedTree.HoldsFile(known, Path.GetFileName(path))) directory = false;
+                else
+                {
+                    var entry = await tree.DescribeNamedEntryAsync(path, reads.Token).WaitAsync(reads.Token);
+                    if (!Current()) return false;
+                    directory = entry.Kind != ViewAllEntryKind.File;
+                }
+            }
+            var folderPath = directory == true ? path : Path.GetDirectoryName(path);
+            if (string.IsNullOrWhiteSpace(folderPath) || !Current()) return false;
+            var folder = await tree.MaterializePathAsync(folderPath, reads.Token).WaitAsync(reads.Token);
+            if (folder is null || !Current() || !ViewAllPath.Equals(folder.FullPath, folderPath)) return false;
+            var index = -1;
+            if (directory != true)
+            {
+                await tree.LoadAsync(folder, reads.Token);
+                if (!Current() || !folder.IsLoaded) return false;
+                if (!await tree.EnsureNamedFileAsync(folder, path, reads.Token, Current) || !Current()) return false;
+                // Local reveal only. The window's stored Layers preference
+                // stays unchanged, as for Show in Explorer file invocations.
+                if (!Shows(CanvasLayer.Files)) ShownLayers |= CanvasLayer.Files;
+                if (!Current()) return false;
+                tree.EnsureLayout(folder);
+                index = tree.FindFileIndex(folder, Path.GetFileName(path));
+                if (index < 0) return false;
+            }
+            if (!Current() || NestedTree.IsDetached(folder) || !NestedTree.IsOnCanvas(folder)) return false;
+            UpdateLayout();
+            if (ActualWidth > 0 && ActualHeight > 0) { _viewWidth = ActualWidth; _viewHeight = ActualHeight; }
+            if (!(_viewWidth > 0 && _viewHeight > 0)) return false;
+            if (directory == true) return FlyTo(folder, 0.88, animated);
+
+            var files = folder.FileGrid;
+            if (files.IsEmpty || index >= folder.Files.Count || !(files.TileWidth > 0 && files.TileHeight > 0)) return false;
+            var width = Math.Min(_viewWidth * 0.75 / files.TileWidth, _viewHeight * 0.75 / files.TileHeight);
+            var (x, y) = files.Origin(index);
+            return FlyToRect(folder, (_viewWidth / 2 - (x + files.TileWidth / 2) * width,
+                _viewHeight / 2 - (y + files.TileHeight / 2) * width, width), animated);
+        }
+        catch (Exception error) when (error is OperationCanceledException or IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException or ObjectDisposedException)
+        {
+            return false;
+        }
+        finally
+        {
+            if (ReferenceEquals(_cameraReads, reads)) _cameraReads = null;
+        }
+    }
+
     /// <summary>Reads everything on the way to <paramref name="path"/>, then flies to it.</summary>
     public async Task<bool> FlyToPathAsync(string path, double fill = 0.72, bool animated = true)
     {

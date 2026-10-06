@@ -1593,6 +1593,7 @@ public partial class MainWindow : Window
     {
         var menu = new ContextMenu { PlacementTarget = target, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
         AddCommandItem(menu, "Fit all", "\uE9A6", _viewModel.FitAllCommand, "Shift+1");
+        AddActionItem(menu, "Focus selected item", "\uE9A6", () => _ = FocusSelectionAsync(), "F");
         if (!IsNested)
         {
             AddCommandItem(menu, "Reset zoom", "\uE71E", _viewModel.ResetZoomCommand, "Ctrl+0");
@@ -2174,10 +2175,15 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (Keyboard.FocusedElement is TextBox)
+        if (IsFocusTextInput(Keyboard.FocusedElement as DependencyObject)
+            || IsFocusTextInput(e.OriginalSource as DependencyObject))
         {
             return;
         }
+
+        if (TryHandleFocusSelectionKey(key, modifiers, e.IsRepeat,
+                e.OriginalSource as DependencyObject, () => e.Handled = true))
+            return;
 
         // The nested canvas moves between cells with the arrows and goes in and
         // out with Enter and Backspace; the tree's meanings for those keys

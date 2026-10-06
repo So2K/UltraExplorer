@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using UltraExplorer.Models;
 
 namespace UltraExplorer.Services;
@@ -6,6 +7,93 @@ namespace UltraExplorer.Services;
 public sealed partial class NestedTree
 {
     private readonly ViewAllFileSystemService _pathFileSystem = new();
+
+    /// <summary>Owned metadata seam for checks; production describes one exact entry off the UI thread.</summary>
+    internal Func<string, CancellationToken, Task<ViewAllEntryDescriptor>>? NamedFileDescribeForChecks { get; set; }
+
+    internal Task<ViewAllEntryDescriptor> DescribeNamedEntryAsync(string path, CancellationToken cancellationToken)
+        => NamedFileDescribeForChecks?.Invoke(path, cancellationToken) ?? _pathFileSystem.DescribeEntryAsync(path, cancellationToken);
+
+    private sealed record NamedFileSlot(string Name, int ReadTicket, WeakReference<NestedFile[]> Listing);
+    private readonly ConditionalWeakTable<NestedFolder, NamedFileSlot> _namedFileSlots = new();
+
+    /// <summary>Ensures one specifically named file has a tile even outside a capped listing. No ancestor or directory enumeration is added.</summary>
+    internal async Task<bool> EnsureNamedFileAsync(NestedFolder folder, string path,
+        CancellationToken cancellationToken = default, Func<bool>? requestCurrent = null)
+    {
+        bool Current() => !_disposed && !IsDetached(folder) && !cancellationToken.IsCancellationRequested
+            && requestCurrent?.Invoke() != false;
+        if (!Current() || !folder.IsLoaded || !ViewAllPath.Equals(Path.GetDirectoryName(path) ?? "", folder.FullPath)) return false;
+        var name = Path.GetFileName(path);
+        if (string.IsNullOrEmpty(name)) return false;
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            // A load of an already loaded folder does not await its refresh.
+            // Let that read finish before adding a leaf it could overwrite.
+            if (folder.QueuedRead != ReadKind.None || folder.NeedsRefresh)
+                await RefreshAsync(folder, cancellationToken);
+            if (!Current() || !folder.IsLoaded) return false;
+            if (HoldsFile(folder, name))
+            {
+                var wasShown = FileIndexAsPlaced(folder, name) >= 0;
+                if (!_forcedVisible.Contains(Key(path))) ForceVisible([path]);
+                if (!Current()) return false;
+                if (!wasShown)
+                {
+                    ApplyVisibleChildren(folder);
+                    VisibilityVersion++;
+                    RaiseChanged();
+                }
+                return Current();
+            }
+            var ticket = folder.ReadTicket;
+            var before = folder.AllFiles;
+            var entry = await DescribeNamedEntryAsync(path, cancellationToken).WaitAsync(cancellationToken);
+            if (!Current() || entry.Kind != ViewAllEntryKind.File || !ViewAllPath.Equals(entry.FullPath, path)) return false;
+            if (ticket != folder.ReadTicket || !ReferenceEquals(before, folder.AllFiles)
+                || folder.QueuedRead != ReadKind.None || folder.NeedsRefresh) continue;
+
+            // One additional selected leaf, not an ever-growing bypass of the
+            // safety cap. A fresh real listing is never stripped of an entry.
+            var remove = -1;
+            if (_namedFileSlots.TryGetValue(folder, out var previous)
+                && (previous.ReadTicket == folder.ReadTicket
+                    || previous.Listing.TryGetTarget(out var prior) && ReferenceEquals(prior, before)))
+                remove = Array.FindIndex(before, file => file.Name == previous.Name);
+            var required = new NestedFile(entry.DisplayName, entry.IsHidden, entry.SizeBytes ?? 0, entry.ModifiedUtc.Ticks);
+            var culture = CultureInfo.CurrentCulture.CompareInfo;
+            var at = 0;
+            var end = before.Length;
+            while (at < end)
+            {
+                var middle = (at + end) / 2;
+                if (NameOrder(culture, before[middle].Name, required.Name) < 0) at = middle + 1;
+                else end = middle;
+            }
+            if (remove >= 0 && remove < at) at--;
+            var named = new NestedFile[before.Length + 1 - (remove >= 0 ? 1 : 0)];
+            var wrote = 0;
+            for (var index = 0; index < before.Length; index++)
+            {
+                if (index == remove) continue;
+                if (wrote == at) named[wrote++] = required;
+                named[wrote++] = before[index];
+            }
+            if (wrote < named.Length) named[wrote] = required;
+            var capped = folder.FileCount > before.Length || before.Length >= MaximumFiles || remove >= 0;
+            folder.AllFiles = named;
+            folder.FileCount = Math.Max(folder.FileCount, named.Length);
+            if (!capped && entry.IsHidden) folder.HiddenFileCount++;
+            _namedFileSlots.Remove(folder);
+            if (capped) _namedFileSlots.Add(folder, new(required.Name, folder.ReadTicket, new(named)));
+            ForceVisible([path]);
+            ApplyVisibleChildren(folder);
+            VisibilityVersion++;
+            RaiseChanged();
+            return Current();
+        }
+        return false;
+    }
 
     /// <summary>A partial ancestor is listed only when the camera enters it,
     /// rather than because it was needed to reach a deeper folder.</summary>
