@@ -22,12 +22,36 @@ public sealed partial class NestedCanvas
     // destination. Only the latest request may apply its result.
     private long _cameraRequest;
 
+    /// <summary>
+    /// What the camera being put back reads, on its way and once it is back
+    /// (<see cref="RestoreCameraAsync"/>); null when nothing is.  Let go of by
+    /// any newer request for the camera.
+    /// </summary>
+    private CancellationTokenSource? _cameraReads;
+
+    /// <summary>
+    /// A new request for the camera - a move of the user's, a flight, a
+    /// camera put back, another tree: only the newest may move the camera once
+    /// its reads are done, and whatever a camera being put back still had to
+    /// read for it is let go.
+    /// </summary>
+    private long NextCameraRequest()
+    {
+        if (_cameraReads is { } reads)
+        {
+            _cameraReads = null;
+            reads.Cancel();
+        }
+
+        return ++_cameraRequest;
+    }
+
     // ---- camera --------------------------------------------------------------
 
     /// <summary>Shows all of This PC.</summary>
     public void FitAll(bool animated = true)
     {
-        _cameraRequest++;
+        NextCameraRequest();
         if (_tree is null)
         {
             return;
@@ -89,7 +113,7 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        _cameraRequest++;
+        NextCameraRequest();
         if (!animated)
         {
             StopFlight();
@@ -157,7 +181,7 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        var request = ++_cameraRequest;
+        var request = NextCameraRequest();
         var folder = await tree.RevealAsync(path);
         if (folder is null || !ReferenceEquals(tree, _tree) || request != _cameraRequest)
         {
@@ -180,7 +204,7 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        _cameraRequest++;
+        NextCameraRequest();
         StopFlight();
         ZoomAround(at, factor);
         Normalize();
@@ -192,16 +216,21 @@ public sealed partial class NestedCanvas
 
     public void ZoomBy(double factor) => ZoomAt(new Point(_viewWidth / 2, _viewHeight / 2), factor);
 
+    /// <summary>
+    /// Moves the view by <paramref name="delta"/>.  A pan of nothing does
+    /// nothing at all: it would otherwise let go of a camera still on its way
+    /// - a flight reading its way there, one being put back - for no move.
+    /// </summary>
     public void Pan(Vector delta)
     {
-        if (!double.IsFinite(delta.X) || !double.IsFinite(delta.Y)) return;
+        if (!double.IsFinite(delta.X) || !double.IsFinite(delta.Y) || delta.X == 0 && delta.Y == 0) return;
         EnsureCamera();
         if (_anchor is null || !double.IsFinite(_ax + delta.X) || !double.IsFinite(_ay + delta.Y))
         {
             return;
         }
 
-        _cameraRequest++;
+        NextCameraRequest();
         StopFlight();
         _ax += delta.X;
         _ay += delta.Y;
@@ -234,7 +263,17 @@ public sealed partial class NestedCanvas
 
     /// <summary>
     /// Puts the camera back where a previous session left it, once the folders
-    /// on the way there have been read - unless the user has moved it since.
+    /// on the way there have been found - unless the user has moved it since.
+    ///
+    /// <para>They are found by name, as a folder opened by name is: described,
+    /// not listed - one look at the disk for the whole way, rather than a full
+    /// listing of every folder on it, each applied a frame or more after the
+    /// last while the window showed This PC and then jumped.  Once the camera
+    /// is back they are listed, nearest first, so what is around it fills in
+    /// as it always did (<see cref="ListFoldersOnTheWayAsync"/>).  A way that
+    /// cannot be found by name - a folder gone since, a tree not on a disk -
+    /// is read the whole way down as before.  The user moving the camera, or
+    /// anything else asking for it, lets go of all of these reads.</para>
     /// </summary>
     public async Task RestoreCameraAsync(NestedCameraState state)
     {
@@ -244,10 +283,22 @@ public sealed partial class NestedCanvas
             return;
         }
 
-        var request = ++_cameraRequest;
+        var request = NextCameraRequest();
         _cameraTouched = false;
         var isRoot = string.IsNullOrWhiteSpace(state.AnchorPath);
-        var folder = isRoot ? tree.Root : await tree.RevealAsync(state.AnchorPath);
+        var reads = new CancellationTokenSource();
+        _cameraReads = reads;
+        NestedFolder? folder;
+        try
+        {
+            folder = isRoot
+                ? tree.Root
+                : await tree.MaterializeContainerAsync(state.AnchorPath, reads.Token) ?? await tree.RevealAsync(state.AnchorPath, reads.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            return;
+        }
 
         // The canvas may have been handed another tree while the folders were
         // read: a folder of the old one is no camera for it.
@@ -258,13 +309,33 @@ public sealed partial class NestedCanvas
             || !isRoot && !ViewAllPath.Equals(folder.FullPath, state.AnchorPath)
             || _viewWidth <= 0)
         {
+            if (ReferenceEquals(_cameraReads, reads))
+            {
+                _cameraReads = null;
+            }
+
             return;
         }
 
+        // Materializing the path can outlast a split/collapse layout. Its
+        // ActualSize may already be current while the deferred SizeChanged
+        // notification still leaves our camera cache at the old pane width.
+        // A restored normalized camera belongs to the current view, not that
+        // earlier width (otherwise a late share returns at half its zoom).
+        UpdateLayout();
+        if (ActualWidth > 0 && ActualHeight > 0)
+        {
+            _viewWidth = ActualWidth;
+            _viewHeight = ActualHeight;
+        }
         var width = state.Width * _viewWidth;
         var x = _viewWidth / 2 + state.X * _viewWidth;
         var y = _viewHeight / 2 + state.Y * _viewWidth;
-        if (!double.IsFinite(width) || !double.IsFinite(x) || !double.IsFinite(y)) return;
+        if (!double.IsFinite(width) || !double.IsFinite(x) || !double.IsFinite(y))
+        {
+            _cameraReads = null;
+            return;
+        }
 
         StopFlight();
         _anchor = folder;
@@ -281,6 +352,38 @@ public sealed partial class NestedCanvas
         // resize keeps it rather than framing everything afresh - which an
         // overview, anchored on This PC, would otherwise lose at once.
         _cameraTouched = true;
+        await ListFoldersOnTheWayAsync(tree, folder, reads);
+    }
+
+    /// <summary>
+    /// The camera is back on <paramref name="folder"/>, reached by name: the
+    /// folders on the way to it, found without being listed, are listed now -
+    /// the nearest first, which is most of what is around the view - so the
+    /// view ends with what it always had around it.  Anything asking for the
+    /// camera meanwhile lets go of the rest: a folder the view is inside is
+    /// then listed when the camera goes into it, as after any folder opened
+    /// by name.
+    /// </summary>
+    private async Task ListFoldersOnTheWayAsync(NestedTree tree, NestedFolder folder, CancellationTokenSource reads)
+    {
+        try
+        {
+            for (var parent = folder.Parent; parent is { IsComputer: false }; parent = parent.Parent)
+            {
+                await tree.LoadAsync(parent, reads.Token);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Let go of by a newer request for the camera.
+        }
+        finally
+        {
+            if (ReferenceEquals(_cameraReads, reads))
+            {
+                _cameraReads = null;
+            }
+        }
     }
 
     /// <summary>The cell of <paramref name="folder"/> on screen, or null when it is not one of the cells.</summary>
@@ -377,6 +480,15 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // A rename is an identity change, not a reason to occupy the sibling
+        // now in the old slot. Keep the anchor's screen rectangle unchanged.
+        if (_tree is { } tree && NestedTree.IsDetached(_anchor)
+            && tree.RenameSuccessor(_anchor) is { } successor)
+        {
+            _anchor = successor;
+            _chain.Clear();
+        }
+
         // Walking up divides by the anchor's own place in its parent, and
         // walking down reads its children's: all of them for the current order.
         EnsureAnchorPath();
@@ -386,6 +498,15 @@ public sealed partial class NestedCanvas
         // view is deep inside must take the view out of it.
         while (_anchor.Parent is not null && (!NestedTree.IsOnCanvas(_anchor) || NestedTree.IsDetached(_anchor)))
         {
+            // If a descendant really went away, its renamed surviving ancestor
+            // is still the right place to climb to, not an unrelated sibling.
+            if (_tree is { } renamedTree && renamedTree.RenameSuccessor(_anchor) is { } renamedAnchor)
+            {
+                _anchor = renamedAnchor;
+                _chain.Clear();
+                EnsureAnchorPath();
+                if (NestedTree.IsOnCanvas(_anchor) && !NestedTree.IsDetached(_anchor)) break;
+            }
             Up();
         }
 
@@ -673,8 +794,8 @@ public sealed partial class NestedCanvas
     /// (see <see cref="OnTreeSortChanged"/>): the anchor when it fills most
     /// of the view, otherwise the deepest folder covering the whole of it.
     /// Null for an overview of This PC, which is no folder.  A walk up from
-    /// the anchor through the rectangles of the last picture, so it is cheap
-    /// enough to ask after every move of the camera.
+    /// the anchor through the rectangles its way up has at the camera now,
+    /// so it is cheap enough to ask after every move of the camera.
     /// </summary>
     public NestedFolder? FolderInView
     {
@@ -690,6 +811,13 @@ public sealed partial class NestedCanvas
                 return _anchor.IsComputer ? null : _anchor;
             }
 
+            // The rectangles are those of the camera now, not of the last
+            // picture: asked straight after a move - as the sort headers ask
+            // on every one - those still had the folder just left covering
+            // the view.  Taken as the folders are placed, so asking never
+            // places anything, even between a change of order and the canvas
+            // taking its bearings from it (OnTreeSortChanged).
+            BuildChainAsPlaced();
             for (var folder = _anchor; folder is not null; folder = folder.Parent)
             {
                 if (_chain.TryGetValue(folder, out var rect) && Covers(rect.X, rect.Y, rect.W))
@@ -705,6 +833,7 @@ public sealed partial class NestedCanvas
     private void AfterCameraMove()
     {
         _lastMotion = System.Diagnostics.Stopwatch.GetTimestamp();
+        _hoverStale = true;
         RequestFrame(Layers.All);
         CameraChanged?.Invoke();
     }
@@ -715,6 +844,34 @@ public sealed partial class NestedCanvas
     // ---- flights -------------------------------------------------------------
 
     private void StopFlight() => _flight = null;
+
+    /// <summary>
+    /// Puts the camera where the flight under way was taking it, at once, as
+    /// the flight's last frame would have; nothing without one.  A flight to
+    /// a folder that has gone since just stops, as it would on its next frame.
+    /// </summary>
+    private void LandFlight()
+    {
+        if (_flight is not { } flight)
+        {
+            return;
+        }
+
+        StopFlight();
+        if (NestedTree.IsDetached(flight.Target) || !NestedTree.IsOnCanvas(flight.Target))
+        {
+            return;
+        }
+
+        flight.End(_viewWidth, _viewHeight, out var x, out var y, out var w);
+        _anchor = flight.Target;
+        _ax = x;
+        _ay = y;
+        _aw = w;
+        _hasCamera = true;
+        Normalize();
+        AfterCameraMove();
+    }
 
     /// <summary>
     /// A smooth zoom-and-pan in the sense of van Wijk and Nuij: the path
@@ -833,6 +990,14 @@ public sealed partial class NestedCanvas
             x = viewWidth / 2 - centreX * w;
             y = viewHeight / 2 - centreY * w;
             return done;
+        }
+
+        /// <summary>The target's rectangle once the flight has arrived: where <see cref="Sample"/> puts it at the end.</summary>
+        public void End(double viewWidth, double viewHeight, out double x, out double y, out double w)
+        {
+            w = viewWidth / _w1;
+            x = viewWidth / 2 - _c1x * w;
+            y = viewHeight / 2 - _c1y * w;
         }
     }
 

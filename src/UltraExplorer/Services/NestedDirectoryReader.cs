@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.IO.Enumeration;
 using UltraExplorer.Models;
 
@@ -16,7 +17,39 @@ public static class NestedDirectoryReader
         public int HiddenFiles;
     }
 
+    /// <summary>
+    /// The lists a read gathers its entries in, one pair per reading thread,
+    /// emptied after every read and filled again by the next: the listing
+    /// gets exact copies.  Made new for every read, a folder of thirty
+    /// thousand files grew its list by doubling through arrays of a megabyte
+    /// and more, every one of them garbage on the large object heap as soon
+    /// as the read was done - and a big folder that keeps changing is read
+    /// again every time it does.  What a thread keeps is the room its largest
+    /// read needed, and goes with the thread.
+    /// </summary>
+    [ThreadStatic]
+    private static List<NestedEntry>? t_folders;
+
+    [ThreadStatic]
+    private static List<NestedFile>? t_files;
+
     public static NestedListing Read(string path, CancellationToken cancellationToken)
+    {
+        var folders = t_folders ??= [];
+        var listed = t_files ??= [];
+        try
+        {
+            return Read(path, folders, listed, cancellationToken);
+        }
+        finally
+        {
+            // Emptied whatever happened, so no name outlives its read here.
+            folders.Clear();
+            listed.Clear();
+        }
+    }
+
+    private static NestedListing Read(string path, List<NestedEntry> folders, List<NestedFile> listed, CancellationToken cancellationToken)
     {
         var options = new EnumerationOptions
         {
@@ -26,8 +59,6 @@ public static class NestedDirectoryReader
             AttributesToSkip = 0
         };
 
-        var folders = new List<NestedEntry>();
-        var listed = new List<NestedFile>();
         var counts = new Counts();
         var truncated = false;
 
@@ -101,18 +132,23 @@ public static class NestedDirectoryReader
 
         // Culture order as Explorer shows it, and ordinal order between names
         // culture order calls equal, so two folders differing only in case (a
-        // WSL tree can have them) always come out the same way round.
-        folders.Sort(static (left, right) =>
+        // WSL tree can have them) always come out the same way round.  The
+        // culture's rules are taken once: StringComparer.CurrentCultureIgnoreCase
+        // makes a new comparer every time it is asked for, and asked inside the
+        // comparison that was one per comparison - a read of thirty thousand
+        // files threw away megabytes of them.
+        var culture = CultureInfo.CurrentCulture.CompareInfo;
+        folders.Sort((left, right) =>
         {
-            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
+            var order = culture.Compare(left.Name, right.Name, CompareOptions.IgnoreCase);
             return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
         });
-        listed.Sort(static (left, right) =>
+        listed.Sort((left, right) =>
         {
-            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
+            var order = culture.Compare(left.Name, right.Name, CompareOptions.IgnoreCase);
             return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
         });
-        return new NestedListing(folders, counts.Files, counts.HiddenFiles, truncated) { Files = listed.ToArray() };
+        return new NestedListing(folders.ToArray(), counts.Files, counts.HiddenFiles, truncated) { Files = listed.ToArray() };
     }
 
     /// <summary>

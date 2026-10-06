@@ -5,6 +5,22 @@ namespace UltraExplorer.Dialogs;
 
 public partial class ConfirmDialog : Window
 {
+    private bool _ownerOnly;
+    private bool _accepted;
+
+    internal bool ShowOwnerModal()
+    {
+        _ownerOnly = true;
+        OwnerOnlyModal.Show(this);
+        return _accepted;
+    }
+
+    private void Complete(bool accepted)
+    {
+        _accepted = accepted;
+        if (!_ownerOnly) DialogResult = accepted;
+        Close();
+    }
     /// <param name="danger">
     /// Whether the confirming button is drawn red, for what destroys
     /// something; otherwise it is the usual accent button, as opening files is.
@@ -30,27 +46,25 @@ public partial class ConfirmDialog : Window
     {
         var dialog = new ConfirmDialog(title, message, "OK") { Owner = owner };
         dialog.CancelButton.Visibility = Visibility.Collapsed;
-        dialog.ShowDialog();
+        dialog.ShowOwnerModal();
     }
 
     private void Confirm_Click(object sender, RoutedEventArgs e)
     {
-        DialogResult = true;
-        Close();
+        Complete(true);
     }
 
     private void Cancel_Click(object sender, RoutedEventArgs e)
     {
-        DialogResult = false;
-        Close();
+        Complete(false);
     }
 
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.Escape)
         {
-            DialogResult = false;
-            Close();
+            Complete(false);
+            e.Handled = true;
         }
     }
 }

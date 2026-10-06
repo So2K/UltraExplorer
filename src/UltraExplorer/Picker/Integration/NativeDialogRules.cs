@@ -57,8 +57,15 @@ internal static partial class NativeDialogRules
     /// <summary>What a dialog with no file-type list offers: every file.</summary>
     public static readonly FileDialogFilterSpec AllFiles = new("All files (*.*)", "*.*");
 
+    /// <summary>
+    /// A type's pattern from its label: the last group in parentheses that is
+    /// all wildcards. Windows appends the real pattern to a label that may
+    /// already name one of its own, narrower - "JPEG (*.jpg) (*.jpg;*.jpeg;*.jpe)"
+    /// - and the first group would hide the .jpeg files the type offers.
+    /// </summary>
     public static FileDialogFilterSpec? ReadFilter(string label)
     {
+        FileDialogFilterSpec? found = null;
         foreach (Match match in FilterPatterns().Matches(label))
         {
             // Windows separates the patterns with semicolons; Qt programs
@@ -68,9 +75,9 @@ internal static partial class NativeDialogRules
             var parts = PatternSeparators().Split(match.Groups[1].Value).Where(part => part.Length > 0).ToArray();
             if (parts.Length > 0 && parts.All(part => part.StartsWith('*')
                     && part.IndexOfAny(['\\', '/', ':', '"', '\0']) < 0))
-                return new(label, string.Join(';', parts));
+                found = new(label, string.Join(';', parts));
         }
-        return null;
+        return found;
     }
 
     [GeneratedRegex(@"\(([^()]*(?:\*|\?)[^()]*)\)")]
@@ -89,10 +96,25 @@ internal static partial class NativeDialogRules
                     && address[i + 2] == '\\') || (i + 1 < address.Length && address[i] == '\\' && address[i + 1] == '\\'))
             {
                 var path = address[i..].Trim(' ', '\u200e', '\u200f');
+                if (WindowsReadsAsAnother(path)) return null;
                 if (Directory.Exists(path)) return path;
             }
         }
         return null;
+    }
+
+    /// <summary>
+    /// Whether Windows, given this path, would go to another folder: a name
+    /// ending in a dot ("pair." beside "pair"), which every ordinary path call
+    /// drops, so that the picker would show - and a Save would go to - the
+    /// neighbour. Only such a name is asked about; the dialog stays with
+    /// Windows, which shows the folder it means.
+    /// </summary>
+    internal static bool WindowsReadsAsAnother(string path)
+    {
+        if (!path.Split('\\').Any(part => part.EndsWith('.'))) return false;
+        try { return !string.Equals(Path.GetFullPath(path), path, StringComparison.Ordinal); }
+        catch (ArgumentException) { return true; }
     }
 
     private static readonly Dictionary<string, Guid> KnownFolderRoots = new(StringComparer.OrdinalIgnoreCase)

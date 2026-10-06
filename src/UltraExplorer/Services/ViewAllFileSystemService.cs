@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO.Enumeration;
 using System.Runtime.InteropServices;
 using UltraExplorer.Models;
 
@@ -337,7 +338,7 @@ public sealed class ViewAllFileSystemService
     /// - "backup." would be asked about as its neighbour "backup", or as
     /// nothing - and the extended-length form leaves them as they are.
     /// </summary>
-    private static string ForWindows(string path) =>
+    internal static string ForWindows(string path) =>
         ViewAllPath.EndsANameInDotOrSpace(path) && Path.IsPathFullyQualified(path)
             && !path.StartsWith(@"\\?\", StringComparison.Ordinal) && !path.StartsWith(@"\\.\", StringComparison.Ordinal)
             ? ExtendedLength(path)
@@ -412,7 +413,13 @@ public sealed class ViewAllFileSystemService
         => Task.Run(() =>
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var directory = new DirectoryInfo(ViewAllPath.Normalize(directoryPath));
+
+            // Asked for as the graph spells it, a name's end and all (see
+            // ForWindows): "backup." was read as its neighbour "backup", whose
+            // entries were then listed - and deleted and renamed - under its
+            // name, and a lone "lonely." could not be read at all.
+            var normalized = ViewAllPath.Normalize(directoryPath);
+            var directory = new DirectoryInfo(ForWindows(normalized));
             if (!directory.Exists)
             {
                 throw new DirectoryNotFoundException($"Folder no longer exists: {directoryPath}");
@@ -437,7 +444,23 @@ public sealed class ViewAllFileSystemService
                 MatchCasing = MatchCasing.CaseInsensitive
             };
 
-            foreach (var info in directory.EnumerateFileSystemInfos("*", enumerationOptions))
+            // Past the cap only folders are still taken, as the canvas's reader
+            // (NestedDirectoryReader) takes them, and the files past it are
+            // passed over before anything is made of them.  Cut where the
+            // file system happened to be, a camera folder of five thousand
+            // pictures lost the folders named after them - Screens and Videos
+            // never showed, in the list, a dialog or the tree, and nothing
+            // offered to load them.
+            var pastCap = false;
+            var listing = new FileSystemEnumerable<FileSystemInfo>(
+                directory.FullName,
+                static (ref FileSystemEntry entry) => entry.ToFileSystemInfo(),
+                enumerationOptions)
+            {
+                ShouldIncludePredicate = (ref FileSystemEntry entry) => !pastCap || entry.IsDirectory
+            };
+
+            foreach (var info in listing)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 try
@@ -473,7 +496,16 @@ public sealed class ViewAllFileSystemService
                     if (entries.Count >= limit)
                     {
                         isTruncated = true;
-                        break;
+                        pastCap = true;
+                        if (!isDirectory)
+                        {
+                            continue;
+                        }
+
+                        if (entries.Count >= ViewAllGraphOptions.MaximumChildrenCeiling)
+                        {
+                            break;
+                        }
                     }
 
                     long? size = null;
@@ -483,8 +515,11 @@ public sealed class ViewAllFileSystemService
                     }
 
                     var kind = isDirectory ? ViewAllEntryKind.Folder : ViewAllEntryKind.File;
+
+                    // Joined onto the folder's own path: read through the
+                    // extended-length form, an entry's full path carries it.
                     entries.Add(new ViewAllEntryDescriptor(
-                        ViewAllPath.Normalize(info.FullName),
+                        ViewAllPath.Normalize(Path.Join(normalized, info.Name)),
                         info.Name,
                         kind,
                         isHidden,
@@ -505,8 +540,10 @@ public sealed class ViewAllFileSystemService
 
             if (entries.Count > maximum)
             {
-                // Read past the cap to keep the first ones in the order shown:
-                // the rest are dropped, and the snapshot says it is cut short.
+                // Read past the cap to keep the first ones in the order shown,
+                // or to take the folders past it: the rest are dropped - files
+                // before any folder, since folders lead in every order - and
+                // the snapshot says it is cut short.
                 entries = ViewAllEntryOrder.Sort(entries, static entry => entry, shownIn);
                 entries.RemoveRange(maximum, entries.Count - maximum);
                 isTruncated = true;

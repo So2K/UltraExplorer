@@ -140,6 +140,12 @@ public sealed partial class NestedCanvas
         }
 
         var active = ActiveTarget();
+        if (isArrow && FocusLeftByRemoval() is not null)
+        {
+            // No item to move from: the arrows start inside the folder (Neighbour).
+            active = null;
+        }
+
         switch (key)
         {
             case Key.Enter when active is { } target:
@@ -533,7 +539,9 @@ public sealed partial class NestedCanvas
             return true;
         }
 
-        if (_pressIntent == PressIntent.Pan)
+        // Taking the mouse raises a move where it already is: a pan of
+        // nothing, which neither moves the camera nor is the user moving it.
+        if (_pressIntent == PressIntent.Pan && point != _panLast)
         {
             Pan(point - _panLast);
             _panLast = point;
@@ -647,10 +655,16 @@ public sealed partial class NestedCanvas
     /// The wheel, as Figma has it: Ctrl zooms at the pointer, Shift pans
     /// sideways, nothing pans up and down.  During a rectangle too - its
     /// start stays on its content, and its mode stays what the press made it.
+    /// A turn of nothing moves nothing, and is no move of the user's.
     /// </summary>
     internal void PointerWheel(Point point, int delta, ModifierKeys modifiers)
     {
         RetryFailedFrames();
+        if (delta == 0)
+        {
+            return;
+        }
+
         if ((modifiers & ModifierKeys.Control) != 0)
         {
             ZoomAt(point, Math.Pow(1.2, delta / 120.0));
@@ -824,6 +838,29 @@ public sealed partial class NestedCanvas
         }
     }
 
+    /// <summary>
+    /// The camera moved since the hover was worked out.  What a name or a mark
+    /// under the pointer means is taken from where the last frame drew them,
+    /// so a hover worked out straight after a move - the wheel's - can name
+    /// the folder whose name was under the pointer before it, and a flight or
+    /// a zoom key leaves the pointer resting on something else altogether.
+    /// </summary>
+    private bool _hoverStale;
+
+    /// <summary>
+    /// A frame has drawn the names and the marks for where the camera is now:
+    /// the hover is worked out again where the pointer rests, unless it rests
+    /// nowhere on the canvas or a button is down.
+    /// </summary>
+    private void RefreshHover()
+    {
+        _hoverStale = false;
+        if (_press == PressKind.None && double.IsFinite(_hoverPoint.X) && double.IsFinite(_hoverPoint.Y))
+        {
+            UpdateHover(_hoverPoint);
+        }
+    }
+
     private void UpdateHover(Point point)
     {
         var wasOnTip = HotspotAt(_hoverPoint) is { Tip: not null };
@@ -909,6 +946,26 @@ public sealed partial class NestedCanvas
     }
 
     /// <summary>
+    /// The folder the window moved the focus to when the item it was on went
+    /// - deleted, moved away - or null.  Only the focus moves there, onto the
+    /// folder the clicks and keys were last in: the folder is not selected,
+    /// and the anchor went with the item.  That folder is no item to move
+    /// from, but where the arrows start, as they did while the focus stayed
+    /// on the item that went: moved from as an item, Down went to the folder
+    /// beside it, and Shift+Down took the folder itself into a range for the
+    /// next Delete to recycle whole.
+    /// </summary>
+    private NestedFolder? FocusLeftByRemoval() =>
+        _selection.Active is { Folder: { } folder }
+        && _selection.Anchor is null
+        && ReferenceEquals(folder, _selection.CurrentFolder)
+        && !_selection.IsSelected(folder)
+        && !NestedTree.IsDetached(folder)
+        && NestedTree.IsOnCanvas(folder)
+            ? folder
+            : null;
+
+    /// <summary>
     /// The next folder or file in the direction of an arrow: sub-folders move
     /// over their parent's grid, files over their folder's.
     /// </summary>
@@ -930,11 +987,14 @@ public sealed partial class NestedCanvas
             // Nothing selected yet: start at the first folder in the one in
             // view, or its first file if it holds only files.  The focus on
             // an item that went - deleted, moved away - starts in the folder
-            // it was in instead, wherever the view is.
-            var start = active is null && _selection.Active is { Container: var left }
-                && !NestedTree.IsDetached(left) && NestedTree.IsOnCanvas(left)
-                ? left
-                : _anchor;
+            // it was in instead, wherever the view is; so does the focus the
+            // window moved to that folder once the item had gone.
+            var start = active is null && FocusLeftByRemoval() is { } emptied
+                ? emptied
+                : active is null && _selection.Active is { Container: var left }
+                    && !NestedTree.IsDetached(left) && NestedTree.IsOnCanvas(left)
+                    ? left
+                    : _anchor;
             if (start is not null)
             {
                 Ensure(start);
@@ -1058,9 +1118,17 @@ public sealed partial class NestedCanvas
     /// Brings what an arrow key moved to into view.  Readable but off screen,
     /// the view only slides - the zoom the user chose stays; too small to read,
     /// it flies to where it can be read.
+    ///
+    /// <para>A flight still under way - a key held down repeats faster than
+    /// one lands - lands at once first, so the move is measured from where
+    /// the view was going.  Started from the middle of the last flight
+    /// instead, every repeat began from a standstill and from the zoom that
+    /// flight's arc had dipped to: a held key left the item further behind
+    /// with each repeat, and the view shrank a little more each time.</para>
     /// </summary>
     private void EnsureVisible(NestedFolder folder, int fileIndex = -1)
     {
+        LandFlight();
         var rect = TargetRect(folder, fileIndex);
         var readable = rect is { } r && (fileIndex >= 0 ? r.Height >= FileLabelPixels : r.Width >= 48);
         if (!readable)

@@ -662,17 +662,13 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         var ticket = ++_menuTicket;
         var path = segment.FullPath;
         var includeHidden = _includeHidden?.Invoke();
-        var children = await Task.Run(() => ChildFolders(path, includeHidden));
+        var children = await Task.Run(() => new System.Collections.ObjectModel.ObservableCollection<AddressSuggestion>(ChildFolders(path, includeHidden)));
         if (_isDisposed || ticket != _menuTicket)
         {
             return;
         }
 
-        segment.Children.Clear();
-        foreach (var child in children)
-        {
-            segment.Children.Add(child);
-        }
+        segment.ReplaceChildren(children);
 
         // Opened even when empty: a chevron that does nothing reads as broken,
         // one that says "no sub-folders" has answered the question.
@@ -1060,6 +1056,12 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>
+    /// Whether a drive is there to be offered.  Asked of an offline network
+    /// drive, it holds the thread until the network gives up on it.
+    /// </summary>
+    internal static Func<DriveInfo, bool> DriveReady { get; set; } = static drive => drive.IsReady;
+
     private static void AddDrives(List<AddressSuggestion> found, HashSet<string> seen, string prefix)
     {
         DriveInfo[] drives;
@@ -1074,22 +1076,23 @@ public sealed class AddressBarViewModel : ObservableObject, IDisposable
 
         foreach (var drive in drives)
         {
-            string name;
-            try
-            {
-                if (!drive.IsReady)
-                {
-                    continue;
-                }
-
-                name = drive.Name;
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            // The letter first, which is only a name: asked before it whether
+            // it was ready, every drive was asked at every pause in the
+            // typing, an offline network one holding the thread each time.
+            var name = drive.Name;
+            if (prefix.Length > 0 && !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
             }
 
-            if (prefix.Length > 0 && !name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            try
+            {
+                if (!DriveReady(drive))
+                {
+                    continue;
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 continue;
             }

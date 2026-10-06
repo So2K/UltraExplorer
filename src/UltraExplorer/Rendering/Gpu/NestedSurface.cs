@@ -73,6 +73,16 @@ internal sealed class NestedSurface : D3DImage, IDisposable
     /// </summary>
     private static readonly Duration Immediately = new(TimeSpan.Zero);
 
+    /// <summary>
+    /// How often <see cref="TryLockWithin"/> asks for the lock while it waits
+    /// (Stopwatch ticks, 50 microseconds).  Each failed try waits on WPF's
+    /// event through the dispatcher's synchronization context, which makes a
+    /// new handle array every time: asked between every spin, a frame that
+    /// waited made some two hundred of them, the most the UI thread allocated
+    /// for anything in a frame.
+    /// </summary>
+    private static readonly long LockPollTicks = Stopwatch.Frequency / 20_000;
+
     private readonly GpuDeviceSet _devices;
     private SharedTexture? _current;
     private SharedTexture? _next;
@@ -520,7 +530,12 @@ internal sealed class NestedSurface : D3DImage, IDisposable
             }
 
             Unlock();
-            spinner.SpinOnce(sleep1Threshold: -1);
+            var next = Stopwatch.GetTimestamp() + LockPollTicks;
+            do
+            {
+                spinner.SpinOnce(sleep1Threshold: -1);
+            }
+            while (Stopwatch.GetTimestamp() < next);
         }
     }
 

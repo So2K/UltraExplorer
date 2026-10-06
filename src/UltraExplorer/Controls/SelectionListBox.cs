@@ -37,8 +37,9 @@ public sealed class SelectionListBox : ListBox
 
     /// <summary>
     /// Selects exactly <paramref name="rows"/>, in one change, and makes
-    /// <paramref name="anchor"/> - when it is one of them - the row Shift
-    /// ranges run from.
+    /// <paramref name="anchor"/> the row Shift ranges run from - selected or
+    /// not, as a Ctrl+click that took it out leaves the anchor on it - or,
+    /// with none, leaves the list no anchor of its own.
     /// </summary>
     public void ApplySelection(IList rows, object? anchor)
     {
@@ -52,14 +53,14 @@ public sealed class SelectionListBox : ListBox
 
         // The list box takes as its anchor only a row it has made a container
         // for - one on screen, or near it - and throws otherwise.  A new
-        // anchor scrolled far away leaves the list with no anchor rather than
-        // its own old one, so a Shift+click runs from the rows selected now,
-        // not from a row picked before them.
-        if (anchor is not null && rows.Contains(anchor) && !Equals(AnchorRow, anchor))
+        // anchor scrolled far away, or none in this list, leaves the list
+        // with no anchor rather than its own old one, so a Shift+click runs
+        // from the rows selected now, not from a row picked before them.
+        if (!Equals(AnchorRow, anchor))
         {
             try
             {
-                AnchorItem = ItemContainerGenerator.ContainerFromItem(anchor) is not null ? anchor : null;
+                AnchorItem = anchor is not null && ItemContainerGenerator.ContainerFromItem(anchor) is not null ? anchor : null;
             }
             catch (InvalidOperationException)
             {

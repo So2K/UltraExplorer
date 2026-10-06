@@ -147,8 +147,40 @@ internal sealed class NestedSelection
         return count;
     }
 
+    /// <summary>How many paths wait for a folder in all: in the window's selection, not yet on the canvas.</summary>
+    public int PendingCount => CountWaiting(static _ => true);
+
     /// <summary>The paths of the folders something waits in (see <see cref="ResolvePending"/>).</summary>
     public IEnumerable<string> PendingFolders => _pending.Keys;
+
+    /// <summary>
+    /// Takes <paramref name="folder"/> out of what waits for its parent to be
+    /// read: the folder gone into, when the folder above it is too big to
+    /// have been listed yet or behind a link the canvas does not read.  True
+    /// when it waited there, and was in the window's selection.
+    /// </summary>
+    public bool TakeWaiting(NestedFolder folder)
+    {
+        if (_pending.Count == 0 || folder.Parent is not { } parent || !_pending.TryGetValue(parent.FullPath, out var names))
+        {
+            return false;
+        }
+
+        // In This PC a drive or a share waits by its whole path, as Load names it.
+        var name = parent.IsComputer ? folder.FullPath : folder.Name;
+        if (names.RemoveAll(waiting => string.Equals(waiting, name, StringComparison.OrdinalIgnoreCase)) == 0)
+        {
+            return false;
+        }
+
+        if (names.Count == 0)
+        {
+            _pending.Remove(parent.FullPath);
+        }
+
+        Version++;
+        return true;
+    }
 
     /// <summary>Every folder something selected is directly inside; for drawing, which visits only these.</summary>
     public IReadOnlyList<NestedFolder> Containers
@@ -174,6 +206,36 @@ internal sealed class NestedSelection
     }
 
     public bool IsSelected(NestedFolder child) => _folders.Contains(child);
+
+    /// <summary>
+    /// How many of the items held here the canvas has on it - each in a
+    /// folder still placed, and every folder above that too - as the files'
+    /// bits were last caught up (see <see cref="FilesOf"/>).  A hidden folder
+    /// still selected while hidden items are hidden is not on it, nor is
+    /// anything selected inside one: they stay selected, for showing hidden
+    /// items again to bring them back, but nothing shows them.
+    /// </summary>
+    public int CountOnCanvas()
+    {
+        var count = 0;
+        foreach (var folder in _folders)
+        {
+            if (NestedTree.IsOnCanvas(folder))
+            {
+                count++;
+            }
+        }
+
+        foreach (var (container, set) in _files)
+        {
+            if (NestedTree.IsOnCanvas(container))
+            {
+                count += set.Count;
+            }
+        }
+
+        return count;
+    }
 
     /// <summary>How many of <paramref name="container"/>'s sub-folders are selected.</summary>
     public int FoldersIn(NestedFolder container) => _foldersPerContainer.TryGetValue(container, out var count) ? count : 0;

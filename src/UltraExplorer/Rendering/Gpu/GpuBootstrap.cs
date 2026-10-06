@@ -42,6 +42,9 @@ internal static class GpuBootstrap
     /// <summary>Command-line switch doing the same, and winning over the variable: <c>--renderer gpu</c>.</summary>
     public const string RendererSwitch = "--renderer";
 
+    /// <summary>Resident picker roles warm only the card they actually need.</summary>
+    internal static bool WarmOtherAdapters { get; set; } = true;
+
     public const string ReasonReady = "the GPU is ready";
     public const string ReasonCpuChosen = "the CPU renderer was chosen";
     public const string ReasonLostTooOften = "the GPU was lost three times within a minute; the CPU draws for the rest of the session";
@@ -525,7 +528,8 @@ internal static class GpuBootstrap
             }
 
             ReadySource.TrySetResult(set);
-            _ = Task.Delay(OtherAdaptersDelay).ContinueWith(_ => AddWork(WarmOthers), TaskScheduler.Default);
+            if (WarmOtherAdapters)
+                _ = Task.Delay(OtherAdaptersDelay).ContinueWith(_ => AddWork(WarmOthers), TaskScheduler.Default);
         }
         finally
         {

@@ -82,7 +82,9 @@ public sealed partial class NestedCanvas
     /// canvas takes in.  The loop unhooks itself on the frame this becomes
     /// true, or when all that is left is a held-back redraw whose timer will
     /// ask for its frame (<see cref="WaitForLoadRedraw"/>), and is hooked
-    /// again only by a request for a frame, a wake, or that timer.
+    /// again only by a request for a frame, a wake, or that timer.  WPF's
+    /// Rendering itself is let go of a couple of frames later
+    /// (<see cref="LetGoAtRest"/>).
     /// </summary>
     internal bool IsIdle => IsIdleWith(IsMoving());
 
@@ -146,27 +148,61 @@ public sealed partial class NestedCanvas
         }
 
         _frameHooked = true;
-        if (!FramesByHandForTests)
+        _framesToLetPass = 0;
+        if (!FramesByHandForTests && !_hookedToRendering)
         {
             _hookedToRendering = true;
             CompositionTarget.Rendering += OnFrame;
         }
     }
 
+    /// <summary>Stops the loop and lets go of WPF's Rendering at once: the canvas is leaving the screen, or its frames keep failing.</summary>
     private void UnhookFrame()
     {
-        if (!_frameHooked)
-        {
-            return;
-        }
-
         _frameHooked = false;
+        _framesToLetPass = 0;
         if (_hookedToRendering)
         {
             _hookedToRendering = false;
             CompositionTarget.Rendering -= OnFrame;
         }
     }
+
+    /// <summary>
+    /// The loop has nothing left to do, found by one of its own frames: it
+    /// stops, but keeps WPF's Rendering for <see cref="FramesLetPassAtRest"/>
+    /// more of WPF's frames, in which it draws nothing, before it lets go.
+    ///
+    /// <para>The frame that finds the loop idle is usually the one that drew
+    /// the settled picture, and WPF commits that drawing after the Rendering
+    /// handlers.  With no handler left, WPF leaves its interlocked
+    /// presentation there and then, and first waits for the render thread to
+    /// show the frame still on its way - the UI thread blocked for a hundred
+    /// milliseconds or more after every stop of the camera, just when the
+    /// next wheel step or click comes.  A frame later nothing is on its way,
+    /// and letting go costs nothing.</para>
+    /// </summary>
+    private void LetGoAtRest(TimeSpan renderingTime)
+    {
+        if (!_hookedToRendering)
+        {
+            UnhookFrame();
+            return;
+        }
+
+        _frameHooked = false;
+        _framesToLetPass = FramesLetPassAtRest;
+        _letPassFrameTime = renderingTime;
+    }
+
+    /// <summary>WPF's frames that pass with nothing drawn between the loop stopping and it letting go of Rendering (see <see cref="LetGoAtRest"/>).</summary>
+    private const int FramesLetPassAtRest = 2;
+
+    /// <summary>Frames still to pass before the loop lets go of Rendering; nought while it runs, or has let go.</summary>
+    private int _framesToLetPass;
+
+    /// <summary>The time of the last of WPF's frames counted as passed, so Rendering raised again within one is not counted twice.</summary>
+    private TimeSpan _letPassFrameTime;
 
     /// <summary>
     /// For tests: the loop is hooked and unhooked as always, but only
@@ -377,7 +413,25 @@ public sealed partial class NestedCanvas
     /// and see every exception.
     /// </summary>
     private void OnFrame(object? sender, EventArgs e)
-        => RunContainedFrame(e is RenderingEventArgs rendering ? rendering.RenderingTime : _clock.Now);
+    {
+        var renderingTime = e is RenderingEventArgs rendering ? rendering.RenderingTime : _clock.Now;
+        if (!_frameHooked)
+        {
+            // Stopped, and letting WPF's frames pass before letting go (LetGoAtRest).
+            if (renderingTime != _letPassFrameTime)
+            {
+                _letPassFrameTime = renderingTime;
+                if (--_framesToLetPass <= 0)
+                {
+                    UnhookFrame();
+                }
+            }
+
+            return;
+        }
+
+        RunContainedFrame(renderingTime);
+    }
 
     private void RunContainedFrame(TimeSpan renderingTime)
     {
@@ -652,7 +706,7 @@ public sealed partial class NestedCanvas
             // loading redraw waiting its turn has a timer to ask for it.
             if (IsIdleWith(moving, loadRedrawTimed: _loadRedrawTimer is { IsEnabled: true }))
             {
-                UnhookFrame();
+                LetGoAtRest(renderingTime);
             }
         }
         finally
@@ -1225,6 +1279,9 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void OnTreeChanged(object? sender, EventArgs e)
     {
+        if (sender is NestedTree visibility && ReferenceEquals(visibility, _tree))
+            RejudgeFilterVisibility(visibility);
+
         if (sender is NestedTree tree && ReferenceEquals(tree, _batchTree) && tree.Version == _batchVersion)
         {
             _batchVersion = -1;
@@ -1417,6 +1474,14 @@ public sealed partial class NestedCanvas
             }
         }
 
+        // The names and the marks the hover is taken from are drawn for this
+        // camera now, and shown: a hover worked out for the camera before -
+        // by the wheel, or none at all for a flight - is worked out again.
+        if (_hoverStale && (layers & (Layers.Labels | Layers.Decor)) == (Layers.Labels | Layers.Decor) && (!decorAfterPresent || shown))
+        {
+            RefreshHover();
+        }
+
         LastAllocations = new FrameAllocations(sceneAllocated, labelsAllocated, decorAllocated, presentAllocated);
         LastFrameLayers = layers;
         return shown;
@@ -1444,7 +1509,7 @@ public sealed partial class NestedCanvas
 
             DrawSelection(dc);
             DrawDropTarget(dc);
-            DrawBeacons(dc);
+            DrawBeacons(dc, _tree?.Version ?? -1, _tree?.SortGeneration ?? -1);
             DrawTrail(dc);
             DrawFavoriteLinks(dc);
         }

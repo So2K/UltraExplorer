@@ -37,6 +37,17 @@ public sealed class FolderMarkService
 
     private readonly ConcurrentDictionary<string, FolderMark> _marks = new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Whether <see cref="_marks"/> holds any mark, set after every change of
+    /// it under <see cref="_changedGate"/>.  A lookup asks this first, tens of
+    /// thousands of times a frame: the map's own IsEmpty walks every bucket
+    /// and takes every lock of it when there is nothing in it, and a map that
+    /// once held thousands of marks keeps all those buckets - six
+    /// microseconds a lookup, a tenth of a second for a frame of
+    /// C:\Windows\WinSxS.
+    /// </summary>
+    private volatile bool _hasMarks;
+
     // The folders that hold a mark, rebuilt whole the first time they are
     // asked for after a change, not at every change - marks change a few
     // times a session, or thousands at once when a large selection is
@@ -59,6 +70,9 @@ public sealed class FolderMarkService
     private readonly Dictionary<string, MarkHalves> _changed = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _changedGate = new();
 
+    /// <summary>Whether the file has been read once: read again, what changed is raised (<see cref="LoadAsync"/>).</summary>
+    private bool _isLoaded;
+
     /// <summary>
     /// One save at a time.  The debounced save and the one made on closing can
     /// overlap, and the one that started with the older snapshot must not be
@@ -75,6 +89,37 @@ public sealed class FolderMarkService
         StatePath = statePath ?? AppPaths.State("folder-marks.json");
         _turnName = @"Local\UltraExplorer.FolderMarks." + Convert.ToHexString(
             System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(StatePath.ToUpperInvariant())));
+    }
+
+    private static readonly Lazy<FolderMarkService> SharedMarks = new(() => new FolderMarkService());
+
+    /// <summary>
+    /// The user's marks, as every window of the process has them: the
+    /// everyday window, each Explorer window taken over, the prepared picker
+    /// and every replaced dialog.  One copy for all of them, so a colour set
+    /// in one is the others' at once, and each hears of it to draw it
+    /// (<see cref="MarkChanged"/>).  A copy of their own, read once at their
+    /// start, never showed what another set since, and a rename followed in
+    /// one wrote that copy's older note - or a colour cleared since in
+    /// another - under the new name.
+    /// </summary>
+    internal static FolderMarkService Shared => SharedMarks.Value;
+
+    /// <summary>
+    /// Lets go of every handler of <see cref="MarkChanged"/> that
+    /// <paramref name="owner"/> left on it: a window's tree is closed with its
+    /// window, and the marks every window shares (<see cref="Shared"/>) would
+    /// otherwise keep it, and everything it holds, for the life of the process.
+    /// </summary>
+    internal void ReleaseListenersOf(object owner)
+    {
+        foreach (var handler in MarkChanged?.GetInvocationList() ?? [])
+        {
+            if (ReferenceEquals(handler.Target, owner))
+            {
+                MarkChanged -= (Action<string, FolderMark>)handler;
+            }
+        }
     }
 
     [Flags]
@@ -102,7 +147,7 @@ public sealed class FolderMarkService
     /// </summary>
     public FolderMark Get(string path)
     {
-        if (_marks.IsEmpty)
+        if (!_hasMarks)
         {
             return FolderMark.None;
         }
@@ -130,7 +175,7 @@ public sealed class FolderMarkService
     /// </summary>
     public FolderMark Get(Models.NestedFolder folder)
     {
-        if (_marks.IsEmpty)
+        if (!_hasMarks)
         {
             return FolderMark.None;
         }
@@ -335,6 +380,61 @@ public sealed class FolderMarkService
         Store(key, updated, MarkHalves.Note);
     }
 
+    /// <summary>Whether <paramref name="path"/> carries a mark, or - a folder - anything inside it does.</summary>
+    public bool HasMarksAtOrUnder(string path)
+    {
+        if (!_hasMarks)
+        {
+            return false;
+        }
+
+        var key = Key(path);
+        return _marks.Any(pair => !pair.Value.IsEmpty && MovedName(pair.Key, key, key) is not null);
+    }
+
+    /// <summary>
+    /// <paramref name="oldPath"/> is <paramref name="newPath"/> now - moved or
+    /// renamed by the window itself, where nothing on disk pairs the two
+    /// names for the change hub to follow: a move to another folder, or a
+    /// rename in a folder no window has read.  Its mark, and for a folder the
+    /// mark of everything inside it, go to the new name, as a rename the hub
+    /// follows takes them (ViewAllViewModel.FollowRename): the old name is
+    /// let go of first, so a rename that only changes the case keeps the
+    /// mark, in the new spelling.
+    /// </summary>
+    public void Move(string oldPath, string newPath)
+    {
+        if (!_hasMarks)
+        {
+            return;
+        }
+
+        var from = Key(oldPath);
+        var to = Key(newPath);
+        foreach (var (path, mark) in Snapshot())
+        {
+            if (MovedName(path, from, to) is not { } moved)
+            {
+                continue;
+            }
+
+            // One complete destination record also carries kind for a
+            // note-only mark, which would be lost between two empty halves.
+            Store(path, FolderMark.None, MarkHalves.Both);
+            Store(moved, mark, MarkHalves.Both);
+        }
+    }
+
+    /// <summary>What the key <paramref name="path"/> is called once <paramref name="from"/> is <paramref name="to"/>: null when it is not that or inside it.</summary>
+    private static string? MovedName(string path, string from, string to) =>
+        string.Equals(path, from, StringComparison.OrdinalIgnoreCase)
+            ? to
+            : path.Length > from.Length
+                && path.StartsWith(from, StringComparison.OrdinalIgnoreCase)
+                && path[from.Length] == Path.DirectorySeparatorChar
+                    ? string.Concat(to, path.AsSpan(from.Length))
+                    : null;
+
     /// <summary>Seeds a mark without raising a change (used by workspace migration).</summary>
     public void Seed(string path, string accentHex, string note)
     {
@@ -349,8 +449,11 @@ public sealed class FolderMarkService
         var key = Key(path);
         lock (_changedGate)
         {
-            _marks[key] = mark;
-            _changed[key] = MarkHalves.Accent | MarkHalves.Note;
+            _marks[key] = mark with { IsDirectory = _marks.TryGetValue(key, out var existing) ? existing.IsDirectory : null };
+            _hasMarks = true;
+            // Legacy workspace values supply no kind evidence. Preserve any
+            // explicit pending classification rather than replacing its mask.
+            _changed[key] = _changed.GetValueOrDefault(key) | MarkHalves.Accent | MarkHalves.Note;
         }
 
         MarkFoldersStale();
@@ -366,16 +469,22 @@ public sealed class FolderMarkService
         await _saving.WaitAsync(cancellationToken);
         try
         {
-            if (!File.Exists(StatePath))
-            {
-                return;
-            }
-
             Dictionary<string, FolderMark>? stored;
             try
             {
-                await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
-                stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
+                if (!File.Exists(StatePath))
+                {
+                    // None written yet, or one set aside since: no marks but
+                    // this copy's own not saved yet.  Read again, the copy
+                    // every window shares (Shared) lets go of the rest, as a
+                    // window opened now would have none of them.
+                    stored = new Dictionary<string, FolderMark>(StringComparer.OrdinalIgnoreCase);
+                }
+                else
+                {
+                    await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
+                    stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
+                }
             }
             catch (JsonException)
             {
@@ -397,11 +506,14 @@ public sealed class FolderMarkService
                 return;
             }
 
-            // Read again - a prepared picker bound to a new dialog - the marks are
-            // the file's as it is now, with this copy's own changes not saved yet
-            // laid over them: a mark cleared elsewhere since goes, and one made
-            // here and not written yet stays.
+            // Read again - a prepared picker bound to a new dialog, another
+            // window opened - the marks are the file's as it is now, with this
+            // copy's own changes not saved yet laid over them: a mark cleared
+            // elsewhere since goes, and one made here and not written yet
+            // stays.  Each mark that changed is raised, for whoever draws it;
+            // read the first time, there is nothing drawn yet to change.
             var loaded = Complete(stored);
+            List<(string Key, FolderMark Mark)>? changed = null;
             lock (_changedGate)
             {
                 foreach (var (key, halves) in _changed)
@@ -411,19 +523,31 @@ public sealed class FolderMarkService
 
                 foreach (var key in _marks.Keys)
                 {
-                    if (!loaded.ContainsKey(key))
+                    if (!loaded.ContainsKey(key) && _marks.TryRemove(key, out _) && _isLoaded)
                     {
-                        _marks.TryRemove(key, out _);
+                        (changed ??= []).Add((key, FolderMark.None));
                     }
                 }
 
                 foreach (var (key, mark) in loaded)
                 {
+                    if (_isLoaded && (!_marks.TryGetValue(key, out var was) || was != mark))
+                    {
+                        (changed ??= []).Add((key, mark));
+                    }
+
                     _marks[key] = mark;
                 }
+
+                _hasMarks = !_marks.IsEmpty;
+                _isLoaded = true;
             }
 
             MarkFoldersStale();
+            foreach (var (key, mark) in changed ?? [])
+            {
+                MarkChanged?.Invoke(key, mark);
+            }
         }
         finally
         {
@@ -655,10 +779,12 @@ public sealed class FolderMarkService
             if (mark.IsEmpty)
             {
                 _marks.TryRemove(key, out _);
+                _hasMarks = !_marks.IsEmpty;
             }
             else
             {
                 _marks[key] = mark;
+                _hasMarks = true;
             }
 
             _changed[key] = _changed.GetValueOrDefault(key) | halves;

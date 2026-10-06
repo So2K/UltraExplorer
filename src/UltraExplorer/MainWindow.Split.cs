@@ -649,7 +649,10 @@ public partial class MainWindow
     /// </summary>
     internal string? OtherPaneFolder() => IsNested && !IsPickerMode && InactivePane is { } other ? other.SortFolder() : null;
 
-    /// <summary>The panes whose Copy or Move to other pane is still asking whether the other pane's folder is there.</summary>
+    /// <summary>
+    /// The panes whose Copy or Move to other pane is still under way: asking
+    /// whether the other pane's folder is there, or copying or moving into it.
+    /// </summary>
     private readonly HashSet<NestedPane> _paneSendsAsking = [];
 
     /// <summary>
@@ -691,47 +694,53 @@ public partial class MainWindow
             return;
         }
 
-        // The window takes keys while the other pane's folder is asked about:
-        // the same key pressed again from this pane meanwhile is let go, or
-        // everything would be copied twice, or moved twice.
+        // The window takes keys while the other pane's folder is asked about,
+        // and while what is selected is copied or moved there - which asks
+        // whether each item is there first, with nothing on screen yet for
+        // thousands on a share: the same key pressed again from this pane
+        // meanwhile, or held down, is let go, or everything would be copied
+        // twice, or moved twice.
         var from = ActivePane;
         if (!_paneSendsAsking.Add(from))
         {
             return;
         }
 
-        var name = FolderName(folder);
-        string[] going;
         try
         {
-            // Asked off the interface thread: the other pane may be showing a
-            // share gone to sleep, which takes as long as the network allows
-            // to answer.
-            if (!await Task.Run(() => Directory.Exists(folder)))
+            var name = FolderName(folder);
+            string[] going;
+            try
             {
-                _viewModel.Toast.ShowError($"{name} is no longer there.");
+                // Asked off the interface thread: the other pane may be showing a
+                // share gone to sleep, which takes as long as the network allows
+                // to answer.
+                if (!await Task.Run(() => Directory.Exists(folder)))
+                {
+                    _viewModel.Toast.ShowError($"{name} is no longer there.");
+                    return;
+                }
+
+                going = PathsGoingTo(paths, folder);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+                _viewModel.Toast.ShowError(ex.Message);
                 return;
             }
 
-            going = PathsGoingTo(paths, folder);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
-        {
-            _viewModel.Toast.ShowError(ex.Message);
-            return;
+            if (going.Length == 0)
+            {
+                _viewModel.Toast.ShowError($"Nothing to {(move ? "move" : "copy")}: what is selected is {name} or already in it.");
+                return;
+            }
+
+            await _viewModel.DropIntoPathAsync(going, folder, move);
         }
         finally
         {
             _paneSendsAsking.Remove(from);
         }
-
-        if (going.Length == 0)
-        {
-            _viewModel.Toast.ShowError($"Nothing to {(move ? "move" : "copy")}: what is selected is {name} or already in it.");
-            return;
-        }
-
-        await _viewModel.DropIntoPathAsync(going, folder, move);
     }
 
     /// <summary>

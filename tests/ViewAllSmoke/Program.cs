@@ -162,6 +162,45 @@ internal static partial class Program
         await Group(ExplorerRoutingReviewChecks);
         await Group(ListSearchReviewChecks);
         await Group(CrossClusterRound2Checks);
+        await Group(CanvasMotionReview2Checks);
+        await Group(SelectionReview2Checks);
+        await Group(IconGlyphRound2Checks);
+        await Group(TreeReadingFixChecks);
+        await Group(LiveWatchFix2Checks);
+        await Group(LiveWatchFix2WindowChecks);
+        await Group(GraphReviewFixChecks);
+        await Group(ViewAllIoReviewChecks);
+        await Group(ViewAllVmRound2Checks);
+        await Group(FolderListRound2Checks);
+        await Group(SearchAddressReview2Checks);
+        await Group(ExternalDropReleaseChecks);
+        await Group(WindowAppReviewChecks);
+        await Group(PanesRound2Checks);
+        await Group(PickerDialogsReviewChecks);
+        await Group(PickerDialogsWindowReviewChecks);
+        await Group(PickerDialogsAgentReviewChecks);
+        await Group(FilterTileMatchChecks);
+        await Group(FilterRereadChecks);
+        await Group(FilterStepChecks);
+        await Group(TypeFilterNoteChecks);
+        await Group(TrailParentChecks);
+        await Group(GpuArrivalChecks);
+        await Group(ExplorerReview2Checks);
+        await Group(ReleasePackagingChecks);
+        await Group(MarkLookupCostChecks);
+        await Group(DrivePaneChecks);
+        await Group(SlowPlacesChecks);
+        await Group(SharedMarksChecks);
+        await Group(CarriedMarksChecks);
+        await Group(Review2IntegrationChecks);
+        await Group(ShellMenuReview2IntegrationChecks);
+        await Group(FastEntryPointChecks);
+        await Group(BeaconIntegrationChecks);
+        await Group(ReadLaneIntegrationChecks);
+        await Group(LongPathShellOperationChecks);
+        await Group(ExplorerIntegrationFollowupChecks);
+        await Group(FileCommandReview2Checks);
+        await Group(NestedVisibilityRenameIntegrationChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

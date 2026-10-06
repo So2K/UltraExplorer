@@ -216,6 +216,11 @@ public static class FolderCommandLine
 
         try
         {
+            // The registered Shell verb adds one "\\." to protect a drive's
+            // quoted trailing slash. Remove that marker before normalization
+            // while preserving a preceding literal dot/space in the folder name.
+            if (path.EndsWith("\\.", StringComparison.Ordinal)) path = path[..^2];
+            if (path.Length == 2 && path[1] == ':') path += Path.DirectorySeparatorChar;
             // A name ending in a dot or a space keeps it: normalising cuts it
             // off, and "backup." would open its neighbour "backup", or nothing.
             normalized = Models.ViewAllPath.KeepNameEnds(path, Path.TrimEndingDirectorySeparator(Path.GetFullPath(path)));

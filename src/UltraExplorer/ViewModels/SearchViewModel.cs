@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Windows.Input;
 using System.Windows.Threading;
@@ -41,6 +42,13 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     /// <summary>How long after going to a result the folder's changes are that trip's, not the user's.</summary>
     private static readonly TimeSpan RevealQuiet = TimeSpan.FromMilliseconds(1500);
 
+    /// <summary>
+    /// The most rows taken out of and put into the list one by one; a bigger
+    /// change - another search's results, a burst of a walk's - fills it again
+    /// in one go, which past about this many costs the list box less.
+    /// </summary>
+    private const int MaximumMergedRows = 100;
+
     private readonly SearchEngine _engine = new();
     private readonly ShellIconService _icons;
     private readonly Func<string, Task> _reveal;
@@ -65,6 +73,10 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     private string? _seenFolder;
     private long _quietUntil;
     private bool _disposed;
+
+    /// <summary>The snapshot on screen, and the search it answers: a walk's is ordered again for another folder rather than searched again.</summary>
+    private SearchSnapshot? _shown;
+    private SearchQuery? _shownQuery;
 
     /// <summary>Set while the wait for Everything is asking whether it is ready yet.</summary>
     private bool _askingEverything;
@@ -133,7 +145,31 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
             _folderSettling.Stop();
             if (IsOpen && !string.Equals(_seenFolder, _here, StringComparison.OrdinalIgnoreCase))
             {
-                _ = RunAsync();
+                // A walk is not made again for the folder: that threw away all
+                // it had found and walked every drive again from the start -
+                // at every stop while browsing, so it never got to the end.
+                // What it has found is ordered for the folder instead, and so
+                // is what it goes on to find.  One stopped at its limit holds
+                // only part of what there is, found from the folder before,
+                // and is made again from this one.
+                if (_shown is { Source: SearchSource.Walk } shown && shown.Hits.Count < SearchEngine.WalkLimit && _shownQuery is { } query)
+                {
+                    _here = SearchRanking.Normalize(HereNow());
+                    _seenFolder = _here;
+                    Apply(shown, query);
+
+                    // Made again, the search went to an Everything that had
+                    // become ready meanwhile; this one still goes to it, once
+                    // it is.
+                    if (!shown.EverythingFailed)
+                    {
+                        _waitingForEverything.Start();
+                    }
+                }
+                else
+                {
+                    _ = RunAsync();
+                }
             }
         };
 
@@ -305,6 +341,8 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         Rows = [];
         Results = [];
         _byPath = new Dictionary<string, SearchResultViewModel>(StringComparer.OrdinalIgnoreCase);
+        _shown = null;
+        _shownQuery = null;
         Summary = string.Empty;
         Status = string.Empty;
         EmptyText = string.Empty;
@@ -414,18 +452,10 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         var run = new CancellationTokenSource();
         _run = run;
         var token = run.Token;
+        _shown = null;
+        _shownQuery = null;
 
-        string? here;
-        try
-        {
-            here = HereFolder?.Invoke();
-        }
-        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
-        {
-            here = null;
-        }
-
-        _here = SearchRanking.Normalize(here);
+        _here = SearchRanking.Normalize(HereNow());
         _seenFolder = _here;
         _folderSettling.Stop();
         IsBusy = true;
@@ -436,21 +466,11 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
             // Started off this thread: before its first wait the engine asks
             // Everything whether it is ready - up to a second when it is busy -
             // and looks at the drives, and this is the window's thread, at
-            // every key.
+            // every key.  A walk orders what it finds from the folder the
+            // results are ordered from now, which going to another one while
+            // it runs changes (see the folder settling).
             await Task.Run(
-                () => _engine.RunAsync(
-                    query,
-                    from,
-                    snapshot => dispatcher.InvokeAsync(
-                        () =>
-                        {
-                            if (!token.IsCancellationRequested && ReferenceEquals(_run, run))
-                            {
-                                Apply(snapshot, query);
-                            }
-                        },
-                        DispatcherPriority.Input),
-                    token),
+                () => _engine.RunAsync(query, from, Publisher(run, query, dispatcher), token, () => Volatile.Read(ref _here)),
                 token);
         }
         catch (OperationCanceledException)
@@ -466,9 +486,62 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         }
     }
 
+    /// <summary>The folder a search is made from now, as the window says it.</summary>
+    private string? HereNow()
+    {
+        try
+        {
+            return HereFolder?.Invoke();
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or ArgumentException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// What the engine tells of <paramref name="run"/>, from whatever thread,
+    /// put on screen on this one.  Only the newest of the snapshots that came
+    /// while the window was busy is put there: each holds everything found so
+    /// far, so the ones before it would only be laid out to be laid out again
+    /// straight after - one by one, each a full pass over the results, while
+    /// the canvas waited.
+    /// </summary>
+    private Action<SearchSnapshot> Publisher(CancellationTokenSource run, SearchQuery query, Dispatcher dispatcher)
+    {
+        SearchSnapshot? waiting = null;
+        return snapshot =>
+        {
+            // One already on its way to the window takes this one instead.
+            if (Interlocked.Exchange(ref waiting, snapshot) is not null)
+            {
+                return;
+            }
+
+            dispatcher.InvokeAsync(
+                () =>
+                {
+                    var newest = Interlocked.Exchange(ref waiting, null);
+                    if (newest is not null && !run.IsCancellationRequested && ReferenceEquals(_run, run))
+                    {
+                        Apply(newest, query);
+                    }
+                },
+                DispatcherPriority.Input);
+        };
+    }
+
     /// <summary>Puts a snapshot of the results on screen, keeping what was selected when it is still there.</summary>
     private void Apply(SearchSnapshot snapshot, SearchQuery query)
     {
+        // A walk's results ordered from a folder the results are no longer
+        // ordered from - sent before the walk heard of the move, or its last,
+        // sent before the move - are ordered again for the one they are.
+        if (snapshot.Source == SearchSource.Walk && !string.Equals(snapshot.Folder, _here, StringComparison.OrdinalIgnoreCase))
+        {
+            snapshot = SearchEngine.OrderedFrom(snapshot, query, _here);
+        }
+
         var rows = new List<ISearchRow>(snapshot.Hits.Count + 2);
         var results = new List<SearchResultViewModel>(snapshot.Hits.Count);
         var byPath = new Dictionary<string, SearchResultViewModel>(snapshot.Hits.Count, StringComparer.OrdinalIgnoreCase);
@@ -479,24 +552,49 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
 
         if (here is not null)
         {
-            rows.Add(new SearchHeaderRow(
+            rows.Add(Header(
                 $"In {hereName}",
                 CountText(hereShown, snapshot.HereTotal, snapshot.IsFinal),
                 here,
                 SearchPlace.Here));
         }
 
+        // The same walk reporting again, ordered from the same folder: a row
+        // it already showed says what it would say now as long as the file is
+        // as it was, so its name's pieces and its place are not worked out
+        // again for every result at every report.
+        var sameWalk = snapshot.Source == SearchSource.Walk
+            && _shown is { Source: SearchSource.Walk } before
+            && string.Equals(before.Folder, here, StringComparison.Ordinal)
+            && string.Equals(_shownQuery?.Text, query.Text, StringComparison.Ordinal);
+
         var elsewhereHeaderAdded = false;
         foreach (var hit in snapshot.Hits)
         {
             if (hit.Place == SearchPlace.Elsewhere && !elsewhereHeaderAdded)
             {
-                rows.Add(new SearchHeaderRow(
+                rows.Add(Header(
                     here is null ? "Everywhere" : "Everywhere else",
                     CountText(elsewhereShown, snapshot.ElsewhereTotal, snapshot.IsFinal),
                     null,
                     SearchPlace.Elsewhere));
                 elsewhereHeaderAdded = true;
+            }
+
+            if (sameWalk
+                && hit.Highlighted is null
+                && _byPath.TryGetValue(hit.FullPath, out var shownRow)
+                && shownRow.Place == hit.Place
+                && shownRow.Size == hit.Size
+                && shownRow.Modified == hit.Modified
+                && shownRow.IsDirectory == hit.IsFolder
+                && string.Equals(shownRow.Name, hit.Name, StringComparison.Ordinal)
+                && string.Equals(shownRow.ParentPath, hit.Directory, StringComparison.Ordinal))
+            {
+                byPath[hit.FullPath] = shownRow;
+                rows.Add(shownRow);
+                results.Add(shownRow);
+                continue;
             }
 
             // The row of the search before is kept - its icon, its selection -
@@ -540,13 +638,15 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
 
         if (!elsewhereHeaderAdded && here is not null && snapshot.IsFinal)
         {
-            rows.Add(new SearchHeaderRow("Everywhere else", CountText(0, snapshot.ElsewhereTotal, true), null, SearchPlace.Elsewhere));
+            rows.Add(Header("Everywhere else", CountText(0, snapshot.ElsewhereTotal, true), null, SearchPlace.Elsewhere));
         }
 
         var selectedPath = _selected?.FullPath;
         _byPath = byPath;
         _source = snapshot.Source;
-        Rows = rows;
+        _shown = snapshot;
+        _shownQuery = query;
+        ShowRows(rows);
         Results = results;
         Selected = selectedPath is not null && byPath.TryGetValue(selectedPath, out var kept)
             ? kept
@@ -567,6 +667,84 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         if (snapshot.IsFinal && snapshot.Source == SearchSource.Walk && !snapshot.EverythingFailed)
         {
             _waitingForEverything.Start();
+        }
+    }
+
+    /// <summary>A group's heading: the one on screen when it says the same, so its row is left as it is.</summary>
+    private SearchHeaderRow Header(string title, string count, string? detail, SearchPlace place)
+    {
+        foreach (var row in _rows)
+        {
+            if (row is SearchHeaderRow shown && shown.Place == place && shown.Title == title && shown.CountText == count && shown.Detail == detail)
+            {
+                return shown;
+            }
+        }
+
+        return new SearchHeaderRow(title, count, detail, place);
+    }
+
+    /// <summary>
+    /// Brings the rows on screen to <paramref name="rows"/>.  The results of
+    /// the same search, coming in as a walk finds more, are merged into the
+    /// list in place: the rows that went are taken out and the new ones put
+    /// in where they belong, and a row kept is never touched - a new list
+    /// every time had the list box lay out every row in sight again, and the
+    /// ones it keeps ready on either side, at every report, for tens of
+    /// milliseconds each.  Another search's results, with no row in common or
+    /// too many changed, fill a new list in one go, as before.
+    /// </summary>
+    private void ShowRows(List<ISearchRow> rows)
+    {
+        if (_rows is not ObservableCollection<ISearchRow> shown || shown.Count == 0)
+        {
+            Rows = new ObservableCollection<ISearchRow>(rows);
+            return;
+        }
+
+        var wanted = new Dictionary<ISearchRow, int>(rows.Count, ReferenceEqualityComparer.Instance);
+        for (var index = 0; index < rows.Count; index++)
+        {
+            wanted[rows[index]] = index;
+        }
+
+        // Which rows on screen stay where they are: those still wanted, in the
+        // order they are wanted in.  A kept row behind one that is now after
+        // it has moved, and is taken out and put back in its place.
+        var leaving = new HashSet<ISearchRow>(ReferenceEqualityComparer.Instance);
+        var furthest = -1;
+        foreach (var row in shown)
+        {
+            if (!wanted.TryGetValue(row, out var place) || place < furthest)
+            {
+                leaving.Add(row);
+                continue;
+            }
+
+            furthest = place;
+        }
+
+        var arriving = rows.Count - (shown.Count - leaving.Count);
+        if (wanted.Count != rows.Count || leaving.Count == shown.Count || leaving.Count + arriving > MaximumMergedRows)
+        {
+            Rows = new ObservableCollection<ISearchRow>(rows);
+            return;
+        }
+
+        for (var index = shown.Count - 1; index >= 0; index--)
+        {
+            if (leaving.Contains(shown[index]))
+            {
+                shown.RemoveAt(index);
+            }
+        }
+
+        for (var index = 0; index < rows.Count; index++)
+        {
+            if (index >= shown.Count || !ReferenceEquals(shown[index], rows[index]))
+            {
+                shown.Insert(index, rows[index]);
+            }
         }
     }
 

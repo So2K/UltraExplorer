@@ -217,6 +217,9 @@ internal static partial class Program
                 Check("and the folder hidden stays on the user's hidden list", tree.IsUserHidden(appData));
 
                 tree.SetUserHidden([appData]);
+                Check("passive synchronization of the same hidden set keeps the explicitly opened folder visible",
+                    opened is not null && NestedTree.IsOnCanvas(opened));
+                tree.HideFromCanvas([appData]);
                 Check("hiding it again hides it again, with the folder opened inside it",
                     tree.Find(appData) is { Index: < 0 } && tree.Find(foo) is { } hidden && !NestedTree.IsOnCanvas(hidden));
             }

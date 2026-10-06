@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Threading;
 using UltraExplorer;
 using UltraExplorer.Controls;
+using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Picker;
 using UltraExplorer.Picker.Integration;
@@ -51,55 +52,76 @@ internal static partial class Program
     /// </summary>
     private static async Task ProxyPaneChecksInOwnProcessAsync()
     {
+        // The broad parent has deliberately changed its workspace many times.
+        // This child exercises the real Loaded path, so give it a settled
+        // state of its own instead of racing a manual split against whatever
+        // the preceding group last saved.
+        var childState = Path.Combine(Path.GetTempPath(), "UltraExplorerProxyPaneState", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(childState);
+        await new WorkspaceStore(Path.Combine(childState, "workspace.json")).SaveAsync(new WorkspaceState
+        {
+            CanvasRenderer = "Cpu",
+            CanvasLayout = nameof(CanvasLayout.Nested),
+            IsSplit = false
+        });
         var start = new ProcessStartInfo(Environment.ProcessPath!, "--only ProxyPaneChecks")
         {
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true
         };
-        using var child = Process.Start(start)!;
-        using var limit = new CancellationTokenSource(TimeSpan.FromMinutes(10));
-        var finished = false;
+        start.Environment[AppPaths.StateDirectoryVariable] = childState;
+        start.Environment["ULTRAEXPLORER_TEST_WINDOW"] = "1";
         try
         {
-            while (await child.StandardOutput.ReadLineAsync(limit.Token) is { } line)
-            {
-                if (line.StartsWith("  ok    ", StringComparison.Ordinal))
-                {
-                    Check(line[8..], true);
-                }
-                else if (line.StartsWith("  FAIL  ", StringComparison.Ordinal))
-                {
-                    Check(line[8..], false);
-                }
-                else if (line.EndsWith(" checks passed", StringComparison.Ordinal))
-                {
-                    finished = true;
-                }
-                else if (line.Length > 0)
-                {
-                    Console.WriteLine(line);
-                }
-            }
-
-            await child.WaitForExitAsync(limit.Token);
-        }
-        catch (OperationCanceledException) when (limit.IsCancellationRequested)
-        {
+            using var child = Process.Start(start)!;
+            using var limit = new CancellationTokenSource(TimeSpan.FromMinutes(10));
+            var finished = false;
             try
             {
-                child.Kill(entireProcessTree: true);
+                while (await child.StandardOutput.ReadLineAsync(limit.Token) is { } line)
+                {
+                    if (line.StartsWith("  ok    ", StringComparison.Ordinal))
+                    {
+                        Check(line[8..], true);
+                    }
+                    else if (line.StartsWith("  FAIL  ", StringComparison.Ordinal))
+                    {
+                        Check(line[8..], false);
+                    }
+                    else if (line.EndsWith(" checks passed", StringComparison.Ordinal))
+                    {
+                        finished = true;
+                    }
+                    else if (line.Length > 0)
+                    {
+                        Console.WriteLine(line);
+                    }
+                }
+
+                await child.WaitForExitAsync(limit.Token);
             }
-            catch (InvalidOperationException)
+            catch (OperationCanceledException) when (limit.IsCancellationRequested)
             {
-                // Gone by itself meanwhile.
+                try
+                {
+                    child.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException)
+                {
+                    // Gone by itself meanwhile.
+                }
+
+                Check("the proxy pane checks' own process finished within ten minutes", false);
+                return;
             }
 
-            Check("the proxy pane checks' own process finished within ten minutes", false);
-            return;
+            Check("the proxy pane checks' own process ran to the end", finished);
         }
-
-        Check("the proxy pane checks' own process ran to the end", finished);
+        finally
+        {
+            TryDelete(childState);
+        }
     }
 
     private static async Task ProxyPaneOnStaAsync()
@@ -268,6 +290,12 @@ internal static partial class Program
         var main = ProxyWindow(out var shell);
         try
         {
+            // ApplyFolderInvocation shows the window early (J097), which runs
+            // its real Loaded path. Let persisted state settle before this
+            // fixture deliberately primes a split, so Loaded cannot restore a
+            // preceding test group's split over it halfway through the check.
+            await shell.InitializeAsync();
+            shell.Layout = CanvasLayout.Nested;
             var parsed = FolderCommandLine.TryOpenFolder(left, out var invocation, out _);
             Check("the launch is of a folder", parsed);
             if (!parsed)
@@ -298,9 +326,9 @@ internal static partial class Program
             Check("a flight that finds no folder, in the pane a launch went to, leaves its drives to be read",
                 first.Canvas.LoadUnfocusedRoots && first.FlightsUnderWay == 0);
 
-            // A launch into the second pane, which the split then closes.  Its
-            // sender gives up on it straight away, so it ends before it would
-            // show the window.
+            // A launch into the second pane, which the split then closes. Its
+            // sender gives up straight away: J097 has already presented the
+            // window, but the request still reports that it was not readied.
             main.ActivatePane(second);
             var fields = BindingFlags.Instance | BindingFlags.NonPublic;
             ((TaskCompletionSource)typeof(MainWindow).GetField("_folderLaunchReady", fields)!.GetValue(main)!).TrySetResult();
@@ -308,7 +336,8 @@ internal static partial class Program
             {
                 var launch = main.ApplyFolderInvocationAsync(invocation, abandoned.Token);
                 abandoned.Cancel();
-                Check("the launch, given up on, ends without showing the window", !await launch && !main.IsVisible);
+                Check("a launch given up after early presentation reports not ready without activating the test window",
+                    !await launch && main.IsVisible && !main.IsActive);
             }
 
             var paneRoots = (IDictionary)typeof(MainWindow).GetField("_folderPaneRoots", fields)!.GetValue(main)!;
@@ -320,7 +349,15 @@ internal static partial class Program
         }
         finally
         {
-            shell.Dispose();
+            // J097 made this a real, visible window. Close its complete window
+            // lifetime; disposing only the model leaves Application.MainWindow
+            // and the pane controls alive for the rest of the child process.
+            main.Close();
+            var closed = await LiveWait(() => Application.Current?.Windows.OfType<MainWindow>().Contains(main) != true, 10_000) >= 0;
+            if (!closed)
+            {
+                shell.Dispose();
+            }
         }
     }
 

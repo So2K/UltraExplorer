@@ -20,6 +20,8 @@ namespace ViewAllSmoke;
 /// </summary>
 internal static partial class Program
 {
+    private static int _liveEverythingUnansweredSkips;
+
     private static async Task SearchChecks()
     {
         SearchQueryChecks();
@@ -29,6 +31,7 @@ internal static partial class Program
         await LiveEverythingChecks();
         RunOnSta("search panel", SearchPanelOnStaAsync);
         RunOnSta("search result content hit-testing", SearchResultContentChecksAsync);
+        await SilentEverythingChecks();
     }
 
     private static void SearchQueryChecks()
@@ -260,27 +263,30 @@ internal static partial class Program
             File.WriteAllText(Path.Combine(far, unique + ".txt"), "x");
             File.WriteAllText(Path.Combine(near, "copy of " + unique + ".txt"), "x");
 
-            EverythingPage? page = null;
             var clock = System.Diagnostics.Stopwatch.StartNew();
-            while (clock.ElapsedMilliseconds < 10_000)
-            {
-                page = await EverythingClient.Shared.QueryAsync(unique + " file:", 10, CancellationToken.None);
-                if (page is { Items.Count: 2 })
-                {
-                    break;
-                }
-
-                await Task.Delay(100);
-            }
+            var page = await WaitForLiveEverythingFixtureAsync(unique + " file:", 2, "live engine");
+            if (page is null) return;
 
             Check($"Everything finds new files ({page?.Items.Count ?? -1} in {clock.ElapsedMilliseconds} ms)", page is { Items.Count: 2, Total: 2 });
             Check("with their folders", page is not null && page.Items.All(item => item.Directory.StartsWith(root, StringComparison.OrdinalIgnoreCase)));
 
             var snapshots = new List<SearchSnapshot>();
             clock.Restart();
-            await new SearchEngine().RunAsync(SearchQuery.Parse(unique), near, snapshots.Add, CancellationToken.None);
+            using var engineBudget = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var engineTimedOut = false;
+            try
+            {
+                await new SearchEngine().RunAsync(SearchQuery.Parse(unique), near, snapshots.Add, engineBudget.Token);
+            }
+            catch (OperationCanceledException) when (engineBudget.IsCancellationRequested)
+            {
+                engineTimedOut = true;
+            }
             var last = snapshots.LastOrDefault();
-            Check($"the engine asks Everything ({clock.ElapsedMilliseconds} ms)", last is { Source: SearchSource.Everything, IsFinal: true });
+            // A fixture which was indexed and answered is a real product
+            // assertion. Do not relabel an engine failure as a dependency skip.
+            Check($"the engine asks Everything within its budget ({clock.ElapsedMilliseconds} ms)",
+                !engineTimedOut && last is { Source: SearchSource.Everything, IsFinal: true });
             Check("the file in the folder searched from comes first, though others are named exactly",
                 last is { Hits.Count: >= 2 } && last.Hits[0].Directory.Equals(near, StringComparison.OrdinalIgnoreCase)
                 && last.Hits[0].Place == SearchPlace.Here && last.Hits[1].Place == SearchPlace.Elsewhere);
@@ -290,6 +296,51 @@ internal static partial class Program
         {
             TryDelete(Path.Combine(Path.GetTempPath(), "UltraExplorerSearch", unique));
         }
+    }
+
+    /// <summary>
+    /// The live backend is an optional integration prerequisite, not a
+    /// deterministic fixture. An unanswered query or an excluded/unindexed
+    /// TEMP directory is named as inconclusive before any engine/panel search
+    /// is started. This prevents the optional live check from falling back to
+    /// walking all user drives. Once the prerequisite answers with the fixture,
+    /// all existing product assertions still run and may fail normally.
+    /// </summary>
+    private static async Task<EverythingPage?> WaitForLiveEverythingFixtureAsync(string query, int expected, string purpose)
+    {
+        using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+        EverythingPage? page = null;
+        try
+        {
+            while (!budget.IsCancellationRequested)
+            {
+                page = await EverythingClient.Shared.QueryAsync(query, 10, budget.Token);
+                if (page is null)
+                {
+                    Interlocked.Increment(ref _liveEverythingUnansweredSkips);
+                    Console.WriteLine($"  (Everything did not answer {purpose}; live assertions are inconclusive/skipped, no all-drive fallback was started)");
+                    return null;
+                }
+
+                // An unexpectedly larger answer or an advertised total with
+                // missing parsed rows is a conclusive product assertion, not
+                // an indexing delay. Do not skip a malformed client result.
+                if (page.Items.Count >= expected || page.Total >= expected) return page;
+                await Task.Delay(100, budget.Token);
+            }
+        }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested)
+        {
+            if (page is null)
+            {
+                Interlocked.Increment(ref _liveEverythingUnansweredSkips);
+                Console.WriteLine($"  (Everything did not answer {purpose} within 12 seconds; live assertions are inconclusive/skipped)");
+                return null;
+            }
+        }
+
+        Console.WriteLine($"  (Everything has not indexed the {purpose} fixture within 12 seconds: {page?.Items.Count ?? -1}/{expected}; live assertions are inconclusive/skipped)");
+        return null;
     }
 
     private static async Task SearchPanelOnStaAsync()
@@ -322,20 +373,23 @@ internal static partial class Program
             var hereFolder = Path.Combine(root, "here");
             search.HereFolder = () => hereFolder;
 
-            // Everything hears of new files within a moment; the panel is
-            // tried once it has.
             var clock = System.Diagnostics.Stopwatch.StartNew();
-            while (clock.ElapsedMilliseconds < 10_000
-                && await EverythingClient.Shared.QueryAsync(unique, 10, CancellationToken.None) is not { Items.Count: 3 })
-            {
-                await Task.Delay(100);
-            }
+            var fixture = await WaitForLiveEverythingFixtureAsync(unique, 3, "live panel");
+            if (fixture is null) return;
+            Check("the panel fixture has exactly the three indexed files", fixture is { Items.Count: 3, Total: 3 });
 
             clock.Restart();
             search.Text = unique;
             Check("typing opens the panel at once", search.IsOpen);
             var complete = await SearchUntil(() => !search.IsBusy && search.Results.Count == 3, 3_000);
             Check($"the results come as you type ({search.Results.Count} in {clock.ElapsedMilliseconds} ms)", complete);
+            if (!complete)
+            {
+                // Keep the failed assertion, cancel a possible fallback walk
+                // and avoid secondary indexing exceptions on empty results.
+                search.Close();
+                return;
+            }
             Check("the folder's heading comes first", search.Rows.Count > 0 && search.Rows[0] is SearchHeaderRow { Place: SearchPlace.Here, Title: "In here" });
             Check("then its result", search.Rows.Count > 1 && search.Rows[1] is SearchResultViewModel { Place: SearchPlace.Here });
             Check("then everywhere else", search.Rows.Count > 2 && search.Rows[2] is SearchHeaderRow { Place: SearchPlace.Elsewhere, Title: "Everywhere else" });
@@ -380,6 +434,70 @@ internal static partial class Program
             TryDelete(root);
         }
     }
+
+    /// <summary>
+    /// Everything running here but not answering - hung, or held up by a
+    /// drive it is reading - says nothing about UltraExplorer: the live
+    /// checks above call that inconclusive and name what they skip, where
+    /// they failed and then waited minutes for the walk of every drive that
+    /// stands in for Everything.  A hidden window of this process plays that
+    /// Everything: its index loaded, every query taken, none answered.  Its
+    /// class is one only this process asks for, so no other program finds it.
+    /// </summary>
+    private static async Task SilentEverythingChecks()
+    {
+        Section("search: an Everything that does not answer");
+        var classes = (string[])typeof(EverythingClient).GetField("WindowClasses", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!.GetValue(null)!;
+        var kept = (string[])classes.Clone();
+        var ready = new TaskCompletionSource<(Dispatcher Dispatcher, System.Windows.Interop.HwndSource Window, string ClassName)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            var silent = new System.Windows.Interop.HwndSource(new System.Windows.Interop.HwndSourceParameters("Everything that does not answer") { WindowStyle = 0 });
+            silent.AddHook((nint window, int message, nint wParam, nint lParam, ref bool handled) =>
+            {
+                // WM_USER, which asks whether the index is loaded, and WM_COPYDATA, a query: both taken.
+                handled = message is 0x0400 or 0x004A;
+                return handled ? 1 : 0;
+            });
+            var name = new StringBuilder(256);
+            SilentEverythingClassName(silent.Handle, name, name.Capacity);
+            ready.SetResult((Dispatcher.CurrentDispatcher, silent, name.ToString()));
+            Dispatcher.Run();
+        })
+        {
+            IsBackground = true,
+            Name = "Everything that does not answer"
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        var (dispatcher, silent, className) = await ready.Task;
+
+        var failures = _failures;
+        var skips = Volatile.Read(ref _liveEverythingUnansweredSkips);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            Array.Fill(classes, className);
+            Check("Everything is there, with its index loaded, as far as UltraExplorer can tell", EverythingClient.IsDatabaseLoaded);
+            await LiveEverythingChecks();
+            RunOnSta("search panel, Everything not answering", SearchPanelOnStaAsync);
+        }
+        finally
+        {
+            kept.CopyTo(classes, 0);
+            dispatcher.Invoke(silent.Dispose);
+            dispatcher.InvokeShutdown();
+            thread.Join();
+        }
+
+        Check($"the live checks fail none of theirs for it, and wait for no walk of every drive ({_failures - failures} failed, {clock.ElapsedMilliseconds:N0} ms)",
+            _failures == failures && clock.ElapsedMilliseconds < 30_000);
+        Check("both optional live sections report their unanswered dependency instead of starting product searches",
+            Volatile.Read(ref _liveEverythingUnansweredSkips) == skips + 2);
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetClassNameW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int SilentEverythingClassName(nint window, StringBuilder name, int capacity);
 
     private static async Task<bool> SearchUntil(Func<bool> condition, int milliseconds)
     {

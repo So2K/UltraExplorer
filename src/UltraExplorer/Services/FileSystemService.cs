@@ -104,22 +104,35 @@ public sealed class FileSystemService(ShellIconService iconService)
     /// </summary>
     public static IReadOnlyList<ReadyDrive> ListReadyDrives()
     {
-        var asking = DriveInfo.GetDrives()
-            .Select(drive => Task.Run(() =>
+        var asking = AskReadyDrives();
+        Task.WaitAll([.. asking.Select(drive => drive.Answer)]);
+        return asking
+            .Where(drive => drive.Answer.Result is not null)
+            .Select(drive => drive.Answer.Result!.Value)
+            .ToArray();
+    }
+
+    /// <summary>
+    /// Asks every drive at once whether it is ready, each on a thread of its
+    /// own, and hands the questions back in the order listed without waiting
+    /// for any answer: the navigation pane shows each drive as it answers, so
+    /// a drive mapped to a server that is off - twenty seconds to say it is
+    /// not ready - holds up only itself, not C: and the rest with it.  Each
+    /// question is by the drive's root (<see cref="ReadyDrive.Path"/>), and
+    /// answers the drive as <see cref="ListReadyDrives"/> names it, or null
+    /// for one that is not ready.  Listing the letters asks no drive anything.
+    /// </summary>
+    public static IReadOnlyList<(string Path, Task<ReadyDrive?> Answer)> AskReadyDrives()
+        => DriveInfo.GetDrives()
+            .Select(drive => (drive.RootDirectory.FullName, Task.Run(() =>
                 // What DriveInfo.IsReady asks, through FolderExists.
                 FolderExists(drive.Name)
                     ? new ReadyDrive(
                         $"{SafeVolumeLabel(drive)} ({drive.Name.TrimEnd('\\')})",
                         drive.RootDirectory.FullName,
                         drive.DriveType == DriveType.Network)
-                    : (ReadyDrive?)null))
+                    : (ReadyDrive?)null)))
             .ToArray();
-        Task.WaitAll(asking);
-        return asking
-            .Where(answer => answer.Result is not null)
-            .Select(answer => answer.Result!.Value)
-            .ToArray();
-    }
 
     /// <summary>WSL distributions and the Explorer network view, when present.</summary>
     public IReadOnlyList<FavoriteItemViewModel> GetNetworkLocations() => GetNetworkLocations(ListWslDistributions());

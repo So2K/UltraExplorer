@@ -240,6 +240,11 @@ internal static class FastDialogRead
         Ask(combo, 0x149, index, left) is { } length and >= 0 and <= 2048
             && ReadText(combo, 0x148, index, 2049, left) is { } text && text.Length <= length ? text : null;
 
+    /// <summary>The original name immediately before handoff, read on a worker with a bounded Win32 message.</summary>
+    internal static string? ReadName(nint edit, TimeSpan budget)
+        => edit == 0 || (DialogNative.Style(edit) & (0x20 | 0x4)) != 0
+            ? null : ReadText(edit, 0xd, 2049, 2049, () => (uint)Math.Clamp(budget.TotalMilliseconds, 1, 1000));
+
     /// <summary>A text the window hands back (WM_GETTEXT, CB_GETLBTEXT); null when not answered in time.</summary>
     private static string? ReadText(nint window, uint message, nint wparam, int capacity, Func<uint> left)
     {
@@ -289,6 +294,7 @@ internal static class FastDialogRead
             if (i > 0 && !char.IsWhiteSpace(caption[i - 1]) && caption[i - 1] is not ('\u200e' or '\u200f')) continue;
             if (network) return null;
             var path = caption[i..].Trim(' ', '\u200e', '\u200f');
+            if (NativeDialogRules.WindowsReadsAsAnother(path)) return null;
             if (!verify || Directory.Exists(path)) return path;
         }
         return names?.Match(caption);

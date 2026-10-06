@@ -65,7 +65,10 @@ internal sealed class SearchQuery
 
     /// <summary>
     /// Everything's query for the text, leaving out what is under each of
-    /// <paramref name="excluded"/>: <c>!path:"L:\"</c>.
+    /// <paramref name="excluded"/>: <c>!path:"L:\"</c>.  A quote still open at
+    /// the end of the text - "my doc, typed on the way to "my doc" - is closed
+    /// first, as Everything would close it: left open, it took the folders
+    /// left out into the phrase, and nothing was found until it was closed.
     /// </summary>
     public string Excluding(IReadOnlyCollection<string> excluded)
     {
@@ -75,6 +78,11 @@ internal sealed class SearchQuery
         }
 
         var builder = new StringBuilder(Text);
+        if (Text.Count(character => character == '"') % 2 != 0)
+        {
+            builder.Append('"');
+        }
+
         foreach (var folder in excluded)
         {
             builder.Append(" !").Append(PathTerm(folder));
@@ -255,7 +263,7 @@ internal sealed class SearchQuery
     private void Parse()
     {
         var words = new List<string>();
-        foreach (var token in Tokens(Text))
+        foreach (var token in JoinedAtBars(Tokens(Text)))
         {
             var raw = token.Text;
             var excluded = false;
@@ -327,7 +335,15 @@ internal sealed class SearchQuery
 
             if (raw.Contains('|'))
             {
+                // A bar with nothing on either side - typed on its own, or not
+                // yet followed by anything - is no term at all: as an OR of
+                // nothing it matched nothing, and every result went.
                 var alternatives = raw.Split('|', StringSplitOptions.RemoveEmptyEntries);
+                if (alternatives.Length == 0)
+                {
+                    continue;
+                }
+
                 _terms.Add(new Term(TermKind.AnyOf, raw, excluded, alternatives));
                 if (!excluded)
                 {
@@ -433,6 +449,42 @@ internal sealed class SearchQuery
         if (builder.Length > 0)
         {
             yield return (builder.ToString(), quoteAt >= 0, quoteAt);
+        }
+    }
+
+    /// <summary>
+    /// The tokens with Everything's OR put back together across the spaces
+    /// around it: to Everything <c>a | b</c>, <c>a |b</c> and <c>a| b</c> are
+    /// all <c>a|b</c>, an OR binding tighter than the space between words.
+    /// Read token by token, a bar standing alone was an OR of nothing that no
+    /// name matched, and a bar at one end of a word cut it off from its other
+    /// side, so the two sides had both to match.
+    /// </summary>
+    private static IEnumerable<(string Text, bool Quoted, int QuoteAt)> JoinedAtBars(IEnumerable<(string Text, bool Quoted, int QuoteAt)> tokens)
+    {
+        (string Text, bool Quoted, int QuoteAt)? pending = null;
+        foreach (var token in tokens)
+        {
+            if (pending is { } left && (left.Text.EndsWith('|') || token.Text.StartsWith('|')))
+            {
+                var quoteAt = left.QuoteAt >= 0 ? left.QuoteAt
+                    : token.QuoteAt >= 0 ? left.Text.Length + token.QuoteAt
+                    : -1;
+                pending = (left.Text + token.Text, left.Quoted || token.Quoted, quoteAt);
+                continue;
+            }
+
+            if (pending is { } done)
+            {
+                yield return done;
+            }
+
+            pending = token;
+        }
+
+        if (pending is { } last)
+        {
+            yield return last;
         }
     }
 

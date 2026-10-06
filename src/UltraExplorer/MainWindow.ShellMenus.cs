@@ -42,9 +42,49 @@ public partial class MainWindow
     /// </summary>
     private const int PreparedMenuMostItems = 100;
 
+    /// <summary>
+    /// The most items the Shell's menu is built for at all.  It grows with
+    /// the selection - 1.6 s for 5,000 files, measured, and on for as long as
+    /// the selection goes - on the thread every window shares; a bigger
+    /// selection gets the app's own menu.
+    /// </summary>
+    private const int ShellMenuMostItems = 2000;
+
+    /// <summary>
+    /// How long a press must stay still before its menu is built: a press
+    /// that moves sooner is the start of a right-drag, which only pans, and
+    /// building the menu it never shows held the pan's start.
+    /// </summary>
+    private static readonly TimeSpan PreparedMenuStillTime = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>
+    /// How long an item on a share is waited for before its menu is built:
+    /// the Shell asks the server while it parses the item, and a server that
+    /// has gone away held every window for the network's timeout - over a
+    /// minute, measured.  An item that does not answer in time gets the app's
+    /// own menu.
+    /// </summary>
+    private static readonly TimeSpan ShareAnswerTime = TimeSpan.FromMilliseconds(1500);
+
+    /// <summary>
+    /// The question last put to each share, by its \\server\share: one still
+    /// unanswered is not asked again, nor waited for, until it is answered.
+    /// </summary>
+    private static readonly ShellSharePreflight ShareQuestions = new(
+        static share => Task.Run(() => Directory.Exists(share)),
+        maximumPending: 2, maximumKeys: 64);
+
+    private long _shellMenuRequestGeneration;
+
+    // Menu events can be reentered while a preflight pumps. A second window
+    // must not nest another wait and stretch the first one's deadline.
+    [ThreadStatic]
+    private static bool _waitingForMenuShare;
+
     private ShellContextMenu? _preparedMenu;
     private string? _preparedKey;
     private DispatcherOperation? _preparing;
+    private DispatcherTimer? _preparedStill;
     private DispatcherTimer? _preparedExpiry;
 
     /// <summary>For tests: the menus built for a press, and the ones built only when shown.</summary>
@@ -68,7 +108,7 @@ public partial class MainWindow
     /// </summary>
     internal void PrepareShellMenu(bool background, IReadOnlyList<string> paths)
     {
-        if (paths.Count is 0 or > PreparedMenuMostItems)
+        if (!ShellMenuCountAllowed(paths.Count, prepared: true) || _closeRequested || Dispatcher.HasShutdownStarted)
         {
             return;
         }
@@ -85,7 +125,7 @@ public partial class MainWindow
 
         var extended = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
         var key = MenuKey(background, paths, extended);
-        if (key == _preparedKey && (_preparedMenu is not null || _preparing is not null))
+        if (key == _preparedKey && (_preparedMenu is not null || _preparing is not null || _preparedStill is not null))
         {
             return;
         }
@@ -93,26 +133,37 @@ public partial class MainWindow
         DropPreparedMenu();
         _preparedKey = key;
         string[] copy = [.. paths];
-        _preparing = Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () =>
+        var current = CaptureShellMenuRequest();
+        // A right press can become a pan. Give it a short still interval
+        // before doing the Shell work; release/pan/close cancels this timer.
+        _preparedStill = CreateShellMenuStillTimer(Dispatcher, () =>
         {
-            _preparing = null;
-            if (_preparedKey != key)
+            _preparedStill = null;
+            if (_preparedKey != key || !current())
             {
+                if (_preparedKey == key) _preparedKey = null;
                 return;
             }
 
             try
             {
-                _preparedMenu = BuildShellMenu(background, copy, extended);
+                var built = BuildShellMenu(background, copy, extended, current);
+                if (!current())
+                {
+                    built?.Dispose();
+                    return;
+                }
+                _preparedMenu = built;
             }
             catch (Exception)
             {
                 // Nothing would catch it here: the app has no handler for what
                 // escapes a dispatcher callback, so it would end the app.  The
                 // release builds the menu again, and says what went wrong.
-                _preparedMenu = null;
+                if (current()) _preparedMenu = null;
             }
 
+            if (!current()) return;
             if (_preparedMenu is null)
             {
                 _preparedKey = null;
@@ -123,11 +174,18 @@ public partial class MainWindow
             _preparedExpiry.Stop();
             _preparedExpiry.Start();
         });
+        _preparedStill.Start();
     }
 
     /// <summary>The menu built for the press when it is for this, else one built now; null when the Shell has none.</summary>
-    private ShellContextMenu? TakeShellMenu(bool background, IReadOnlyList<string> paths)
+    private ShellContextMenu? TakeShellMenu(bool background, IReadOnlyList<string> paths, out bool abandoned)
     {
+        abandoned = false;
+        if (_closeRequested || Dispatcher.HasShutdownStarted)
+        {
+            abandoned = true;
+            return null;
+        }
         var extended = Keyboard.Modifiers.HasFlag(ModifierKeys.Shift);
         var key = MenuKey(background, paths, extended);
         if (_preparedMenu is { } prepared && _preparedKey == key && prepared.IsOnThisThread)
@@ -141,8 +199,15 @@ public partial class MainWindow
         }
 
         DropPreparedMenu();
+        var current = CaptureShellMenuRequest();
         MenusBuiltOnShow++;
-        var built = BuildShellMenu(background, paths, extended);
+        var built = BuildShellMenu(background, paths, extended, current);
+        if (!current())
+        {
+            built?.Dispose();
+            abandoned = true;
+            return null;
+        }
         LastShownMenu = (built?.BuildTime ?? TimeSpan.Zero, false, built?.BuildSteps ?? string.Empty);
         return built;
     }
@@ -150,21 +215,45 @@ public partial class MainWindow
     /// <summary>Lets go of a menu built for a press whose release asked for another, or for none.</summary>
     private void DropPreparedMenu()
     {
+        _shellMenuRequestGeneration++;
         _preparing?.Abort();
         _preparing = null;
+        _preparedStill?.Stop();
+        _preparedStill = null;
         _preparedKey = null;
         _preparedExpiry?.Stop();
         _preparedMenu?.Dispose();
         _preparedMenu = null;
     }
 
-    private ShellContextMenu? BuildShellMenu(bool background, IReadOnlyList<string> paths, bool extended)
+    private Func<bool> CaptureShellMenuRequest()
     {
+        var generation = _shellMenuRequestGeneration;
+        var selection = _viewModel.Tree.Selection.Version;
+        var pane = ActivePane;
+        return () => !_closeRequested && !Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished
+            && generation == _shellMenuRequestGeneration
+            && selection == _viewModel.Tree.Selection.Version && ReferenceEquals(pane, ActivePane);
+    }
+
+    private ShellContextMenu? BuildShellMenu(bool background, IReadOnlyList<string> paths, bool extended, Func<bool>? current = null)
+    {
+        Dispatcher.VerifyAccess();
+        if (!ShellMenuCountAllowed(paths.Count, prepared: false)) return null;
+        current ??= CaptureShellMenuRequest();
+        if (!current()) return null;
         var owner = new WindowInteropHelper(this).Handle;
         if (owner == IntPtr.Zero)
         {
             return null;
         }
+
+        var shares = paths.Select(VolumeKinds.ShareKey).OfType<string>().Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        // Items from different shares cannot have one native parent menu.
+        if (shares.Length > 1) return null;
+        if (shares is [var share] && !WaitForShellShare(Dispatcher, ShareQuestions.Ask(share), ShareAnswerTime, current))
+            return null;
+        if (!current()) return null;
 
         try
         {
@@ -176,6 +265,117 @@ public partial class MainWindow
         catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or InvalidOperationException or ArgumentException)
         {
             return null;
+        }
+    }
+
+    internal static bool ShellMenuCountAllowed(int count, bool prepared) =>
+        count > 0 && count <= (prepared ? PreparedMenuMostItems : ShellMenuMostItems);
+
+    internal static TimeSpan ShellSharePreflightBudget => ShareAnswerTime;
+
+    /// <summary>A one-shot press timer. Stop cancels it before any COM work starts.</summary>
+    internal static DispatcherTimer CreateShellMenuStillTimer(Dispatcher dispatcher, Action callback)
+    {
+        var timer = new DispatcherTimer(DispatcherPriority.Background, dispatcher) { Interval = PreparedMenuStillTime };
+        timer.Tick += (_, _) => { timer.Stop(); callback(); };
+        return timer;
+    }
+
+    /// <summary>
+    /// Only a newly started preflight may wait. UI messages keep pumping on
+    /// the original apartment; a second click on a still pending share falls
+    /// back immediately. This bounds preflight, not subsequent Shell COM or
+    /// installed extensions, which cannot be safely aborted on this apartment.
+    /// </summary>
+    internal static bool WaitForShellShare(Dispatcher dispatcher, ShellShareQuestion question, TimeSpan budget, Func<bool> current)
+    {
+        dispatcher.VerifyAccess();
+        if (!current()) return false;
+        if (question.Answer.IsCompleted) return question.Answer.IsCompletedSuccessfully && question.Answer.Result;
+        if (!question.NewlyStarted || budget <= TimeSpan.Zero || _waitingForMenuShare) return false;
+        var elapsed = System.Diagnostics.Stopwatch.StartNew();
+        var frame = new DispatcherFrame();
+        var timer = new DispatcherTimer(DispatcherPriority.Input, dispatcher) { Interval = TimeSpan.FromMilliseconds(15) };
+        timer.Tick += (_, _) =>
+        {
+            if (question.Answer.IsCompleted || !current() || elapsed.Elapsed >= budget || dispatcher.HasShutdownStarted)
+                frame.Continue = false;
+        };
+        timer.Start();
+        _waitingForMenuShare = true;
+        try { Dispatcher.PushFrame(frame); }
+        finally { timer.Stop(); _waitingForMenuShare = false; }
+        return current() && question.Answer.IsCompletedSuccessfully && question.Answer.Result;
+    }
+
+    internal readonly record struct ShellShareQuestion(Task<bool> Answer, bool NewlyStarted);
+
+    /// <summary>
+    /// Process-wide bounded, single-flight reachability. Pending entries are
+    /// never evicted; even an uncancellable SMB wait consumes at most one of
+    /// the two physical probes. Saturated capacity uses the app menu instead
+    /// of queueing threads. Tests supply owned TaskCompletionSource probes.
+    /// </summary>
+    internal sealed class ShellSharePreflight
+    {
+        private sealed class Entry(Task<bool> answer)
+        {
+            internal readonly Task<bool> Answer = answer;
+            internal long Expires = long.MaxValue;
+        }
+
+        private readonly Lock _gate = new();
+        private readonly Dictionary<string, Entry> _questions = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Func<string, Task<bool>> _probe;
+        private readonly Func<long> _now;
+        private readonly Action<Exception> _report;
+        private readonly int _maximumPending;
+        private readonly int _maximumKeys;
+        private static readonly Task<bool> Unavailable = Task.FromResult(false);
+
+        internal ShellSharePreflight(Func<string, Task<bool>> probe, int maximumPending = 2, int maximumKeys = 64, Func<long>? now = null, Action<Exception>? report = null)
+        {
+            if (maximumPending <= 0 || maximumKeys < maximumPending) throw new ArgumentOutOfRangeException(nameof(maximumPending));
+            _probe = probe ?? throw new ArgumentNullException(nameof(probe));
+            _maximumPending = maximumPending;
+            _maximumKeys = maximumKeys;
+            _now = now ?? (() => Environment.TickCount64);
+            _report = report ?? (error => Infrastructure.CrashReporter.Log("checking a share before its context menu", error));
+        }
+
+        internal int PendingCount { get { lock (_gate) return _questions.Values.Count(entry => !entry.Answer.IsCompleted); } }
+        internal int KeyCount { get { lock (_gate) return _questions.Count; } }
+
+        internal ShellShareQuestion Ask(string share)
+        {
+            lock (_gate)
+            {
+                if (_questions.TryGetValue(share, out var known))
+                {
+                    if (!known.Answer.IsCompleted || known.Expires > _now()) return new(known.Answer, false);
+                    _questions.Remove(share);
+                }
+                if (_questions.Values.Count(entry => !entry.Answer.IsCompleted) >= _maximumPending)
+                    return new(Unavailable, false);
+                if (_questions.Count >= _maximumKeys)
+                {
+                    var oldest = _questions.Where(pair => pair.Value.Answer.IsCompleted).MinBy(pair => pair.Value.Expires);
+                    if (oldest.Value is null) return new(Unavailable, false);
+                    _questions.Remove(oldest.Key);
+                }
+                Task<bool> answer;
+                try { answer = _probe(share) ?? Task.FromException<bool>(new InvalidOperationException("A share preflight returned no task.")); }
+                catch (Exception error) { answer = Task.FromException<bool>(error); }
+                var entry = new Entry(answer);
+                _questions.Add(share, entry);
+                _ = answer.ContinueWith(completed =>
+                {
+                    if (completed.IsFaulted)
+                        _report(completed.Exception!);
+                    lock (_gate) entry.Expires = _now() + 10_000;
+                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                return new(answer, true);
+            }
         }
     }
 
@@ -365,14 +565,16 @@ public partial class MainWindow
     /// The Shell's menu for items or for a folder's open space, with the
     /// app's entries: true when it was shown, false when the Shell has none
     /// and the caller's own menu is wanted instead.  A failure once it is up
-    /// is said, not answered with a second menu.
+    /// is said, not answered with a second menu. A superseded/closed request
+    /// is consumed without showing either an old Shell menu or a fallback.
     /// </summary>
     private bool TryShowShellMenu(bool background, IReadOnlyList<string> paths, FrameworkElement origin, Point point, Func<IReadOnlyList<ShellMenuEntry>> entries)
     {
         ShellContextMenu? menu;
         try
         {
-            menu = TakeShellMenu(background, paths);
+            menu = TakeShellMenu(background, paths, out var abandoned);
+            if (abandoned) return true;
         }
         catch (Exception ex)
         {

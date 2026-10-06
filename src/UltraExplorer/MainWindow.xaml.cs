@@ -223,6 +223,15 @@ public partial class MainWindow : Window
                 Editor.ViewportZoom = _viewModel.Tree.RestoredViewportZoom;
                 Editor.ViewportLocation = _viewModel.Tree.RestoredViewportLocation;
             }
+            else if (_folderInitialPath is not null)
+            {
+                // A window opened for a folder - every Explorer-replacement
+                // window - has no saved view either, but its folder is on its
+                // way (ApplyFolderInvocationAsync) and the start has put the
+                // camera on it already.  Framing This PC here flew out from the
+                // folder, and the flight ran on until the folder landed and the
+                // view snapped back to it.
+            }
             else
             {
                 // First run: the profile branch is already open, so framing the
@@ -366,6 +375,9 @@ public partial class MainWindow : Window
             // before it has acquired and copied an archive source's bytes.
             if (_pendingExternalDrop is { } transfer)
             {
+                // Said at once: the copy can take minutes, and a window whose
+                // close button and Alt+F4 did nothing that long looked hung.
+                if (!transfer.IsCompleted) _viewModel.Toast.ShowBusy("Closing once the drop in progress has finished…");
                 try { await transfer; }
                 catch (Exception) { /* The drop handler reports the transfer error; still save the window. */ }
             }
@@ -902,6 +914,7 @@ public partial class MainWindow : Window
     private void FolderListItems_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
         _folderListMouseDown = false;
+        if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
 
         // With Ctrl or Shift the click was about the selection - the list box
         // has made it, and the canvas shows it - not about going anywhere.
@@ -939,6 +952,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void FolderListItems_PreviewMouseRightButtonUp(object sender, MouseButtonEventArgs e)
     {
+        if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
         if (RowUnder(e) is not { } item)
         {
             return;
@@ -1011,6 +1025,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void FolderListPanel_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)
     {
+        if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
         if (RowUnder(e) is { } item)
         {
             var selection = _viewModel.Tree.Selection;
@@ -1046,6 +1061,7 @@ public partial class MainWindow : Window
         if (FolderListItems.SelectedItems.Count == 1
             && FolderListItems.SelectedItem is FolderListItem row
             && clicked is not null
+            && _viewModel.Tree.FolderList.IsCurrentRow(row)
             && ViewAllPath.Equals(row.FullPath, clicked.FullPath))
         {
             _viewModel.RenameCommand.Execute(null);
@@ -1179,17 +1195,55 @@ public partial class MainWindow : Window
     private IDataObject? _dropData;
     private string[] _dropPaths = [];
     private Task<bool>? _pendingExternalDrop;
+    private bool _holdingExternalDrop;
 
-    bool INestedPaneHost.CompleteExternalDrop(Func<Task<bool>> beginTransfer)
-        => CompleteExternalDrop(beginTransfer);
+    bool INestedPaneHost.CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
+        => CompleteExternalDrop(data, paths, reported, beginTransfer);
 
-    private bool CompleteExternalDrop(Func<Task<bool>> beginTransfer)
+    /// <summary>
+    /// Runs a drop's transfer: true when the drop is to be reported as done.
+    /// An affirmatively async source retains its bytes after Drop returns;
+    /// every other source is held only until its files are copied (see
+    /// <see cref="ExternalFileDrop"/>). A drop that would have to be held
+    /// while another is held is refused: its frame inside the first one's
+    /// would keep the first source blocked until the second ended.  Close
+    /// waits for every transfer still running.
+    /// </summary>
+    private bool CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
     {
-        if (_closeRequested || _pendingExternalDrop is not null) return false;
-        var transfer = beginTransfer();
-        _pendingExternalDrop = transfer;
-        try { return ExternalFileDrop.Complete(Dispatcher, transfer); }
-        finally { _pendingExternalDrop = null; }
+        if (_closeRequested) return false;
+        if (ExternalFileDrop.TryContinue(data, beginTransfer, reported, out var asyncTransfer))
+        {
+            TrackExternalDrop(asyncTransfer);
+            return true;
+        }
+
+        if (_holdingExternalDrop) return false;
+        _holdingExternalDrop = true;
+        try { return ExternalFileDrop.Complete(Dispatcher, beginTransfer, TrackExternalDrop); }
+        finally { _holdingExternalDrop = false; }
+    }
+
+    /// <summary>Keeps a dropped transfer in what Close waits for until it has ended.</summary>
+    private void TrackExternalDrop(Task<bool> transfer)
+    {
+        var all = _pendingExternalDrop is { } earlier ? AfterBothAsync(earlier, transfer) : transfer;
+        _pendingExternalDrop = all;
+        _ = ForgetExternalDropAsync(all);
+    }
+
+    private async Task ForgetExternalDropAsync(Task<bool> all)
+    {
+        try { await all; }
+        catch (Exception) { /* The drop's own toast reports the failure. */ }
+        if (ReferenceEquals(_pendingExternalDrop, all)) _pendingExternalDrop = null;
+    }
+
+    private static async Task<bool> AfterBothAsync(Task<bool> first, Task<bool> second)
+    {
+        try { await first; }
+        catch (Exception) { /* Reported by its own drop. */ }
+        return await second;
     }
 
     /// <summary>The last folder the drag was over, and whether its items may not go in (see <see cref="IsDropRefused"/>).</summary>
@@ -1242,7 +1296,7 @@ public partial class MainWindow : Window
             var effect = DropEffectFor(e, paths, target.FullPath);
             if (effect == DragDropEffects.None) return;
 
-            if (CompleteExternalDrop(() => _viewModel.DropIntoPathWithResultAsync(
+            if (CompleteExternalDrop(e.Data, paths, ReportedDropEffect(effect), () => _viewModel.DropIntoPathWithResultAsync(
                     paths, target.FullPath, move: effect == DragDropEffects.Move)))
                 e.Effects = ReportedDropEffect(effect);
         }
@@ -2143,7 +2197,8 @@ public partial class MainWindow : Window
         // take the keyboard, so a click on one leaves these keys working.)
         // Going places, zooming and refreshing work from anywhere, as they
         // always have.
-        var onSelection = IsSelectionSurfaceFocused();
+        var onSelection = IsSelectionSurfaceFocused()
+            && (!FolderListItems.IsKeyboardFocusWithin || _viewModel.Tree.FolderList.HasCurrentRows);
 
         // Shift+F5 and Shift+F6: what is selected, to the other pane.
         if (onSelection && TryHandlePaneTransferKey(key, modifiers))
@@ -2376,13 +2431,13 @@ public partial class MainWindow : Window
     private string? ShowInputDialog(string title, string prompt, string initialValue, bool selectStem)
     {
         var dialog = new InputDialog(title, prompt, initialValue, selectStem) { Owner = this };
-        return dialog.ShowDialog() == true ? dialog.Value : null;
+        return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 
     private bool ShowConfirmDialog(string title, string message, string confirmLabel)
     {
         var dialog = new ConfirmDialog(title, message, confirmLabel, danger: confirmLabel == "Delete") { Owner = this };
-        return dialog.ShowDialog() == true;
+        return dialog.ShowOwnerModal();
     }
 
     // ---- Win32 -------------------------------------------------------------
@@ -2514,11 +2569,73 @@ public partial class MainWindow : Window
         var height = Math.Min(bounds.Bottom - bounds.Top, work.Bottom - work.Top);
         var left = Math.Clamp(bounds.Left, work.Left, work.Right - width);
         var top = Math.Clamp(bounds.Top, work.Top, work.Bottom - height);
+        if (WindowStartupLocation == WindowStartupLocation.CenterScreen)
+        {
+            (left, top) = CentreInWorkArea(window, work, left, top, width, height, dpi.DpiScaleY);
+        }
+
         if (left != bounds.Left || top != bounds.Top || width != bounds.Right - bounds.Left || height != bounds.Bottom - bounds.Top)
         {
             SetWindowPos(window, IntPtr.Zero, left, top, width, height, SwpNoZOrder | SwpNoActivate);
         }
     }
+
+    /// <summary>
+    /// Where a window that opens in the middle of the screen goes, being
+    /// <paramref name="width"/> by <paramref name="height"/> on the work area
+    /// <paramref name="work"/>, from where it is (<paramref name="left"/>,
+    /// <paramref name="top"/>).  WPF centres it at the scale it was made at -
+    /// the primary monitor's - before it moves over to its own monitor and
+    /// takes that monitor's scale: on a 100 % monitor beside a 150 % primary
+    /// it was centred at one and a half times its size, shrank, and was
+    /// pushed into the monitor's corner.  So it is centred again at the size
+    /// it has now; one that WPF centred already, within its rounding, stays
+    /// exactly where it is.  And another window of the app in that very spot
+    /// - several folders opened together each open one - moves it a caption
+    /// lower and further right, as many times as it takes and the work area
+    /// allows: exactly over the other, the windows looked like one.
+    /// </summary>
+    private (int Left, int Top) CentreInWorkArea(IntPtr window, RectL work, int left, int top, int width, int height, double scale)
+    {
+        var centredLeft = work.Left + (work.Right - work.Left - width) / 2;
+        var centredTop = work.Top + (work.Bottom - work.Top - height) / 2;
+        if (Math.Abs(left - centredLeft) > 1 || Math.Abs(top - centredTop) > 1)
+        {
+            left = centredLeft;
+            top = centredTop;
+        }
+
+        var step = (int)Math.Round((System.Windows.Shell.WindowChrome.GetWindowChrome(this)?.CaptionHeight ?? 40) * scale);
+        while (step > 0 && left + step + width <= work.Right && top + step + height <= work.Bottom
+            && IsAnotherWindowAt(window, left, top))
+        {
+            left += step;
+            top += step;
+        }
+
+        return (left, top);
+    }
+
+    /// <summary>
+    /// Whether another window of the app that is shown, neither maximized nor
+    /// minimized and not on its way out, has its top left corner at
+    /// (<paramref name="left"/>, <paramref name="top"/>).  Only the app's own
+    /// thread lists its windows: a window made on another one compares with
+    /// none.
+    /// </summary>
+    private static bool IsAnotherWindowAt(IntPtr window, int left, int top) =>
+        Application.Current is { } application
+        && application.CheckAccess()
+        && application.Windows.OfType<MainWindow>().Any(other =>
+            other.IsVisible
+            && !other._closeRequested
+            && other.WindowState == WindowState.Normal
+            && new WindowInteropHelper(other).Handle is var handle
+            && handle != IntPtr.Zero
+            && handle != window
+            && GetWindowRect(handle, out var bounds)
+            && Math.Abs(bounds.Left - left) <= 1
+            && Math.Abs(bounds.Top - top) <= 1);
 
     private const int HtClient = 1;
     private const int HtCaption = 2;

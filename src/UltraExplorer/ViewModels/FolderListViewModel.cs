@@ -33,7 +33,7 @@ namespace UltraExplorer.ViewModels;
 /// </summary>
 public sealed class FolderListViewModel : ObservableObject
 {
-    /// <summary>Rows that get a real Shell icon; the rest keep the glyph.</summary>
+    /// <summary>Rows asked for their Shell icon as the list fills; the rest ask when first shown (<see cref="FolderListItem.AskForIcon"/>).</summary>
     private const int IconBudget = 300;
 
     /// <summary>
@@ -51,10 +51,18 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>How long after a read for a change failed, its folder still there, it is tried the once more (see <see cref="LeaveGoneFolderAsync"/>).</summary>
     private static readonly TimeSpan UnreadableRetryTime = TimeSpan.FromSeconds(1);
 
+    /// <summary>How long the next folder's read may take before the rows of the folder before give way to <see cref="LoadingText"/>.</summary>
+    private static readonly TimeSpan LoadingDelay = TimeSpan.FromMilliseconds(150);
+
+    private const string LoadingText = "Loading…";
+
     private readonly Func<string, ItemSort, CancellationToken, Task<ViewAllDirectorySnapshot>> _read;
     private readonly Func<string, bool, Task> _activate;
     private readonly Func<string, bool> _isOnCanvas;
     private readonly ShellIconService _icons;
+
+    /// <summary><see cref="IconWhenShown"/>, made once: handed to every row past the ones asked for as the list fills.</summary>
+    private readonly Func<FolderListItem, System.Windows.Media.ImageSource?> _iconWhenShown;
 
     private readonly List<FolderListItem> _all = [];
 
@@ -67,10 +75,26 @@ public sealed class FolderListViewModel : ObservableObject
 
     private string _folderPath = string.Empty;
     private long _folderVersion;
+
+    /// <summary>
+    /// The <see cref="_folderVersion"/> whose read the rows shown - or the
+    /// reason there are none - came from: behind it while the next folder is
+    /// read, when the rows are still the folder before's.
+    /// </summary>
+    private long _rowsVersion;
     private string _title = "No folder";
     private string _countText = string.Empty;
     private string _filter = string.Empty;
     private string _emptyText = string.Empty;
+
+    /// <summary>
+    /// What the list says while it has no rows read, when that is not that
+    /// the folder is empty: that there is no folder, or why it could not be
+    /// read.  Null once a read found the folder, empty or not.  A filter
+    /// typed meanwhile, or cleared, keeps saying it (<see cref="UpdateEmptyText"/>).
+    /// </summary>
+    private string? _noRowsText;
+
     private bool _isVisible;
     private int _held;
 
@@ -155,14 +179,21 @@ public sealed class FolderListViewModel : ObservableObject
         _activate = activate;
         _isOnCanvas = isOnCanvas;
         _icons = icons;
+        _iconWhenShown = IconWhenShown;
 
-        ActivateCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: true));
-        RevealCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: false));
-        OpenFirstMatchCommand = new AsyncRelayCommand(() => Activate(Items.FirstOrDefault(), open: true));
+        // Going somewhere, each of them: a row clicked while another row's
+        // reveal is still under way - a share taking its time - is a newer
+        // pick, not a second go at the first, and Up or Back pressed again
+        // while the folder the last press went to is read is one more step.
+        // Run one at a time, they dropped every press but the first.  The
+        // canvas and the list see to it that the last one asked for wins.
+        ActivateCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: true), allowConcurrent: true);
+        RevealCommand = new AsyncRelayCommand<FolderListItem>(item => Activate(item, open: false), allowConcurrent: true);
+        OpenFirstMatchCommand = new AsyncRelayCommand(() => Activate(Items.FirstOrDefault(), open: true), allowConcurrent: true);
         ClearFilterCommand = new RelayCommand(() => Filter = string.Empty);
         HideCommand = new RelayCommand(() => IsVisible = false);
-        UpCommand = new AsyncRelayCommand(GoUpAsync, () => CanGoUp);
-        BackCommand = new AsyncRelayCommand(GoBackAsync, () => CanGoBack);
+        UpCommand = new AsyncRelayCommand(GoUpAsync, () => CanGoUp, allowConcurrent: true);
+        BackCommand = new AsyncRelayCommand(GoBackAsync, () => CanGoBack, allowConcurrent: true);
     }
 
     /// <summary>Rows that survive the current filter, best match first.</summary>
@@ -441,7 +472,7 @@ public sealed class FolderListViewModel : ObservableObject
     /// </summary>
     public IReadOnlyList<FolderListItem> SelectedRows()
     {
-        if (SharedSelection is not { Count: > 0 } selection || _byPath.Count == 0 || selection.CountIn(FolderPath) == 0)
+        if (!HasCurrentRows || SharedSelection is not { Count: > 0 } selection || _byPath.Count == 0 || selection.CountIn(FolderPath) == 0)
         {
             return [];
         }
@@ -691,7 +722,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// its own little explorer: going up a level to look at a sibling should not
     /// mean opening that whole branch out on the canvas first.
     /// </summary>
-    public async Task NavigateAsync(string path, bool remember = true)
+    /// <param name="moveCanvas">
+    /// Whether the canvas comes along once the folder is read.  Not when the
+    /// list only leaves a folder that went from disk (<see cref="LeaveGoneFolderAsync"/>):
+    /// the canvas going there selects the folder above, and the next Delete -
+    /// meant for something in the folder that went - would recycle it whole.
+    /// </param>
+    public async Task NavigateAsync(string path, bool remember = true, bool moveCanvas = true)
     {
         string normalized;
         try
@@ -729,7 +766,7 @@ public sealed class FolderListViewModel : ObservableObject
 
         var version = _folderVersion;
         await ReloadAsync();
-        if (version != _folderVersion || !ViewAllPath.Equals(normalized, FolderPath)) return;
+        if (version != _folderVersion || !ViewAllPath.Equals(normalized, FolderPath) || !moveCanvas) return;
 
         // The canvas comes along.  Going into a folder already moved it - the
         // row was clicked - and going back up leaving it behind was the half of
@@ -795,7 +832,7 @@ public sealed class FolderListViewModel : ObservableObject
             _byPath.Clear();
             ReplaceRows([]);
             CountText = string.Empty;
-            EmptyText = FolderPath.Length == 0 ? "Nothing is selected." : string.Empty;
+            EmptyText = _noRowsText = FolderPath.Length == 0 ? "Nothing is selected." : string.Empty;
             return;
         }
 
@@ -806,7 +843,13 @@ public sealed class FolderListViewModel : ObservableObject
         try
         {
             var sort = _sort;
-            var snapshot = await _read(FolderPath, sort, cancellation.Token);
+            var reading = _read(FolderPath, sort, cancellation.Token);
+            if (!reading.IsCompleted && _rowsVersion != _folderVersion)
+            {
+                _ = ShowLoadingLaterAsync(cancellation);
+            }
+
+            var snapshot = await reading;
             if (cancellation.IsCancellationRequested)
             {
                 return;
@@ -815,11 +858,13 @@ public sealed class FolderListViewModel : ObservableObject
             _readSort = sort;
             _staleWhileHidden = false;
             _unreadableRetried = false;
+            _noRowsText = null;
+            _rowsVersion = _folderVersion;
 
             _all.Clear();
             foreach (var entry in snapshot.Entries)
             {
-                _all.Add(new FolderListItem(entry));
+                _all.Add(new FolderListItem(entry) { CanvasHolds = _isOnCanvas });
             }
 
             _isTruncated = snapshot.IsTruncated;
@@ -845,13 +890,23 @@ public sealed class FolderListViewModel : ObservableObject
             // An overtaken provider can fail after the new folder succeeded.
             // Its error must not erase that folder or its current status.
             if (cancellation.IsCancellationRequested || !ReferenceEquals(_load, cancellation)) return;
+            _rowsVersion = _folderVersion;
             _all.Clear();
             _byPath.Clear();
             ReplaceRows([]);
             CountText = string.Empty;
-            EmptyText = exception is UnauthorizedAccessException
+            EmptyText = _noRowsText = exception is UnauthorizedAccessException
                 ? "Access denied."
                 : "This folder could not be read.";
+
+            // Gone before the list came to it - the canvas still pointing at
+            // it, the change that said it went heard before the list was
+            // there: no change is coming to take the list out of it, so it
+            // leaves as it would have, for the nearest folder above.
+            if (exception is DirectoryNotFoundException)
+            {
+                _ = LeaveGoneFolderAsync(FolderPath, exception);
+            }
         }
         finally
         {
@@ -869,6 +924,28 @@ public sealed class FolderListViewModel : ObservableObject
         if (_liveAgain && _load is null && !_liveReading)
         {
             _ = RefreshLiveAsync();
+        }
+    }
+
+    /// <summary>
+    /// The rows shown are another folder's, and this one's read is taking its
+    /// time - a share, a folder of thousands.  A moment from now, still under
+    /// way, it takes them away and the list says it is loading, rather than
+    /// show the folder before under this one's name, its rows and count
+    /// passing for this folder's and answering Enter and a double-click as if
+    /// they were.  Only on a thread that can be come back to - the window's.
+    /// </summary>
+    private async Task ShowLoadingLaterAsync(CancellationTokenSource load)
+    {
+        if (SynchronizationContext.Current is null)
+        {
+            return;
+        }
+
+        await Task.Delay(LoadingDelay);
+        if (ReferenceEquals(_load, load) && _rowsVersion != _folderVersion)
+        {
+            ShowEmpty(LoadingText);
         }
     }
 
@@ -906,11 +983,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>
     /// What to say when no row is shown, and nothing when one is.  A folder
     /// with more entries than one read holds was filtered among the rows read
-    /// only, and says so: a name past them is not "nothing".
+    /// only, and says so: a name past them is not "nothing".  With no rows
+    /// read, why (<see cref="_noRowsText"/>) - "Access denied." is not "This
+    /// folder is empty." for having had a filter typed over it.
     /// </summary>
     private void UpdateEmptyText() =>
         EmptyText = Items.Count == 0
-            ? _all.Count == 0 ? "This folder is empty."
+            ? _all.Count == 0 ? _noRowsText ?? "This folder is empty."
                 : _isTruncated ? $"Nothing matches “{_filter.Trim()}” among the first {_all.Count:N0}."
                 : $"Nothing matches “{_filter.Trim()}”."
             : string.Empty;
@@ -940,24 +1019,73 @@ public sealed class FolderListViewModel : ObservableObject
         _byPath.Clear();
         foreach (var item in matched)
         {
-            item.IsOnCanvas = _isOnCanvas(item.FullPath);
             item.DetailColumn = _sort.Column;
             rows.Add(item);
             _byPath.TryAdd(item.FullPath, item);
 
-            if (rows.Count <= IconBudget && item.Icon is null)
+            if (rows.Count <= IconBudget)
             {
-                // Answers synchronously when the icon is already known, so a
-                // folder that has been looked at once fills in with no flicker.
-                _icons.Request(item.FullPath, item.IsDirectory, icon => item.Icon = icon);
+                item.AskForIcon = null;
+                if (item.Icon is null)
+                {
+                    // Answers synchronously when the icon is already known, so a
+                    // folder that has been looked at once fills in with no flicker.
+                    _icons.Request(item.FullPath, item.IsDirectory, icon => item.Icon = icon);
+                }
+            }
+            else
+            {
+                // Past those, a row asks when the list box first shows it.
+                item.AskForIcon = _iconWhenShown;
             }
         }
 
         return rows;
     }
 
+    /// <summary>
+    /// A row's icon, asked for as the list box first shows it
+    /// (<see cref="FolderListItem.AskForIcon"/>).  One already known is
+    /// handed back at once, while the binding that asked is still reading it
+    /// - told through the row, it would be a change in the middle of that
+    /// read; one the Shell has yet to answer comes through the row later.
+    /// </summary>
+    private System.Windows.Media.ImageSource? IconWhenShown(FolderListItem item)
+    {
+        System.Windows.Media.ImageSource? known = null;
+        var asking = true;
+        _icons.Request(item.FullPath, item.IsDirectory, icon =>
+        {
+            if (asking)
+            {
+                known = icon;
+            }
+            else
+            {
+                item.Icon = icon;
+            }
+        });
+
+        asking = false;
+        return known;
+    }
+
     private Task Activate(FolderListItem? item, bool open)
-        => item is null ? Task.CompletedTask : ActivateOwn(item.FullPath, open);
+        => item is null || IsLeftOver(item) ? Task.CompletedTask : ActivateOwn(item.FullPath, open);
+
+    /// <summary>
+    /// A row of the folder before, still shown while the list's own folder is
+    /// read: it is not in the folder the list's name says, and a click, Enter
+    /// or a double-click on it is not meant for what it would act on.  An
+    /// item handed in from elsewhere, not one of the rows shown, is not one.
+    /// </summary>
+    internal bool HasCurrentRows => _rowsVersion == _folderVersion;
+
+    internal bool IsCurrentRow(FolderListItem item) =>
+        HasCurrentRows && ReferenceEquals(RowFor(item.FullPath), item);
+
+    private bool IsLeftOver(FolderListItem item) =>
+        !HasCurrentRows && ReferenceEquals(RowFor(item.FullPath), item);
 
     // ---- changes on disk ---------------------------------------------------------
 
@@ -1194,6 +1322,8 @@ public sealed class FolderListViewModel : ObservableObject
     {
         LiveMerges++;
         _readSort = sort;
+        _noRowsText = null;
+        _rowsVersion = _folderVersion;
         var previous = new Dictionary<string, FolderListItem>(_all.Count, StringComparer.OrdinalIgnoreCase);
         foreach (var item in _all)
         {
@@ -1212,7 +1342,7 @@ public sealed class FolderListViewModel : ObservableObject
                 continue;
             }
 
-            var added = new FolderListItem(entry) { IsNew = true };
+            var added = new FolderListItem(entry) { IsNew = true, CanvasHolds = _isOnCanvas };
             _newRows.Add((added, now));
             _all.Add(added);
         }
@@ -1347,9 +1477,13 @@ public sealed class FolderListViewModel : ObservableObject
     /// <summary>
     /// The list's folder went from disk.  The list goes to the nearest folder
     /// above it that is still there, as Explorer does when the folder it shows
-    /// is deleted; a folder only renamed or replaced in the same place and back
-    /// already is simply read again.  One still there that a read for a change
-    /// could not list (<paramref name="failure"/>) - a dangling junction, a
+    /// is deleted - the list alone: taken along, the canvas would select that
+    /// folder, for the next Delete to recycle it whole, and what the canvas
+    /// had selected in the folder that went is the tree's to let go of.  So
+    /// is a folder found gone as it is read (<see cref="ReloadAsync"/>) left.
+    /// A folder only renamed or replaced in the same place and back already
+    /// is simply read again.  One still there that a read could not list
+    /// (<paramref name="failure"/>) - a dangling junction, a
     /// folder taken out of reach - is tried once more a moment later, and
     /// failing again says so and waits for the next change: read again at
     /// once, it would fail again at once, over and over.  With nothing above
@@ -1429,7 +1563,7 @@ public sealed class FolderListViewModel : ObservableObject
         }
 
         LeftGoneFolders++;
-        await NavigateAsync(nearest, remember: false);
+        await NavigateAsync(nearest, remember: false, moveCanvas: false);
     }
 
     /// <summary>
@@ -1444,7 +1578,7 @@ public sealed class FolderListViewModel : ObservableObject
         _byPath.Clear();
         ReplaceRows([]);
         CountText = string.Empty;
-        EmptyText = reason;
+        EmptyText = _noRowsText = reason;
         _listedWriteTicks = 0;
     }
 

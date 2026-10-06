@@ -11,6 +11,7 @@ namespace UltraExplorer.Models;
 public sealed class BreadcrumbSegment(string name, string fullPath, bool isLast) : ObservableObject
 {
     private bool _isMenuOpen;
+    private ObservableCollection<AddressSuggestion> _children = [];
 
     public string Name { get; } = name;
 
@@ -20,7 +21,11 @@ public sealed class BreadcrumbSegment(string name, string fullPath, bool isLast)
     public bool IsLast { get; } = isLast;
 
     /// <summary>Sub-folders of this crumb, read when its chevron is first opened.</summary>
-    public ObservableCollection<AddressSuggestion> Children { get; } = [];
+    public ObservableCollection<AddressSuggestion> Children => _children;
+
+    /// <summary>Publishes an already-built menu in one bound change, not an Add per directory.</summary>
+    internal void ReplaceChildren(ObservableCollection<AddressSuggestion> children)
+        => SetProperty(ref _children, children, nameof(Children));
 
     public bool IsMenuOpen
     {

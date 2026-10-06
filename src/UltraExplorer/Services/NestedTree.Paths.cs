@@ -1,3 +1,4 @@
+using System.Globalization;
 using UltraExplorer.Models;
 
 namespace UltraExplorer.Services;
@@ -67,13 +68,7 @@ public sealed partial class NestedTree
                 {
                     child = NestedFolder.ChildOf(current, entry.DisplayName, entry.IsHidden,
                         entry.IsReparsePoint, entry.ModifiedUtc.Ticks);
-                    var children = current.AllChildren.Append(child).ToArray();
-                    Array.Sort(children, static (left, right) =>
-                    {
-                        var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
-                        return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
-                    });
-                    current.AllChildren = children;
+                    current.AllChildren = WithChildInOrder(current.AllChildren, child);
                     if (!current.IsLoaded) current.HasPartialListing = true;
                     ApplyVisibleChildren(current);
                     _knownCount++;
@@ -85,5 +80,38 @@ public sealed partial class NestedTree
             return (ViewAllPath.Equals(current.FullPath, target) || allowFile && namedFile) && IsOnCanvas(current) ? current : null;
         }
         return null;
+    }
+
+    /// <summary>
+    /// The sub-folders in <paramref name="children"/>, already in the order
+    /// a reader lists them (<see cref="NameOrder"/>), with <paramref name="child"/>
+    /// put in its place among them: a binary search for where it goes, not a
+    /// sort of them all again - a folder named in a parent of tens of
+    /// thousands of sub-folders made that sort, a comparer for every
+    /// comparison, on the UI thread.
+    /// </summary>
+    private static NestedFolder[] WithChildInOrder(NestedFolder[] children, NestedFolder child)
+    {
+        var culture = CultureInfo.CurrentCulture.CompareInfo;
+        var at = 0;
+        var end = children.Length;
+        while (at < end)
+        {
+            var middle = (at + end) / 2;
+            if (NameOrder(culture, children[middle].Name, child.Name) < 0)
+            {
+                at = middle + 1;
+            }
+            else
+            {
+                end = middle;
+            }
+        }
+
+        var placed = new NestedFolder[children.Length + 1];
+        Array.Copy(children, placed, at);
+        placed[at] = child;
+        Array.Copy(children, at, placed, at + 1, children.Length - at);
+        return placed;
     }
 }

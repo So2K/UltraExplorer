@@ -53,6 +53,8 @@ public sealed partial class NestedCanvas
         }
 
         var target = EnsureGpuLabels(atlases);
+        _gpuIconsLooked = !inMotion;
+        _gpuIconWaiting = false;
         try
         {
             target.Begin(_gpuFrame, surface.Devices, ScenePixelWidth, ScenePixelHeight, _scaleX, _scaleY, snap: !inMotion);
@@ -78,6 +80,8 @@ public sealed partial class NestedCanvas
         {
             RequestFrame(Layers.Labels);
         }
+
+        _gpuLabelsWaiting = inMotion || target.TextsPending > 0 || target.GlyphsPending > 0 || _gpuIconWaiting || target.WantsAnotherFrame;
 
         _labelsOnGpu = true;
         _presentPending = true;
@@ -203,15 +207,53 @@ public sealed partial class NestedCanvas
     }
 
     /// <summary>
+    /// Whether the names last drawn on the GPU left out something still to
+    /// arrive - a name being shaped, a glyph not made yet, an icon not found
+    /// yet - or were drawn for motion, which leaves out whatever is not ready
+    /// and draws again anyway.  The atlases are shared by every canvas on the
+    /// card and every one listens to them: what arrives for one canvas wakes
+    /// all of them, and a canvas whose names wait for none of it has nothing
+    /// to draw again.  Each wave of glyphs and icons one window zoomed into
+    /// had every other one - the other pane of a split view, a window behind
+    /// or minimized - draw and present all its names again.
+    /// </summary>
+    private bool _gpuLabelsWaiting = true;
+
+    /// <summary>Whether the names being drawn on the GPU at rest look for icons still to come (<see cref="IconStillToCome"/>); in motion they count as waiting anyway.</summary>
+    private bool _gpuIconsLooked;
+
+    /// <summary>Whether an icon the names being drawn on the GPU drew is still to come.</summary>
+    private bool _gpuIconWaiting;
+
+    /// <summary>
+    /// Whether <paramref name="file"/>'s icon is still to come: none was
+    /// found for its type yet (<paramref name="drawn"/> false), or it is a
+    /// type each file has its own icon of, and the file is drawn with its
+    /// type's until its own is extracted.
+    /// </summary>
+    private bool IconStillToCome(bool drawn, NestedFolder folder, in NestedFile file)
+    {
+        if (!drawn)
+        {
+            return true;
+        }
+
+        return _labelAtlases is { } atlases
+            && atlases.Icons.UsesPerFileIcon(file.Extension)
+            && atlases.Icons.SlotFor(folder.FullPath, file.Name, file.Extension) == atlases.Icons.SlotFor(file.Extension);
+    }
+
+    /// <summary>
     /// Part of a frame's fourth phase: whatever arrived for the names since
     /// the last frame is one redraw of them - glyphs, shaped names and icons
-    /// when they are on the GPU, names the text worker made when WPF draws
-    /// them (<see cref="TakePreparedTexts"/>), those no oftener than
-    /// <see cref="RedrawNamesWhenAllowed"/> lets them be.
+    /// when they are on the GPU and the names left something out that was
+    /// still to come (<see cref="_gpuLabelsWaiting"/>), names the text worker
+    /// made when WPF draws them (<see cref="TakePreparedTexts"/>), those no
+    /// oftener than <see cref="RedrawNamesWhenAllowed"/> lets them be.
     /// </summary>
     private void TakeLabelMaterial()
     {
-        if (Interlocked.Exchange(ref _labelMaterialArrived, 0) != 0 && _labelsOnGpu)
+        if (Interlocked.Exchange(ref _labelMaterialArrived, 0) != 0 && _labelsOnGpu && _gpuLabelsWaiting)
         {
             _dirty |= Layers.Labels;
         }
@@ -925,7 +967,12 @@ public sealed partial class NestedCanvas
         {
             // The icon atlas streams independently. Its arrival changes the
             // ink, never the filename's origin or available room.
-            target.DrawIcon(folder, job.Index, file, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize));
+            var drawn = target.DrawIcon(folder, job.Index, file, new Rect(cursor, job.Y + (job.H - iconSize) / 2, iconSize, iconSize));
+            if (_gpuIconsLooked && !_gpuIconWaiting && ReferenceEquals(target, _gpuLabels))
+            {
+                _gpuIconWaiting = IconStillToCome(drawn, folder, file);
+            }
+
             cursor += iconSize + font * 0.4;
         }
 
@@ -959,7 +1006,7 @@ public sealed partial class NestedCanvas
         // label must not suddenly become a full timestamp and take back the
         // filename's characters halfway through a zoom.
         var column = folder.PlacedSort.Column;
-        var faded = file.IsHidden || _filter is not null && !_filter(file.Name);
+        var faded = file.IsHidden || _filter is not null && !FilterTakesFile(folder, job.Index);
         var ink = faded ? TextDimColour : TextColour;
         var available = right - cursor;
         var metadataRight = right;
@@ -1556,12 +1603,17 @@ public sealed partial class NestedCanvas
         }
         else if (folder.Children.Count == 0 && folder.Files.Count == 0)
         {
-            message = folder.FileCount switch
-            {
-                0 => "Empty folder",
-                1 => "1 hidden file",
-                _ => NoteText(HiddenFilesNote, folder.FileCount)
-            };
+            // With a file type chosen - a dialog's "Images" - the files a
+            // folder would show are left out for not being of it, not for
+            // being hidden: a folder of documents said "37 hidden files".
+            message = _tree?.FileNameFilter is not null && FilesBehindLayer(folder) is > 0 and var other
+                ? NoteText(OtherTypeNote, other)
+                : folder.FileCount switch
+                {
+                    0 => "Empty folder",
+                    1 => "1 hidden file",
+                    _ => NoteText(HiddenFilesNote, folder.FileCount)
+                };
         }
         else if (folder.UnlistedFileCount > 0 && Shows(CanvasLayer.Files))
         {
@@ -1597,6 +1649,7 @@ public sealed partial class NestedCanvas
     private const int UnlistedFilesNote = 2;
     private const int TruncatedNote = 3;
     private const int FilesNote = 4;
+    private const int OtherTypeNote = 5;
 
     /// <summary>The files the files layer keeps off a folder: every one it counted, less the hidden ones while hidden items are not shown.</summary>
     private int FilesBehindLayer(NestedFolder folder) =>
@@ -1619,6 +1672,7 @@ public sealed partial class NestedCanvas
             HiddenFilesNote => $"{count:N0} hidden files",
             UnlistedFilesNote => $"{count:N0} more files are not drawn",
             FilesNote => $"{count:N0} files",
+            OtherTypeNote => $"No files of this type ({count:N0})",
             _ => $"Only the first {count:N0} folders are shown"
         });
     }
@@ -1665,8 +1719,11 @@ public sealed partial class NestedCanvas
             return string.Empty;
         }
 
+        // With a file type chosen, the files a title counts are the ones of
+        // that type the folder shows; with every type, all it holds, shown
+        // or hidden.
         var folders = folder.Children.Count;
-        var files = folder.FileCount;
+        var files = _tree?.FileNameFilter is not null && folder.PlacedShowFiles ? folder.Files.Count : folder.FileCount;
         if (folders == 0 && files == 0)
         {
             return string.Empty;

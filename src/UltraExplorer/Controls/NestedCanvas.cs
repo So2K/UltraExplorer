@@ -16,7 +16,9 @@ public enum NestedBeaconKind
     Note = 2,
     Pinned = 4,
     Active = 8,
-    Search = 16
+    Search = 16,
+    /// <summary>A match of this canvas's name filter, not an indexed search result.</summary>
+    Filter = 32
 }
 
 /// <summary>
@@ -338,7 +340,10 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     private Hotspot? _pressHotspot;
 
     private NestedHit? _hover;
-    private Point _hoverPoint;
+
+    /// <summary>Where the pointer rests over the canvas; not a number while it is elsewhere, as before it first comes in.</summary>
+    private Point _hoverPoint = new(double.NaN, double.NaN);
+
     private NestedFolder? _dropTarget;
     private string _activePath = string.Empty;
     private Func<string, FolderMark>? _markLookup;
@@ -463,7 +468,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             // over or went down on.  Any of them would take the camera, or a
             // frame's walk, into a tree it is no longer drawing, whose This
             // PC is not the one the walk starts from.
-            _cameraRequest++;
+            NextCameraRequest();
             StopFlight();
             CancelMarquee();
             _anchor = null;
@@ -769,8 +774,15 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     /// off, when only the selection's and a search's are - a colour, a note
     /// or a pin is a mark.
     /// </summary>
-    private bool IsShown(NestedBeacon beacon) =>
-        Shows(CanvasLayer.Marks) || (beacon.Kind & (NestedBeaconKind.Active | NestedBeaconKind.Search)) != 0;
+    private bool IsShown(NestedBeacon beacon)
+    {
+        // Filter-only hits cannot materialize a stale, hidden match. A global
+        // search/mark/pin at that same path remains an independent user intent.
+        if (beacon.Kind == NestedBeaconKind.Filter
+            && (!_filterMatchSet.Contains(beacon.Path) || !IsVisibleFilterTarget(beacon.Path))) return false;
+        return Shows(CanvasLayer.Marks)
+            || (beacon.Kind & (NestedBeaconKind.Active | NestedBeaconKind.Search | NestedBeaconKind.Filter)) != 0;
+    }
 
     /// <summary>Everything again, from the cells up.</summary>
     public void Redraw() => RequestFrame(Layers.All);

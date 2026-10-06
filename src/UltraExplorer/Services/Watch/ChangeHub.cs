@@ -53,8 +53,22 @@ namespace UltraExplorer.Services.Watch;
 /// </summary>
 public sealed partial class ChangeHub : IDisposable
 {
-    /// <summary>At most this many renames and file changes are listed with a change (<see cref="FolderChange"/>).</summary>
+    /// <summary>At most this many file changes, and sub-folders whose own entry changed, are listed with a change (<see cref="FolderChange"/>).</summary>
     public const int MaximumDetails = 8;
+
+    /// <summary>
+    /// At most this many renames are listed with a change.  A rename not
+    /// listed is an item gone and a new one come: the colour, the note and
+    /// the selection of a renamed item follow it only by its listed pair, and
+    /// a batch rename - thirty photos through PowerRename, in one burst - kept
+    /// them for the first eight alone when renames shared the eight of the
+    /// other details.  No more than this, though: the window follows each
+    /// pair through the whole selection and every mark on the interface
+    /// thread, and four thousand of them, with as many selected and marked,
+    /// held it for over four seconds where two hundred and fifty-six hold it
+    /// for under half of one.
+    /// </summary>
+    public const int MaximumRenames = 256;
 
     /// <summary>The watch buffer of a local volume, and of a share (which SMB caps at 64 KB).</summary>
     internal const int LocalBufferBytes = 256 * 1024;

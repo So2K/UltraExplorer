@@ -78,7 +78,7 @@ public readonly record struct FileDelta(string Name, long Length, long ModifiedT
 /// and there were at most <see cref="ChangeHub.MaximumDetails"/> of them,
 /// none hidden or system (whose attributes may have changed what is shown);
 /// empty means the folder has to be read to know what changed.  Renames beyond
-/// the first <see cref="ChangeHub.MaximumDetails"/> are not listed - the
+/// the first <see cref="ChangeHub.MaximumRenames"/> are not listed - the
 /// renamed entries are then simply new ones to whoever reads the folder.</para>
 /// </summary>
 public readonly struct FolderChange(string key, ChangeKinds kinds, long firstTicks, ReadOnlyMemory<RenamePair> renames, ReadOnlyMemory<FileDelta> files)
@@ -114,6 +114,14 @@ public readonly struct FolderChange(string key, ChangeKinds kinds, long firstTic
     /// compares the attributes with what it has.
     /// </summary>
     public ReadOnlyMemory<FileDelta> Folders { get; init; }
+
+    /// <summary>
+    /// More sub-folders' own entries changed than <see cref="Folders"/> lists,
+    /// which is then empty: whether any of them was hidden or shown - attrib
+    /// +h * /d, the Hidden box on a dozen at once - cannot be told from the
+    /// change, and a consumer that shows hidden folders apart reads the folder.
+    /// </summary>
+    public bool FoldersIncomplete { get; init; }
 }
 
 /// <summary>

@@ -962,6 +962,7 @@ public sealed partial class NestedCanvas
             (_viewWidth - x) / w,
             (_viewHeight - y) / w);
         var files = folder.Files;
+        var answers = _filter is null ? null : FileFilterAnswersOf(folder);
         var labels = labelsAllowed && tileHeight >= FileLabelPixels;
         var visibleTiles = (long)(lastColumn - firstColumn + 1) * (lastRow - firstRow + 1);
         if (_tilesDrawn + visibleTiles > MaximumTilesPerFrame)
@@ -994,7 +995,7 @@ public sealed partial class NestedCanvas
                 _tilesDrawn++;
 
                 PlaceFile(folder, index, x, y, w, out var fx, out var fy, out var fw, out var fh);
-                PaintFile(files[index], fx, fy, fw, fh);
+                PaintFile(files[index], fx, fy, fw, fh, answers is not null && answers.Takes(index, _filter!), answers is not null);
                 if (labels)
                 {
                     _fileLabels.Add(new FileLabelJob(folder, index, fx, fy, fw, fh));
@@ -1003,12 +1004,17 @@ public sealed partial class NestedCanvas
         }
     }
 
-    private void PaintFile(NestedFile file, double x, double y, double w, double h)
+    /// <summary>
+    /// One file's tile.  With the filter on (<paramref name="filtering"/>),
+    /// <paramref name="taken"/> is whether it takes the file - asked once per
+    /// filter and kept for the folder (<see cref="FileFilterAnswersOf"/>).
+    /// </summary>
+    private void PaintFile(NestedFile file, double x, double y, double w, double h, bool taken, bool filtering)
     {
         var (body, stripe, speck) = FilePalette(file.Extension);
-        if (_filter is not null)
+        if (filtering)
         {
-            if (_filter(file.Name))
+            if (taken)
             {
                 body = NestedRaster.Mix(body, FilterColour, 0.3);
                 stripe = FilterColour;

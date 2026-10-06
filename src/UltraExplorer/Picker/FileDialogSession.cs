@@ -197,6 +197,13 @@ public sealed class FileDialogSession : ObservableObject
         }
     }
 
+    /// <summary>
+    /// Whether the name box holds a name of the user's own: not empty, and
+    /// put there neither by a selection nor by the dialog as it opened.
+    /// </summary>
+    internal bool HasTypedName => _selectionNameText is null && _fileNameText.Trim().Length > 0
+        && !string.Equals(_fileNameText, Request.FileName, StringComparison.Ordinal);
+
     /// <summary>The folder the canvas is showing, which bare names resolve against.</summary>
     public string CurrentFolder
     {
@@ -279,10 +286,23 @@ public sealed class FileDialogSession : ObservableObject
         _ => $"Selected files ({_pendingSelection.Count})"
     };
 
-    /// <summary>Where the one choice is; nothing for a drive, which is in no folder.</summary>
-    public string PendingSelectionLocation => _pendingSelection.Count == 1
-        ? Path.GetDirectoryName(_pendingSelection[0]) is { Length: > 0 } parent ? $"Location: {parent}" : string.Empty
-        : string.Join(Environment.NewLine, _pendingSelection);
+    /// <summary>
+    /// Where the one choice is (nothing for a drive, which is in no folder);
+    /// of several, the first <see cref="ListedChoices"/> and how many more.
+    /// Thousands chosen at once (Ctrl+A over photos to upload) were each laid
+    /// out in the footer's wrapping text on every further click; the tip over
+    /// it still names them all.
+    /// </summary>
+    public string PendingSelectionLocation => _pendingSelection.Count switch
+    {
+        1 => Path.GetDirectoryName(_pendingSelection[0]) is { Length: > 0 } parent ? $"Location: {parent}" : string.Empty,
+        <= ListedChoices => string.Join(Environment.NewLine, _pendingSelection),
+        _ => string.Join(Environment.NewLine, _pendingSelection.Take(ListedChoices))
+            + Environment.NewLine + $"and {_pendingSelection.Count - ListedChoices:N0} more"
+    };
+
+    /// <summary>How many of several chosen paths the footer lists.</summary>
+    private const int ListedChoices = 10;
 
     /// <summary>A path's own name, or the whole path for a drive, which has none.</summary>
     private static string NameOrPath(string path) =>
@@ -579,7 +599,9 @@ public sealed class FileDialogSession : ObservableObject
                 continue;
             }
 
-            var expanded = Environment.ExpandEnvironmentVariables(candidate);
+            // A replaced dialog's folder is the one it shows, as it is: a
+            // folder may be named "%OS%", and expanded it would be another.
+            var expanded = Request.IsNativeProxy ? candidate : Environment.ExpandEnvironmentVariables(candidate);
             if (Directory.Exists(expanded))
             {
                 return Path.GetFullPath(expanded);

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using UltraExplorer.Controls;
 using UltraExplorer.Models;
 using UltraExplorer.Services.Watch;
@@ -46,7 +47,7 @@ public sealed class NestedChangeBatch
 public sealed partial class NestedTree
 {
     /// <summary>
-    /// Reads in flight at once on local disks.  A read is mostly waiting on the
+    /// Reads in flight at once on each local volume. A read is mostly waiting on the
     /// file system's cache or the disk; eight keep an SSD busy without making
     /// a spinning disk seek much more than three did.
     /// </summary>
@@ -79,6 +80,53 @@ public sealed partial class NestedTree
 
     /// <summary>Folders waiting for a slot, in no order: each worker takes the most wanted one it may.</summary>
     private readonly List<NestedFolder> _pending = [];
+
+    /// <summary>How many of the waiting folders a ranking keeps (<see cref="_ranked"/>).</summary>
+    private const int RankedFolders = 512;
+
+    /// <summary>Prefix of local-volume lanes; an unknown root conservatively shares this fallback lane.</summary>
+    private const string LocalLane = "local|";
+
+    private readonly Dictionary<string, int> _localVolumeRunning = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _localSpecialLanes = new(StringComparer.OrdinalIgnoreCase);
+    private string?[] _localLaneLetters = new string?[26];
+
+    /// <summary>Cheap cached-letter metadata, injectable for owned fake-volume checks.</summary>
+    internal Func<char, VolumeResolver.Letter> LocalReadVolumeFor { get; set; } = VolumeResolver.FromSystem;
+
+    /// <summary>Object-manager device identity, never a directory/volume-handle probe.</summary>
+    internal Func<char, string?> LocalReadDeviceFor { get; set; } = LocalReadDeviceName;
+
+    /// <summary>A <see cref="_rankedFrame"/> no picture has: the next pick ranks the waiting folders again.</summary>
+    private const long NotRanked = long.MinValue;
+
+    /// <summary>
+    /// The most wanted of the folders waiting, least wanted first, as one pass
+    /// over the queue found them in <see cref="_rankedFrame"/>: a freed slot
+    /// takes its next folder from the end of this rather than from a pass
+    /// over the whole queue.  A pass for every finished read, with thousands
+    /// of folders waiting, made reading them all take as long as the square
+    /// of their number - 25,000 reads spent 1.5 s picking - all of it under
+    /// the lock the canvas queues every folder it draws behind.  Ranked again
+    /// for every new picture, when the folders asked for and their widths
+    /// change; when it runs out while others wait; when a waiting folder
+    /// becomes one something waits for; and when a lane whose folders were
+    /// left out for want of room frees a slot.  A folder queued in between
+    /// is put in its place if it belongs among them (<see cref="RankNewcomerLocked"/>).
+    /// </summary>
+    private readonly List<RankedFolder> _ranked = new(RankedFolders + 1);
+
+    /// <summary>Where a ranking gathers its folders before they are put in order.</summary>
+    private readonly RankedFolder[] _rankHeap = new RankedFolder[RankedFolders];
+
+    /// <summary>The <see cref="Frame"/> <see cref="_ranked"/> was made in, or <see cref="NotRanked"/>.</summary>
+    private long _rankedFrame = NotRanked;
+
+    /// <summary>Whether a folder waiting is not in <see cref="_ranked"/>: one less wanted than all it holds, or one whose lane had no room.</summary>
+    private bool _rankedPartial;
+
+    /// <summary>Share or prefixed local-volume keys the ranking left out for want of a free slot.</summary>
+    private readonly HashSet<string> _rankedBlocked = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>Reads in flight on each share, by share.</summary>
     private readonly Dictionary<string, int> _shareRunning = new(StringComparer.OrdinalIgnoreCase);
@@ -199,11 +247,16 @@ public sealed partial class NestedTree
     /// is given it, with the watch on its volume: every folder below it takes
     /// that watch from its parent.
     /// </summary>
-    private NestedFolder CreateRoot(NestedRoot root) =>
-        new(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText)
+    private NestedFolder CreateRoot(NestedRoot root)
+    {
+        // Added/reinserted drives may have changed their device or alias. A
+        // pick keeps its old lane so its completion always frees the right one.
+        lock (_gate) { _localLaneLetters = new string?[26]; _localSpecialLanes.Clear(); _rankedFrame = NotRanked; }
+        return new(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText)
         {
             Watch = WatchRootFor?.Invoke(root.FullPath)
         };
+    }
 
     /// <summary>Raises the batch of the folders just applied, if anyone listens, and empties it for the next.</summary>
     private void RaiseBatchApplied()
@@ -297,9 +350,12 @@ public sealed partial class NestedTree
                 Enqueue(folder, ReadKind.Refresh);
                 break;
 
+            // Heard from the hub once its read begins (see Read), not here: a
+            // folder drawn for the first time is one of thousands in a frame
+            // flying into a big folder, most of them never read before they
+            // leave the screen again.
             case NestedLoadState.NotLoaded:
                 Enqueue(folder, ReadKind.Load);
-                OnFirstReadQueued(folder);
                 break;
 
             // A share that did not answer, a drive that was not ready: worth
@@ -382,8 +438,9 @@ public sealed partial class NestedTree
     /// Reads one folder now, unless it already has been, and completes when
     /// the read is applied: queued ahead of whatever the canvas asks for, or
     /// joined if a read of it is already on its way.  A folder whose read
-    /// failed is read again only once something changed in it or around it
-    /// (<see cref="NestedFolder.NeedsRefresh"/>), as when it is drawn.
+    /// failed retries immediately when the error was transient. Permanent
+    /// errors still need a change/refresh. Automatic canvas requests retain
+    /// their twenty-second retry backoff; this is an explicit navigation.
     /// Cancelled, a read that has not started is taken off the queue, and one
     /// under way is left to finish unapplied - the folder is unread again at
     /// once, as before it was asked for.
@@ -406,7 +463,7 @@ public sealed partial class NestedTree
         lock (_gate)
         {
             if (folder.LoadState is NestedLoadState.Loaded
-                || folder.LoadState is NestedLoadState.Failed && !folder.NeedsRefresh)
+                || folder.LoadState is NestedLoadState.Failed && !folder.NeedsRefresh && !folder.IsRetryable)
             {
                 return Task.CompletedTask;
             }
@@ -520,9 +577,14 @@ public sealed partial class NestedTree
     /// </summary>
     private void EnqueueLocked(NestedFolder folder, ReadKind kind, bool sticky)
     {
-        if (sticky)
+        if (sticky && !folder.IsSticky)
         {
             folder.IsSticky = true;
+            if (folder.QueueIndex >= 0)
+            {
+                // Waiting already, and now ahead of every folder the canvas asked for.
+                _rankedFrame = NotRanked;
+            }
         }
 
         if (folder.QueuedRead != ReadKind.None)
@@ -544,6 +606,7 @@ public sealed partial class NestedTree
 
         folder.QueueIndex = _pending.Count;
         _pending.Add(folder);
+        RankNewcomerLocked(folder);
     }
 
     /// <summary>
@@ -559,7 +622,11 @@ public sealed partial class NestedTree
         var request = ExplicitFor(folder);
         if (folder.QueueIndex >= 0)
         {
-            folder.IsSticky = true;
+            if (!folder.IsSticky)
+            {
+                folder.IsSticky = true;
+                _rankedFrame = NotRanked;
+            }
         }
         else if (folder.QueuedRead != ReadKind.None)
         {
@@ -602,27 +669,30 @@ public sealed partial class NestedTree
     /// </summary>
     private bool TryBeginLocked(NestedFolder folder, out ReadPick pick)
     {
-        var share = ShareOf(folder);
-        if (share is null)
+        var lane = LaneOf(folder);
+        var local = lane.StartsWith(LocalLane, StringComparison.Ordinal);
+        if (local)
         {
-            if (_localRunning >= LocalReadSlots)
+            var running = _localVolumeRunning.GetValueOrDefault(lane);
+            if (running >= LocalReadSlots)
             {
                 pick = default;
                 return false;
             }
 
             _localRunning++;
+            _localVolumeRunning[lane] = running + 1;
         }
         else
         {
-            _shareRunning.TryGetValue(share, out var running);
+            _shareRunning.TryGetValue(lane, out var running);
             if (running >= NetworkSlotsPerShare)
             {
                 pick = default;
                 return false;
             }
 
-            _shareRunning[share] = running + 1;
+            _shareRunning[lane] = running + 1;
             _networkRunning++;
         }
 
@@ -634,16 +704,25 @@ public sealed partial class NestedTree
             folder.LoadState = NestedLoadState.Loading;
         }
 
-        pick = new ReadPick(folder, folder.QueuedRead, folder.ReadTicket, share);
+        pick = new ReadPick(folder, folder.QueuedRead, folder.ReadTicket, local ? null : lane, lane);
         return true;
     }
 
     /// <summary>Gives back the slot a finished read held.</summary>
     private void EndLocked(in ReadPick pick)
     {
+        // Folders of this lane left out of the ranking for want of room may
+        // be the ones to read now.
+        if (_rankedBlocked.Count > 0 && _rankedBlocked.Contains(pick.Lane))
+        {
+            _rankedFrame = NotRanked;
+        }
+
         if (pick.Share is null)
         {
             _localRunning--;
+            if (_localVolumeRunning[pick.Lane] <= 1) _localVolumeRunning.Remove(pick.Lane);
+            else _localVolumeRunning[pick.Lane]--;
             return;
         }
 
@@ -665,8 +744,9 @@ public sealed partial class NestedTree
     /// screen and are dropped on the way: a first read goes back to waiting to
     /// be drawn, a refresh stays stale and is read when the folder is drawn
     /// again.  Nothing here walks up the tree - whether a folder was cut off
-    /// meanwhile is seen when its read is applied - so a pick costs one pass
-    /// over the queue.
+    /// meanwhile is seen when its read is applied.  The pick comes from the
+    /// ranking of the most wanted folders (<see cref="_ranked"/>), and a pass
+    /// over the whole queue is made only to rank them again.
     /// </summary>
     private bool TryPickLocked(out ReadPick pick)
     {
@@ -681,9 +761,46 @@ public sealed partial class NestedTree
 
     private bool TryPickBestLocked(out ReadPick pick)
     {
-        var oldest = Frame - ExpireAfterFrames;
-        var localFree = _localRunning < LocalReadSlots;
-        NestedFolder? best = null;
+        var ranked = _rankedFrame != Frame;
+        if (ranked)
+        {
+            RankLocked();
+        }
+
+        var best = TakeRankedLocked();
+        if (best is null && _rankedPartial && !ranked)
+        {
+            // Every folder ranked is read or has no room in its lane, and
+            // others wait that were left out.
+            RankLocked();
+            best = TakeRankedLocked();
+        }
+
+        if (best is null)
+        {
+            pick = default;
+            return false;
+        }
+
+        RemoveLocked(best);
+        return TryBeginLocked(best, out pick);
+    }
+
+    /// <summary>
+    /// One pass over the queue: drops the folders that have left the screen,
+    /// and keeps the <see cref="RankedFolders"/> most wanted of the rest whose
+    /// lanes have room in <see cref="_ranked"/>, worst first.  Only a folder
+    /// that would be kept has its lane looked at.
+    /// </summary>
+    private void RankLocked()
+    {
+        _ranked.Clear();
+        _rankedBlocked.Clear();
+        _rankedPartial = false;
+        _rankedFrame = Frame;
+        var oldest = _rankedFrame - ExpireAfterFrames;
+        var heap = _rankHeap;
+        var count = 0;
         for (var index = _pending.Count - 1; index >= 0; index--)
         {
             var candidate = _pending[index];
@@ -699,27 +816,220 @@ public sealed partial class NestedTree
                 continue;
             }
 
-            // Only a folder that would be the best so far has its lane looked at.
-            var better = best is null
-                || candidate.IsSticky && !best.IsSticky
-                || candidate.IsSticky == best.IsSticky && candidate.Priority > best.Priority;
-            if (better && (ShareOf(candidate) is { } share
-                    ? _shareRunning.GetValueOrDefault(share) < NetworkSlotsPerShare
-                    : localFree))
+            var entry = new RankedFolder(candidate, candidate.IsSticky, candidate.Priority);
+            if (count == heap.Length && RankOrder(entry, heap[0]) <= 0)
             {
-                best = candidate;
+                _rankedPartial = true;
+                continue;
+            }
+
+            var lane = LaneOf(candidate);
+            if (!HasRoomLocked(lane))
+            {
+                _rankedBlocked.Add(lane);
+                _rankedPartial = true;
+                continue;
+            }
+
+            // A heap with the least wanted kept at its top, to be pushed out.
+            if (count < heap.Length)
+            {
+                var at = count++;
+                heap[at] = entry;
+                while (at > 0 && RankOrder(heap[at], heap[(at - 1) / 2]) < 0)
+                {
+                    (heap[at], heap[(at - 1) / 2]) = (heap[(at - 1) / 2], heap[at]);
+                    at = (at - 1) / 2;
+                }
+            }
+            else
+            {
+                _rankedPartial = true;
+                heap[0] = entry;
+                for (var at = 0; ;)
+                {
+                    var least = at;
+                    var left = 2 * at + 1;
+                    if (left < count && RankOrder(heap[left], heap[least]) < 0)
+                    {
+                        least = left;
+                    }
+
+                    if (left + 1 < count && RankOrder(heap[left + 1], heap[least]) < 0)
+                    {
+                        least = left + 1;
+                    }
+
+                    if (least == at)
+                    {
+                        break;
+                    }
+
+                    (heap[at], heap[least]) = (heap[least], heap[at]);
+                    at = least;
+                }
             }
         }
 
-        if (best is null)
+        var kept = heap.AsSpan(0, count);
+        kept.Sort(static (left, right) => RankOrder(left, right));
+        foreach (var entry in kept)
         {
-            pick = default;
-            return false;
+            _ranked.Add(entry);
         }
 
-        RemoveLocked(best);
-        return TryBeginLocked(best, out pick);
+        // No folder outlives its ranking here.
+        kept.Clear();
     }
+
+    /// <summary>
+    /// The most wanted folder of the ranking whose lane has room, taken out
+    /// of it; null when there is none.  Folders taken off the queue since it
+    /// was made - read, cancelled, forgotten - are dropped on the way.
+    /// </summary>
+    private NestedFolder? TakeRankedLocked()
+    {
+        for (var index = _ranked.Count - 1; index >= 0; index--)
+        {
+            var candidate = _ranked[index].Folder;
+            if (candidate.QueueIndex < 0)
+            {
+                _ranked.RemoveAt(index);
+                continue;
+            }
+
+            if (HasRoomLocked(LaneOf(candidate)))
+            {
+                _ranked.RemoveAt(index);
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// A folder just queued, while the ranking of this picture holds: put in
+    /// its place if it belongs among the most wanted, as a pass over the queue
+    /// would have put it.  One less wanted than every folder the ranking holds
+    /// waits for the next ranking, as do the folders of a lane it left out.
+    /// </summary>
+    private void RankNewcomerLocked(NestedFolder folder)
+    {
+        if (_rankedFrame != Frame)
+        {
+            return;
+        }
+
+        var entry = new RankedFolder(folder, folder.IsSticky, folder.Priority);
+        if (_rankedPartial && (_ranked.Count == 0 || RankOrder(entry, _ranked[0]) <= 0)
+            || _rankedBlocked.Count > 0 && _rankedBlocked.Contains(LaneOf(folder)))
+        {
+            _rankedPartial = true;
+            return;
+        }
+
+        var low = 0;
+        var high = _ranked.Count;
+        while (low < high)
+        {
+            var middle = (low + high) / 2;
+            if (RankOrder(_ranked[middle], entry) <= 0)
+            {
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle;
+            }
+        }
+
+        _ranked.Insert(low, entry);
+        if (_ranked.Count > RankedFolders)
+        {
+            _ranked.RemoveAt(0);
+            _rankedPartial = true;
+        }
+    }
+
+    /// <summary>
+    /// The order folders are read in, least wanted first: one something
+    /// waits for before any the canvas asked for, then the wider on screen.
+    /// Taken from what the folder was when it was ranked - the canvas changes
+    /// a folder's width while it is drawn, and an order that moved under a
+    /// sort would not be one.
+    /// </summary>
+    private static int RankOrder(in RankedFolder left, in RankedFolder right) =>
+        left.IsSticky != right.IsSticky ? (left.IsSticky ? 1 : -1) : left.Priority.CompareTo(right.Priority);
+
+    /// <summary>A share's lane, or a cached local logical-volume identity. Called only under the read gate.</summary>
+    private string LaneOf(NestedFolder folder) =>
+        ShareOf(folder) ?? LocalLaneForPath(folder.Watch?.Key ?? folder.FullPath, 0);
+
+    private string LocalLaneForPath(string path, uint visited)
+    {
+        var span = path.AsSpan();
+        if (span.StartsWith(@"\\?\", StringComparison.Ordinal) || span.StartsWith(@"\\.\", StringComparison.Ordinal)) span = span[4..];
+        if (span.StartsWith("Volume{", StringComparison.OrdinalIgnoreCase))
+        {
+            var end = span.IndexOf('}');
+            if (end >= 0)
+            {
+                var key = span[..(end + 1)];
+                if (_localSpecialLanes.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(key, out var knownVolume)) return knownVolume;
+                var spelling = key.ToString();
+                return _localSpecialLanes[spelling] = LocalLane + spelling;
+            }
+        }
+        if (path.StartsWith(@"\\", StringComparison.Ordinal) && VolumeKinds.ShareKey(path) is { } share) return share;
+        if (span.Length < 2 || span[1] != ':' || !char.IsAsciiLetter(span[0])) return LocalLane;
+        var index = char.ToUpperInvariant(span[0]) - 'A';
+        if (_localLaneLetters[index] is { } known) return known;
+        var bit = 1u << index;
+        if ((visited & bit) != 0) return LocalLane;
+        var letter = (char)('A' + index);
+        var volume = LocalReadVolumeFor(letter);
+        var lane = volume.SubstTarget is { Length: > 0 } target
+            ? LocalLaneForPath(target, visited | bit)
+            : volume.DriveType == WatchNative.DriveRemote
+                ? VolumeKinds.ShareKey(volume.Share ?? $@"{letter}:\") ?? $@"{letter}:\"
+                : LocalReadDeviceFor(letter) is { Length: > 0 } device
+                    ? LocalLane + device
+                    : LocalLane + letter;
+        return _localLaneLetters[index] = lane;
+    }
+
+    /// <summary>
+    /// QueryDosDevice reads the object manager's letter table, not disk or
+    /// directory data. Letters for one Windows volume share its device name.
+    /// This is logical-volume identity, not physical-spindle detection. A
+    /// folder-mounted volume with no known watch identity conservatively uses
+    /// its containing letter; no per-frame handle/disk probe is introduced.
+    /// </summary>
+    private static string? LocalReadDeviceName(char letter)
+    {
+        var buffer = new char[1024];
+        var length = WatchNative.QueryDosDeviceW($"{letter}:", buffer, buffer.Length);
+        if (length == 0) return null;
+        var end = Array.IndexOf(buffer, '\0');
+        return end > 0 ? new string(buffer, 0, end) : null;
+    }
+
+    /// <summary>Whether a lane has a slot free.</summary>
+    private bool HasRoomLocked(string lane) =>
+        lane.StartsWith(LocalLane, StringComparison.Ordinal)
+            ? _localVolumeRunning.GetValueOrDefault(lane) < LocalReadSlots
+            : _shareRunning.GetValueOrDefault(lane) < NetworkSlotsPerShare;
+
+    internal string ReadLaneForChecks(NestedFolder folder) { lock (_gate) return LaneOf(folder); }
+
+    internal (int LocalReads, int NetworkReads, int LocalVolumes) ReadLanesForChecks
+    {
+        get { lock (_gate) return (_localRunning, _networkRunning, _localVolumeRunning.Count); }
+    }
+
+    /// <summary>A waiting folder as it was ranked.</summary>
+    private readonly record struct RankedFolder(NestedFolder Folder, bool IsSticky, double Priority);
 
     /// <summary>
     /// Takes a folder out of the waiting list by moving the last one into its
@@ -822,6 +1132,18 @@ public sealed partial class NestedTree
             // Picked just before the tree went away: nobody will look.
             _lifetimeToken.ThrowIfCancellationRequested();
             var path = folder.FullPath;
+
+            // A folder read for the first time is registered with the hub here,
+            // before its listing is taken, so a file written after that and
+            // before the listing is applied marks it out of date.  Here rather
+            // than when the canvas queued it: registering thousands of folders
+            // inside the frame that first drew them doubled that frame, and
+            // the ones that left the screen unread stayed registered for ever.
+            // The tree counts it as its own once the read is applied.
+            if (pick.Kind == ReadKind.Load && _changes is { } hub)
+            {
+                hub.Register(ChangeConsumer.Nested, path, folder);
+            }
 
             // Where changes are not watched as they happen, the directory's own
             // time is what polling compares: a volume that refuses a watch, a
@@ -951,12 +1273,22 @@ public sealed partial class NestedTree
     private static NestedFolder[] WithNamedSince(NestedFolder[] children, NestedFolder[] namedSince)
     {
         NestedFolder[] all = [.. children, .. namedSince];
-        Array.Sort(all, static (left, right) =>
-        {
-            var order = StringComparer.CurrentCultureIgnoreCase.Compare(left.Name, right.Name);
-            return order != 0 ? order : string.CompareOrdinal(left.Name, right.Name);
-        });
+        var culture = CultureInfo.CurrentCulture.CompareInfo;
+        Array.Sort(all, (left, right) => NameOrder(culture, left.Name, right.Name));
         return all;
+    }
+
+    /// <summary>
+    /// The order a reader lists names in: culture order ignoring case, then
+    /// ordinal between names that calls equal.  The culture's rules are taken
+    /// once by the caller rather than through StringComparer.CurrentCultureIgnoreCase,
+    /// which makes a new comparer each time it is asked for - once per
+    /// comparison, in a sort.
+    /// </summary>
+    private static int NameOrder(CompareInfo culture, string left, string right)
+    {
+        var order = culture.Compare(left, right, CompareOptions.IgnoreCase);
+        return order != 0 ? order : string.CompareOrdinal(left, right);
     }
 
     // ---- applying --------------------------------------------------------------
@@ -1058,6 +1390,10 @@ public sealed partial class NestedTree
             folder.ErrorMessage = listing.ErrorMessage;
             folder.FailedAt = Stopwatch.GetTimestamp();
             folder.IsRetryable = listing.IsRetryable;
+
+            // Kept registered, as one read: a change heard in it - made again,
+            // a device back - is what has it read again.
+            Register(folder);
             _batch.Applied.Add(folder);
             Answer(folder, request);
             return true;
@@ -1112,6 +1448,8 @@ public sealed partial class NestedTree
         folder.IsTruncated = listing.IsTruncated;
         folder.ErrorMessage = string.Empty;
         folder.LoadState = NestedLoadState.Loaded;
+        folder.IsRetryable = false;
+        folder.FailedAt = 0;
         folder.HasPartialListing = false;
         ApplyVisibleChildren(folder);
         AfterApply(folder, read);
@@ -1295,6 +1633,8 @@ public sealed partial class NestedTree
             }
 
             _pending.Clear();
+            _ranked.Clear();
+            _rankedFrame = NotRanked;
         }
 
         foreach (var waiter in waiters)
@@ -1304,7 +1644,7 @@ public sealed partial class NestedTree
     }
 
     /// <summary>A read a slot has begun: the folder, which read, its ticket, and the share whose lane it holds (null: local).</summary>
-    private readonly record struct ReadPick(NestedFolder Folder, ReadKind Kind, int Ticket, string? Share);
+    private readonly record struct ReadPick(NestedFolder Folder, ReadKind Kind, int Ticket, string? Share, string Lane);
 
     /// <summary>Who is waiting on one folder's read, and whether a read already under way will not do.</summary>
     private sealed class ExplicitRead

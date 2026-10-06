@@ -131,7 +131,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         _isFolderWindow = normalWorkspacePath is not null;
         _workspaceStore = new WorkspaceStore();
-        _marks = new FolderMarkService();
+        _marks = FolderMarkService.Shared;
         _fileSystemService = new FileSystemService(_iconService);
 
         // Pickers keep their own state. Native replacement starts with the
@@ -179,8 +179,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         NewFolderCommand = new AsyncRelayCommand(CreateFolderAsync);
         NewTextFileCommand = new AsyncRelayCommand(CreateTextFileAsync);
-        CutCommand = new RelayCommand(() => CopySelection(true));
-        CopyCommand = new RelayCommand(() => CopySelection(false));
+        CutCommand = new AsyncRelayCommand(() => CopySelectionAsync(true));
+        CopyCommand = new AsyncRelayCommand(() => CopySelectionAsync(false));
         CopyPathCommand = new RelayCommand(CopySelectionPath);
         PasteCommand = new AsyncRelayCommand(PasteAsync);
         RenameCommand = new AsyncRelayCommand(RenameSelectionAsync);
@@ -188,8 +188,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         DeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(false));
         PermanentDeleteCommand = new AsyncRelayCommand(() => DeleteSelectionAsync(true));
         PropertiesCommand = new RelayCommand(ShowProperties);
-        OpenCommand = new RelayCommand(OpenSelection);
-        OpenWithCommand = new RelayCommand(OpenSelectionWith);
+        OpenCommand = new AsyncRelayCommand(OpenSelectionAsync);
+        OpenWithCommand = new AsyncRelayCommand(OpenSelectionWithAsync);
         ToggleHiddenItemsCommand = new AsyncRelayCommand(ToggleHiddenItemsAsync);
         ShowInExplorerCommand = new RelayCommand(ShowSelectionInExplorer);
         AddToFavoritesCommand = new RelayCommand(AddSelectionToFavorites);
@@ -854,31 +854,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _savedWorkspace = CaptureWorkspace();
 
         // Which known folders, drives and WSL distributions are there is asked
-        // off the UI thread, the three at once: a drive mapped to a server that
-        // is off takes some twenty seconds to say it is not ready, and every
-        // window of the process - Explorer's replacements and the pickers too -
-        // shares this thread.  The drives are not waited for: the window is not
-        // ready until its tree is, and the broker gives a window it made
-        // fifteen seconds, so the pane's drives come in when they have answered
-        // (ShowDrivesAsync), as they do when a volume arrives or leaves.
+        // off the UI thread, all at once, and none of it is waited for: a
+        // drive mapped to a server that is off takes some twenty seconds to
+        // say it is not ready, and so can Downloads or Documents moved onto a
+        // NAS that is asleep, or \\wsl$ while WSL starts.  Every window of the
+        // process - Explorer's replacements and the pickers too - shares this
+        // thread, the window is not ready until its tree is, and the broker
+        // gives a window it made fifteen seconds: waited for, they held the
+        // folder up, and past that the window was closed and the folder lost.
+        // The pane takes each in as it answers (ShowPlacesAsync,
+        // ShowDrivesAsync, ShowNetworkLocationsAsync).
         var knownPlaces = Task.Run(FileSystemService.ListQuickAccess);
-        var readyDrives = Task.Run(FileSystemService.ListReadyDrives);
+        var readyDrives = FileSystemService.AskReadyDrives();
         var distributions = Task.Run(FileSystemService.ListWslDistributions);
-        await Task.WhenAll(knownPlaces, distributions);
-        if (_isDisposed) return;
-
-        var quickAccess = _fileSystemService.GetQuickAccess(await knownPlaces);
-        foreach (var item in quickAccess)
-        {
-            if (item.Name == "Home")
-            {
-                HomeItems.Add(item);
-            }
-            else
-            {
-                QuickAccess.Add(item);
-            }
-        }
 
         if (state is not null)
         {
@@ -887,7 +875,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             // disk not plugged in: checking would hold the window up for as
             // long as the network takes to give up, and dropping the pin would
             // lose it for good at the next save.  One that is still out of
-            // reach says so when it is clicked.
+            // reach says so when it is clicked.  A pin of a known folder gives
+            // way to it once it has answered (ShowPlacesAsync).
             foreach (var favorite in state.Favorites ?? [])
             {
                 if (favorite is null || string.IsNullOrWhiteSpace(favorite.Path))
@@ -917,12 +906,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         _fileSystemService.AttachIcons(HomeItems.Concat(QuickAccess).ToArray());
 
+        _ = ShowPlacesAsync(knownPlaces);
         _ = ShowDrivesAsync(readyDrives);
+        _ = ShowNetworkLocationsAsync(distributions);
 
-        foreach (var location in _fileSystemService.GetNetworkLocations(await distributions))
-        {
-            NetworkLocations.Add(location);
-        }
+        // One turn of the dispatcher before the tree is built: a window
+        // closed while it read its state stops here, rather than building a
+        // tree nobody will see.
+        await Task.Yield();
+        if (_isDisposed) return;
 
         // While the nested canvas is the picture, the tree behind it only has
         // to hold the path of what is selected, not open every folder on the
@@ -942,39 +934,174 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// <summary>
     /// A volume arrived or left: the navigation pane's drives are listed
     /// again.  Which drives are ready is asked off the UI thread - a disc
-    /// spinning up takes seconds to say - and the list is only replaced when
-    /// it changed.
+    /// spinning up takes seconds to say - and the pane changes only where a
+    /// drive's answer changed it.
     /// </summary>
-    public Task RefreshDrivesAsync() => ShowDrivesAsync(Task.Run(FileSystemService.ListReadyDrives));
+    public Task RefreshDrivesAsync() => ShowDrivesAsync(FileSystemService.AskReadyDrives());
 
     /// <summary>
-    /// Puts the drives a listing found in the navigation pane once it has
-    /// answered - the start's own listing, or one made because a volume came
-    /// or went.  A start's listing waits for a drive mapped to a server that
-    /// is off, so a newer listing can answer first: only the latest asked for
-    /// is shown, and an older one answering after it is let go.
+    /// Puts the drives in the navigation pane as each answers whether it is
+    /// ready - the start's own asking, or one made because a volume came or
+    /// went - in the order listed.  A drive mapped to a server that is off
+    /// takes some twenty seconds to say it is not ready, and holds up only
+    /// itself: waiting for every drive, the pane showed none, not even C:,
+    /// until it had answered, in every window and dialog.  A drive the pane
+    /// shows already stays until it has answered.  Only the latest asking is
+    /// shown: an older one, still waiting for a drive, is let go once a newer
+    /// one has begun.
     /// </summary>
-    private async Task ShowDrivesAsync(Task<IReadOnlyList<ReadyDrive>> listing)
+    private async Task ShowDrivesAsync(IReadOnlyList<(string Path, Task<ReadyDrive?> Answer)> asking)
     {
         var ticket = ++_drivesListing;
-        var ready = await listing;
-        if (_isDisposed || ticket != _drivesListing)
+        var waiting = asking.Select(drive => (Task)drive.Answer).ToList();
+        do
+        {
+            if (waiting.Count > 0)
+            {
+                await Task.WhenAny(waiting);
+            }
+
+            if (_isDisposed || ticket != _drivesListing)
+            {
+                return;
+            }
+
+            waiting.RemoveAll(answer => answer.IsCompleted);
+            ShowAnsweredDrives(asking);
+        }
+        while (waiting.Count > 0);
+    }
+
+    /// <summary>
+    /// The pane's drives as far as <paramref name="asking"/> has answered:
+    /// each drive listed that answered it is ready, and each not answered yet
+    /// that the pane shows already, in the order listed.  A drive shown
+    /// already keeps its entry, unless it answered under another name.
+    /// </summary>
+    private void ShowAnsweredDrives(IReadOnlyList<(string Path, Task<ReadyDrive?> Answer)> asking)
+    {
+        static bool SamePath(string first, string second) => string.Equals(first, second, StringComparison.OrdinalIgnoreCase);
+        int Shown(string path)
+        {
+            for (var index = 0; index < Drives.Count; index++)
+            {
+                if (SamePath(Drives[index].Path, path))
+                {
+                    return index;
+                }
+            }
+
+            return -1;
+        }
+
+        var wanted = new List<(string Path, ReadyDrive? Drive)>(asking.Count);
+        foreach (var (path, answer) in asking)
+        {
+            if (!answer.IsCompleted)
+            {
+                if (Shown(path) >= 0)
+                {
+                    wanted.Add((path, null));
+                }
+            }
+            else if (answer.IsCompletedSuccessfully && answer.Result is { } drive)
+            {
+                wanted.Add((drive.Path, drive));
+            }
+        }
+
+        var changed = false;
+        for (var index = Drives.Count - 1; index >= 0; index--)
+        {
+            if (!wanted.Any(entry => SamePath(entry.Path, Drives[index].Path)))
+            {
+                Drives.RemoveAt(index);
+                changed = true;
+            }
+        }
+
+        for (var index = 0; index < wanted.Count; index++)
+        {
+            var (path, drive) = wanted[index];
+            var shown = Shown(path);
+            if (shown >= 0 && (drive is not { } answered || Drives[shown].Name == answered.Name))
+            {
+                if (shown != index)
+                {
+                    Drives.Move(shown, index);
+                    changed = true;
+                }
+
+                continue;
+            }
+
+            if (shown >= 0)
+            {
+                Drives.RemoveAt(shown);
+            }
+
+            Drives.Insert(index, _fileSystemService.GetDrives([drive!.Value])[0]);
+            changed = true;
+        }
+
+        if (changed)
+        {
+            UpdateSidebarSelection();
+        }
+    }
+
+    /// <summary>
+    /// Puts Home and the known folders in the navigation pane once they have
+    /// answered, as a start that waited for them had them: Home alone above
+    /// the first divider, the known folders ahead of the pins.  A pin of one
+    /// of them gives way to it, and is left in the file as it is there, as a
+    /// start that waited never showed it.
+    /// </summary>
+    private async Task ShowPlacesAsync(Task<IReadOnlyList<KnownPlace>> listing)
+    {
+        var places = await listing;
+        if (_isDisposed)
         {
             return;
         }
 
-        var same = ready.Count == Drives.Count
-            && ready.Select(drive => drive.Path).SequenceEqual(Drives.Select(item => item.Path), StringComparer.OrdinalIgnoreCase);
-        if (!same)
+        var index = 0;
+        foreach (var item in _fileSystemService.GetQuickAccess(places))
         {
-            Drives.Clear();
-            foreach (var drive in _fileSystemService.GetDrives(ready))
+            if (QuickAccess.FirstOrDefault(pin => pin.IsCustom && ViewAllPath.Equals(pin.Path, item.Path)) is { } pinned)
             {
-                Drives.Add(drive);
+                QuickAccess.Remove(pinned);
+                _savedFavorites = [.. _savedFavorites.Where(saved => !ViewAllPath.Equals(saved.Path, item.Path))];
             }
 
-            UpdateSidebarSelection();
+            if (item.Name == "Home")
+            {
+                HomeItems.Add(item);
+            }
+            else
+            {
+                QuickAccess.Insert(index++, item);
+            }
         }
+
+        UpdateSidebarSelection();
+    }
+
+    /// <summary>The WSL distributions and the network view in the navigation pane, once <c>\\wsl$</c> has answered.</summary>
+    private async Task ShowNetworkLocationsAsync(Task<IReadOnlyList<string>> listing)
+    {
+        var distributions = await listing;
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        foreach (var location in _fileSystemService.GetNetworkLocations(distributions))
+        {
+            NetworkLocations.Add(location);
+        }
+
+        UpdateSidebarSelection();
     }
 
     /// <summary>
@@ -1027,6 +1154,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     internal async Task RefreshPickerNavigationPreferencesAsync()
     {
         if (!_isPickerSession || _isDisposed) return;
+
+        // The prepared picker of the dialog worker is a process of its own,
+        // with the marks read when it was prepared: bound to a new dialog, it
+        // reads them again, and draws what another copy of the app changed
+        // since (FolderMarkService.MarkChanged).
+        await _marks.LoadAsync();
+        if (_isDisposed) return;
         var state = await _workspaceStore.LoadAsync();
         if (state is null || _isDisposed) return;
         if (!_favoriteLinksChanged && _showFavoriteLinks != state.ShowFavoriteLinks)
@@ -1339,6 +1473,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Tree.MessageRequested -= OnTreeMessage;
         Address.Dispose();
         Tree.Dispose();
+
+        // The marks are every window's (FolderMarkService.Shared): whatever
+        // the tree still listens to them with must not keep it, and all it
+        // holds, for as long as the process runs.
+        _marks.ReleaseListenersOf(Tree);
         _changes.Dispose();
 
         // Its thread (an STA of its own, with the Shell's objects and COM's
@@ -1497,7 +1636,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             try
             {
-                NativeShellService.Open(item.Path);
+                // A Shell namespace link is not a filesystem folder.  The
+                // Shell launch can still wait on an extension, so it runs off
+                // the one dispatcher shared by every window.
+                await Task.Run(() => OpenKnownItem(item.Path, false));
             }
             catch (Exception ex)
             {
@@ -1532,7 +1674,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var path = NativeShellService.CreateFolder(target, name);
+            var path = await Task.Run(() => CreateFolderOnDisk(target, name));
+            if (_isDisposed)
+            {
+                return;
+            }
+
             await Tree.RefreshPathAsync(target);
             ShowDone($"Created {Path.GetFileName(path)}");
         }
@@ -1558,9 +1705,27 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var path = NativeShellService.CreateNoteFile(target, name);
+            // Creating the file and handing it to its default program are one
+            // user action.  Keep both off the dispatcher and in that order.
+            var path = await Task.Run(() =>
+            {
+                var created = CreateNoteFileOnDisk(target, name);
+                // Closing the window while a slow share creates the file must
+                // not launch a program afterwards.  The filesystem operation
+                // already asked for is allowed to finish; the follow-up is not.
+                if (!Volatile.Read(ref _isDisposed))
+                {
+                    OpenKnownItem(created, false);
+                }
+
+                return created;
+            });
+            if (_isDisposed)
+            {
+                return;
+            }
+
             await Tree.RefreshPathAsync(target);
-            NativeShellService.Open(path);
         }
         catch (Exception ex)
         {
@@ -1568,28 +1733,66 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void CopySelection(bool cut)
+    private async Task CopySelectionAsync(bool cut)
     {
-        var paths = Tree.SelectedPaths;
-        if (paths.Count == 0)
+        // Keep exactly what the user selected while the disk is being asked;
+        // a later click must not change what this invocation copies.
+        var paths = Tree.SelectedPaths.ToArray();
+        if (paths.Length == 0)
         {
             return;
         }
 
-        if (!NativeShellService.CopyPathsToClipboard(paths, cut))
+        string[] present;
+        try
         {
-            // Refused either because nothing selected is there any more -
-            // deleted from outside since it was selected - or because another
-            // program holds the clipboard.  Trying again only helps the second.
-            Toast.ShowError(paths.Any(ItemExists)
-                ? "Another application is holding the clipboard — try again."
-                : paths.Count == 1
-                    ? $"{(Path.GetFileName(Path.TrimEndingDirectorySeparator(paths[0])) is { Length: > 0 } name ? name : paths[0])} is no longer there."
-                    : "The selected items are no longer there.");
+            present = await Task.Run(() => paths
+                .Where(ItemExists)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray());
+        }
+        catch (Exception ex)
+        {
+            // A provider or a testable existence backend may fail rather than
+            // answer false.  This is an async command: never let that exception
+            // escape async void and take down the shared dispatcher.
+            if (!_isDisposed)
+            {
+                Toast.ShowError(ex.Message);
+            }
+
             return;
         }
 
-        _ = Toast.ShowSuccessAsync(cut ? $"Cut {paths.Count} item(s)" : $"Copied {paths.Count} item(s)");
+        if (_isDisposed)
+        {
+            return;
+        }
+
+        if (present.Length == 0)
+        {
+            Toast.ShowError(paths.Length == 1
+                ? $"{(Path.GetFileName(Path.TrimEndingDirectorySeparator(paths[0])) is { Length: > 0 } name ? name : paths[0])} is no longer there."
+                : "The selected items are no longer there.");
+            return;
+        }
+
+        try
+        {
+            // Clipboard.SetDataObject must remain on this STA dispatcher.  All
+            // potentially blocking filesystem validation has already ended.
+            if (!NativeShellService.CopyPathsToClipboard(present, cut))
+            {
+                Toast.ShowError("Another application is holding the clipboard — try again.");
+                return;
+            }
+
+            _ = Toast.ShowSuccessAsync(cut ? $"Cut {present.Length} item(s)" : $"Copied {present.Length} item(s)");
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or NotSupportedException)
+        {
+            Toast.ShowError(ex.Message);
+        }
     }
 
     private void CopySelectionPath()
@@ -1638,6 +1841,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// </summary>
     internal static Func<string, bool> ItemExists { get; set; } = path => File.Exists(path) || Directory.Exists(path);
 
+    /// <summary>Command boundaries replaced by responsiveness checks; production delegates to the native service.</summary>
+    internal static Func<string, string, string> CreateFolderOnDisk { get; set; } = NativeShellService.CreateFolder;
+    internal static Func<string, string, string> CreateNoteFileOnDisk { get; set; } = NativeShellService.CreateNoteFile;
+    internal static Action<string, bool?> OpenKnownItem { get; set; } = NativeShellService.Open;
+
     private async Task<bool> TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
     {
         var given = paths.ToArray();
@@ -1656,6 +1864,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return false;
         }
 
+        // Moved, a marked item takes its colour and note along (CarryMarksAsync):
+        // only one whose name is free in the target, as a name taken there is
+        // replaced, or kept beside under one the Shell makes up, and which of
+        // the two it was cannot be told afterwards.
+        var carried = move ? safePaths.Where(_marks.HasMarksAtOrUnder).ToArray() : [];
+        if (carried.Length > 0)
+        {
+            carried = await Task.Run(() => carried.Where(path => !ItemExists(MovedInto(path, targetDirectory))).ToArray());
+            if (_isDisposed)
+            {
+                return false;
+            }
+        }
+
         var sourceDirectories = safePaths
             .Select(Path.GetDirectoryName)
             .Where(directory => !string.IsNullOrEmpty(directory))
@@ -1666,6 +1888,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             Toast.ShowBusy($"{verb} {safePaths.Length} item(s)…");
             await _shellService.CopyOrMoveAsync(safePaths, targetDirectory, move);
+            await CarryMarksAsync(carried, targetDirectory);
             if (move)
             {
                 // Moved away: nothing that was selected there is any more, in
@@ -1689,6 +1912,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         catch (OperationCanceledException)
         {
+            await CarryMarksAsync(carried, targetDirectory);
             await RefreshAfterOperationAsync(targetDirectory, sourceDirectories);
             ShowDone($"{(move ? "Move" : "Copy")} cancelled");
         }
@@ -1699,6 +1923,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         return false;
     }
+
+    /// <summary>
+    /// The colour and note of each of <paramref name="carried"/> moved into
+    /// <paramref name="targetDirectory"/> - for a folder those of everything
+    /// inside it too - go to its new name: across two folders nothing on disk
+    /// pairs the old name with the new for the change hub to follow, and they
+    /// stayed behind on a name nothing had any more.  Only for those there now
+    /// and gone from where they were: the rest were skipped, or the move was
+    /// cancelled before it came to them.
+    /// </summary>
+    private async Task CarryMarksAsync(string[] carried, string targetDirectory)
+    {
+        if (carried.Length == 0)
+        {
+            return;
+        }
+
+        var arrived = await Task.Run(() => carried
+            .Where(path => !ItemExists(path) && ItemExists(MovedInto(path, targetDirectory)))
+            .ToArray());
+        foreach (var path in arrived)
+        {
+            _marks.Move(path, MovedInto(path, targetDirectory));
+        }
+
+        if (arrived.Length > 0)
+        {
+            Tree.ScheduleSave();
+        }
+    }
+
+    /// <summary>Where <paramref name="path"/> is once moved into <paramref name="targetDirectory"/> under its own name.</summary>
+    private static string MovedInto(string path, string targetDirectory) =>
+        Path.Combine(targetDirectory, Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)));
 
     private async Task RefreshAfterOperationAsync(string? targetDirectory, IEnumerable<string?> sourceDirectories)
     {
@@ -1733,7 +1991,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
         try
         {
-            var renamed = NativeShellService.Rename(path, newName);
+            var renamed = await Task.Run(() => NativeShellService.Rename(path, newName));
+            Tree.NoteOwnRename(path, renamed);
+
+            // In a folder no window has read, nothing tells the change hub of
+            // the rename to follow, and the colour and note stayed behind on
+            // the old name: they go with it here.  In one a window has read,
+            // the hub finds them moved already.
+            if (_marks.HasMarksAtOrUnder(path))
+            {
+                _marks.Move(path, renamed);
+                Tree.ScheduleSave();
+            }
+
             var parent = Path.GetDirectoryName(renamed);
             if (!string.IsNullOrEmpty(parent))
             {
@@ -1918,7 +2188,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// fifteen only once the user says so, as Explorer asks; with one, the
     /// focus, a folder going in on the tree and a file opening.
     /// </summary>
-    private void OpenSelection()
+    private async Task OpenSelectionAsync()
     {
         if (Tree.Selection.Count > 1)
         {
@@ -1931,16 +2201,21 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                     return;
                 }
 
-                foreach (var file in files)
+                try
                 {
-                    try
+                    await Task.Run(() =>
                     {
-                        NativeShellService.Open(file);
-                    }
-                    catch (Exception ex)
+                        foreach (var file in files)
+                        {
+                            OpenKnownItem(file, false);
+                        }
+                    });
+                }
+                catch (Exception ex)
+                {
+                    if (!_isDisposed)
                     {
-                        Toast.ShowError($"Could not open {Path.GetFileName(file)}: {ex.Message}");
-                        return;
+                        Toast.ShowError($"Could not open the selection: {ex.Message}");
                     }
                 }
 
@@ -1961,13 +2236,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    private void OpenSelectionWith()
+    private async Task OpenSelectionWithAsync()
     {
-        if (Tree.SelectedOrActivePaths.FirstOrDefault() is { } path && File.Exists(path))
+        var path = Tree.SelectedOrActivePaths.FirstOrDefault();
+        if (path is not null && await Task.Run(() => File.Exists(path)))
         {
             try
             {
-                NativeShellService.OpenWith(path);
+                await NativeShellService.OpenWithAsync(path);
             }
             catch (Exception ex)
             {
@@ -2078,17 +2354,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     /// folder is shown on the canvas and gone into, as a double-click there
     /// would.
     /// </summary>
-    private void OpenSearchResult(string path, bool isDirectory)
+    private void OpenSearchResult(string path, bool isDirectory) => _ = OpenSearchResultAsync(path, isDirectory);
+
+    private async Task OpenSearchResultAsync(string path, bool isDirectory)
     {
         if (isDirectory)
         {
-            _ = Tree.RevealPathAsync(path);
+            await Tree.RevealPathAsync(path);
             return;
         }
 
         try
         {
-            NativeShellService.Open(path);
+            await Task.Run(() => OpenKnownItem(path, false));
         }
         catch (Exception exception) when (exception is System.ComponentModel.Win32Exception or InvalidOperationException or FileNotFoundException)
         {

@@ -88,7 +88,8 @@ public sealed partial class NestedCanvas
     /// says it is left out; so does one in a folder too large for the canvas
     /// to list whole.  One left out of a folder the canvas has read - hidden
     /// while hidden items are hidden, or a file while the Files layer is
-    /// off - does not.
+    /// off - does not, nor does a hidden folder still selected or anything
+    /// selected inside one.
     /// </summary>
     internal int? ShownOfSelection(long version)
     {
@@ -98,7 +99,23 @@ public sealed partial class NestedCanvas
             return null;
         }
 
-        return _selection.Count + _selection.CountWaiting(path =>
+        // Files selected in a folder placed again since they were drawn -
+        // hidden items or the Files layer switched off with the folder off
+        // screen, which nothing draws - are caught up first, as drawing it
+        // would: what is no longer shown then waits, and is counted out.
+        var before = _selection.Version;
+        foreach (var container in _selection.Containers.ToArray())
+        {
+            Ensure(container);
+            _selection.FilesOf(container, _vanished);
+        }
+
+        if (_selection.Version != before)
+        {
+            SelectionChangedHere();
+        }
+
+        return _selection.CountOnCanvas() + _selection.CountWaiting(path =>
             _tree?.Find(path) is not { } folder || !folder.IsLoaded && !folder.IsComputer
             || folder.IsTruncated || folder.UnlistedFileCount > 0);
     }
@@ -262,14 +279,17 @@ public sealed partial class NestedCanvas
     /// folder above it out, their paths added to <paramref name="removed"/>:
     /// kept, a Delete or a Move would act on the whole folder rather than on
     /// what was picked in it.  True when there were any; the edit's items are
-    /// then not all in one folder.
+    /// then not all in one folder.  One still waiting for the folder above
+    /// it to be read - gone into by its path, under a link or a folder too
+    /// big to have been listed yet - is selected in the window all the same,
+    /// and goes too.
     /// </summary>
     private bool DeselectFoldersAbove(NestedFolder container, List<string> removed)
     {
         var any = false;
         for (var folder = container; folder.Parent is not null; folder = folder.Parent)
         {
-            if (_selection.SetFolder(folder, false))
+            if (_selection.SetFolder(folder, false) || _selection.TakeWaiting(folder))
             {
                 removed.Add(folder.FullPath);
                 any = true;
@@ -593,7 +613,8 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// The count handed on while the rectangle is drawn, at most every
     /// <see cref="MarqueeCountInterval"/>: what would be selected in all if
-    /// it were let go now.
+    /// it were let go now - in an addition or a toggle, what waits for a
+    /// folder not read yet included, as the window holds it selected.
     /// </summary>
     private void CountMarquee(NestedMarquee marquee)
     {
@@ -613,7 +634,7 @@ public sealed partial class NestedCanvas
         var inside = marquee.CountSelected();
         var total = marquee.Mode == NestedSelectMode.Replace
             ? inside
-            : _selection.Count - BaseCount(marquee) + inside;
+            : _selection.Count + _selection.PendingCount - BaseCount(marquee) + inside;
         marquee.CountStale = false;
         marquee.CountRaisedAt = now;
         if (total != marquee.HitCount)
@@ -972,8 +993,16 @@ public sealed partial class NestedCanvas
         return new SelectionItem(path, false, index >= 0 && index < files.Count ? files[index].Length : 0);
     }
 
-    /// <summary>Whether the filter lets a gesture take this sub-folder: always with no filter, else only a match.</summary>
-    private bool FolderMatches(NestedFolder child) => _filter is null || (FilterStateOf(child) & FilterSelf) != 0;
+    /// <summary>
+    /// Whether the filter lets a gesture take this sub-folder: always with no
+    /// filter, else only a match.  One the filter has not come to yet - a
+    /// big tree is judged a slice at a time - is judged by its name here, as
+    /// the filter will judge it: taken for no match until then, it was left
+    /// out of a Ctrl+A, a range or a rectangle, and Copy or Delete acted on
+    /// part of what the user asked for.
+    /// </summary>
+    private bool FolderMatches(NestedFolder child) =>
+        _filter is null || (child.FilterStamp == _filterStamp ? (child.FilterState & FilterSelf) != 0 : !child.IsComputer && _filter(child.Name));
 
     private bool FileMatches(in NestedFile file) => _filter is null || _filter(file.Name);
 }

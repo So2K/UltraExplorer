@@ -242,6 +242,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Raised when a message belongs on the shell toast.</summary>
     public event Action<string, bool>? MessageRequested;
 
+    /// <summary>Exact successfully resolved folder paths explicitly hidden by a user command, including an already-hidden path reopened by name.</summary>
+    public event Action<IReadOnlyList<string>>? FoldersHiddenByUser;
+
     /// <summary>Raised when the graph structure changed and cached drawing is stale.</summary>
     public event Action? GraphInvalidated;
 
@@ -252,6 +255,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// like any change on disk; this is for whoever wants to know as well.
     /// </summary>
     public event Action<string>? PathRefreshed;
+
+    /// <summary>Explicit filesystem rename, independent of which item is selected.</summary>
+    public event Action<string, string>? RenameFollowed;
 
     /// <summary>
     /// F5 on a folder: everything read in and below it is to be taken as out
@@ -499,7 +505,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         var node = outcome.IsExact ? outcome.Node : null;
         if (node is null)
         {
-            if (open)
+            // Given way to on its way down, it stopped short of the row: not gone.
+            if (open && !outcome.Superseded)
             {
                 MessageRequested?.Invoke($"{Path.GetFileName(path)} could not be shown", true);
             }
@@ -1246,6 +1253,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         });
         OnPropertyChanged(nameof(HiddenPaths));
         OnPropertyChanged(nameof(HiddenCount));
+        FoldersHiddenByUser?.Invoke([.. targets.Select(node => node.FullPath)]);
         MessageRequested?.Invoke(
             targets.Count == 1
                 ? $"{targets[0].DisplayName} hidden — bring it back from the canvas menu"
@@ -1518,7 +1526,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// no longer on disk is let go, in one change.  The folder is listed once,
     /// off the UI thread - a folder of ten thousand selected files is one
     /// read, not ten thousand questions - and only when something in it is
-    /// selected at all.
+    /// selected at all.  Only what was selected when the listing began can be
+    /// missing from it: a folder made or an item renamed, and selected, while
+    /// a share took seconds to list is not in the listing, and stays.
     /// </summary>
     private async Task PruneSelectionAsync(string folder)
     {
@@ -1527,10 +1537,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
+        var asked = SelectedIn(folder);
         HashSet<string> present;
         try
         {
-            present = await Task.Run(() => new HashSet<string>(Directory.EnumerateFileSystemEntries(folder), StringComparer.OrdinalIgnoreCase));
+            var normalized = ViewAllPath.Normalize(folder);
+            present = await Task.Run(() => new HashSet<string>(
+                new DirectoryInfo(ViewAllFileSystemService.ForWindows(normalized)).EnumerateFileSystemInfos()
+                    .Select(entry => Path.Combine(normalized, entry.Name)), StringComparer.OrdinalIgnoreCase));
         }
         catch (DirectoryNotFoundException)
         {
@@ -1542,11 +1556,41 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
-        Selection.RemoveMissingUnder(folder, present.Contains);
+        bool Stays(string path) => present.Contains(path) || !asked.Contains(path);
+        Selection.RemoveMissingUnder(folder, Stays);
         foreach (var kept in _keptSelections)
         {
-            kept.RemoveMissingUnder(folder, present.Contains);
+            kept.RemoveMissingUnder(folder, Stays);
         }
+    }
+
+    /// <summary>What every pane's selection holds directly inside <paramref name="folder"/>.</summary>
+    private HashSet<string> SelectedIn(string folder)
+    {
+        var selected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Collect(ItemSelection selection)
+        {
+            if (selection.CountIn(folder) == 0)
+            {
+                return;
+            }
+
+            foreach (var path in selection.Paths)
+            {
+                if (ItemSelection.ParentOf(path).Equals(folder.AsSpan(), StringComparison.OrdinalIgnoreCase))
+                {
+                    selected.Add(path);
+                }
+            }
+        }
+
+        Collect(Selection);
+        foreach (var kept in _keptSelections)
+        {
+            Collect(kept);
+        }
+
+        return selected;
     }
 
     public async Task LoadMoreAsync(ViewAllNodeViewModel node)
@@ -1636,6 +1680,12 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// before still reads its way down: then, as when superseded, nothing is
     /// selected or flown to.
     /// </param>
+    /// <param name="holdGone">
+    /// Handed the message that the path is no longer inside the folder the
+    /// reveal got to, in place of the toast: for a caller that says so only
+    /// once the disk has.  A share that did not answer for a moment has not
+    /// lost anything.
+    /// </param>
     public async Task<RevealOutcome> RevealAsync(
         string path,
         bool focus = true,
@@ -1643,7 +1693,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         int? ticket = null,
         bool records = true,
         bool exact = false,
-        long? selectionVersion = null)
+        long? selectionVersion = null,
+        Action<string>? holdGone = null)
     {
         if (string.IsNullOrWhiteSpace(path))
         {
@@ -1683,11 +1734,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             node = result.Node;
             if (result.MissingStep is { } missing)
             {
-                MessageRequested?.Invoke(
-                    node is null
-                        ? "That drive is not available on this machine."
-                        : $"{Path.GetFileName(missing)} is no longer inside {node.DisplayName}.",
-                    true);
+                ReportMissing(missing, node, holdGone);
             }
         }
         else
@@ -1711,6 +1758,14 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 var lost = false;
                 foreach (var step in chain)
                 {
+                    // Given way to - Back twice on a slow share - it opens no
+                    // more folders on its way: they would only reflow the tree
+                    // under the navigation that came after it.
+                    if (select && node is not null && taken != LatestRevealOf(holder))
+                    {
+                        break;
+                    }
+
                     if (!_graph.TryGetNode(step, out var found))
                     {
                         // The step may simply be filtered out of its parent - hidden,
@@ -1719,11 +1774,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                         var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
                         if (adopted is null)
                         {
-                            MessageRequested?.Invoke(
-                                node is null
-                                    ? "That drive is not available on this machine."
-                                    : $"{Path.GetFileName(step)} is no longer inside {node.DisplayName}.",
-                                true);
+                            // Not given because the folder was read again while
+                            // the disk was asked, and is another node now: lost,
+                            // like a folder read again while it was opened.
+                            if (attempt < 2 && node is not null && !IsLive(node))
+                            {
+                                lost = true;
+                                break;
+                            }
+
+                            ReportMissing(step, node, holdGone);
                             break;
                         }
 
@@ -1755,11 +1815,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return default;
         }
 
-        // Superseded: the folders on the way are open and the node exists, but
-        // the selection, the view and the history belong to the navigation
-        // that came after.  Short of the path, with only the exact path
-        // wanted: the message above has said it is gone, and the selection
-        // stays where it was.
+        // Superseded: the folders on the way are open, as far as it got before
+        // it was given way to, and the node exists, but the selection, the
+        // view and the history belong to the navigation that came after.
+        // Short of the path, with only the exact path wanted: the message
+        // above has said it is gone, and the selection stays where it was.
         var superseded = taken != LatestRevealOf(holder) || selectionVersion is { } version && version != Selection.Version;
         var isExact = ViewAllPath.Equals(node.FullPath, normalized);
         var acts = !superseded && (isExact || !exact);
@@ -1785,11 +1845,40 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         RebuildRenderSet();
         if (focus && acts)
         {
+            // A light by-name node can be replaced while its ancestors are
+            // expanded for the tree canvas. Keep the focus on the live node
+            // without turning a focus-only reveal into a single selection or
+            // a new navigation (especially when several files are selected).
+            if (!select && Selection.Focus is { } currentFocus && ViewAllPath.Equals(currentFocus, node.FullPath))
+                SetActive(node, records: false);
             FocusNodeRequested?.Invoke(node, true);
         }
 
         ScheduleSave();
         return new RevealOutcome(node, isExact, superseded);
+    }
+
+    /// <summary>
+    /// Says that a path asked for is not there: its drive, or the step of it
+    /// no longer inside the folder the reveal got to - that one handed to
+    /// <paramref name="holdGone"/> instead when there is one (see <see cref="RevealAsync"/>).
+    /// </summary>
+    private void ReportMissing(string missing, ViewAllNodeViewModel? reached, Action<string>? holdGone)
+    {
+        if (reached is null)
+        {
+            MessageRequested?.Invoke("That drive is not available on this machine.", true);
+            return;
+        }
+
+        var message = $"{Path.GetFileName(missing)} is no longer inside {reached.DisplayName}.";
+        if (holdGone is not null)
+        {
+            holdGone(message);
+            return;
+        }
+
+        MessageRequested?.Invoke(message, true);
     }
 
     /// <summary>
@@ -1856,11 +1945,15 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     }
 
     /// <summary>Makes sure a path has a node, without selecting it or moving the canvas.</summary>
-    public async Task<ViewAllNodeViewModel?> MaterializeAsync(string path)
+    public Task<ViewAllNodeViewModel?> MaterializeAsync(string path) => MaterializeAsync(path, holdGone: null);
+
+    /// <param name="path">The path to give a node.</param>
+    /// <param name="holdGone">Handed the message that the path is gone instead of the toast (see <see cref="RevealAsync"/>).</param>
+    private async Task<ViewAllNodeViewModel?> MaterializeAsync(string path, Action<string>? holdGone)
     {
         var node = TryGetNode(path, out var known)
             ? known
-            : await RevealPathAsync(path, focus: false, select: false);
+            : (await RevealAsync(path, focus: false, select: false, holdGone: holdGone)).Node;
         return node is not null && IsExactly(node, path) ? node : null;
     }
 
@@ -1890,15 +1983,47 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         UpdateStatus();
     }
 
-    public void OpenInDefaultApplication(ViewAllNodeViewModel node)
+    /// <summary>
+    /// Opens a file the way a double-click in Explorer does.  Whether it is a
+    /// folder after all is asked on the thread pool, and the Shell is handed
+    /// the file there too: a file on a share that has gone to sleep holds
+    /// whoever asks about it for twenty seconds, and then the Shell for as
+    /// long again, and this thread is every window's.  A folder - a link to
+    /// one, opened as a file - goes to <see cref="NativeShellService.Open"/>
+    /// here, which hands it to this app's own windows when they stand in for
+    /// Explorer.  Nothing is opened for a window closed meanwhile.
+    /// </summary>
+    public void OpenInDefaultApplication(ViewAllNodeViewModel node) => _ = OpenInDefaultApplicationAsync(node);
+
+    private async Task OpenInDefaultApplicationAsync(ViewAllNodeViewModel node)
     {
+        var path = node.FullPath;
         try
         {
-            NativeShellService.Open(node.FullPath);
+            if (await Task.Run(() => Directory.Exists(path)))
+            {
+                if (!_isDisposed)
+                {
+                    NativeShellService.Open(path, isDirectory: true);
+                }
+
+                return;
+            }
+
+            if (_isDisposed)
+            {
+                return;
+            }
+
+            // Off an STA thread the runtime makes one of its own for the Shell.
+            await Task.Run(() => System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(path) { UseShellExecute = true })?.Dispose());
         }
         catch (Exception ex)
         {
-            MessageRequested?.Invoke($"Could not open {node.DisplayName}: {ex.Message}", true);
+            if (!_isDisposed)
+            {
+                MessageRequested?.Invoke($"Could not open {node.DisplayName}: {ex.Message}", true);
+            }
         }
     }
 
@@ -2002,15 +2127,51 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Colours every path given - the selection's, which need not have nodes.</summary>
     public void ApplyAccent(IEnumerable<string> paths, string? accentHex)
     {
-        foreach (var path in paths)
+        BeginMarkBatch();
+        try
         {
-            bool? isDirectory = TryGetNode(path, out var node)
-                ? node.IsDirectory
-                : Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : null;
-            _marks.SetAccent(path, accentHex, isDirectory);
+            foreach (var path in paths)
+            {
+                bool? isDirectory = TryGetNode(path, out var node)
+                    ? node.IsDirectory
+                    : Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : null;
+                _marks.SetAccent(path, accentHex, isDirectory);
+            }
+        }
+        finally
+        {
+            EndMarkBatch();
         }
 
         ScheduleSave();
+    }
+
+    /// <summary>
+    /// How many batches of marks are being changed right now (see
+    /// <see cref="BeginMarkBatch"/>), and whether one of them has recoloured
+    /// a node of the graph.
+    /// </summary>
+    private int _markBatches;
+    private bool _markBatchRecoloured;
+
+    /// <summary>
+    /// Many marks about to change at once - a selection of thousands coloured
+    /// or cleared, a folder renamed with marks inside it.  Each node still
+    /// takes its colour as its mark changes, but the tree canvas's batched
+    /// layers, which are drawn again whole, are told once, after the last
+    /// (<see cref="EndMarkBatch"/>), rather than once a mark.
+    /// </summary>
+    private void BeginMarkBatch() => _markBatches++;
+
+    private void EndMarkBatch()
+    {
+        if (--_markBatches > 0 || !_markBatchRecoloured)
+        {
+            return;
+        }
+
+        _markBatchRecoloured = false;
+        InvalidateCanvas();
     }
 
     public void ApplyNote(ViewAllNodeViewModel node, string? note) => ApplyNote(node.FullPath, note);
@@ -2359,7 +2520,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             for (var index = 0; index < renames.Length; index++)
             {
                 var pair = renames[index];
-                if (NamedAgain(renames, index) is { } again)
+                if (NamedAgain(renames, index, change.Key) is { } again)
                 {
                     if (!string.Equals(again, pair.OldName, StringComparison.Ordinal))
                     {
@@ -2387,8 +2548,11 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// backup that moves on, or a copy that was itself renamed in, is an item
     /// moving - a swap, or a batch rename's shift or its two passes through
     /// temporary names - and the mark and the selection follow the item.
+    /// So is a copy that was selected or marked before the change: an editor's
+    /// copy is a new file nobody has picked yet, and one somebody had is an
+    /// item of its own - a renumber, IMG_2 to IMG_3 and then IMG_1 to IMG_2.
     /// </summary>
-    private static string? NamedAgain(ReadOnlySpan<RenamePair> renames, int index)
+    private string? NamedAgain(ReadOnlySpan<RenamePair> renames, int index, string folder)
     {
         var backup = renames[index].NewName;
         for (var other = 0; other < renames.Length; other++)
@@ -2415,14 +2579,38 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
                 }
             }
 
+            if (WasPicked(Path.Combine(folder, copy)))
+            {
+                return null;
+            }
+
             return renames[later].NewName;
         }
 
         return null;
     }
 
+    /// <summary>Whether <paramref name="path"/> is selected in any pane or carries a mark.</summary>
+    private bool WasPicked(string path)
+    {
+        if (Selection.Contains(path) || !_marks.Get(path).IsEmpty)
+        {
+            return true;
+        }
+
+        foreach (var kept in _keptSelections)
+        {
+            if (kept.Contains(path))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>What <paramref name="path"/> is called once <paramref name="oldPath"/> is <paramref name="newPath"/>: null when it is not that or inside it.</summary>
-    private static string? Renamed(string path, string oldPath, string newPath) =>
+    internal static string? Renamed(string path, string oldPath, string newPath) =>
         string.Equals(path, oldPath, StringComparison.OrdinalIgnoreCase)
             ? newPath
             : path.Length > oldPath.Length
@@ -2484,24 +2672,24 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             FollowRenameIn(kept, oldPath, newPath);
         }
 
-        foreach (var (path, mark) in _marks.Snapshot())
+        BeginMarkBatch();
+        try
         {
-            if (Renamed(path, oldPath, newPath) is not { } moved)
-            {
-                continue;
-            }
-
-            // The old name is let go of before the new one takes the mark.
-            // Marks are kept without regard to case, so after a rename that
-            // only changed the case - Photos to photos - the two names are one
-            // key, and clearing the old name last would clear the mark it had
-            // just been given.  This way round the mark also takes the new
-            // spelling.
-            _marks.SetAccent(path, null);
-            _marks.SetNote(path, null);
-            _marks.SetAccent(moved, mark.AccentHex, mark.IsDirectory);
-            _marks.SetNote(moved, mark.Note);
+            _marks.Move(oldPath, newPath);
         }
+        finally
+        {
+            EndMarkBatch();
+        }
+
+        RenameFollowed?.Invoke(oldPath, newPath);
+    }
+
+    /// <summary>Queues the app's known rename pair before an immediate reread can overtake the watcher.</summary>
+    internal void NoteOwnRename(string oldPath, string newPath)
+    {
+        _changes?.TouchRename(oldPath, newPath);
+        FollowRename(oldPath, newPath);
     }
 
     /// <summary>Renames the selection followed, for tests.</summary>
@@ -2599,6 +2787,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         if ((change.Kinds & ~ChangeKinds.DirDate) == 0 && Orders.SortOf(node.FullPath).Column != SortColumn.Modified)
+        {
+            return;
+        }
+
+        // A folder never read holds only what was brought in by name, and
+        // reading it again is asking the disk about each of those - a log
+        // growing beside four thousand files picked on the nested canvas was
+        // four thousand questions a write.  Only something added, removed or
+        // renamed can have taken one of them away.
+        if (!node.AreChildrenLoaded && (change.Kinds & (ChangeKinds.Structural | ChangeKinds.Gone)) == 0)
         {
             return;
         }
@@ -2902,7 +3100,13 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         node.Note = mark.Note;
 
         // Zoomed out the canvas is one cached geometry per colour, so a recolour
-        // is not visible until it is rebuilt.
+        // is not visible until it is rebuilt - once for a whole batch of marks.
+        if (_markBatches > 0)
+        {
+            _markBatchRecoloured = true;
+            return;
+        }
+
         InvalidateCanvas();
     }
 
@@ -3003,15 +3207,21 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// Gives the focus its node, without selecting anything or moving a
     /// canvas.  While the list is what picked it, the list keeps its folder
     /// meanwhile, as a click on a row always has.  A path found gone is let
-    /// go of, and its folder read again.
+    /// go of, its folder read again, and said to be gone - once, and only
+    /// when the disk says so: a share that did not answer for a moment has
+    /// lost nothing.  The focus goes to the folder with it, as when a
+    /// refresh finds the focus gone (see <see cref="ReleaseRemovedFocus"/>):
+    /// left on the gone path, letting go of it was a change of the selection
+    /// that asked for the path all over again, and said so twice.
     /// </summary>
     private async Task FocusAsync(string path, int ticket, bool records, bool holdList)
     {
         using var hold = holdList ? FolderList.HoldFolder() : null;
         ViewAllNodeViewModel? node;
+        string? gone = null;
         try
         {
-            node = await MaterializeAsync(path);
+            node = await MaterializeAsync(path, message => gone = message);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {
@@ -3029,10 +3239,22 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             // not there: a share that has stopped answering would hold the
             // window up for as long as the network takes to say so, and what
             // is selected in it is not to be let go of meanwhile.
-            if (await IsGoneAsync(path) && !_isDisposed)
+            if (await IsGoneAsync(path) && ticket == _selectTicket && !_isDisposed)
             {
-                Selection.Remove([path], SelectionSource.Command);
-                if (Path.GetDirectoryName(path) is { Length: > 0 } parent)
+                var parent = Path.GetDirectoryName(path);
+                var focused = ViewAllPath.Equals(Selection.Focus ?? string.Empty, path);
+                Selection.Apply(new SelectionEdit
+                {
+                    Removed = [path],
+                    Focus = focused && !string.IsNullOrEmpty(parent) ? parent : null,
+                    Source = SelectionSource.Command
+                });
+                if (gone is not null)
+                {
+                    MessageRequested?.Invoke(gone, true);
+                }
+
+                if (!string.IsNullOrEmpty(parent))
                 {
                     await RefreshPathAsync(parent);
                 }
@@ -3055,7 +3277,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     {
         try
         {
-            _ = File.GetAttributes(path);
+            _ = File.GetAttributes(ViewAllFileSystemService.ForWindows(path));
             return false;
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
@@ -3196,7 +3418,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             AlwaysRealized(viewport),
             viewport,
             _viewportZoom,
-            _visibleNodeCount);
+            _visibleNodeCount,
+            _graph.IncomingEdges);
         PerfLog.Value("renderset.nodes", set.Nodes.Count);
         int pending;
         using (PerfLog.Measure("renderset.sync"))

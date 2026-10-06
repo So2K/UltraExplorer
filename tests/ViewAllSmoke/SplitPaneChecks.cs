@@ -806,6 +806,13 @@ internal static partial class Program
             Check("an item deleted or moved away leaves the other pane's selection too", second.KeptSelection.Count == 0);
 
             // ---- F6, and closing with the second pane worked with ----
+            // Explicit chords are authoritative here. SetKeyboardState is tied
+            // to the active desktop/input queue and cannot reliably make
+            // WPF's global Keyboard.Modifiers report a synthetic physical key
+            // in this inactive test process.
+            var beforeKey = main.ActivePane;
+            Check("an explicitly shifted F6 is not the unmodified pane-switch chord",
+                !PressKey(main, Key.F6, ModifierKeys.Shift) && ReferenceEquals(main.ActivePane, beforeKey));
             PressKey(main, Key.F6);
             Check("F6 goes to the other pane", ReferenceEquals(main.ActivePane, second) && Lit(second));
             PressKey(main, Key.F6);
@@ -1420,10 +1427,16 @@ internal static partial class Program
         return args;
     }
 
-    /// <summary>A key pressed in the window, as the keyboard sends it: down from the window first.</summary>
-    private static void PressKey(Window window, Key key)
-    {
-        using var source = new System.Windows.Interop.HwndSource(new System.Windows.Interop.HwndSourceParameters("UltraExplorer split key check") { ParentWindow = new IntPtr(-3), WindowStyle = 0 });
-        window.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, key) { RoutedEvent = Keyboard.PreviewKeyDownEvent });
-    }
+    /// <summary>
+    /// An owned shortcut with an explicit modifier chord, through the same
+    /// split-key dispatcher the window calls. Raising KeyEventArgs does not
+    /// carry modifiers: that route reads whatever the desktop holds at the
+    /// time and used to turn this fixture's F6 into Shift+F6. This helper
+    /// tests the product's chord routing directly, not physical key injection.
+    /// </summary>
+    private static bool PressKey(Window window, Key key, ModifierKeys modifiers = ModifierKeys.None) =>
+        window is MainWindow main
+            ? main.TryHandleSplitKey(key, modifiers)
+            : throw new ArgumentException("The split shortcut fixture requires its own MainWindow.", nameof(window));
+
 }

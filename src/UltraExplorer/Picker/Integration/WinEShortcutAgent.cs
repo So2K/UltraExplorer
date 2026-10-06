@@ -12,6 +12,9 @@ internal sealed record WinEShortcutStatus(int Process, long Started, bool Ready,
 
 internal static class WinEShortcutAgent
 {
+    /// <summary>Process fallback after the existing-window broker declines; replaceable by isolated checks.</summary>
+    internal static Func<string[], Process> StartHomeProcess { get; set; } = DialogSelfProcess.Start;
+
     internal static void RecordFailure(string error) => DialogIntegrationStore.Update(settings => settings with
     {
         WinEEnabled = false,
@@ -52,16 +55,7 @@ internal static class WinEShortcutAgent
         using var process = Process.GetCurrentProcess();
         var identity = new WinEShortcutStatus(process.Id, process.StartTime.ToUniversalTime().ToFileTimeUtc(), false, null);
         var done = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        using var service = new WinExplorerShortcutService(() =>
-        {
-            if (DialogIntegrationStore.Read().WinEEnabled != true) return;
-            try { using var launched = DialogSelfProcess.Start(FolderCommandLine.HomeSwitch); }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
-            {
-                DialogIntegrationStore.Log("The Win+E folder window could not start", ex);
-                throw; // The service releases the shortcut and reports the launch failure.
-            }
-        });
+        using var service = new WinExplorerShortcutService(LaunchHome);
         var poll = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(200) };
         try
         {
@@ -102,6 +96,25 @@ internal static class WinEShortcutAgent
             service.Dispose();
             Write(identity with { Ready = false, Error = service.LastError });
             mutex.ReleaseMutex();
+        }
+    }
+
+    /// <summary>
+    /// Runs on the shortcut service's queued worker, never its keyboard hook or
+    /// WPF dispatcher.  An existing window gets Home directly; only a missing
+    /// or declining broker needs a launcher process.
+    /// </summary>
+    internal static void LaunchHome()
+    {
+        if (DialogIntegrationStore.Read().WinEEnabled != true) return;
+        if (FastEntryPoint.TryForwardHome()) return;
+        // OFF wins when it races the bounded broker attempt already in flight.
+        if (DialogIntegrationStore.Read().WinEEnabled != true) return;
+        try { using var launched = StartHomeProcess([FolderCommandLine.HomeSwitch]); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+        {
+            DialogIntegrationStore.Log("The Win+E folder window could not start", ex);
+            throw; // WinExplorerShortcutService releases the shortcut and reports the launch failure.
         }
     }
 

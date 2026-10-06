@@ -46,6 +46,11 @@ internal sealed class NativeDialogProxy
     /// <summary>The prepared picker taken for this dialog and put over it, not yet bound (and never shown unbound).</summary>
     private (MainWindow Window, NativeOptionsView Controls, nint Handle)? _placed;
     private nint _placedHandle;
+    private nint _nameEdit;
+    private string? _nameWhenRead;
+    private string? _folderWhenRead;
+    private string? _addressWhenRead;
+    private bool _handoffDelayApplied;
     private NativeOptionsView? _controls;
     private FileDialogSession? _session;
     private Task _pending = Task.CompletedTask;
@@ -128,6 +133,9 @@ internal sealed class NativeDialogProxy
             if (!DialogIntegrationStore.Read().Enabled || !OriginalExists) return;
             if (_recognised == 0 || Stopwatch.GetElapsedTime(_recognised) > TimeSpan.FromMinutes(1)) _recognised = Stopwatch.GetTimestamp();
             var glance = FastDialogRead.Read(_original, PreparedPicker.Names);
+            _nameEdit = glance.NameEdit;
+            _folderWhenRead = glance.Folder;
+            _addressWhenRead = glance.Address;
             bounds = glance.Bounds;
             // The dialog's own thread answers the Win32 details before UI
             // Automation adds its traffic to that thread; the full read then
@@ -180,6 +188,8 @@ internal sealed class NativeDialogProxy
                 || DialogIntegrationStore.IsExcluded(_snapshot.ApplicationPath) || !InFront())
             { DialogIntegrationStore.Log($"{Application}: its dialog is no longer in front; it stays with Windows."); return; }
             var request = NativeDialogRules.RequestFor(_snapshot);
+            _nameWhenRead ??= _snapshot.FileName;
+            _folderWhenRead ??= _snapshot.Folder;
             if (_window is not null)
             {
                 var shown = !double.IsNaN(_frameMs);
@@ -191,7 +201,7 @@ internal sealed class NativeDialogProxy
                 if (!shown)
                 {
                     await _window.WhenFolderDrawnAsync(TimeSpan.FromMilliseconds(1500));
-                    if (!Uncloak()) { DialogIntegrationStore.Log($"{Application}: its dialog is no longer in front; it stays with Windows."); return; }
+                    if (!await UncloakAsync()) { DialogIntegrationStore.Log($"{Application}: its dialog is no longer in front or has changed; it stays with Windows."); return; }
                 }
             }
             else if ((_placed ?? _prepared?.Take()) is { } prepared)
@@ -199,7 +209,7 @@ internal sealed class NativeDialogProxy
                 _placed = null;
                 _path = "prepared";
                 await BindPreparedAsync(prepared, new FileDialogSession(request), TimeSpan.FromMilliseconds(1500));
-                if (!Uncloak()) { DialogIntegrationStore.Log($"{Application}: its dialog is no longer in front; it stays with Windows."); return; }
+                if (!await UncloakAsync()) { DialogIntegrationStore.Log($"{Application}: its dialog is no longer in front or has changed; it stays with Windows."); return; }
             }
             if (_fallback) return;
 
@@ -215,6 +225,10 @@ internal sealed class NativeDialogProxy
             if (_lease is null) { await HandBackEarlyAsync(result); return; }
             if (!DialogLease.BelongsToWindow(_lease.Record)) return;
             await _pending.WaitAsync(TimeSpan.FromSeconds(8));
+            if (_fallback || !DialogLease.BelongsToWindow(_lease.Record)) return;
+            if (result.Accepted)
+                await FromDialogAsync(_thread.Run(() => { _automation!.PrepareSubmit(result); return true; }).WaitAsync(TimeSpan.FromSeconds(4)),
+                    "the answer could not be handed to its dialog");
             if (_fallback || !DialogLease.BelongsToWindow(_lease.Record)) return;
             // The original window is visible before the application can open
             // any overwrite/sharing/custom warning. Native validation is final.
@@ -347,6 +361,7 @@ internal sealed class NativeDialogProxy
         catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
         Stage("details");
         if (details is null || (glance.Mode != FileDialogMode.PickFolder && details.Filters is not { Length: > 0 })) return null;
+        _nameWhenRead = details.FileName;
         return (application, details);
     }
 
@@ -366,7 +381,7 @@ internal sealed class NativeDialogProxy
         // Its footer already names the application (see ReadEarlyAsync).
         _controls = prepared.Controls;
         // On screen now only with the folder drawn; otherwise after the full read.
-        if (await BindPreparedAsync(prepared, new FileDialogSession(request.Normalize()), TimeSpan.FromMilliseconds(700))) Uncloak();
+        if (await BindPreparedAsync(prepared, new FileDialogSession(request.Normalize()), TimeSpan.FromMilliseconds(700))) await UncloakAsync();
     }
 
     /// <summary>
@@ -411,21 +426,15 @@ internal sealed class NativeDialogProxy
     /// disabled until the contract is confirmed. False, and nothing shown,
     /// when the dialog is no longer in front or already found not mirrorable.
     /// </summary>
-    private bool Uncloak()
+    private async Task<bool> UncloakAsync()
     {
         if (_fallback || _window is null || _window.PickerResult.IsCompleted || !OriginalExists || !InFront()
             || (_lease is not null && (!_lease.IsProtected || !DialogLease.BelongsToWindow(_lease.Record)))
             || _capture is { IsFaulted: true } or { IsCanceled: true }) return false;
-        // Under a lease the original goes from the screen only now, as the
-        // picker comes over it.
-        if (_lease is not null)
-        {
-            if (!DialogNative.IsHidden(_original) && !DialogNative.Hide(_original)) return false;
-            _hidden = true;
-        }
-        // The frame drawn while cloaked is composed; the uncloak shows it,
-        // over the original (still cloaked, so its first frame is over it).
-        DialogNative.WaitForComposition();
+        if (!await OriginalNameUnchangedAsync()) return false;
+        // Prepare z-order while cloaked, then compose the picker above the
+        // still-visible original. Hiding/flushing the original first exposes
+        // the owner/desktop for a frame on a fast monitor.
         if (!DialogNative.RaiseAbove(_handle, _original))
         {
             DialogIntegrationStore.Log($"{Application}: the picker could not be put over its dialog.");
@@ -433,13 +442,62 @@ internal sealed class NativeDialogProxy
         }
         DialogNative.CloakOwn(_handle, false);
         DialogNative.WaitForComposition();
+        if (_lease is not null)
+        {
+            if (!_lease.IsProtected || !DialogLease.BelongsToWindow(_lease.Record)
+                || (!DialogNative.IsHidden(_original) && !DialogNative.Hide(_original)))
+            {
+                ReturnToWindows();
+                return false;
+            }
+            _hidden = true;
+            DialogNative.WaitForComposition();
+        }
         _frameMs = Since;
         CaptureRootDiagnostics();
         HandKeyboardOver();
         StartPulse();
-        // The tree behind the canvas is watched on disk once the frame is out.
         var window = _window;
         _ = window.Dispatcher.InvokeAsync(window.WatchChanges, DispatcherPriority.Background);
+        return true;
+    }
+
+    private async Task<bool> OriginalNameUnchangedAsync()
+    {
+        // A fixture-only pause makes typing during preparation deterministic;
+        // ordinary applications have no delay or extra folder enumeration.
+        if (!_handoffDelayApplied && IsFixture && int.TryParse(Environment.GetEnvironmentVariable("ULTRAEXPLORER_DIALOG_TEST_HANDOFF_DELAY_MS"),
+                out var delay) && delay is > 0 and <= 15000)
+        {
+            _handoffDelayApplied = true;
+            await Task.Delay(delay);
+        }
+        string? currentName;
+        try
+        {
+            currentName = await Task.Run(() => FastDialogRead.ReadName(_nameEdit, TimeSpan.FromMilliseconds(80)))
+                .WaitAsync(TimeSpan.FromMilliseconds(200));
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            currentName = null;
+        }
+        if (_fallback || _window?.PickerResult.IsCompleted == true || !OriginalExists || !InFront()
+            || (_lease is not null && (!_lease.IsProtected || !DialogLease.BelongsToWindow(_lease.Record)))) return false;
+        // Navigation can leave the same filename in a different directory.
+        // Read the live address without filesystem I/O; do not let a stale
+        // early glance move the user back to the folder they have left.
+        var live = FastDialogRead.Read(_original, PreparedPicker.Names);
+        var folderChanged = live.NameEdit != _nameEdit
+            || live.Folder is { } liveFolder && _folderWhenRead is { } boundFolder
+                && !Models.ViewAllPath.Equals(liveFolder, boundFolder)
+            || !string.Equals(live.Address, _addressWhenRead, StringComparison.Ordinal);
+        if (folderChanged || currentName is null || _nameWhenRead is null || !string.Equals(currentName, _nameWhenRead, StringComparison.Ordinal))
+        {
+            DialogIntegrationStore.Log($"{Application}: the original name or folder changed or could not be verified before handoff; it stays with Windows.");
+            ReturnToWindows();
+            return false;
+        }
         return true;
     }
 
@@ -548,6 +606,7 @@ internal sealed class NativeDialogProxy
         return ShowAsync();
         async Task ShowAsync()
         {
+            if (!await OriginalNameUnchangedAsync()) return;
             _lease = await DialogLease.ArmAsync(_original);
             _lastRefresh = Environment.TickCount64;
             StartPulse();
@@ -606,6 +665,16 @@ internal sealed class NativeDialogProxy
         // dialog it replaces did; its own placement already put it elsewhere.
         if (!DialogNative.MayActivate && monitor.Primary) return;
         var bounds = NativeDialogRules.ProxyBounds(original, monitor.Work, monitor.Scale);
+        // The window's minimum was fitted to the monitor it was made on; a
+        // prepared picker put over a dialog on a shorter one (1080p at 175 %)
+        // would keep it, and its OK and Cancel would hang below the work
+        // area. Fitted again to what this placement holds.
+        if (HwndSource.FromHwnd(handle)?.RootVisual is Window window)
+        {
+            var scale = monitor.Scale is > 0.5 and < 8 ? monitor.Scale : 1;
+            window.MinWidth = Math.Min(window.MinWidth, Math.Floor(bounds.Width / scale));
+            window.MinHeight = Math.Min(window.MinHeight, Math.Floor(bounds.Height / scale));
+        }
         // Twice: a move onto a monitor of another scale makes the window
         // rescale itself to what it was on the old one (WM_DPICHANGED); the
         // second call, on the right monitor already, sets the size meant.
@@ -632,10 +701,11 @@ internal sealed class NativeDialogProxy
     private bool InFront() => IsFixture || DialogNative.IsForegroundDialog(_original)
         || (_handle != 0 && DialogNative.GetForegroundWindow() == _handle);
 
-    private void OnPresented(object? sender, EventArgs e)
+    private async void OnPresented(object? sender, EventArgs e)
     {
         if (_window is null || _lease is null || _fallback) return;
         _window.ContentRendered -= OnPresented;
+        if (!await OriginalNameUnchangedAsync()) return;
         // The frame just rendered reaches the screen before the original goes.
         DialogNative.WaitForComposition();
         _frameMs = Since;

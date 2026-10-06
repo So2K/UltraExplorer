@@ -104,6 +104,7 @@ public partial class MainWindow : INestedPaneHost
 
         _viewModel.PropertyChanged += OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged += OnTreePropertyChangedForNested;
+        _viewModel.Tree.FoldersHiddenByUser += OnFoldersHiddenByUserForNested;
         _viewModel.Tree.DeepRefreshRequested += OnTreeDeepRefreshRequested;
         _viewModel.Tree.DriveAdded += OnDriveAddedForNested;
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
@@ -123,6 +124,7 @@ public partial class MainWindow : INestedPaneHost
         _viewModel.ShownSelectionCount = null;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
+        _viewModel.Tree.FoldersHiddenByUser -= OnFoldersHiddenByUserForNested;
         _viewModel.Tree.DeepRefreshRequested -= OnTreeDeepRefreshRequested;
         _viewModel.Tree.DriveAdded -= OnDriveAddedForNested;
         _viewModel.QuickAccess.CollectionChanged -= OnBeaconSourceChanged;
@@ -336,21 +338,37 @@ public partial class MainWindow : INestedPaneHost
         ActivePane.Enter(fromStartup);
     }
 
-    /// <summary>A share or distribution the workspace lists answered after the start: the nested canvas shows it too.</summary>
+    /// <summary>
+    /// A share or distribution the workspace lists answered after the start:
+    /// the nested canvas shows it too, and a camera the last session left in
+    /// it is put back, as for a drive that answered late (see
+    /// <see cref="OnDriveAddedForNested"/>).  Shares are only looked for once
+    /// the window is up, so a camera left in one always waits for it.
+    /// </summary>
     private void OnExtraRootAdded(ViewAllNodeViewModel root)
     {
         if (_nestedReady)
         {
             SyncNestedRoots();
+            foreach (var pane in _panes)
+            {
+                pane.DriveArrived(root.FullPath);
+            }
+
+            // The colours, notes and pins in it were looked for before it
+            // answered, found nowhere, and set aside until the beacons are
+            // gathered again.
+            ScheduleBeacons();
         }
     }
 
     /// <summary>
     /// A drive that had not answered as the window started has, and the tree
     /// has it now: it joins the canvas's drives where a start that waited for
-    /// it would have put it, named as the tree names it, and a camera the
-    /// last session left on it is put back.  Before the canvas copied the
-    /// tree's drives, the copy takes it in.  Once the drives have been listed
+    /// it would have put it, named as the tree names it, a camera the last
+    /// session left on it is put back, and the marks on it are drawn.
+    /// Before the canvas copied the tree's drives, the copy takes it in.
+    /// Once the drives have been listed
     /// again for a volume arriving or leaving, that listing is newer than this
     /// answer, and stands.
     /// </summary>
@@ -378,6 +396,10 @@ public partial class MainWindow : INestedPaneHost
             {
                 pane.DriveArrived(drive.FullPath);
             }
+
+            // Its colours, notes and pins, looked for before it answered and
+            // set aside as nowhere, are looked for again.
+            ScheduleBeacons();
         }
     }
 
@@ -456,6 +478,11 @@ public partial class MainWindow : INestedPaneHost
     // and every other change reaches the active pane's canvas, in
     // MainWindow.Selection.cs.
 
+    private void OnFoldersHiddenByUserForNested(IReadOnlyList<string> paths)
+    {
+        foreach (var pane in _panes) pane.Tree.HideFromCanvas(paths);
+    }
+
     private void OnTreePropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
     {
         switch (e.PropertyName)
@@ -530,7 +557,15 @@ public partial class MainWindow : INestedPaneHost
                 foreach (var pane in _panes)
                 {
                     pane.Canvas.ShowFavoriteLinks = _viewModel.ShowFavoriteLinks;
-                    pane.RebuildBeacons();
+
+                    // Said as the workspace is read, before the pane has its
+                    // drives: it gathers its beacons once it has them (see
+                    // NestedPane.Initialize), and every mark gathered and
+                    // looked for in an empty tree now would be for nothing.
+                    if (pane.IsReady)
+                    {
+                        pane.RebuildBeacons();
+                    }
                 }
                 break;
         }
@@ -579,7 +614,10 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>
     /// Back to the tree: what is selected was only brought in by name, so it
     /// is revealed properly - its folders opened - before the tree is shown,
-    /// and the reveal itself brings it into view.
+    /// and the reveal itself brings it into view.  Revealed without being
+    /// selected again: that would cut a selection of several items down to
+    /// the one with the focus, and stand in for a navigation still on its way
+    /// as one of its own.
     ///
     /// <para>With a folder of thousands on the way the reveal takes a while,
     /// and the nested canvas may be back before it is done: the tree was only
@@ -600,7 +638,7 @@ public partial class MainWindow : INestedPaneHost
         {
             if (!string.IsNullOrEmpty(tree.ActivePath))
             {
-                await tree.RevealPathAsync(tree.ActivePath);
+                await tree.RevealPathAsync(tree.ActivePath, focus: true, select: false);
             }
         }
         finally

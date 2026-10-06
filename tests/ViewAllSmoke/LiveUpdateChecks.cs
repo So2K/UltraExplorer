@@ -32,8 +32,59 @@ internal static partial class Program
         RunOnSta("live updates in the canvas's frame", LiveFrameChecks);
         RunOnSta("live updates when polled", LivePollChecks);
         RunOnSta("live updates when a watch is down", LivePollDownChecks);
+        RunOnSta("live updates armed before their window", LiveDeviceBeforeWindowChecks);
         RunOnSta("live updates for a drive about to go", LiveDeviceChecks);
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A slow startup can arm local-volume watches before WPF creates its
+    /// HWND. Giving those roots their window registers each once without
+    /// mutating the waiting-list enumeration, and disposal unregisters it.
+    /// </summary>
+    private static async Task LiveDeviceBeforeWindowChecks()
+    {
+        var baseDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerLiveBeforeWindow", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(baseDirectory);
+        HwndSource? window = null;
+        try
+        {
+            using var hub = new ChangeHub(TimeProvider.System);
+            var notifications = new VolumeNotifications(hub, System.Windows.Threading.Dispatcher.CurrentDispatcher);
+            try
+            {
+                var root = hub.RootFor(baseDirectory);
+                Check("the pre-window fixture gets a local-volume watch", root is { Kind: WatchKind.Local });
+                if (root is null)
+                {
+                    return;
+                }
+
+                var waiting = await LiveWait(() => root.Handle is { IsInvalid: false, IsClosed: false }
+                    && notifications.WaitingForWindowCount == 1, 3_000) >= 0;
+                Check("an armed root waits for the HWND instead of losing its device notification", waiting);
+                window = new HwndSource(new HwndSourceParameters("UltraExplorer pre-window device check")
+                {
+                    ParentWindow = new IntPtr(-3),
+                    WindowStyle = 0
+                });
+                notifications.SetWindow(window.Handle);
+                Check("giving the HWND registers the waiting root once and drains the startup queue",
+                    notifications.WaitingForWindowCount == 0 && notifications.RegisteredCount == 1
+                    && notifications.Registrations == 1 && ReferenceEquals(notifications.RegisteredHandleFor(root), root.Handle));
+                notifications.Dispose();
+                Check("disposing after startup unregisters the real OS notification", notifications.RegisteredCount == 0);
+            }
+            finally
+            {
+                notifications.Dispose();
+            }
+        }
+        finally
+        {
+            window?.Dispose();
+            TryDelete(baseDirectory);
+        }
     }
 
     /// <summary>

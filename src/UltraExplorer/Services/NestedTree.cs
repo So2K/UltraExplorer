@@ -372,6 +372,7 @@ public sealed partial class NestedTree : IDisposable
     /// A case-sensitive folder (a WSL tree) can hold names that differ in case
     /// alone, "Build" and "build": the one spelt exactly as asked is the one
     /// meant, and only a name spelt like neither takes the first of them.
+    /// The name of one of its files is not scanned for.
     /// </summary>
     internal static NestedFolder? FindChild(NestedFolder folder, string name)
     {
@@ -426,6 +427,16 @@ public sealed partial class NestedTree : IDisposable
                 {
                     high = middle - 1;
                 }
+            }
+
+            // A name that is one of the folder's files is no sub-folder's - a
+            // folder cannot hold a file and a folder of one name - and the
+            // path of a file always comes this way: a file's beacon, looked
+            // up every frame, scanned all twenty-five thousand sub-folders of
+            // its folder for nothing.  Its files are in name order too.
+            if (SearchFiles(folder.AllFiles, name) >= 0)
+            {
+                return null;
             }
         }
 
@@ -641,9 +652,23 @@ public sealed partial class NestedTree : IDisposable
     /// <summary>
     /// A path as the tree keys it: the one spelling every map uses, a name
     /// ending in a dot or a space included (see <see cref="ViewAllPath.KeepNameEnds"/>).
+    /// A path with a '~' in it that is spelt that way already - a folder's
+    /// own path, as every mark, beacon and selection hands it back - is
+    /// taken as it is: normalising it would change nothing, and a '~'
+    /// anywhere makes <see cref="Path.GetFullPath(string)"/> ask the file
+    /// system for the long form of every name on the way, in case one is a
+    /// short 8.3 alias - about a millisecond a look on a local disk, a round
+    /// trip per name on a share, and the beacons look theirs up every frame.
+    /// One with a name that may be such an alias ("PROGRA~1") is normalised
+    /// as ever.
     /// </summary>
     private static string Key(string path)
     {
+        if (path.Contains('~') && IsKeyedAlready(path))
+        {
+            return path;
+        }
+
         try
         {
             return ViewAllPath.Normalize(path);
@@ -652,5 +677,87 @@ public sealed partial class NestedTree : IDisposable
         {
             return path;
         }
+    }
+
+    /// <summary>
+    /// Whether <see cref="ViewAllPath.Normalize"/> would give <paramref name="path"/>
+    /// back as it is but for expanding short names, and no name in it may be
+    /// one: a drive's path (<c>C:\a\b</c>) or a share's (<c>\\server\share\a</c>),
+    /// with single backslashes between names, none of them "." or "..", none
+    /// ending in a dot or a space, none a device's (<c>CON</c>, <c>NUL</c>...),
+    /// and none shaped like a short name Windows makes - at most eight
+    /// characters ending in '~' and a number, with at most three after a dot.
+    /// Anything else is left to <see cref="ViewAllPath.Normalize"/>.
+    /// </summary>
+    private static bool IsKeyedAlready(string path)
+    {
+        int start;
+        if (path.Length > 3 && char.IsAsciiLetter(path[0]) && path[1] == ':' && path[2] == '\\')
+        {
+            start = 3;
+        }
+        else if (path.Length > 4 && path[0] == '\\' && path[1] == '\\' && path[2] is not ('\\' or '?' or '.'))
+        {
+            start = 2;
+        }
+        else
+        {
+            return false;
+        }
+
+        var names = 0;
+        var remaining = path.AsSpan(start);
+        while (true)
+        {
+            var end = remaining.IndexOf('\\');
+            var name = end < 0 ? remaining : remaining[..end];
+            if (name.IsEmpty || name is "." or ".." || name[^1] == '.' || char.IsWhiteSpace(name[^1])
+                || name.IndexOfAny('/', ':', '"') >= 0 || IsDeviceName(name) || MayBeShortName(name))
+            {
+                return false;
+            }
+
+            names++;
+            if (end < 0)
+            {
+                break;
+            }
+
+            remaining = remaining[(end + 1)..];
+        }
+
+        // A share's path holds its server and its share at least.
+        return start == 3 || names >= 2;
+    }
+
+    /// <summary>Whether a name is shaped like a short name Windows makes: "PROGRA~1", "AB12C~10.TXT".</summary>
+    private static bool MayBeShortName(ReadOnlySpan<char> name)
+    {
+        var dot = name.IndexOf('.');
+        var stem = dot < 0 ? name : name[..dot];
+        if (stem.Length > 8 || dot >= 0 && (name.Length - dot - 1 > 3 || name[(dot + 1)..].Contains('.')))
+        {
+            return false;
+        }
+
+        var tilde = stem.LastIndexOf('~');
+        return tilde >= 0 && tilde < stem.Length - 1 && !stem[(tilde + 1)..].ContainsAnyExceptInRange('0', '9');
+    }
+
+    /// <summary>Whether a name, up to its first dot, is one Windows keeps for a device.</summary>
+    private static bool IsDeviceName(ReadOnlySpan<char> name)
+    {
+        var dot = name.IndexOf('.');
+        var stem = (dot < 0 ? name : name[..dot]).TrimEnd(' ');
+        if (stem.Length is < 3 or > 7)
+        {
+            return false;
+        }
+
+        return stem.Equals("CON", StringComparison.OrdinalIgnoreCase) || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+            || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase) || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase)
+            || stem.Equals("CONIN$", StringComparison.OrdinalIgnoreCase) || stem.Equals("CONOUT$", StringComparison.OrdinalIgnoreCase)
+            || stem.Length == 4 && (stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase))
+                && (char.IsAsciiDigit(stem[3]) || stem[3] is '\u00B9' or '\u00B2' or '\u00B3');
     }
 }

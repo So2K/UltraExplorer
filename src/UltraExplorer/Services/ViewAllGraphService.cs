@@ -82,6 +82,23 @@ public sealed class ViewAllGraphService : IDisposable
     internal static readonly TimeSpan DriveAnswerWait = TimeSpan.FromSeconds(1);
 
     /// <summary>
+    /// Drives found slow to answer, by every graph in the process, by root:
+    /// the question still out, or when one that was not waited for answered
+    /// not ready.  Each new window - Explorer's replacement, Win+E, a dialog's
+    /// picker - waited the whole <see cref="DriveAnswerWait"/> again for a
+    /// drive mapped to a server that is off, and asked it again besides; now
+    /// it takes the question still out instead, and waits for neither (see
+    /// <see cref="AddDriveRootsAsync"/>).
+    /// </summary>
+    private static readonly Dictionary<string, SlowDrive> SlowDrives = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How long a drive that answered not ready, too late to be waited for, is still taken for slow: a drive back meanwhile answers its next question at once, and comes in as soon as it does.</summary>
+    internal static readonly TimeSpan SlowDriveMemory = TimeSpan.FromMinutes(10);
+
+    /// <summary>A drive found slow: its question still out, or answered not ready at <see cref="NotReadySince"/>.</summary>
+    private sealed record SlowDrive(Task<ViewAllEntryDescriptor?> Answer, DateTime? NotReadySince);
+
+    /// <summary>
     /// What refreshes of a folder still under way owe it: the sub-folders that
     /// were open before, to be opened again once the folder has been read.  By
     /// the folder's path, and shared by every refresh of it in flight - a
@@ -112,9 +129,14 @@ public sealed class ViewAllGraphService : IDisposable
     /// separately indexed and announced - the index is rebuilt in one go after.</summary>
     private bool _arranging;
 
-    /// <summary>Depth of nested <see cref="SuspendLayout"/> scopes.</summary>
-    private int _layoutSuspended;
-    private bool _layoutPending;
+    /// <summary>
+    /// The innermost <see cref="SuspendLayout"/> scope of the operation under
+    /// way, if it holds one.  It flows with that operation across its awaits
+    /// and into what it calls, and nowhere else: a refresh holds the layout
+    /// back while it reads its sub-folders again, and a folder opened by the
+    /// user meanwhile is still laid out at once.
+    /// </summary>
+    private readonly AsyncLocal<LayoutScope?> _layoutScope = new();
     private bool _disposed;
 
     /// <summary>The node the layout pass under way is to keep in view, if any (see <see cref="ReflowAnchoredOn"/>).</summary>
@@ -143,6 +165,9 @@ public sealed class ViewAllGraphService : IDisposable
     public IReadOnlyList<ViewAllNodeViewModel> Nodes => _nodes;
 
     public IReadOnlyList<ViewAllEdgeViewModel> Edges => _edges;
+
+    /// <summary>Existing incoming-edge index, used to cull work as well as pixels.</summary>
+    internal IReadOnlyDictionary<Guid, ViewAllEdgeViewModel> IncomingEdges => _incomingEdges;
 
     public IReadOnlyList<ViewAllNodeViewModel> Roots => _roots;
 
@@ -362,14 +387,47 @@ public sealed class ViewAllGraphService : IDisposable
     /// each that has answered ready within <see cref="DriveAnswerWait"/> is
     /// made a root, in name order, as a start that waited for every drive
     /// made them; the rest are left to answer in their own time
-    /// (<see cref="_pendingDrives"/>).
+    /// (<see cref="_pendingDrives"/>).  A drive another start in the process
+    /// already found slow (<see cref="SlowDrives"/>) is not waited for: its
+    /// question still out is taken over, and it comes in, or is passed over,
+    /// when that answers.
     /// </summary>
     private async Task AddDriveRootsAsync(CancellationToken cancellationToken)
     {
-        var drives = _fileSystem.AskDriveRoots(cancellationToken);
+        var asked = _fileSystem.AskDriveRoots(cancellationToken);
+        var drives = new List<(string Path, Task<ViewAllEntryDescriptor?> Answer)>(asked.Count);
+        var slow = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        lock (SlowDrives)
+        {
+            foreach (var (path, answer) in asked)
+            {
+                if (SlowDrives.TryGetValue(path, out var known))
+                {
+                    if (!known.Answer.IsCompleted)
+                    {
+                        slow.Add(path);
+                        drives.Add((path, known.Answer));
+                        continue;
+                    }
+
+                    if (known.NotReadySince is { } since && DateTime.UtcNow - since < SlowDriveMemory)
+                    {
+                        slow.Add(path);
+                    }
+                    else
+                    {
+                        SlowDrives.Remove(path);
+                    }
+                }
+
+                drives.Add((path, answer));
+            }
+        }
+
         try
         {
-            await Task.WhenAll(drives.Select(drive => drive.Answer)).WaitAsync(DriveAnswerWait, cancellationToken);
+            await Task.WhenAll(drives.Where(drive => !slow.Contains(drive.Path)).Select(drive => drive.Answer))
+                .WaitAsync(DriveAnswerWait, cancellationToken);
         }
         catch (TimeoutException)
         {
@@ -384,12 +442,69 @@ public sealed class ViewAllGraphService : IDisposable
             if (!answer.IsCompleted)
             {
                 _pendingDrives[path] = answer;
+                RememberSlowDrive(path, answer);
+                continue;
             }
-            else if (answer.Result is { } entry)
+
+            if (answer.Result is { } entry)
             {
+                // One taken for slow that has answered ready all the same is
+                // back: the next start waits for it as for any other.
+                if (slow.Contains(path))
+                {
+                    lock (SlowDrives)
+                    {
+                        SlowDrives.Remove(path);
+                    }
+                }
+
                 RestorePosition(CreateNode(entry, depth: 0, parent: null));
             }
         }
+    }
+
+    /// <summary>
+    /// Notes a drive whose question start-up went on without (see
+    /// <see cref="SlowDrives"/>), for the next start in the process to take
+    /// over: until it answers, then - answered not ready - for
+    /// <see cref="SlowDriveMemory"/>.  One that answers ready, or fails, is
+    /// asked afresh and waited for as ever by the next start.
+    /// </summary>
+    private static void RememberSlowDrive(string path, Task<ViewAllEntryDescriptor?> answer)
+    {
+        lock (SlowDrives)
+        {
+            if (SlowDrives.TryGetValue(path, out var known) && ReferenceEquals(known.Answer, answer))
+            {
+                return;
+            }
+
+            SlowDrives[path] = new SlowDrive(answer, NotReadySince: null);
+        }
+
+        _ = answer.ContinueWith(
+            done =>
+            {
+                lock (SlowDrives)
+                {
+                    if (!SlowDrives.TryGetValue(path, out var known) || !ReferenceEquals(known.Answer, done))
+                    {
+                        return;
+                    }
+
+                    if (done.IsCompletedSuccessfully && done.Result is null)
+                    {
+                        SlowDrives[path] = known with { NotReadySince = DateTime.UtcNow };
+                    }
+                    else
+                    {
+                        SlowDrives.Remove(path);
+                    }
+                }
+            },
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -441,10 +556,7 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         var root = CreateNode(entry, depth: 0, parent: null);
-        _roots.Remove(root);
-        var place = _roots.FindIndex(other => !other.IsDrive
-            || string.Compare(other.FullPath, root.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
-        _roots.Insert(place < 0 ? _roots.Count : place, root);
+        PlaceAmongDrives(root);
         RestorePosition(root);
         Reflow();
         GraphChanged?.Invoke(this, EventArgs.Empty);
@@ -463,6 +575,15 @@ public sealed class ViewAllGraphService : IDisposable
         }
 
         return root;
+    }
+
+    /// <summary>Moves a drive just made a root to where a start that found it would have put it: among the drives, in name order, ahead of every share and distribution.</summary>
+    private void PlaceAmongDrives(ViewAllNodeViewModel root)
+    {
+        _roots.Remove(root);
+        var place = _roots.FindIndex(other => !other.IsDrive
+            || string.Compare(other.FullPath, root.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
+        _roots.Insert(place < 0 ? _roots.Count : place, root);
     }
 
     /// <summary>The drive start-up went on without whose root is <paramref name="path"/>, if it has not answered or not been taken in yet.</summary>
@@ -669,9 +790,9 @@ public sealed class ViewAllGraphService : IDisposable
     /// </summary>
     private void Reflow()
     {
-        if (_layoutSuspended > 0)
+        if (_layoutScope.Value is { IsOpen: true } scope)
         {
-            _layoutPending = true;
+            scope.Pending = true;
             return;
         }
 
@@ -779,32 +900,54 @@ public sealed class ViewAllGraphService : IDisposable
     /// Holds the layout back until the scope closes.  Restoring a saved session
     /// expands dozens of folders one after another; laying the tree out once at
     /// the end is the difference between one pass and dozens.
+    ///
+    /// <para>Held back for the operation that takes the scope only, through
+    /// every await of it (see <see cref="_layoutScope"/>).  A count for the
+    /// whole graph held it back for everything else as well: a folder opened
+    /// while another was being read again got no places until the other's
+    /// last sub-folder had been read, and then jumped into place.</para>
     /// </summary>
     private IDisposable SuspendLayout() => new LayoutScope(this);
 
     private sealed class LayoutScope : IDisposable
     {
         private readonly ViewAllGraphService _graph;
-        private bool _closed;
+
+        /// <summary>The scope of the same operation this one is inside, which a pass held back here is handed on to.</summary>
+        private readonly LayoutScope? _outer;
 
         public LayoutScope(ViewAllGraphService graph)
         {
             _graph = graph;
-            _graph._layoutSuspended++;
+            _outer = graph._layoutScope.Value is { IsOpen: true } outer ? outer : null;
+            graph._layoutScope.Value = this;
         }
+
+        public bool IsOpen { get; private set; } = true;
+
+        /// <summary>Whether a layout pass was held back while the scope was open.</summary>
+        public bool Pending { get; set; }
 
         public void Dispose()
         {
-            if (_closed)
+            if (!IsOpen)
             {
                 return;
             }
 
-            _closed = true;
-            _graph._layoutSuspended--;
-            if (_graph._layoutSuspended == 0 && _graph._layoutPending)
+            IsOpen = false;
+            _graph._layoutScope.Value = _outer;
+            if (!Pending)
             {
-                _graph._layoutPending = false;
+                return;
+            }
+
+            if (_outer is { IsOpen: true } outer)
+            {
+                outer.Pending = true;
+            }
+            else
+            {
                 _graph.Reflow();
             }
         }
@@ -853,10 +996,29 @@ public sealed class ViewAllGraphService : IDisposable
     /// what Load more had brought into the folder before it was read again,
     /// so that a refresh keeps it (see <see cref="RefreshBranchAsync"/>).
     /// </param>
-    public async Task<ViewAllExpansionResult> ExpandAsync(
+    public Task<ViewAllExpansionResult> ExpandAsync(
         ViewAllNodeViewModel node,
         CancellationToken cancellationToken = default,
         int childLimit = 0)
+        => ExpandAsync(node, cancellationToken, childLimit, open: true);
+
+    /// <param name="open">
+    /// False to read the folder without opening it, as a refresh asked to
+    /// leave a closed folder closed does (see <see cref="RefreshBranchAsync"/>):
+    /// its children are made off the tree, as a closed folder's are, and one
+    /// already read is left as it is.
+    /// </param>
+    /// <param name="preRead">
+    /// What the folder holds, already read by a refresh before it took the
+    /// branch down (see <see cref="RefreshBranchAsync"/>), read with
+    /// <paramref name="childLimit"/>: put in without asking the disk again.
+    /// </param>
+    private async Task<ViewAllExpansionResult> ExpandAsync(
+        ViewAllNodeViewModel node,
+        CancellationToken cancellationToken,
+        int childLimit,
+        bool open,
+        ViewAllDirectorySnapshot? preRead = null)
     {
         ThrowIfDisposed();
         if (!CanExpand(node))
@@ -866,6 +1028,11 @@ public sealed class ViewAllGraphService : IDisposable
 
         if (node.AreChildrenLoaded)
         {
+            if (!open)
+            {
+                return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
+            }
+
             // Closed while the options changed: read again under the new
             // ones, with what was open below it opened again.
             if (_staleRoots.Remove(node))
@@ -893,12 +1060,10 @@ public sealed class ViewAllGraphService : IDisposable
         // disposed source for its token throws, and nothing up the chain of
         // callers would catch that.
         var token = loadCancellation.Token;
-        var readOptions = childLimit > Options.SafeMaximumChildren
-            ? Options with { MaximumChildrenPerFolder = Math.Min(childLimit, ViewAllGraphOptions.MaximumChildrenCeiling) }
-            : Options;
+        var readOptions = ReadOptionsFor(childLimit);
         try
         {
-            var snapshot = await _fileSystem.GetChildrenAsync(node.FullPath, readOptions, token, _layout.SortFor(node.FullPath));
+            var snapshot = preRead ?? await _fileSystem.GetChildrenAsync(node.FullPath, readOptions, token, _layout.SortFor(node.FullPath));
             token.ThrowIfCancellationRequested();
 
             // A folder the graph let go of while it was being read - the
@@ -912,11 +1077,23 @@ public sealed class ViewAllGraphService : IDisposable
             ApplySnapshot(node, snapshot, added);
 
             node.AreChildrenLoaded = true;
-            node.IsExpanded = true;
+            if (open)
+            {
+                node.IsExpanded = true;
+            }
+
             node.IsTruncated = snapshot.IsTruncated;
             node.ChildLoadLimit = readOptions.SafeMaximumChildren;
             node.NotifyChildrenChanged();
-            ShowOrHideLoadedBranch(node);
+            if (node.IsExpanded)
+            {
+                ShowOrHideLoadedBranch(node);
+            }
+            else
+            {
+                HideDescendants(node);
+            }
+
             ReflowAnchoredOn(node);
             UpdateEdgeVisibility();
             GraphChanged?.Invoke(this, EventArgs.Empty);
@@ -938,8 +1115,9 @@ public sealed class ViewAllGraphService : IDisposable
             // home share's parent, WindowsApps - and what is named below it is
             // reached that way and laid out under it.  It opens, as it did
             // when it read as empty, but stays unread, so the next opening
-            // asks the disk again.  Not one collapsed or let go of meanwhile.
-            if (ex is UnauthorizedAccessException && !token.IsCancellationRequested && !_disposed && IsLive(node))
+            // asks the disk again.  Not one collapsed or let go of meanwhile,
+            // nor one only to be read.
+            if (ex is UnauthorizedAccessException && open && !token.IsCancellationRequested && !_disposed && IsLive(node))
             {
                 node.IsExpanded = true;
                 ShowOrHideLoadedBranch(node);
@@ -961,6 +1139,12 @@ public sealed class ViewAllGraphService : IDisposable
             loadCancellation.Dispose();
         }
     }
+
+    /// <summary>The options a folder is read with when <paramref name="childLimit"/> children are wanted: the graph's, with a higher cap when Load more had read further.</summary>
+    private ViewAllGraphOptions ReadOptionsFor(int childLimit)
+        => childLimit > Options.SafeMaximumChildren
+            ? Options with { MaximumChildrenPerFolder = Math.Min(childLimit, ViewAllGraphOptions.MaximumChildrenCeiling) }
+            : Options;
 
     public void Collapse(ViewAllNodeViewModel node)
     {
@@ -1037,6 +1221,21 @@ public sealed class ViewAllGraphService : IDisposable
 
             var added = new List<ViewAllNodeViewModel>();
             ApplySnapshot(node, snapshot, added);
+
+            // A new child is made on the tree, which is where it belongs only
+            // under a folder that is open on it.  Load more on a closed one
+            // left the page on the tree under a folder the layout does not
+            // measure, and a child of it placed by hand had every layout pass
+            // after that throw.
+            if (node.IsExpanded)
+            {
+                ShowOrHideLoadedBranch(node);
+            }
+            else
+            {
+                HideDescendants(node);
+            }
+
             node.ChildLoadLimit = nextLimit;
             node.IsTruncated = snapshot.IsTruncated;
             node.NotifyChildrenChanged();
@@ -1072,9 +1271,19 @@ public sealed class ViewAllGraphService : IDisposable
     /// are retained, so refreshing a branch never silently collapses the tree
     /// the user had opened or takes away what Load more brought in.
     /// </summary>
+    /// <param name="forChange">
+    /// For a refresh because something in the folder changed - on the disk,
+    /// or by a file operation - rather than one asked for, or one for a
+    /// folder about to be shown: a folder that is closed is left closed.  It
+    /// is read, and what was open in it is opened again for when it is
+    /// opened, but nothing of it is shown; without it every collapsed folder
+    /// a change touched opened itself.  Otherwise the folder is opened, as F5
+    /// and a caller about to show it want.
+    /// </param>
     public async Task<ViewAllExpansionResult> RefreshBranchAsync(
         ViewAllNodeViewModel node,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool forChange = false)
     {
         ThrowIfDisposed();
         _staleRoots.Remove(node);
@@ -1089,9 +1298,68 @@ public sealed class ViewAllGraphService : IDisposable
             _pendingRefreshes[node.FullPath] = pending;
         }
 
+        // Open once read, unless read for a change and closed - as the first
+        // refresh of it found it: a later one finds it closed by that one, to
+        // be read.
+        pending.Open |= !forChange || (pending.Refreshes == 0 && node.IsExpanded);
         pending.Refreshes++;
         try
         {
+            // Read before anything is taken down.  A read that failed - a
+            // share that blinked, a folder that could not be listed for a
+            // moment - left the folder emptied and closed, with everything
+            // that was open in it gone and no longer watched; now all of it
+            // stays as it was, and the folder only says it could not be read.
+            // A folder that is gone is let go of as ever.  Read as ExpandAsync
+            // reads, and cancelled as that read is: collapsing the folder, or a
+            // refresh of it or above it, meanwhile ends this one with nothing
+            // touched - the other has it.  Read here and not in a method of its
+            // own, so that nothing can happen between the read coming back and
+            // the branch being taken down: an await more let a refresh above
+            // replace the folder in between, and this one then took the
+            // replacement's read away from it.
+            ViewAllDirectorySnapshot? read = null;
+            if (CanExpand(node))
+            {
+                CancelLoad(node);
+                var reading = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                _loads[node.Id] = reading;
+                node.IsLoading = true;
+                var token = reading.Token;
+                try
+                {
+                    read = await _fileSystem.GetChildrenAsync(node.FullPath, ReadOptionsFor(node.ChildLoadLimit), token, _layout.SortFor(node.FullPath));
+                    token.ThrowIfCancellationRequested();
+                    if (_disposed || !IsLive(node))
+                    {
+                        return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException or IOException && ex is not DirectoryNotFoundException)
+                {
+                    node.ErrorMessage = ex is UnauthorizedAccessException ? "Access denied" : ex.Message;
+                    return new ViewAllExpansionResult(node, [], WasLoaded: false, node.IsTruncated);
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    // Gone: taken down below, and the read again says so.
+                }
+                finally
+                {
+                    if (_loads.TryGetValue(node.Id, out var active) && ReferenceEquals(active, reading))
+                    {
+                        _loads.Remove(node.Id);
+                        node.IsLoading = false;
+                    }
+
+                    reading.Dispose();
+                }
+            }
+
             var previouslyExpanded = pending.Expanded;
             var pagedTo = pending.ChildLoadLimits;
             var named = pending.Named;
@@ -1122,11 +1390,52 @@ public sealed class ViewAllGraphService : IDisposable
                 {
                     named.Add(descendant.FullPath);
                 }
+
+                // Nor the folders above what is selected, once the listing
+                // leaves them out - a hidden folder, as hidden items are
+                // hidden - which let go of the selection with them: they are
+                // asked for by name, as a folder typed into the address bar
+                // is.  Not what is selected itself: a hidden item selected
+                // goes with the rest.
+                if (descendant.IsSelected)
+                {
+                    for (var folder = descendant.Parent; folder is not null && !ReferenceEquals(folder, node); folder = folder.Parent)
+                    {
+                        named.Add(folder.FullPath);
+                    }
+                }
+            }
+
+            // A refresh of a folder inside this one still under way has
+            // emptied and closed it to read it, so what it is to open again -
+            // the folder itself among it, if it is to be open - is this
+            // one's to open again too.  Without it the folder came back
+            // closed, with everything that was open in it gone.
+            foreach (var (path, inner) in _pendingRefreshes)
+            {
+                if (ReferenceEquals(inner, pending) || !IsAtOrUnderNormalized(path, node.FullPath))
+                {
+                    continue;
+                }
+
+                if (inner.Open)
+                {
+                    previouslyExpanded.Add(path);
+                    pagedTo[path] = Math.Max(pagedTo.GetValueOrDefault(path), inner.OwnLimit);
+                }
+
+                previouslyExpanded.UnionWith(inner.Expanded);
+                named.UnionWith(inner.Named);
+                foreach (var (folder, limit) in inner.ChildLoadLimits)
+                {
+                    pagedTo[folder] = Math.Max(pagedTo.GetValueOrDefault(folder), limit);
+                }
             }
 
             // Read as far as Load more had read it, or what it brought in
             // would go again with every change on the disk.
             var ownLimit = node.ChildLoadLimit;
+            pending.OwnLimit = Math.Max(pending.OwnLimit, ownLimit);
             RemoveDescendants(node);
             node.AreChildrenLoaded = false;
             node.IsExpanded = false;
@@ -1136,13 +1445,14 @@ public sealed class ViewAllGraphService : IDisposable
             ViewAllExpansionResult result;
             using (SuspendLayout())
             {
-                result = await ExpandAsync(node, cancellationToken, ownLimit);
+                result = await ExpandAsync(node, cancellationToken, ownLimit, pending.Open, read);
 
                 // Parents sort before descendants, so each re-expansion - and
                 // each child brought back by name - has already created the
                 // node the next path needs.  Taken as the lists stand now: a
                 // refresh that starts meanwhile adds to them, and restores what
                 // it added itself.
+                var adoptedAny = false;
                 foreach (var path in previouslyExpanded
                              .Union(named, StringComparer.OrdinalIgnoreCase)
                              .OrderBy(PathDepth)
@@ -1157,18 +1467,29 @@ public sealed class ViewAllGraphService : IDisposable
                         // and only if it is still on the disk.
                         if (!named.Contains(path)
                             || !TryGetNode(Path.GetDirectoryName(path) ?? string.Empty, out var folder)
-                            || await AdoptChildAsync(folder, path, cancellationToken) is not { } adopted)
+                            || await AdoptChildAsync(folder, path, cancellationToken, announce: false) is not { } adopted)
                         {
                             continue;
                         }
 
                         restored = adopted;
+                        adoptedAny = true;
                     }
 
                     if (!restored.IsExpanded && previouslyExpanded.Contains(path))
                     {
                         await ExpandAsync(restored, cancellationToken, pagedTo.GetValueOrDefault(path));
                     }
+                }
+
+                // What was brought back by name is announced once, not once
+                // each: a folder hundreds had been asked for in by name raised
+                // as many graph changes, each after a pass over every link.
+                if (adoptedAny)
+                {
+                    Reflow();
+                    UpdateEdgeVisibility();
+                    GraphChanged?.Invoke(this, EventArgs.Empty);
                 }
             }
 
@@ -1195,6 +1516,12 @@ public sealed class ViewAllGraphService : IDisposable
         public HashSet<string> Named { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public int Refreshes { get; set; }
+
+        /// <summary>Whether the folder is to be open once read (see the forChange of <see cref="RefreshBranchAsync"/>).</summary>
+        public bool Open { get; set; }
+
+        /// <summary>How far Load more had read the folder itself, for a refresh of a folder above it that starts meanwhile.</summary>
+        public int OwnLimit { get; set; }
     }
 
     /// <summary>
@@ -1203,10 +1530,22 @@ public sealed class ViewAllGraphService : IDisposable
     /// type filters away.  Naming something is a stronger statement than any
     /// display rule, which is how the address bar has always behaved.
     /// </summary>
-    public async Task<ViewAllNodeViewModel?> AdoptChildAsync(
+    public Task<ViewAllNodeViewModel?> AdoptChildAsync(
         ViewAllNodeViewModel parent,
         string childPath,
         CancellationToken cancellationToken = default)
+        => AdoptChildAsync(parent, childPath, cancellationToken, announce: true);
+
+    /// <param name="announce">
+    /// False to leave the layout pass, the links and the announcement to the
+    /// caller, who brings many back at once and announces them together (see
+    /// <see cref="RefreshBranchAsync"/>).
+    /// </param>
+    private async Task<ViewAllNodeViewModel?> AdoptChildAsync(
+        ViewAllNodeViewModel parent,
+        string childPath,
+        CancellationToken cancellationToken,
+        bool announce)
     {
         ThrowIfDisposed();
         if (!parent.IsDirectory)
@@ -1294,9 +1633,13 @@ public sealed class ViewAllGraphService : IDisposable
         _edges.Add(edge);
         _incomingEdges[child.Id] = edge;
         parent.NotifyChildrenChanged();
-        Reflow();
-        UpdateEdgeVisibility();
-        GraphChanged?.Invoke(this, EventArgs.Empty);
+        if (announce)
+        {
+            Reflow();
+            UpdateEdgeVisibility();
+            GraphChanged?.Invoke(this, EventArgs.Empty);
+        }
+
         return child;
     }
 
@@ -1624,6 +1967,31 @@ public sealed class ViewAllGraphService : IDisposable
             }
         }
 
+        // A drive reached after start-up - a stick plugged in since - is a
+        // drive: described as the drive list describes one, and put among the
+        // drives.  Asked as a folder it became a plain folder root named
+        // "E:\" at the end of the roots.  One that is not ready is out of
+        // reach, as a folder that cannot be described is.
+        else if (DriveLetterRoot(directoryPath) is { } drivePath)
+        {
+            if (await DescribeDriveAsync(drivePath, cancellationToken) is not { } driveEntry)
+            {
+                return null;
+            }
+
+            if (_nodesByPath.TryGetValue(driveEntry.FullPath, out var known))
+            {
+                return known;
+            }
+
+            var drive = CreateNode(driveEntry, depth: 0, parent: null);
+            PlaceAmongDrives(drive);
+            RestorePosition(drive);
+            Reflow();
+            GraphChanged?.Invoke(this, EventArgs.Empty);
+            return drive;
+        }
+
         try
         {
             var descriptor = await _fileSystem.DescribeDirectoryAsync(directoryPath, cancellationToken);
@@ -1643,6 +2011,36 @@ public sealed class ViewAllGraphService : IDisposable
             return null;
         }
     }
+
+    /// <summary><paramref name="path"/> spelled the one way, when it is the root of a drive letter (see <see cref="IsDriveLetterRoot"/>); otherwise null.</summary>
+    private static string? DriveLetterRoot(string path)
+    {
+        try
+        {
+            var normalized = ViewAllPath.Normalize(path);
+            return IsDriveLetterRoot(normalized) ? normalized : null;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>A drive's cell as the drive list makes it (<see cref="ViewAllFileSystemService.DescribeDrive"/>), asked off the window's thread; null for a drive that is not ready or not there.</summary>
+    private static Task<ViewAllEntryDescriptor?> DescribeDriveAsync(string root, CancellationToken cancellationToken)
+        => Task.Run<ViewAllEntryDescriptor?>(
+            () =>
+            {
+                try
+                {
+                    return ViewAllFileSystemService.DescribeDrive(new DriveInfo(root));
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+                {
+                    return null;
+                }
+            },
+            cancellationToken);
 
     /// <summary>
     /// Reads a directory without touching the canvas, under the same enumeration
@@ -2082,6 +2480,11 @@ public sealed class ViewAllGraphService : IDisposable
         ViewAllDirectorySnapshot snapshot,
         ICollection<ViewAllNodeViewModel> added)
     {
+        // The folder's children as a set, made the first time an entry is
+        // found already there: a page of Load more lists again every entry
+        // the folder holds, and looking each up in the list itself was one
+        // pass over tens of thousands of children per entry.
+        HashSet<ViewAllNodeViewModel>? held = null;
         foreach (var entry in snapshot.Entries)
         {
             if (_nodesByPath.TryGetValue(entry.FullPath, out var existing))
@@ -2091,7 +2494,8 @@ public sealed class ViewAllGraphService : IDisposable
                     // Listed by its folder now: one of the folder's own, which
                     // a refresh brings back by listing it.
                     _namedOnly.Remove(existing);
-                    if (!parent.Children.Contains(existing))
+                    held ??= new HashSet<ViewAllNodeViewModel>(parent.Children, ReferenceEqualityComparer.Instance);
+                    if (held.Add(existing))
                     {
                         parent.Children.Add(existing);
                     }

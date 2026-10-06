@@ -94,9 +94,13 @@ internal interface INestedPaneHost
     /// <summary>The drag left or was dropped: what it carried is not kept for the next one.</summary>
     void ForgetDropPaths();
 
-    /// <summary>Keeps an OLE source's temporary files alive until transfer ends.</summary>
-    bool CompleteExternalDrop(Func<Task<bool>> beginTransfer)
-        => ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, beginTransfer());
+    /// <summary>
+    /// Runs a drop's transfer, keeping an OLE source's temporary files alive
+    /// until they are copied: true when the drop is reported as
+    /// <paramref name="reported"/>.
+    /// </summary>
+    bool CompleteExternalDrop(IDataObject data, IReadOnlyList<string> paths, DragDropEffects reported, Func<Task<bool>> beginTransfer)
+        => ExternalFileDrop.Complete(Dispatcher.CurrentDispatcher, beginTransfer);
 }
 
 /// <summary>
@@ -153,6 +157,24 @@ internal sealed class NestedPane
     /// of the program's own - a flight, a camera put back - clears it.
     /// </summary>
     private bool _movedByUser;
+
+    /// <summary>
+    /// Set while the camera was last moved by the user's own hand - the
+    /// wheel, a drag, a zoom key - in a window or a file dialog alike; a move
+    /// of the program's own clears it.
+    /// </summary>
+    private bool _movedByHand;
+
+    /// <summary>
+    /// The folder the view is in, known only by the way to a deeper one (a
+    /// partial listing), as the user's hand left the camera in it and it is
+    /// let be listed: the folder in view - the one nearest the middle of the
+    /// view - and its place and size in the folder's own frame, where that is
+    /// one unit wide.  The listing places it among its sisters, smaller and
+    /// elsewhere, while the folder holding the view stays put: noted, it is
+    /// kept where it was on screen instead (<see cref="OnFolderLoadedKeepInView"/>).
+    /// </summary>
+    private (NestedFolder Sparse, NestedFolder Child, double X, double Y, double Scale)? _sparseInView;
 
     /// <summary>
     /// Set while the camera the last session left is on its way back - the
@@ -290,14 +312,27 @@ internal sealed class NestedPane
         // a deeper one, and is listed once the camera goes into it.  Any
         // other drawn - beside the folder in view, known by a beacon's
         // chain - is listed as every folder drawn there is.
-        Tree.PartialListingReadAllowed = folder => !Canvas.IsCameraMoving && Canvas.Anchor is { } anchor
-            && (anchor.IsComputer ? !_host.IsPickerMode
-                : MainWindow.IsNestedPathInside(folder.FullPath, anchor.FullPath)
-                    || !MainWindow.IsNestedPathInside(anchor.FullPath, folder.FullPath));
+        // The one the view is in, listed where the user's hand brought the
+        // camera to rest, keeps the folder in view where it is on screen
+        // (NoteSparseInView).
+        Tree.PartialListingReadAllowed = folder =>
+        {
+            var allowed = !Canvas.IsCameraMoving && Canvas.Anchor is { } anchor
+                && (anchor.IsComputer ? !_host.IsPickerMode
+                    : MainWindow.IsNestedPathInside(folder.FullPath, anchor.FullPath)
+                        || !MainWindow.IsNestedPathInside(anchor.FullPath, folder.FullPath));
+            if (allowed && ReferenceEquals(folder, Canvas.Anchor))
+            {
+                NoteSparseInView(folder);
+            }
+
+            return allowed;
+        };
         Canvas.MarkLookup = _viewModel.Marks.Get;
         Canvas.IconLookup = LookUpFileIcon;
         Canvas.IconArrivals = _iconInbox;
         Tree.FolderLoaded += OnFolderLoadedForIcons;
+        Tree.FolderLoaded += OnFolderLoadedKeepInView;
         Canvas.OpenRequested += OnOpenRequested;
         Canvas.FavoriteLinkRequested += OnFavoriteLinkRequested;
         Canvas.ContextMenuRequested += OnContextMenuRequested;
@@ -396,6 +431,7 @@ internal sealed class NestedPane
         KeptSelection.Changed -= OnKeptSelectionChanged;
         _viewModel.Tree.RemoveKeptSelection(KeptSelection);
         Tree.FolderLoaded -= OnFolderLoadedForIcons;
+        Tree.FolderLoaded -= OnFolderLoadedKeepInView;
         Canvas.OpenRequested -= OnOpenRequested;
         Canvas.FavoriteLinkRequested -= OnFavoriteLinkRequested;
         Canvas.ContextMenuRequested -= OnContextMenuRequested;
@@ -573,10 +609,18 @@ internal sealed class NestedPane
     /// <summary>
     /// The camera as it is now, kept for the next session: it came to rest,
     /// or the window or the pane is being closed.  One still on its way back
-    /// keeps where it was going.
+    /// keeps where it was going, and so does one waiting for its drive or
+    /// share to answer (<see cref="_cameraOnLateDrive"/>): the overview shown
+    /// meanwhile, saved, would stand for the place from then on.
     /// </summary>
     public void CaptureCamera()
     {
+        if (_cameraOnLateDrive is { } waiting)
+        {
+            KeptCamera = waiting;
+            return;
+        }
+
         if (!_cameraRestoring && Canvas.CaptureCamera() is { } camera)
         {
             KeptCamera = camera;
@@ -626,6 +670,7 @@ internal sealed class NestedPane
         // Whose move it was is told after it (OnUserCameraMoved): one of the
         // program's own, a flight's frame, takes the dialog nowhere.
         _movedByUser = false;
+        _movedByHand = false;
 
         if (_host.IsActivePane(this))
         {
@@ -648,6 +693,7 @@ internal sealed class NestedPane
     /// </summary>
     private void OnUserCameraMoved()
     {
+        _movedByHand = true;
         if (!_host.IsPickerMode)
         {
             return;
@@ -1225,6 +1271,91 @@ internal sealed class NestedPane
     /// </summary>
     private void OnFolderLoadedForIcons(NestedFolder folder) => _viewModel.Icons.Prefetch(folder);
 
+    /// <summary>
+    /// The folder the view is in is let be listed, though known only by the
+    /// way to a deeper one: if the user's hand brought the camera there, the
+    /// folder in view - the one nearest the middle of the view - is noted
+    /// with its place, for <see cref="OnFolderLoadedKeepInView"/>.  Asked
+    /// while the canvas draws, so only the camera and the places are read.
+    /// </summary>
+    private void NoteSparseInView(NestedFolder sparse)
+    {
+        _sparseInView = null;
+        if (!_movedByHand || Canvas.CaptureCamera() is not { Width: > 0 } camera)
+        {
+            return;
+        }
+
+        // The middle of the view, in the folder's own frame.
+        var x = -camera.X / camera.Width;
+        var y = -camera.Y / camera.Width;
+        NestedFolder? nearest = null;
+        var best = double.MaxValue;
+        foreach (var child in sparse.Children)
+        {
+            var dx = Math.Max(0, Math.Max(child.OffsetX - x, x - child.OffsetX - child.Scale));
+            var dy = Math.Max(0, Math.Max(child.OffsetY - y, y - child.OffsetY - child.Scale * NestedLayout.CellHeight));
+            var distance = dx * dx + dy * dy;
+            if (distance < best)
+            {
+                best = distance;
+                nearest = child;
+            }
+        }
+
+        if (nearest is not null)
+        {
+            _sparseInView = (sparse, nearest, nearest.OffsetX, nearest.OffsetY, nearest.Scale);
+        }
+    }
+
+    /// <summary>
+    /// The folder the view is in was listed where the user's hand left the
+    /// camera (<see cref="NoteSparseInView"/>).  It stays put on screen, as
+    /// the folder holding the view always does, and the folder in view went
+    /// from filling it to one cell among its sisters, smaller and elsewhere:
+    /// a jump the moment the camera came to rest.  The camera follows the
+    /// folder in view instead, so it stays where it was, as it was, and its
+    /// sisters come in around it.  Not after a flight, which went to the
+    /// folder itself, nor while the camera moves on.  Told as the listing is
+    /// taken in, before the frame that shows it.
+    /// </summary>
+    private void OnFolderLoadedKeepInView(NestedFolder folder)
+    {
+        if (_sparseInView is not { } noted || !ReferenceEquals(noted.Sparse, folder))
+        {
+            return;
+        }
+
+        _sparseInView = null;
+        if (!_movedByHand || Canvas.IsCameraMoving || !ReferenceEquals(Canvas.Anchor, folder)
+            || !ReferenceEquals(noted.Child.Parent, folder) || noted.Child.Index < 0
+            || Canvas.ScreenRectOf(folder) is not { Width: > 0 } cell
+            || Canvas.ScreenRectOf(noted.Child) is not { Width: > 0 } now)
+        {
+            return;
+        }
+
+        var was = new Rect(cell.X + noted.X * cell.Width, cell.Y + noted.Y * cell.Width,
+            noted.Scale * cell.Width, noted.Scale * cell.Width * NestedLayout.CellHeight);
+        // Nothing moves on screen: a file dialog still takes the folder the
+        // user's hand brought the view to, as it would have without this.
+        var movedByUser = _movedByUser;
+        var factor = was.Width / now.Width;
+        if (Math.Abs(factor - 1) > 1e-6)
+        {
+            // Zoomed about the one point that takes it from where it is now
+            // to where it was.
+            Canvas.ZoomAt(new Point((was.X - factor * now.X) / (1 - factor), (was.Y - factor * now.Y) / (1 - factor)), factor);
+        }
+        else if (Math.Abs(was.X - now.X) > 0.01 || Math.Abs(was.Y - now.Y) > 0.01)
+        {
+            Canvas.Pan(new Vector(was.X - now.X, was.Y - now.Y));
+        }
+
+        _movedByUser = movedByUser;
+    }
+
     // ---- the order ---------------------------------------------------------------
 
     /// <summary>
@@ -1433,7 +1564,7 @@ internal sealed class NestedPane
         {
             foreach (var match in Canvas.FilterMatches.Take(FilterBeaconLimit))
             {
-                Add(match, NestedBeaconKind.Search, SearchBeaconColour, LeafName(match));
+                Add(match, NestedBeaconKind.Filter, SearchBeaconColour, LeafName(match));
             }
         }
 
@@ -1664,7 +1795,7 @@ internal sealed class NestedPane
         }
 
         // The keys and what the source allows, as the tree canvas has them (see DropEffectFor).
-        var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
+        var effect = DropEffectOver(e, paths, target.FullPath);
         canvas.DropTarget = effect == DragDropEffects.None ? null : target;
         e.Effects = effect;
     }
@@ -1701,7 +1832,7 @@ internal sealed class NestedPane
             var effect = MainWindow.DropEffectFor(e, paths, target.FullPath);
             if (effect == DragDropEffects.None) return;
 
-            if (_host.CompleteExternalDrop(() => _viewModel.DropIntoPathWithResultAsync(
+            if (_host.CompleteExternalDrop(e.Data, paths, MainWindow.ReportedDropEffect(effect), () => _viewModel.DropIntoPathWithResultAsync(
                     paths, target.FullPath, move: effect == DragDropEffects.Move)))
                 e.Effects = MainWindow.ReportedDropEffect(effect);
         }
@@ -1726,12 +1857,153 @@ internal sealed class NestedPane
         }
 
         var target = hit.Folder;
-        return _host.IsDropRefused(target.FullPath, () => paths.Any(path =>
-            ViewAllPath.Equals(path, target.FullPath)
-            || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)
-            || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _host.NestedDragPaths is not null))
+        return _host.IsDropRefused(target.FullPath, () =>
+            _dropCarried.GetValue(paths, DropCarried.Gather).Refuses(target.FullPath, fromThisWindow: _host.NestedDragPaths is not null) is { } refused
+                ? refused
+                : paths.Any(path =>
+                    ViewAllPath.Equals(path, target.FullPath)
+                    || NativeShellService.IsInvalidMoveTarget(path, target.FullPath)
+                    || ViewAllPath.Equals(Path.GetDirectoryName(path) ?? string.Empty, target.FullPath) && _host.NestedDragPaths is not null))
             ? null
             : target;
+    }
+
+    /// <summary>What each drag's items are, by name (<see cref="DropCarried"/>): gathered once for the list the window keeps for the drag, and let go with it.</summary>
+    private readonly System.Runtime.CompilerServices.ConditionalWeakTable<IReadOnlyList<string>, DropCarried> _dropCarried = new();
+
+    /// <summary>
+    /// What a drag carries, by name, for <see cref="ResolveDropTarget"/>: the
+    /// items, the folders they are in, and the items as folders a target may
+    /// be inside, each in the full form the item-by-item comparison works out.
+    /// That worked every one out again for each folder the pointer came to -
+    /// a tenth of a second and more for fifty thousand photos, a stall at
+    /// every folder; gathered once for the drag, a folder is answered by a
+    /// few lookups, the same answer.  A drag with an item whose full form
+    /// cannot be worked out, or a folder whose own cannot, is compared item
+    /// by item, as ever.  The drop effect last worked out for it is kept here
+    /// too (<see cref="DropEffectOver"/>).
+    /// </summary>
+    private sealed class DropCarried
+    {
+        private readonly HashSet<string> _items = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _parents = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Each item as a folder something may be inside, ending in a separator, as NativeShellService.IsInvalidMoveTarget has it: the item, by it.</summary>
+        private readonly Dictionary<string, string> _containers = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>Any item that comes to the same folder as one before it, named another way.</summary>
+        private List<KeyValuePair<string, string>>? _moreContainers;
+
+        private bool _usable = true;
+
+        /// <summary>The drop effect last worked out for the drag, over a folder with the keys held and the effects allowed then.</summary>
+        public (string Folder, DragDropKeyStates Keys, DragDropEffects Allowed, DragDropEffects Effect)? LastEffect { get; set; }
+
+        public static DropCarried Gather(IReadOnlyList<string> paths)
+        {
+            var carried = new DropCarried();
+            var parents = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                foreach (var path in paths)
+                {
+                    carried._items.Add(ViewAllPath.Normalize(path));
+
+                    // An item with no folder of its own - a drive - is
+                    // compared by an empty name, which no folder has.
+                    if (Path.GetDirectoryName(path) is { Length: > 0 } parent && parents.Add(parent))
+                    {
+                        carried._parents.Add(ViewAllPath.Normalize(parent));
+                    }
+
+                    if (path.Length > 0)
+                    {
+                        var container = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                        if (!carried._containers.TryAdd(container, path))
+                        {
+                            (carried._moreContainers ??= []).Add(new(container, path));
+                        }
+                    }
+                }
+            }
+            catch
+            {
+                // Whatever working out a full form throws, the item-by-item
+                // comparison meets it as it always has.
+                carried._usable = false;
+            }
+
+            return carried;
+        }
+
+        /// <summary>
+        /// Whether a drop into <paramref name="folder"/> is refused: it is one
+        /// of the items, or inside one that is a folder, or - for a drag from
+        /// this window - the folder an item is in.  Null where the items are
+        /// to be compared one by one instead.
+        /// </summary>
+        public bool? Refuses(string folder, bool fromThisWindow)
+        {
+            if (!_usable || folder.Length == 0)
+            {
+                return null;
+            }
+
+            string normal;
+            string inside;
+            try
+            {
+                normal = ViewAllPath.Normalize(folder);
+                inside = Path.GetFullPath(folder).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            }
+            catch
+            {
+                return null;
+            }
+
+            if (_items.Contains(normal) || fromThisWindow && _parents.Contains(normal))
+            {
+                return true;
+            }
+
+            // Inside an item if the item is the folder or one of the folders
+            // it is in - and that item is a folder on disk.
+            for (var end = inside.IndexOf(Path.DirectorySeparatorChar); end >= 0; end = inside.IndexOf(Path.DirectorySeparatorChar, end + 1))
+            {
+                var container = inside[..(end + 1)];
+                if (_containers.TryGetValue(container, out var item)
+                    && (Directory.Exists(item)
+                        || _moreContainers?.Any(more => string.Equals(more.Key, container, StringComparison.OrdinalIgnoreCase) && Directory.Exists(more.Value)) == true))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// The drop effect over <paramref name="folder"/>, as
+    /// <see cref="MainWindow.DropEffectFor"/> works it out, kept until the
+    /// pointer comes to another folder or the keys or the effects allowed
+    /// change: it asks whether every item is on the folder's drive -
+    /// milliseconds for fifty thousand - and DragOver comes many times a
+    /// second while the pointer stays.
+    /// </summary>
+    private DragDropEffects DropEffectOver(DragEventArgs e, IReadOnlyList<string> paths, string folder)
+    {
+        var carried = _dropCarried.GetValue(paths, DropCarried.Gather);
+        var keys = e.KeyStates & (DragDropKeyStates.ShiftKey | DragDropKeyStates.ControlKey | DragDropKeyStates.AltKey);
+        if (carried.LastEffect is { } last && last.Keys == keys && last.Allowed == e.AllowedEffects
+            && string.Equals(last.Folder, folder, StringComparison.Ordinal))
+        {
+            return last.Effect;
+        }
+
+        var effect = MainWindow.DropEffectFor(e, paths, folder);
+        carried.LastEffect = (folder, keys, e.AllowedEffects, effect);
+        return effect;
     }
 
     // ---- the name filter ---------------------------------------------------------
@@ -1814,6 +2086,13 @@ internal sealed class NestedPane
         View.CanvasFilterPrevious.Visibility = navigation;
         View.CanvasFilterNext.Visibility = navigation;
         View.CanvasFilterClear.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
-        ScheduleBeacons();
+
+        // While folders are read the matches change frame after frame, each
+        // frame saying so: the beacons are gathered as the timer comes round,
+        // not put off again by every frame for as long as the reading goes on.
+        if (_beaconTimer is not { IsEnabled: true })
+        {
+            ScheduleBeacons();
+        }
     }
 }

@@ -5,6 +5,22 @@ namespace UltraExplorer.Dialogs;
 
 public partial class InputDialog : Window
 {
+    private bool _ownerOnly;
+    private bool _accepted;
+
+    internal bool ShowOwnerModal()
+    {
+        _ownerOnly = true;
+        OwnerOnlyModal.Show(this);
+        return _accepted;
+    }
+
+    private void Complete(bool accepted)
+    {
+        _accepted = accepted;
+        if (!_ownerOnly) DialogResult = accepted;
+        Close();
+    }
     /// <param name="selectStem">
     /// Picks out the text before its last dot, so typing replaces a file's
     /// name and keeps its extension.  Off, the whole text is picked out - for
@@ -29,22 +45,20 @@ public partial class InputDialog : Window
 
     private void Ok_Click(object sender, RoutedEventArgs e)
     {
-        DialogResult = true;
-        Close();
+        Complete(true);
     }
 
     private void Cancel_Click(object sender, RoutedEventArgs e)
     {
-        DialogResult = false;
-        Close();
+        Complete(false);
     }
 
     private void Window_KeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.Escape)
         {
-            DialogResult = false;
-            Close();
+            Complete(false);
+            e.Handled = true;
         }
     }
 }

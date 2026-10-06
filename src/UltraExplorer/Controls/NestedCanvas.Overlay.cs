@@ -886,32 +886,125 @@ public sealed partial class NestedCanvas
     /// <summary>The beacons the last picture of the marks placed, on the view or at its edges.</summary>
     internal int BeaconsPlaced { get; private set; }
 
-    private void DrawBeacons(DrawingContext dc)
+    /// <summary>For checks: path-to-tree resolution passes, not frames which reused their result.</summary>
+    internal int BeaconResolutionPasses { get; private set; }
+
+    /// <summary>For checks: spatial comparisons made by the last beacon layout.</summary>
+    internal int LastBeaconSpatialComparisons => _lastBeaconSpatialComparisons;
+    private int _lastBeaconSpatialComparisons;
+
+    /// <summary>For checks: cluster captions in the order their badges were drawn.</summary>
+    internal IReadOnlyList<string> BeaconCaptionsForTests => _beaconCaptions;
+
+    private readonly List<ResolvedBeacon> _resolvedBeacons = [];
+    private readonly List<string> _beaconCaptions = [];
+    private IReadOnlyList<NestedBeacon>? _resolvedBeaconSource;
+    private NestedTree? _resolvedBeaconTree;
+    private int _resolvedBeaconTreeVersion = -1;
+    private int _resolvedBeaconSortGeneration = -1;
+    private int _resolvedBeaconFilterStamp = -1;
+    private CanvasLayer _resolvedBeaconLayers;
+
+    /// <summary>
+    /// Resolves paths only when something that can change their target does:
+    /// a new beacon set, tree/read/rename version, sort placement or layer
+    /// visibility. Camera motion still computes current screen rectangles from
+    /// these live folder references.
+    /// </summary>
+    private IReadOnlyList<ResolvedBeacon> ResolveBeaconTargets(int treeVersion, int sortGeneration)
+    {
+        var tree = _tree;
+        if (tree is null)
+        {
+            _resolvedBeacons.Clear();
+            _resolvedBeaconTree = null;
+            _resolvedBeaconSource = null;
+            return _resolvedBeacons;
+        }
+
+        if (ReferenceEquals(_resolvedBeaconSource, _beacons)
+            && ReferenceEquals(_resolvedBeaconTree, tree)
+            && _resolvedBeaconTreeVersion == treeVersion
+            && _resolvedBeaconSortGeneration == sortGeneration
+            && _resolvedBeaconFilterStamp == _filterStamp
+            && _resolvedBeaconLayers == _shownLayers)
+        {
+            return _resolvedBeacons;
+        }
+
+        BeaconResolutionPasses++;
+        _resolvedBeaconSource = _beacons;
+        _resolvedBeaconTree = tree;
+        _resolvedBeaconTreeVersion = treeVersion;
+        _resolvedBeaconSortGeneration = sortGeneration;
+        _resolvedBeaconFilterStamp = _filterStamp;
+        _resolvedBeaconLayers = _shownLayers;
+        _resolvedBeacons.Clear();
+        foreach (var beacon in _beacons)
+        {
+            if (IsShown(beacon) && ResolveAsPlaced(beacon.Path) is { } target)
+            {
+                _resolvedBeacons.Add(new(
+                    beacon,
+                    target.Folder,
+                    target.FileIndex,
+                    target.Folder.LayoutSortGeneration,
+                    Priority(beacon.Kind)));
+            }
+        }
+
+        return _resolvedBeacons;
+    }
+
+    private void DrawBeacons(DrawingContext dc, int treeVersion, int sortGeneration)
     {
         BeaconsPlaced = 0;
+        _lastBeaconSpatialComparisons = 0;
+        _beaconCaptions.Clear();
         if (_tree is null || _beacons.Count == 0)
         {
+            _resolvedBeacons.Clear();
+            _resolvedBeaconSource = null;
+            _resolvedBeaconTree = null;
+            _resolvedBeaconTreeVersion = -1;
+            _resolvedBeaconSortGeneration = -1;
             return;
         }
 
         var pins = new List<Pin>();
         var offscreen = new List<Pin>();
-        foreach (var beacon in _beacons)
+        var targets = ResolveBeaconTargets(treeVersion, sortGeneration);
+        for (var targetIndex = 0; targetIndex < targets.Count; targetIndex++)
         {
-            if (!IsShown(beacon))
+            var resolved = targets[targetIndex];
+            // A sort sweep can place one folder on demand without changing the
+            // tree-wide generation again. Refresh only that folder's file
+            // index; all other cached paths remain valid.
+            if (resolved.FileIndex >= 0 && resolved.LayoutSortGeneration != resolved.Folder.LayoutSortGeneration)
             {
-                continue;
+                if (ResolveAsPlaced(resolved.Beacon.Path) is not { } replaced)
+                {
+                    continue;
+                }
+
+                resolved = new(
+                    resolved.Beacon,
+                    replaced.Folder,
+                    replaced.FileIndex,
+                    replaced.Folder.LayoutSortGeneration,
+                    resolved.Priority);
+                _resolvedBeacons[targetIndex] = resolved;
             }
 
-            if (ResolveAsPlaced(beacon.Path) is not { } target || TargetRect(target.Folder, target.FileIndex, place: false) is not { } rect)
+            if (TargetRect(resolved.Folder, resolved.FileIndex, place: false) is not { } rect)
             {
                 continue;
             }
 
             // Anything big enough to carry its own name carries its own mark,
             // and a folder the whole view is inside is not "somewhere else".
-            if (target.FileIndex < 0
-                    ? _labelled.Contains(target.Folder) && rect.Width >= 90 || Covers(rect.X, rect.Y, rect.Width)
+            if (resolved.FileIndex < 0
+                    ? _labelled.Contains(resolved.Folder) && rect.Width >= 90 || Covers(rect.X, rect.Y, rect.Width)
                     : rect.Height >= FileLabelPixels)
             {
                 continue;
@@ -920,11 +1013,11 @@ public sealed partial class NestedCanvas
             var centre = new Point(rect.X + rect.Width / 2, rect.Y + Math.Min(rect.Height / 2, 10));
             if (centre.X < -8 || centre.Y < -8 || centre.X > _viewWidth + 8 || centre.Y > _viewHeight + 8)
             {
-                offscreen.Add(new Pin(beacon, target.Folder, target.FileIndex, centre, Priority(beacon.Kind)));
+                offscreen.Add(new Pin(resolved.Beacon, resolved.Folder, resolved.FileIndex, centre, resolved.Priority));
                 continue;
             }
 
-            pins.Add(new Pin(beacon, target.Folder, target.FileIndex, centre, Priority(beacon.Kind)));
+            pins.Add(new Pin(resolved.Beacon, resolved.Folder, resolved.FileIndex, centre, resolved.Priority));
         }
 
         BeaconsPlaced = pins.Count + offscreen.Count;
@@ -938,23 +1031,37 @@ public sealed partial class NestedCanvas
         // badge with a count, not twenty dots on top of each other.
         pins.Sort((left, right) => right.Priority.CompareTo(left.Priority));
         var clusters = new List<List<Pin>>();
+        var clusterLeads = new List<Point>();
+        var clusterBuckets = new Dictionary<long, List<int>>();
         foreach (var pin in pins)
         {
             // Close enough that their circles would overlap: one badge.
-            var home = clusters.FirstOrDefault(cluster => (cluster[0].Centre - pin.Centre).Length < 26);
-            if (home is null)
+            var home = FindNearbyLead(pin.Centre, 26, clusterLeads, clusterBuckets, ref _lastBeaconSpatialComparisons);
+            if (home < 0)
             {
                 clusters.Add([pin]);
+                clusterLeads.Add(pin.Centre);
+                IndexPoint(clusterBuckets, pin.Centre, 26, clusters.Count - 1);
             }
             else
             {
-                home.Add(pin);
+                clusters[home].Add(pin);
             }
         }
 
         var placedLabels = new List<Rect>();
-        foreach (var cluster in clusters)
+        var placedLabelBuckets = new Dictionary<long, List<int>>();
+        var seenLabels = new HashSet<int>();
+        var seenLeads = new HashSet<int>();
+        var leadBuckets = new Dictionary<long, List<int>>();
+        for (var index = 0; index < clusterLeads.Count; index++)
         {
+            IndexPoint(leadBuckets, clusterLeads[index], 32, index);
+        }
+
+        for (var clusterIndex = 0; clusterIndex < clusters.Count; clusterIndex++)
+        {
+            var cluster = clusters[clusterIndex];
             var lead = cluster[0];
             var brush = BrushFor(lead.Beacon.Colour);
             var centre = lead.Centre;
@@ -986,6 +1093,7 @@ public sealed partial class NestedCanvas
             var caption = cluster.Count == 1
                 ? lead.Beacon.Label
                 : $"{lead.Beacon.Label} +{cluster.Count - 1}";
+            _beaconCaptions.Add(caption);
             var text = Text(caption, 11, TextBrush, 220, bold: false);
             var labelRect = new Rect(centre.X + 12, centre.Y - text.Height / 2 - 2, text.Width + 10, text.Height + 4);
             if (labelRect.Right > _viewWidth - 2)
@@ -993,12 +1101,14 @@ public sealed partial class NestedCanvas
                 labelRect.X = centre.X - 12 - labelRect.Width;
             }
 
-            if (placedLabels.Any(placed => placed.IntersectsWith(labelRect)) || clusters.Any(other => other != cluster && labelRect.Contains(other[0].Centre)))
+            if (IntersectsIndexed(labelRect, placedLabels, placedLabelBuckets, seenLabels, 32, ref _lastBeaconSpatialComparisons)
+                || ContainsIndexedPoint(labelRect, clusterIndex, clusterLeads, leadBuckets, seenLeads, 32, ref _lastBeaconSpatialComparisons))
             {
                 continue;
             }
 
             placedLabels.Add(labelRect);
+            IndexRect(placedLabelBuckets, labelRect, 32, placedLabels.Count - 1);
             dc.DrawRoundedRectangle(PillBrush, null, labelRect, 4, 4);
             DrawTextAt(dc, text, new Point(labelRect.X + 5, labelRect.Y + 2));
             _hotspots.Add(new Hotspot(labelRect, () => OnBeaconClicked(members), null));
@@ -1027,6 +1137,8 @@ public sealed partial class NestedCanvas
         // inset frame; marks in the same direction share one arrow.
         offscreen.Sort((left, right) => right.Priority.CompareTo(left.Priority));
         var groups = new List<(Point At, Vector Direction, List<Pin> Members)>();
+        var groupLeads = new List<Point>();
+        var groupBuckets = new Dictionary<long, List<int>>();
         foreach (var pin in offscreen)
         {
             var direction = pin.Centre - centre;
@@ -1041,10 +1153,12 @@ public sealed partial class NestedCanvas
             var at = new Point(centre.X + direction.X * scale, centre.Y + direction.Y * scale);
             direction.Normalize();
 
-            var home = groups.FindIndex(group => (group.At - at).Length < 22);
+            var home = FindNearbyLead(at, 22, groupLeads, groupBuckets, ref _lastBeaconSpatialComparisons);
             if (home < 0)
             {
                 groups.Add((at, direction, [pin]));
+                groupLeads.Add(at);
+                IndexPoint(groupBuckets, at, 22, groups.Count - 1);
             }
             else
             {
@@ -1093,7 +1207,8 @@ public sealed partial class NestedCanvas
         var targets = new List<(NestedFolder Folder, int FileIndex)>(pins.Count);
         foreach (var pin in pins)
         {
-            if (Resolve(pin.Beacon.Path) is { } target)
+            if (IsShown(pin.Beacon) && Resolve(pin.Beacon.Path) is { } target
+                && NestedTree.IsOnCanvas(target.Folder) && !NestedTree.IsDetached(target.Folder))
             {
                 targets.Add(target);
             }
@@ -1140,12 +1255,12 @@ public sealed partial class NestedCanvas
         + ((kind & NestedBeaconKind.Pinned) != 0 ? 8 : 0)
         + ((kind & NestedBeaconKind.Note) != 0 ? 4 : 0)
         + ((kind & NestedBeaconKind.Colour) != 0 ? 2 : 0)
-        + ((kind & NestedBeaconKind.Search) != 0 ? 1 : 0);
+        + ((kind & (NestedBeaconKind.Search | NestedBeaconKind.Filter)) != 0 ? 1 : 0);
 
     private static string BeaconGlyph(NestedBeaconKind kind) =>
         (kind & NestedBeaconKind.Pinned) != 0 ? ""
         : (kind & NestedBeaconKind.Note) != 0 ? ""
-        : (kind & NestedBeaconKind.Search) != 0 ? ""
+        : (kind & (NestedBeaconKind.Search | NestedBeaconKind.Filter)) != 0 ? ""
         : string.Empty;
 
     private static Brush BeaconGlyphBrush(Color colour)
@@ -1159,7 +1274,11 @@ public sealed partial class NestedCanvas
     /// <summary>
     /// The folders the view is inside whose names have scrolled off the top:
     /// deep in, every visible cell belongs to something whose title is far
-    /// above the screen, and this says what.
+    /// above the screen, and this says what.  A title more than half above
+    /// the top edge is off the screen too: its name is cut off there.  A
+    /// folder opened in a parent that holds little else lands with the
+    /// parent's title across the edge, and the parent's name was nowhere -
+    /// neither readable on its title nor in the trail.
     /// </summary>
     private void DrawTrail(DrawingContext dc)
     {
@@ -1175,7 +1294,7 @@ public sealed partial class NestedCanvas
         var probe = new Point(_viewWidth / 2, Math.Min(_viewHeight / 2, 80));
         while (true)
         {
-            if (y + w * NestedLayout.HeaderHeight < 0 && !folder.IsComputer)
+            if (y + w * NestedLayout.HeaderHeight / 2 < 0 && !folder.IsComputer)
             {
                 trail.Add(folder);
             }
@@ -1205,7 +1324,7 @@ public sealed partial class NestedCanvas
                 (x, y, w) = (x + child.OffsetX * w, y + child.OffsetY * w, w * child.Scale);
             }
 
-            if (y + w * NestedLayout.HeaderHeight >= 0)
+            if (y + w * NestedLayout.HeaderHeight / 2 >= 0)
             {
                 break;
             }
@@ -1281,6 +1400,9 @@ public sealed partial class NestedCanvas
     }
 
     private readonly List<NestedFolder> _trail = [];
+
+    /// <summary>For tests: the folders the last picture of the marks named in the trail, outermost first.</summary>
+    internal IReadOnlyList<NestedFolder> TrailForTests => _trail;
     private readonly List<NestedFolder?> _trailShown = [];
     private readonly List<(NestedFolder? Folder, string? Name)> _trailKey = [];
     private readonly List<Hotspot> _trailHotspots = [];
@@ -1344,6 +1466,193 @@ public sealed partial class NestedCanvas
         }
     }
 
+    private static int FindNearbyLead(
+        Point point,
+        double radius,
+        IReadOnlyList<Point> leads,
+        Dictionary<long, List<int>> buckets,
+        ref int comparisons)
+    {
+        var x = Bucket(point.X, radius);
+        var y = Bucket(point.Y, radius);
+        var radiusSquared = radius * radius;
+        var found = int.MaxValue;
+        for (var by = y - 1; by <= y + 1; by++)
+        {
+            for (var bx = x - 1; bx <= x + 1; bx++)
+            {
+                if (!buckets.TryGetValue(BucketKey(bx, by), out var candidates))
+                {
+                    continue;
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    comparisons++;
+                    var dx = leads[candidate].X - point.X;
+                    var dy = leads[candidate].Y - point.Y;
+                    if (candidate < found && dx * dx + dy * dy < radiusSquared)
+                    {
+                        found = candidate;
+                    }
+                }
+            }
+        }
+
+        return found == int.MaxValue ? -1 : found;
+    }
+
+    /// <summary>Exercises the badge grouping algorithm without a visual, for deterministic compatibility and work-count checks.</summary>
+    internal static (int[] Assignments, int Comparisons) ClusterPointsForTests(IReadOnlyList<Point> points, double radius)
+    {
+        var assignments = new int[points.Count];
+        var leads = new List<Point>();
+        var buckets = new Dictionary<long, List<int>>();
+        var comparisons = 0;
+        for (var index = 0; index < points.Count; index++)
+        {
+            var group = FindNearbyLead(points[index], radius, leads, buckets, ref comparisons);
+            if (group < 0)
+            {
+                group = leads.Count;
+                leads.Add(points[index]);
+                IndexPoint(buckets, points[index], radius, group);
+            }
+
+            assignments[index] = group;
+        }
+
+        return (assignments, comparisons);
+    }
+
+    private static void IndexPoint(Dictionary<long, List<int>> buckets, Point point, double cell, int index)
+    {
+        var key = BucketKey(Bucket(point.X, cell), Bucket(point.Y, cell));
+        if (!buckets.TryGetValue(key, out var at))
+        {
+            buckets[key] = at = [];
+        }
+
+        at.Add(index);
+    }
+
+    private static bool ContainsIndexedPoint(
+        Rect area,
+        int except,
+        IReadOnlyList<Point> points,
+        Dictionary<long, List<int>> buckets,
+        HashSet<int> seen,
+        double cell,
+        ref int comparisons)
+    {
+        seen.Clear();
+        var (left, top, right, bottom) = BucketRange(area, cell);
+        for (var y = top; y <= bottom; y++)
+        {
+            for (var x = left; x <= right; x++)
+            {
+                if (!buckets.TryGetValue(BucketKey(x, y), out var candidates))
+                {
+                    continue;
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    if (candidate == except || !seen.Add(candidate))
+                    {
+                        continue;
+                    }
+
+                    comparisons++;
+                    if (area.Contains(points[candidate]))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IntersectsIndexed(
+        Rect area,
+        IReadOnlyList<Rect> rectangles,
+        Dictionary<long, List<int>> buckets,
+        HashSet<int> seen,
+        double cell,
+        ref int comparisons)
+    {
+        seen.Clear();
+        var (left, top, right, bottom) = BucketRange(area, cell);
+        for (var y = top; y <= bottom; y++)
+        {
+            for (var x = left; x <= right; x++)
+            {
+                if (!buckets.TryGetValue(BucketKey(x, y), out var candidates))
+                {
+                    continue;
+                }
+
+                foreach (var candidate in candidates)
+                {
+                    if (!seen.Add(candidate))
+                    {
+                        continue;
+                    }
+
+                    comparisons++;
+                    if (rectangles[candidate].IntersectsWith(area))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static void IndexRect(Dictionary<long, List<int>> buckets, Rect area, double cell, int index)
+    {
+        var (left, top, right, bottom) = BucketRange(area, cell);
+        for (var y = top; y <= bottom; y++)
+        {
+            for (var x = left; x <= right; x++)
+            {
+                var key = BucketKey(x, y);
+                if (!buckets.TryGetValue(key, out var at))
+                {
+                    buckets[key] = at = [];
+                }
+
+                at.Add(index);
+            }
+        }
+    }
+
+    private static (int Left, int Top, int Right, int Bottom) BucketRange(Rect area, double cell) =>
+        (Bucket(area.Left, cell), Bucket(area.Top, cell), Bucket(area.Right, cell), Bucket(area.Bottom, cell));
+
+    private static int Bucket(double value, double cell)
+    {
+        if (!double.IsFinite(value))
+        {
+            return 0;
+        }
+
+        var result = Math.Floor(value / cell);
+        return result <= int.MinValue ? int.MinValue + 1 : result >= int.MaxValue ? int.MaxValue - 1 : (int)result;
+    }
+
+    private static long BucketKey(int x, int y) => ((long)x << 32) | (uint)y;
+
+    private readonly record struct ResolvedBeacon(
+        NestedBeacon Beacon,
+        NestedFolder Folder,
+        int FileIndex,
+        int LayoutSortGeneration,
+        int Priority);
     private readonly record struct Pin(NestedBeacon Beacon, NestedFolder Folder, int FileIndex, Point Centre, int Priority);
 
     /// <summary>A clickable spot drawn this frame (a beacon, a trail step) or a handle to grab a folder by.</summary>
