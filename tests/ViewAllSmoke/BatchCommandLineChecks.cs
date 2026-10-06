@@ -47,7 +47,8 @@ internal static partial class Program
             }
             var executable = NativeShellService.CreateProgramDropStartInfo(new(@"C:\owned\editor.EXE", "--mode plain", root), arguments);
             Check("ordinary EXE arguments preserve the existing CRT builder and configured prefix", executable.UseShellExecute
-                && executable.Arguments == "--mode plain " + NativeShellService.BuildCommandLine(arguments) && executable.WorkingDirectory == root);
+                && executable.Arguments == "--mode plain " + NativeShellService.BuildCommandLine(arguments) && executable.WorkingDirectory == root
+                && executable.Verb.Length == 0);
             Check("the generic CRT builder remains unchanged for IPC/executables", NativeShellService.BuildCommandLine([@"C:\owned\a&ver"]) == @"C:\owned\a&ver");
 
             var actualLink = Path.Combine(root, "actual-batch.lnk");
@@ -96,9 +97,13 @@ internal static partial class Program
             NativeShellService.ProgramMetadataReaderForChecks = (_, _) => new(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "", "");
             Check("a custom cmd-mediated script association is not silently treated as an EXE", await BatchRejectedAsync(Path.Combine(root, "script.custom"), arguments));
             NativeShellService.ProgramMetadataReaderForChecks = (_, _) => new(Path.Combine(Environment.SystemDirectory, "wscript.exe"), "", "");
-            Check("ordinary WSH script associations retain ShellExecute behavior", (await NativeShellService.CreateProgramDropStartInfoAsync(Path.Combine(root, "script.vbs"), arguments)).UseShellExecute);
+            var wsh = await NativeShellService.CreateProgramDropStartInfoAsync(Path.Combine(root, "script.vbs"), arguments);
+            Check("ordinary WSH script associations retain ShellExecute behavior", wsh.UseShellExecute);
+            Check("a WSH association launches the inspected open verb, never an unchecked registered default", wsh.Verb == "open");
             NativeShellService.ProgramMetadataReaderForChecks = (_, _) => new(Path.Combine(Environment.SystemDirectory, "powershell.exe"), "powershell.exe -File \"%1\" %*", "");
-            Check("a literal PowerShell -File association keeps ordinary Shell opening", (await NativeShellService.CreateProgramDropStartInfoAsync(Path.Combine(root, "script.ps1"), arguments)).UseShellExecute);
+            var powershell = await NativeShellService.CreateProgramDropStartInfoAsync(Path.Combine(root, "script.ps1"), arguments);
+            Check("a literal PowerShell -File association keeps ordinary Shell opening", powershell.UseShellExecute);
+            Check("a literal PowerShell File association uses the exact inspected open verb", powershell.Verb == "open");
             NativeShellService.ProgramMetadataReaderForChecks = (_, _) => new(Path.Combine(Environment.SystemDirectory, "powershell.exe"), "powershell.exe -Command \"%1\" %*", "");
             Check("a PowerShell command-text association cannot interpret dropped names as code", await BatchRejectedAsync(Path.Combine(root, "script.code"), arguments));
             foreach (var codeFlag in new[] { "-ec", "-cwa", "-enc", "-CommandWithArgs" })
@@ -111,6 +116,12 @@ internal static partial class Program
                 ? new(Path.Combine(root, "script.custom"), "", root)
                 : new(Path.Combine(Environment.SystemDirectory, "cmd.exe"), "/c %1 %*", "");
             Check("a shortcut to a script cannot bypass its association's command-host guard", await BatchRejectedAsync(Path.Combine(root, "associated.lnk"), arguments));
+            NativeShellService.ProgramMetadataReaderForChecks = (_, shortcut) => shortcut
+                ? new(Path.Combine(root, "script.vbs"), "", root)
+                : new(Path.Combine(Environment.SystemDirectory, "wscript.exe"), "", "");
+            var scriptShortcut = await NativeShellService.CreateProgramDropStartInfoAsync(Path.Combine(root, "wsh-script.lnk"), arguments);
+            Check("a script shortcut also pins the inspected association verb without changing its target", scriptShortcut.Verb == "open"
+                && scriptShortcut.FileName == Path.Combine(root, "script.vbs") && scriptShortcut.WorkingDirectory == root);
 
             using var held = new ManualResetEventSlim();
             using var release = new ManualResetEventSlim();

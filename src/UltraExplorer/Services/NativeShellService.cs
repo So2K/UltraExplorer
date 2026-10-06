@@ -89,14 +89,19 @@ public sealed class NativeShellService
         if (extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase))
             launch = await ReadProgramMetadataAsync(programPath, shortcut: true).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
         var targetExtension = Path.GetExtension(launch.Target);
-        if (!IsBatchProgram(launch.Target) && !targetExtension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
-            && !targetExtension.Equals(".com", StringComparison.OrdinalIgnoreCase))
+        var associatedScript = !IsBatchProgram(launch.Target) && !targetExtension.Equals(".exe", StringComparison.OrdinalIgnoreCase)
+            && !targetExtension.Equals(".com", StringComparison.OrdinalIgnoreCase);
+        if (associatedScript)
         {
             var association = await ReadProgramMetadataAsync(launch.Target, shortcut: false).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
             if (IsCommandTextHost(association.Target) && !IsLiteralPowerShellFileAssociation(association))
                 throw new IOException("This script association uses a command shell and cannot safely receive dropped file names. Use its .cmd/.bat file directly.");
         }
-        return CreateProgramDropStartInfo(launch, paths);
+        var start = CreateProgramDropStartInfo(launch, paths);
+        // Inspection used the explicit open verb. An empty launch verb could
+        // select a different registered default and bypass that host check.
+        if (associatedScript) start.Verb = "open";
+        return start;
     }
 
     internal sealed record ProgramShortcut(string Target, string Arguments, string WorkingDirectory);
