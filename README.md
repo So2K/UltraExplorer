@@ -165,7 +165,7 @@ check is closed. The notes record the tested scope and remaining failures.
 | Pan | Middle/right drag, `Space+drag`, wheel / `Shift+wheel` |
 | Enter a folder / open a file | Double-click |
 | Fit the whole map / selected item | `Shift+1` / `Shift+2` |
-| Jump tightly to the focused selected file or folder | `F` |
+| Smoothly zoom tightly to the focused selected file or folder | `F` |
 | Type or paste a path | `Ctrl+L` or `Alt+D` |
 | Search across drives | `Ctrl+F` |
 | Reveal / open a search result | `Enter` / `Ctrl+Enter` |

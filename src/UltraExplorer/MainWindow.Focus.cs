@@ -47,8 +47,8 @@ public partial class MainWindow
         return false;
     }
 
-    /// <summary>Frames one selected item; it never selects its parent or records navigation.</summary>
-    internal async Task<bool> FocusSelectionAsync(bool animated = false)
+    /// <summary>Flies smoothly to one selected item; it never selects its parent or records navigation.</summary>
+    internal async Task<bool> FocusSelectionAsync(bool animated = true)
     {
         if (_closeRequested) return false;
         var tree = _viewModel.Tree;

@@ -428,20 +428,41 @@ internal static partial class Program
         main.ActivatePane(pane);
         shell.Tree.Selection.ReplaceSingle(selectedPath, false, 7, SelectionSource.Canvas);
         pane.SyncSelection();
+        pane.Canvas.FramesByHandForTests = true;
         pane.Canvas.FitAll(animated: false);
+        var takeoff = pane.Canvas.CaptureCamera();
         var marked = 0;
         var handled = main.TryHandleFocusSelectionKey(Key.F, ModifierKeys.None, inputOrigin: pane.Canvas,
             markHandled: () => marked++);
         Check("plain F on the selection surface is synchronously claimed before its async focus starts", handled && marked == 1);
-        Check("the claimed plain F asynchronously frames the selected leaf",
-            await LiveWait(() => FocusFileRect(pane.Canvas, pane.Tree, selectedPath) is { } rect && FocusCentred(rect, pane.Canvas, 0.75), 3_000) >= 0);
+        var flightField = typeof(NestedCanvas).GetField("_flight", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        await WaitUntil(() => flightField.GetValue(pane.Canvas) is not null, 3_000);
+        Check("plain F starts the existing smooth camera flight instead of jumping at once",
+            flightField.GetValue(pane.Canvas) is not null && pane.Canvas.CaptureCamera() == takeoff);
+        var flight = flightField.GetValue(pane.Canvas)!;
+        var startedField = flight.GetType().GetField("_started", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var durationField = flight.GetType().GetField("_duration", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var duration = (double)durationField.GetValue(flight)!;
+        var frameTime = TimeSpan.FromSeconds(100);
+        startedField.SetValue(flight, Stopwatch.GetTimestamp() - (long)(Stopwatch.Frequency * duration * 0.5));
+        pane.Canvas.RunFrameForTests(frameTime);
+        var midway = pane.Canvas.CaptureCamera();
+        Check("an intermediate F frame advances along the flight without already cutting to the final card",
+            midway is not null && midway != takeoff
+            && !(FocusFileRect(pane.Canvas, pane.Tree, selectedPath) is { } middleRect && FocusCentred(middleRect, pane.Canvas, 0.75)));
+        startedField.SetValue(flight, Stopwatch.GetTimestamp() - (long)(Stopwatch.Frequency * duration * 2));
+        pane.Canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
+        Check("the smooth F flight settles on the exact selected leaf",
+            flightField.GetValue(pane.Canvas) is null
+            && FocusFileRect(pane.Canvas, pane.Tree, selectedPath) is { } rect && FocusCentred(rect, pane.Canvas, 0.75));
 
         pane.Canvas.Pan(new Vector(31, -17));
         var repeatedCamera = pane.Canvas.CaptureCamera();
         marked = 0;
         Check("a repeated F is claimed but does not start another focus",
             main.TryHandleFocusSelectionKey(Key.F, ModifierKeys.None, isRepeat: true, inputOrigin: pane.Canvas,
-                markHandled: () => marked++) && marked == 1 && pane.Canvas.CaptureCamera() == repeatedCamera);
+                markHandled: () => marked++) && marked == 1 && pane.Canvas.CaptureCamera() == repeatedCamera
+            && flightField.GetValue(pane.Canvas) is null);
         Check("Ctrl+F and Ctrl+Shift+F remain available to search and the pane filter",
             !main.TryHandleFocusSelectionKey(Key.F, ModifierKeys.Control, inputOrigin: pane.Canvas)
             && !main.TryHandleFocusSelectionKey(Key.F, ModifierKeys.Control | ModifierKeys.Shift, inputOrigin: pane.Canvas));
