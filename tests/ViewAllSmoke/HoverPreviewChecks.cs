@@ -397,9 +397,21 @@ internal static partial class Program
             }
 
             Section("hover preview: queued releases cannot undo later input or dismissal");
+            // Switching to Tree, revealing the list and scrolling its row
+            // queues viewport/ScrollChanged work above Background priority.
+            // Finish those real dismissals before arming an uninterrupted
+            // release; otherwise the fixture itself invalidates its ticket.
+            await SettingsSettle();
+            Check("the queued-release fixture is open, enabled and empty after layout settles",
+                !fixtureClosed && window.IsLoaded && window.IsVisible && model.ShowHoverPreviews
+                && window.HoverPreviewsForChecks.Path is null && card.Visibility == Visibility.Collapsed);
+            var generationField = typeof(MainWindow).GetField("_previewGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var generationBeforeRelease = (long)generationField.GetValue(window)!;
             var queued = 0;
             window.QueueHoverPreviewAfterRelease(MouseButton.Left, () => queued++);
             await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
+            if (queued != 1)
+                Console.WriteLine($"  note: release callback count={queued}, generation={generationBeforeRelease}->{generationField.GetValue(window)}, closed={fixtureClosed}, enabled={model.ShowHoverPreviews}");
             Check("an uninterrupted left release reevaluates stationary hover exactly once", queued == 1);
             window.QueueHoverPreviewAfterRelease(MouseButton.Right, () => queued++);
             window.QueueHoverPreviewAfterRelease(MouseButton.Middle, () => queued++);
