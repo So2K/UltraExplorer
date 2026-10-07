@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Interop;
@@ -22,38 +23,68 @@ namespace UltraExplorer.Controls;
 internal sealed class NativePreviewHost : UserControl, IDisposable
 {
     private readonly NativeSurface _surface = new();
+    private readonly DockPanel _header = new() { LastChildFill = true, Height = 38 };
+    private readonly Border _audioCard = new() { Visibility = Visibility.Collapsed, MaxWidth = 480, Margin = new Thickness(24),
+        HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, CornerRadius = new CornerRadius(12),
+        Padding = new Thickness(24), BorderThickness = new Thickness(1) };
+    private readonly Border _audioIcon = new() { Width = 68, Height = 68, CornerRadius = new CornerRadius(20), HorizontalAlignment = HorizontalAlignment.Center };
+    private readonly TextBlock _audioName = new() { FontSize = 18, FontWeight = FontWeights.SemiBold, TextAlignment = TextAlignment.Center,
+        TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(0, 16, 0, 8) };
+    private readonly TextBlock _audioDetail = new() { FontSize = 12, TextAlignment = TextAlignment.Center };
     private readonly TextBlock _status = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 4, 0), FontSize = 12 };
     private readonly StackPanel _tools = new() { Orientation = Orientation.Horizontal };
-    private readonly Grid _mediaControls = new() { Margin = new Thickness(12, 5, 12, 10), Visibility = Visibility.Collapsed };
+    private readonly Grid _mediaControls = new() { Margin = new Thickness(16, 8, 16, 12), Visibility = Visibility.Collapsed };
     private readonly Slider _timeline = new() { Minimum = 0, Maximum = 1, IsMoveToPointEnabled = true, VerticalAlignment = VerticalAlignment.Center };
-    private readonly Slider _volume = new() { Minimum = 0, Maximum = 100, Value = 100, Width = 110, VerticalAlignment = VerticalAlignment.Center, ToolTip = "Volume" };
+    private readonly Slider _volume = new() { Minimum = 0, Maximum = 100, Value = 100, Width = 100, IsMoveToPointEnabled = true,
+        VerticalAlignment = VerticalAlignment.Center, ToolTip = "Volume" };
     private readonly TextBlock _position = new() { Text = "0:00", VerticalAlignment = VerticalAlignment.Center, MinWidth = 46 };
     private readonly TextBlock _duration = new() { Text = "0:00", VerticalAlignment = VerticalAlignment.Center, MinWidth = 46, TextAlignment = TextAlignment.Right };
-    private readonly Button _playPause = new() { Content = "Play" };
-    private readonly Button _mute = new() { Content = "Mute" };
-    private readonly ComboBox _speed = new() { Width = 76, Height = 28, ToolTip = "Playback speed" };
+    private readonly Button _playPause = new();
+    private readonly Button _mute = new();
+    private readonly ComboBox _speed = new() { Width = 76, Height = 32, ToolTip = "Playback speed" };
     private readonly DispatcherTimer _playbackTimer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(250) };
     private readonly DispatcherTimer _seekTimer = new(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(80) };
     private readonly CancellationTokenSource _lifetime = new();
     private CancellationTokenSource? _session;
     private CancellationTokenRegistration _processCancellation;
     private Process? _process;
+    private ModelProcessDiagnostics? _modelDiagnostics;
+    private MediaSession? _mediaSession;
+    private Task? _mediaObserver;
     private string? _pipeName;
     private string? _sessionDirectory;
     private IntPtr _modelWindow;
     private int _generation;
     private bool _disposed;
     private bool _refreshingPlayback, _syncingControls, _scrubbing, _resumeAfterScrub;
+    private bool _paused = true;
+    private string _mediaExtension = "";
     private double? _pendingSeek;
     private CancellationTokenSource? _seekRequest;
     private long _playbackPolls;
     internal string? LastError { get; private set; }
     internal string? LastNativeDiagnostic { get; private set; }
     internal int? OwnedProcessId => _process is { } process && !process.HasExited ? process.Id : null;
+    internal int? LastStartedProcessId { get; private set; }
+    internal bool IsMediaObserverRunning => _mediaObserver is { IsCompleted: false };
     internal IntPtr ViewportHandle => _surface.Window;
     internal IntPtr ModelWindowHandle => _modelWindow;
     internal bool IsPlaybackTimerRunning => _playbackTimer.IsEnabled;
     internal long PlaybackPollCount => _playbackPolls;
+    internal bool IsAudioOnly { get; private set; }
+    internal JsonElement? InitialMediaTracks { get; private set; }
+    internal bool IsMediaLoaded => !_disposed && _pipeName is not null && _mediaControls.Visibility == Visibility.Visible && _mediaControls.IsEnabled;
+    internal bool IsMediaHeaderVisible => _header.Visibility == Visibility.Visible;
+    internal bool IsNativeViewportVisible => _surface.Visibility == Visibility.Visible;
+    internal string AudioDisplayName => _audioName.Text;
+    internal string AudioDetail => _audioDetail.Text;
+    internal FrameworkElement AudioCard => _audioCard;
+    internal FrameworkElement PlaybackControls => _mediaControls;
+    internal Slider TimelineControl => _timeline;
+    internal Slider VolumeControl => _volume;
+    internal Button PlayPauseControl => _playPause;
+    internal Button MuteControl => _mute;
+    internal ComboBox SpeedControl => _speed;
     internal string? ModelSnapshotPath => _sessionDirectory is null ? null : Path.Combine(_sessionDirectory, "viewport.png");
     internal void RequestModelSnapshot() => _surface.ModelKey(0x7B); // F12, sent only to the owned viewport.
 
@@ -65,19 +96,21 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         grid.RowDefinitions.Add(new RowDefinition());
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var header = new DockPanel { LastChildFill = true, Height = 42 };
-        header.SetResourceReference(Panel.BackgroundProperty, "SurfaceBrush");
+        _header.SetResourceReference(Panel.BackgroundProperty, "SurfaceBrush");
         DockPanel.SetDock(_tools, Dock.Right);
-        header.Children.Add(_tools);
-        header.Children.Add(_status);
-        grid.Children.Add(header);
+        _header.Children.Add(_tools);
+        _header.Children.Add(_status);
+        grid.Children.Add(_header);
         Grid.SetRow(_surface, 1);
         grid.Children.Add(_surface);
+        BuildAudioCard();
+        Grid.SetRow(_audioCard, 1); grid.Children.Add(_audioCard);
         BuildMediaControls();
         Grid.SetRow(_mediaControls, 2);
         grid.Children.Add(_mediaControls);
         _playbackTimer.Tick += PlaybackTick;
         _seekTimer.Tick += SeekTick;
+        _surface.SizeChanged += (_, _) => UpdateAudioCardSize();
         Content = grid;
         Unloaded += (_, _) => Dispose();
     }
@@ -89,7 +122,15 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         StopSession();
         var generation = ++_generation;
         LastError = null;
+        LastNativeDiagnostic = null;
+        LastStartedProcessId = null;
+        IsAudioOnly = false;
+        InitialMediaTracks = null;
+        _surface.Visibility = Visibility.Visible;
+        _audioCard.Visibility = Visibility.Collapsed;
+        _header.Visibility = Visibility.Visible;
         _mediaControls.Visibility = Visibility.Collapsed;
+        _mediaControls.IsEnabled = true;
         _status.Text = "Loading preview…";
         var model = PreviewTools.IsModel(path);
         var executable = model ? PreviewTools.FindF3d() : PreviewTools.FindMpv();
@@ -104,6 +145,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _session = session;
         using var loading = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
         loading.CancelAfter(TimeSpan.FromSeconds(20));
+        MediaSession? media = null;
+        ModelProcessDiagnostics? modelDiagnostics = null;
         try
         {
             await _surface.Ready.WaitAsync(loading.Token);
@@ -127,18 +170,34 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                     "--idle=yes", "--force-window=yes", "--keep-open=yes", "--pause=yes", "--osc=no", "--hwdec=auto-safe",
                     "--input-default-bindings=no", "--input-builtin-bindings=no", "--input-vo-keyboard=no", "--input-cursor=no",
                     "--load-stats-overlay=no", "--load-console=no", "--load-commands=no", "--load-select=no", "--osd-level=0",
-                    "--sub-auto=no", "--audio-file-auto=no", "--save-position-on-quit=no", "--write-filename-in-watch-later-config=no",
-                    "--", DocumentPreviewService.LiteralPath(path)];
+                    "--sub-auto=no", "--audio-file-auto=no", "--save-position-on-quit=no", "--write-filename-in-watch-later-config=no"];
+                // Generated native fixtures must decode and exercise IPC even
+                // on a runner without a physical playback device. Everyday
+                // previews retain mpv's default real audio output.
+                if (Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1")
+                    arguments = arguments.Append("--ao=null");
             }
-            var process = PreviewTools.Start(executable, arguments, _sessionDirectory);
+            var process = model
+                ? StartModelProcess(executable, arguments, _sessionDirectory, out modelDiagnostics)
+                : PreviewTools.Start(executable, arguments, _sessionDirectory);
+            _modelDiagnostics = modelDiagnostics;
             _process = process;
+            LastStartedProcessId = process.Id;
             _processCancellation = session.Token.Register(() => PreviewTools.Kill(process));
             process.EnableRaisingEvents = true;
             process.Exited += (_, _) => Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (!_disposed && generation == _generation)
+                if (!_disposed && generation == _generation && ReferenceEquals(_process, process) && ReferenceEquals(_session, session))
                 {
-                    _status.Text = "Preview closed";
+                    if (modelDiagnostics is not null) LastNativeDiagnostic = modelDiagnostics.Snapshot();
+                    if (media is { } closedMedia && ReferenceEquals(closedMedia, _mediaSession))
+                    {
+                        closedMedia.Fail("The media engine closed its preview process.");
+                        LastError = closedMedia.Failure; CaptureMediaDiagnostic(closedMedia);
+                    }
+                    _status.Text = LastError ?? "Preview closed";
+                    _header.Visibility = Visibility.Visible;
+                    _mediaControls.IsEnabled = false;
                     _playbackTimer.Stop();
                     _seekTimer.Stop();
                     _surface.Detach();
@@ -170,32 +229,84 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
             }
             else
             {
-                // A pipe being created proves only that mpv started. Wait until
-                // an actual file is loaded so corrupt codecs get a clear fallback.
+                // Connect before loadfile: the file-loaded/end-file events must
+                // belong to a persistent client, not a short-lived command pipe.
+                media = new MediaSession(); _mediaSession = media;
+                _mediaObserver = ObserveMediaAsync(_pipeName!, media, generation, session.Token);
+                await media.ObserverReady.Task.WaitAsync(loading.Token);
+                media.ThrowIfFailed();
+                var loaded = await MpvCommandAsync(["loadfile", DocumentPreviewService.LiteralPath(path), "replace"], loading.Token);
+                if (!PropertySucceeded(loaded)) throw new IOException("The media engine could not begin loading this file.");
+                await media.FileLoaded.Task.WaitAsync(loading.Token);
+                media.ThrowIfFailed();
+                JsonElement? tracks;
                 while (true)
                 {
                     loading.Token.ThrowIfCancellationRequested();
-                    if (process.HasExited) throw new IOException("mpv could not open this media file.");
-                    var response = await MpvCommandAsync(["get_property", "idle-active"], loading.Token);
-                    if (response is { } reply && reply.TryGetProperty("data", out var idle) && idle.ValueKind == JsonValueKind.False) break;
-                    await Task.Delay(80, loading.Token);
+                    media.ThrowIfFailed();
+                    if (process.HasExited) throw new IOException("The media engine closed before decoding this file.");
+                    tracks = await MpvCommandAsync(["get_property", "track-list"], loading.Token);
+                    var currentPath = await MpvCommandAsync(["get_property", "path"], loading.Token);
+                    var videoParams = await MpvCommandAsync(["get_property", "video-params"], loading.Token);
+                    var audioParams = await MpvCommandAsync(["get_property", "audio-params"], loading.Token);
+                    var time = await MpvCommandAsync(["get_property", "time-pos"], loading.Token);
+                    media.ThrowIfFailed();
+                    if (MediaPropertiesReady(tracks, currentPath, videoParams, audioParams, time, path)) break;
+                    await Task.Delay(40, loading.Token);
                 }
-                _status.Text = "Drag the timeline to preview a frame";
+                if (generation != _generation) throw new OperationCanceledException(session.Token);
+                InitialMediaTracks = tracks;
+                IsAudioOnly = HasOnlyAudio(tracks, path);
+                _mediaExtension = Path.GetExtension(path.TrimEnd(' ', '.')).TrimStart('.').ToUpperInvariant();
+                _audioName.Text = Path.GetFileName(path.TrimEnd(' ', '.'));
+                _audioName.ToolTip = _audioName.Text;
+                _audioCard.Visibility = IsAudioOnly ? Visibility.Visible : Visibility.Collapsed;
+                UpdateAudioCardSize();
+                // Keep the existing HWND alive for IPC, but cover/hide its blank
+                // video canvas for audio. Switching back to video reuses this host.
+                _surface.Visibility = IsAudioOnly ? Visibility.Hidden : Visibility.Visible;
+                _header.Visibility = Visibility.Collapsed;
+                _status.Text = "";
                 _mediaControls.Visibility = Visibility.Visible;
                 await RefreshPlaybackAsync(loading.Token);
+                media.ThrowIfFailed();
                 _playbackTimer.Start();
             }
         }
         catch (Exception ex)
         {
+            var mediaFailure = media?.Failure;
             var ownTimeout = ex is OperationCanceledException && !session.IsCancellationRequested;
+            if (modelDiagnostics is not null)
+            {
+                // Drain only the already-exited process, with a fixed bound. Capture
+                // before StopSession deletes this request's temporary directory.
+                var diagnostic = await modelDiagnostics.CaptureAsync();
+                if (generation == _generation)
+                {
+                    LastNativeDiagnostic = diagnostic;
+                    if (_surface.LastAttachDiagnostic is { } attachment)
+                        LastNativeDiagnostic += "\nAttachment: " + attachment;
+                    if (_sessionDirectory is { } diagnosticDirectory)
+                    {
+                        try { File.WriteAllText(Path.Combine(diagnosticDirectory, "engine-error.log"), LastNativeDiagnostic, Encoding.UTF8); }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                }
+            }
             if (generation == _generation)
             {
-                LastError = ownTimeout
-                    ? "The preview engine took too long to load this file." : ex.Message;
+                LastError = mediaFailure ?? (ownTimeout
+                    ? "The preview engine took too long to load this file." : ex.Message);
+                if (media is not null) CaptureMediaDiagnostic(media);
                 _status.Text = LastError;
+                _header.Visibility = Visibility.Visible;
+                _mediaControls.Visibility = Visibility.Collapsed;
+                _audioCard.Visibility = Visibility.Collapsed;
                 StopSession();
             }
+            if (mediaFailure is not null && ex is not IOException) throw new IOException(mediaFailure, ex);
             if (ownTimeout) throw new TimeoutException("The preview engine took too long to load this file.", ex);
             throw;
         }
@@ -207,6 +318,95 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         button.SetResourceReference(FrameworkElement.StyleProperty, "FlatButton");
         button.Click += (_, _) => action();
         _tools.Children.Add(button);
+    }
+
+    private static Process StartModelProcess(string executable, IEnumerable<string> arguments, string directory,
+        out ModelProcessDiagnostics diagnostics)
+    {
+        // Equivalent launch settings to PreviewTools.Start; only F3D's diagnostic
+        // streams differ. No renderer flags, input path or model bytes change.
+        var start = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = directory, RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        var process = Process.Start(start) ?? throw new IOException("The preview engine did not start.");
+        try { diagnostics = new ModelProcessDiagnostics(process); return process; }
+        catch { PreviewTools.Kill(process); process.Dispose(); throw; }
+    }
+
+    private sealed class ModelProcessDiagnostics : IDisposable
+    {
+        // Each UTF-16 tail is below 8K characters; both streams plus labels and
+        // attachment diagnostics stay below 64KiB even when encoded as UTF-8.
+        private const int MaximumStreamCharacters = 7_936;
+        private readonly object _gate = new();
+        private readonly Process _process;
+        private readonly CancellationTokenSource _stop = new();
+        private readonly StreamReader _stdoutReader, _stderrReader;
+        private readonly StringBuilder _stdout = new(), _stderr = new();
+        private readonly Task _stdoutDrain, _stderrDrain;
+
+        internal ModelProcessDiagnostics(Process process)
+        {
+            _process = process;
+            _stdoutReader = process.StandardOutput; _stderrReader = process.StandardError;
+            _stdoutDrain = DrainAsync(_stdoutReader, _stdout);
+            _stderrDrain = DrainAsync(_stderrReader, _stderr);
+        }
+
+        private async Task DrainAsync(StreamReader reader, StringBuilder tail)
+        {
+            // Read chunks rather than ReadLine: a single oversized warning must
+            // not allocate an unbounded string or fill and block the child pipe.
+            var buffer = new char[4096];
+            try
+            {
+                while (true)
+                {
+                    var count = await reader.ReadAsync(buffer.AsMemory(), _stop.Token).ConfigureAwait(false);
+                    if (count == 0) return;
+                    lock (_gate)
+                    {
+                        tail.Append(buffer, 0, count);
+                        if (tail.Length > MaximumStreamCharacters) tail.Remove(0, tail.Length - MaximumStreamCharacters);
+                    }
+                }
+            }
+            catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException) { }
+        }
+
+        internal async Task<string> CaptureAsync()
+        {
+            try
+            {
+                if (_process.HasExited)
+                {
+                    // Descendants can retain a redirected handle after parent
+                    // exit; never let diagnostic collection delay close forever.
+                    try { await Task.WhenAll(_stdoutDrain, _stderrDrain).WaitAsync(TimeSpan.FromSeconds(1)); }
+                    catch (TimeoutException) { }
+                }
+            }
+            catch (InvalidOperationException) { }
+            return Snapshot();
+        }
+
+        internal string Snapshot()
+        {
+            string exit;
+            try { exit = _process.HasExited ? _process.ExitCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "still running"; }
+            catch (InvalidOperationException) { exit = "unavailable"; }
+            lock (_gate) return $"F3D exit code: {exit}\nstdout:\n{_stdout}\nstderr:\n{_stderr}";
+        }
+
+        public void Dispose()
+        {
+            _stop.Cancel();
+            _stdoutReader.Dispose(); _stderrReader.Dispose();
+            _stop.Dispose();
+        }
     }
 
     internal async Task<JsonElement?> MpvCommandAsync(object[] command, CancellationToken token = default)
@@ -224,9 +424,10 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
             await pipe.WriteAsync(bytes, timeout.Token).ConfigureAwait(false);
             await pipe.FlushAsync(timeout.Token).ConfigureAwait(false);
             using var reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+            var lines = new BoundedMediaLineReader(reader);
             for (var index = 0; index < 64; index++)
             {
-                var line = await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false);
+                var line = await lines.ReadAsync(timeout.Token).ConfigureAwait(false);
                 if (line is null) return null;
                 using var json = JsonDocument.Parse(line);
                 if (json.RootElement.TryGetProperty("request_id", out var id) && id.GetInt32() == 1)
@@ -238,48 +439,278 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         return null;
     }
 
+    private async Task ObserveMediaAsync(string pipeName, MediaSession media, int generation, CancellationToken token)
+    {
+        try
+        {
+            using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            await pipe.ConnectAsync(token).ConfigureAwait(false);
+            var request = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { command = new[] { "request_log_messages", "warn" }, request_id = 91 }) + "\n");
+            await pipe.WriteAsync(request, token).ConfigureAwait(false);
+            await pipe.FlushAsync(token).ConfigureAwait(false);
+            using var reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+            var lines = new BoundedMediaLineReader(reader);
+            while (true)
+            {
+                var line = await lines.ReadAsync(token).ConfigureAwait(false);
+                // Windows mpv closes IPC before sending a shutdown JSON event.
+                if (line is null) throw new IOException("The media engine closed its preview connection.");
+                using var document = JsonDocument.Parse(line);
+                var message = document.RootElement;
+                if (message.TryGetProperty("request_id", out var id) && id.TryGetInt32(out var requestId) && requestId == 91)
+                {
+                    if (MessageString(message, "error") != "success") throw new IOException("The media engine could not observe preview events.");
+                    media.ObserverReady.TrySetResult();
+                    continue;
+                }
+                switch (MessageString(message, "event"))
+                {
+                    case "log-message":
+                        media.AppendLog($"[{MessageString(message, "prefix")}] {MessageString(message, "level")}: {MessageString(message, "text")}");
+                        break;
+                    case "file-loaded":
+                        media.AppendLog("file-loaded\n");
+                        media.FileLoaded.TrySetResult();
+                        break;
+                    case "end-file":
+                        media.AppendLog(line + "\n");
+                        if (MessageString(message, "reason") == "error")
+                            throw new IOException("The media engine could not play this file: " + MessageString(message, "file_error"));
+                        // This means UNLOADED, including incomplete files which
+                        // can report eof. Ordinary keep-open EOF remains loaded.
+                        throw new IOException("The media file was unloaded before its preview could continue.");
+                    case "shutdown":
+                        throw new IOException("The media engine closed before previewing finished.");
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            media.ObserverReady.TrySetCanceled(token); media.FileLoaded.TrySetCanceled(token);
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or InvalidOperationException)
+        {
+            if (token.IsCancellationRequested) return;
+            media.Fail(ex.Message);
+            if (Dispatcher.HasShutdownStarted) return;
+            try
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_disposed || generation != _generation || !ReferenceEquals(media, _mediaSession)) return;
+                    LastError = media.Failure; CaptureMediaDiagnostic(media);
+                    _status.Text = LastError;
+                    _header.Visibility = Visibility.Visible;
+                    _mediaControls.IsEnabled = false;
+                    StopSession();
+                }));
+            }
+            catch (InvalidOperationException) { }
+        }
+    }
+
+    private void CaptureMediaDiagnostic(MediaSession media)
+    {
+        LastNativeDiagnostic = media.LogSnapshot();
+        if (_sessionDirectory is not { } directory) return;
+        try { File.WriteAllText(Path.Combine(directory, "engine-error.log"), LastNativeDiagnostic, Encoding.UTF8); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    internal static bool MediaPropertiesReady(JsonElement? tracksResponse, JsonElement? pathResponse, JsonElement? videoParamsResponse,
+        JsonElement? audioParamsResponse, JsonElement? positionResponse, string expectedPath)
+    {
+        if (!PropertyData(tracksResponse, out var tracks) || tracks.ValueKind != JsonValueKind.Array
+            || !PropertyData(pathResponse, out var path) || path.ValueKind != JsonValueKind.String
+            || !PropertyData(positionResponse, out var position) || position.ValueKind != JsonValueKind.Number
+            || !position.TryGetDouble(out var seconds) || !double.IsFinite(seconds) || seconds < 0) return false;
+        var currentPath = path.GetString();
+        if (string.IsNullOrEmpty(currentPath) || !Path.IsPathFullyQualified(currentPath)
+            || !string.Equals(DocumentPreviewService.LiteralPath(currentPath), DocumentPreviewService.LiteralPath(expectedPath), StringComparison.OrdinalIgnoreCase)) return false;
+        var selectedAudio = false; var selectedVideo = false;
+        foreach (var track in tracks.EnumerateArray())
+        {
+            if (track.ValueKind != JsonValueKind.Object || !track.TryGetProperty("selected", out var selected) || selected.ValueKind != JsonValueKind.True) continue;
+            var type = MessageString(track, "type");
+            selectedAudio |= type == "audio";
+            selectedVideo |= type == "video" && !(track.TryGetProperty("albumart", out var cover) && cover.ValueKind == JsonValueKind.True);
+        }
+        if (selectedVideo)
+            return PropertyData(videoParamsResponse, out var video) && video.ValueKind == JsonValueKind.Object
+                && PositiveNumber(video, "w") && PositiveNumber(video, "h");
+        return selectedAudio && PropertyData(audioParamsResponse, out var audio) && audio.ValueKind == JsonValueKind.Object && PositiveNumber(audio, "samplerate");
+    }
+
+    private static bool PositiveNumber(JsonElement value, string name) => value.TryGetProperty(name, out var number)
+        && number.ValueKind == JsonValueKind.Number && number.TryGetDouble(out var result) && double.IsFinite(result) && result > 0;
+    private static bool PropertySucceeded(JsonElement? response) => response is { } root && MessageString(root, "error") == "success";
+    private static bool PropertyData(JsonElement? response, out JsonElement data)
+    {
+        data = default;
+        return response is { } root && PropertySucceeded(response) && root.TryGetProperty("data", out data);
+    }
+    private static string MessageString(JsonElement message, string name) => message.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
+
+    private sealed class MediaSession
+    {
+        // A UTF-16 log of at most 16K characters also stays below 64KiB
+        // when captured as UTF-8, including non-ASCII error messages.
+        private const int MaximumLogCharacters = 16 * 1024;
+        private readonly object _gate = new();
+        private readonly StringBuilder _log = new();
+        private string? _failure;
+        internal TaskCompletionSource ObserverReady { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource FileLoaded { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal string? Failure => Volatile.Read(ref _failure);
+        internal void AppendLog(string line)
+        {
+            lock (_gate)
+            {
+                if (line.Length > MaximumLogCharacters) line = line[^MaximumLogCharacters..];
+                _log.Append(line);
+                if (_log.Length > MaximumLogCharacters) _log.Remove(0, _log.Length - MaximumLogCharacters);
+            }
+        }
+        internal void Fail(string reason)
+        {
+            if (Interlocked.CompareExchange(ref _failure, reason, null) is null) AppendLog(reason + "\n");
+            ObserverReady.TrySetResult(); FileLoaded.TrySetResult();
+        }
+        internal void ThrowIfFailed() { if (Failure is { } failure) throw new IOException(failure); }
+        internal string LogSnapshot() { lock (_gate) return _log.ToString(); }
+    }
+
+    internal sealed class BoundedMediaLineReader(StreamReader reader)
+    {
+        private const int MaximumCharacters = 256 * 1024;
+        private readonly char[] _buffer = new char[4096];
+        private int _offset, _count;
+        internal async Task<string?> ReadAsync(CancellationToken token)
+        {
+            StringBuilder? collected = null;
+            while (true)
+            {
+                if (_offset == _count)
+                {
+                    _count = await reader.ReadAsync(_buffer.AsMemory(), token).ConfigureAwait(false);
+                    _offset = 0;
+                    if (_count == 0) return collected?.ToString();
+                }
+                var newline = Array.IndexOf(_buffer, '\n', _offset, _count - _offset);
+                var length = (newline < 0 ? _count : newline) - _offset;
+                if (length + (collected?.Length ?? 0) > MaximumCharacters)
+                    throw new IOException("The media engine returned an oversized preview response.");
+                if (newline >= 0)
+                {
+                    var line = collected is null ? new string(_buffer, _offset, length) : collected.Append(_buffer, _offset, length).ToString();
+                    _offset = newline + 1;
+                    return line.TrimEnd('\r');
+                }
+                collected ??= new StringBuilder(Math.Min(MaximumCharacters, length + 4096));
+                collected.Append(_buffer, _offset, length); _offset = _count;
+            }
+        }
+    }
+
+    private void BuildAudioCard()
+    {
+        _audioCard.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+        _audioCard.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+        _audioName.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+        _audioDetail.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        var body = new StackPanel();
+        _audioIcon.SetResourceReference(Border.BackgroundProperty, "AccentSoftBrush");
+        var glyph = PlaybackGlyph("\uE8D6", 28);
+        glyph.SetResourceReference(TextBlock.ForegroundProperty, "AccentBrush");
+        _audioIcon.Child = glyph;
+        body.Children.Add(_audioIcon); body.Children.Add(_audioName); body.Children.Add(_audioDetail);
+        _audioCard.Child = body;
+    }
+
+    private void UpdateAudioCardSize()
+    {
+        if (!IsAudioOnly) return;
+        var compact = _surface.ActualHeight < 200;
+        _audioCard.Margin = compact ? new Thickness(16, 8, 16, 8) : new Thickness(24);
+        _audioCard.Padding = compact ? new Thickness(16, 12, 16, 12) : new Thickness(24);
+        _audioIcon.Width = _audioIcon.Height = compact ? 40 : 68;
+        _audioIcon.CornerRadius = new CornerRadius(compact ? 12 : 20);
+        if (_audioIcon.Child is TextBlock glyph) glyph.FontSize = compact ? 22 : 28;
+        _audioName.FontSize = compact ? 16 : 18;
+        _audioName.Margin = compact ? new Thickness(0, 10, 0, 6) : new Thickness(0, 16, 0, 8);
+    }
+
     private void BuildMediaControls()
     {
         _mediaControls.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _mediaControls.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var seek = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+        var seek = new Grid { Margin = new Thickness(0, 0, 0, 5) };
         seek.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         seek.ColumnDefinitions.Add(new ColumnDefinition());
         seek.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        _timeline.Margin = new Thickness(10, 0, 10, 0);
+        _position.FontSize = _duration.FontSize = 11;
+        _position.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        _duration.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        _timeline.Margin = new Thickness(8, 0, 8, 0);
+        _timeline.Height = _volume.Height = 28;
+        _timeline.Template = _volume.Template = BuildSliderTemplate();
+        _timeline.ToolTip = "Seek";
+        AutomationProperties.SetName(_timeline, "Playback position");
+        AutomationProperties.SetName(_volume, "Volume");
         Grid.SetColumn(_timeline, 1); Grid.SetColumn(_duration, 2);
         seek.Children.Add(_position); seek.Children.Add(_timeline); seek.Children.Add(_duration);
         _mediaControls.Children.Add(seek);
-        var buttons = new DockPanel { LastChildFill = false };
+
+        var buttons = new Grid();
+        foreach (var width in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto, GridLength.Auto })
+            buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = width });
         Grid.SetRow(buttons, 1); _mediaControls.Children.Add(buttons);
-        StylePlaybackButton(_playPause); _playPause.Click += (_, _) => RunPlaybackAction(() => TogglePlaybackAsync());
-        var stop = new Button { Content = "Stop" }; StylePlaybackButton(stop); stop.Click += (_, _) => RunPlaybackAction(() => StopPlaybackAsync());
-        buttons.Children.Add(_playPause); buttons.Children.Add(stop);
-        buttons.Children.Add(new TextBlock { Text = "Speed", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 7, 0) });
+        StylePlaybackButton(_playPause, true); SetButtonGlyph(_playPause, "\uE768", "Play");
+        _playPause.Click += (_, _) => RunPlaybackAction(() => TogglePlaybackAsync());
+        var stop = new Button(); StylePlaybackButton(stop); SetButtonGlyph(stop, "\uE71A", "Stop");
+        stop.Click += (_, _) => RunPlaybackAction(() => StopPlaybackAsync());
+        Grid.SetColumn(stop, 1); buttons.Children.Add(_playPause); buttons.Children.Add(stop);
+        _speed.Margin = new Thickness(8, 0, 0, 0);
         _speed.SetResourceReference(Control.ForegroundProperty, "TextMutedBrush");
+        _speed.SetResourceReference(Control.FocusVisualStyleProperty, "AppFocusVisual");
+        AutomationProperties.SetName(_speed, "Playback speed");
         _speed.Template = (ControlTemplate)XamlReader.Parse("""
             <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ComboBox">
               <Grid>
                 <ToggleButton Foreground="{DynamicResource TextMutedBrush}" Focusable="False" IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}">
                   <ToggleButton.Template><ControlTemplate TargetType="ToggleButton">
-                    <Border Background="{DynamicResource SurfaceRaisedBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="4" Padding="8,3">
-                      <DockPanel><TextBlock DockPanel.Dock="Right" Text="⌄" Foreground="{DynamicResource TextMutedBrush}" Margin="8,0,0,0"/>
+                    <Border Name="Chrome" Background="Transparent" BorderBrush="Transparent" BorderThickness="1" CornerRadius="6" Padding="10,3">
+                      <DockPanel VerticalAlignment="Center"><TextBlock DockPanel.Dock="Right" Text="⌄" Foreground="{DynamicResource TextDimBrush}" Margin="8,0,0,0"/>
                         <ContentPresenter Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"/>
                       </DockPanel>
                     </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{DynamicResource SurfaceHoverBrush}"/></Trigger>
+                      <Trigger Property="IsChecked" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{DynamicResource SurfaceRaisedBrush}"/></Trigger>
+                    </ControlTemplate.Triggers>
                   </ControlTemplate></ToggleButton.Template>
                 </ToggleButton>
                 <Popup Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False">
-                  <Border Background="{DynamicResource SurfaceRaisedBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" Padding="3">
+                  <Border Background="{DynamicResource SurfaceRaisedBrush}" BorderBrush="{DynamicResource BorderStrongBrush}" BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="76">
                     <ScrollViewer CanContentScroll="True"><ItemsPresenter/></ScrollViewer>
                   </Border>
                 </Popup>
               </Grid>
             </ControlTemplate>
             """);
+        var itemTemplate = (ControlTemplate)XamlReader.Parse("""
+            <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ComboBoxItem">
+              <Border Name="Row" Background="Transparent" CornerRadius="4" Padding="10,6"><ContentPresenter/></Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SurfaceHoverBrush}"/></Trigger>
+                <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource AccentSoftBrush}"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+            """);
         foreach (var value in new[] { 0.25, 0.5, 1, 1.5, 2, 3 })
         {
-            var item = new ComboBoxItem { Content = value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "×", Tag = value };
+            var item = new ComboBoxItem { Content = value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "×", Tag = value, Template = itemTemplate };
             item.SetResourceReference(Control.ForegroundProperty, "TextMutedBrush");
             _speed.Items.Add(item);
         }
@@ -288,18 +719,16 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         {
             if (!_syncingControls && _speed.SelectedItem is ComboBoxItem { Tag: double value }) RunPlaybackAction(() => SetSpeedAsync(value));
         };
-        buttons.Children.Add(_speed);
-        DockPanel.SetDock(_mute, Dock.Right); StylePlaybackButton(_mute);
+        Grid.SetColumn(_speed, 2); buttons.Children.Add(_speed);
+        StylePlaybackButton(_mute); SetButtonGlyph(_mute, "\uE767", "Mute");
         _mute.Click += (_, _) => RunPlaybackAction(async () => { await MpvCommandAsync(["cycle", "mute"]); await RefreshPlaybackAsync(); });
-        buttons.Children.Add(_mute);
-        DockPanel.SetDock(_volume, Dock.Right); _volume.Margin = new Thickness(10, 0, 4, 0); buttons.Children.Add(_volume);
-        var volumeLabel = new TextBlock { Text = "Volume", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) };
-        DockPanel.SetDock(volumeLabel, Dock.Right); buttons.Children.Add(volumeLabel);
+        Grid.SetColumn(_mute, 4); buttons.Children.Add(_mute);
+        _volume.Margin = new Thickness(6, 0, 0, 0); Grid.SetColumn(_volume, 5); buttons.Children.Add(_volume);
         _volume.ValueChanged += (_, _) => { if (!_syncingControls) RunPlaybackAction(() => SetVolumeAsync(_volume.Value)); };
         _timeline.ValueChanged += (_, _) => { if (!_syncingControls) QueueSeek(_timeline.Value); };
         _timeline.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) =>
         {
-            _scrubbing = true; _resumeAfterScrub = _playPause.Content as string == "Pause";
+            _scrubbing = true; _resumeAfterScrub = !_paused;
             RunPlaybackAction(async () => { await MpvCommandAsync(["set_property", "pause", true]); });
         }));
         _timeline.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) =>
@@ -311,10 +740,91 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         }));
     }
 
-    private static void StylePlaybackButton(Button button)
+    private static ControlTemplate BuildSliderTemplate() => (ControlTemplate)XamlReader.Parse("""
+        <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Slider">
+          <Grid Name="Root" Background="Transparent" MinHeight="28">
+            <Border Name="FocusRing" BorderBrush="Transparent" BorderThickness="1" CornerRadius="5"/>
+            <Track Name="PART_Track" Height="28" VerticalAlignment="Center" Minimum="{TemplateBinding Minimum}" Maximum="{TemplateBinding Maximum}" Value="{Binding Value, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}" IsDirectionReversed="{TemplateBinding IsDirectionReversed}">
+              <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="{DynamicResource AccentBrush}" Height="4" CornerRadius="2"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
+              <Track.IncreaseRepeatButton><RepeatButton Command="Slider.IncreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="{DynamicResource BorderStrongBrush}" Height="4" CornerRadius="2"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.IncreaseRepeatButton>
+              <Track.Thumb><Thumb Width="12" Height="28" Focusable="False"><Thumb.Template><ControlTemplate TargetType="Thumb"><Border Width="12" Height="12" VerticalAlignment="Center" Background="{DynamicResource TextBrush}" CornerRadius="6" BorderBrush="{DynamicResource AccentBrush}" BorderThickness="2"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+            </Track>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="FocusRing" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/></Trigger>
+            <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Root" Property="Opacity" Value="0.4"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+        """);
+
+    private static TextBlock PlaybackGlyph(string glyph, double size = 16)
     {
-        button.Margin = new Thickness(0, 1, 5, 1); button.Padding = new Thickness(9, 4, 9, 4);
-        button.SetResourceReference(FrameworkElement.StyleProperty, "FlatButton");
+        var icon = new TextBlock { Text = glyph, FontSize = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        icon.SetResourceReference(TextBlock.FontFamilyProperty, "IconFont");
+        return icon;
+    }
+
+    private static void SetButtonGlyph(Button button, string glyph, string name)
+    {
+        if (button.Content is TextBlock icon) icon.Text = glyph;
+        else button.Content = PlaybackGlyph(glyph);
+        button.ToolTip = name;
+        AutomationProperties.SetName(button, name);
+    }
+
+    private static void StylePlaybackButton(Button button, bool primary = false)
+    {
+        button.Width = primary ? 42 : 34; button.Height = 34;
+        button.Margin = new Thickness(0, 0, 4, 0);
+        button.SetResourceReference(Control.ForegroundProperty, primary ? "CanvasBrush" : "TextMutedBrush");
+        button.SetResourceReference(Control.BackgroundProperty, primary ? "AccentBrush" : "CanvasBrush");
+        button.SetResourceReference(Control.FocusVisualStyleProperty, "AppFocusVisual");
+        button.Template = (ControlTemplate)XamlReader.Parse("""
+            <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+              <Border Name="Chrome" Background="{TemplateBinding Background}" CornerRadius="7" BorderThickness="1" BorderBrush="Transparent">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.8"/><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource AccentBrightBrush}"/></Trigger>
+                <Trigger Property="IsPressed" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.65"/></Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Chrome" Property="Opacity" Value="0.4"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+            """);
+    }
+
+    internal bool OwnsPlaybackControl(DependencyObject? source)
+    {
+        var control = false;
+        for (var current = source; current is not null; current = current is Visual or System.Windows.Media.Media3D.Visual3D
+                 ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current))
+        {
+            // Popup visuals end at PopupRoot rather than the media panel. Use
+            // the item's actual ItemsControl owner, never a foreign dropdown.
+            if (current is ComboBoxItem item && ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(item), _speed)) return true;
+            control |= current is Slider or ComboBox or ButtonBase;
+            if (ReferenceEquals(current, _mediaControls)) return control;
+        }
+        return false;
+    }
+
+    internal static bool HasOnlyAudio(JsonElement? response, string path)
+    {
+        if (response is { } reply && reply.TryGetProperty("data", out var tracks) && tracks.ValueKind == JsonValueKind.Array && tracks.GetArrayLength() > 0)
+        {
+            var audio = false;
+            foreach (var track in tracks.EnumerateArray())
+            {
+                if (track.ValueKind != JsonValueKind.Object || !track.TryGetProperty("type", out var type)) continue;
+                if (type.ValueKind != JsonValueKind.String) continue;
+                var kind = type.GetString();
+                if (kind == "video" && !(track.TryGetProperty("albumart", out var cover) && cover.ValueKind == JsonValueKind.True)) return false;
+                audio |= kind == "audio";
+            }
+            return audio;
+        }
+        return Path.GetExtension(path.TrimEnd(' ', '.')).ToLowerInvariant() is ".aac" or ".ac3" or ".aif" or ".aiff" or ".alac" or ".amr" or ".ape"
+            or ".dts" or ".flac" or ".m4a" or ".mka" or ".mp2" or ".mp3" or ".oga" or ".ogg" or ".opus" or ".wav" or ".wma" or ".wv";
     }
 
     private async void RunPlaybackAction(Func<Task> action)
@@ -380,10 +890,14 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 _timeline.Maximum = Math.Max(0.001, total); _timeline.IsEnabled = total > 0;
                 if (!_scrubbing && _pendingSeek is null) _timeline.Value = Math.Clamp(seconds, 0, _timeline.Maximum);
                 _position.Text = FormatTime(_scrubbing ? _timeline.Value : seconds); _duration.Text = FormatTime(total);
-                _playPause.Content = PropertyBool(pause) ? "Play" : "Pause";
-                _mute.Content = PropertyBool(mute) ? "Unmute" : "Mute";
+                _paused = PropertyBool(pause);
+                SetButtonGlyph(_playPause, _paused ? "\uE768" : "\uE769", _paused ? "Play" : "Pause");
+                var muted = PropertyBool(mute);
+                SetButtonGlyph(_mute, muted ? "\uE74F" : "\uE767", muted ? "Unmute" : "Mute");
                 _volume.Value = Math.Clamp(PropertyNumber(volume), 0, 100);
                 _volume.ToolTip = $"Volume: {_volume.Value:0}%";
+                if (IsAudioOnly) _audioDetail.Text = string.IsNullOrEmpty(_mediaExtension) ? $"Audio · {FormatTime(total)}" : $"{_mediaExtension} audio · {FormatTime(total)}";
+                AutomationProperties.SetHelpText(_timeline, $"{FormatTime(seconds)} of {FormatTime(total)}");
                 var currentSpeed = PropertyNumber(speed);
                 _speed.SelectedItem = _speed.Items.Cast<ComboBoxItem>().FirstOrDefault(item => item.Tag is double value && Math.Abs(value - currentSpeed) < 0.001);
                 _playbackPolls++;
@@ -443,9 +957,12 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _session = null;
         _processCancellation.Dispose();
         PreviewTools.Kill(_process);
+        _modelDiagnostics?.Dispose();
+        _modelDiagnostics = null;
         _process?.Dispose();
         _process = null;
         _pipeName = null;
+        _mediaSession = null;
         _modelWindow = IntPtr.Zero;
         _surface.Detach();
         if (_sessionDirectory is { } directory)

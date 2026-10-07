@@ -43,6 +43,7 @@ public partial class MainWindow
         if (_quickPreview is null)
         {
             var preview = new QuickPreviewWindow { Owner = this };
+            PreviewOwnerActivation.Attach(preview, this, () => _previewDetached || _closeRequested || _quickPreviewClosingOwner);
             _quickPreview = preview;
             preview.Closed += (_, _) =>
             {
