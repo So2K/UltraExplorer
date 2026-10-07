@@ -26,6 +26,8 @@ internal sealed class PreviewTextEditSession
     internal static async Task<PreviewTextEditSession> OpenAsync(string path, string encodingName, bool hasBom, CancellationToken token)
     {
         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        if ((File.GetAttributes(DocumentPreviewService.LiteralPath(path)) & FileAttributes.ReadOnly) != 0)
+            throw new IOException("The file is read only. Use Open with to edit it in another application.");
         var encoding = Encoding.GetEncoding(encodingName, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
         var bytes = await ReadBoundedAsync(path, token);
         byte[] preamble = hasBom ? encoding.GetPreamble() : [];

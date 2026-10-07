@@ -402,10 +402,30 @@ internal static partial class Program
             // Finish those real dismissals before arming an uninterrupted
             // release; otherwise the fixture itself invalidates its ticket.
             await SettingsSettle();
-            Check("the queued-release fixture is open, enabled and empty after layout settles",
-                !fixtureClosed && window.IsLoaded && window.IsVisible && model.ShowHoverPreviews
-                && window.HoverPreviewsForChecks.Path is null && card.Visibility == Visibility.Collapsed);
             var generationField = typeof(MainWindow).GetField("_previewGeneration", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var settledGeneration = (long)generationField.GetValue(window)!;
+            var stableSince = Stopwatch.GetTimestamp();
+            // ContextIdle drains already queued layout work, but a render or
+            // deferred camera callback can enqueue another dismissal next
+            // frame. Require a real quiet interval before calling the following
+            // release uninterrupted. Keep HoverWait's existing 2.5 s deadline.
+            var releaseFixtureIdle = await HoverWait(() =>
+            {
+                var currentGeneration = (long)generationField.GetValue(window)!;
+                if (currentGeneration != settledGeneration || model.Tree.FolderList.IsLoading
+                    || !content.IsMeasureValid || !content.IsArrangeValid)
+                {
+                    settledGeneration = currentGeneration;
+                    stableSince = Stopwatch.GetTimestamp();
+                    return false;
+                }
+                return Stopwatch.GetElapsedTime(stableSince) >= TimeSpan.FromMilliseconds(150);
+            });
+            if (!releaseFixtureIdle)
+                Console.WriteLine($"  note: release fixture did not reach 150 ms idle; generation={generationField.GetValue(window)}, loading={model.Tree.FolderList.IsLoading}, measure={content.IsMeasureValid}, arrange={content.IsArrangeValid}");
+            Check("the queued-release fixture is open, enabled and empty after layout settles",
+                releaseFixtureIdle && !fixtureClosed && window.IsLoaded && window.IsVisible && model.ShowHoverPreviews
+                && window.HoverPreviewsForChecks.Path is null && card.Visibility == Visibility.Collapsed);
             var generationBeforeRelease = (long)generationField.GetValue(window)!;
             var queued = 0;
             window.QueueHoverPreviewAfterRelease(MouseButton.Left, () => queued++);
@@ -424,11 +444,13 @@ internal static partial class Program
                     queued++;
                     window.SetHoverPreviewTarget(second, new Point(600, 300));
                 });
-                // These handlers only dismiss previews, so invoking the exact
-                // subscribed handler faithfully exercises the cancellation
-                // without changing the user's physical mouse or keyboard.
+                // Use an actual non-Space key argument now that the handler
+                // also preserves Space's pending tap/hold decision.
                 var method = typeof(MainWindow).GetMethod(dismiss, BindingFlags.Instance | BindingFlags.NonPublic)!;
-                method.Invoke(window, [window, dismiss == "PreviewHoverDeactivate" ? EventArgs.Empty : null]);
+                object? argument = dismiss == "PreviewHoverDeactivate" ? EventArgs.Empty
+                    : dismiss == "PreviewHoverKey" ? new KeyEventArgs(Keyboard.PrimaryDevice,
+                        PresentationSource.FromVisual(window) ?? throw new InvalidOperationException("The owned hover window has no input source."), Environment.TickCount, Key.F) : null;
+                method.Invoke(window, [window, argument]);
                 await Dispatcher.CurrentDispatcher.InvokeAsync(() => { }, DispatcherPriority.Background);
                 Check($"{dismiss} invalidates an older queued left release", queued == 1
                     && window.HoverPreviewsForChecks.Path is null && card.Visibility == Visibility.Collapsed);

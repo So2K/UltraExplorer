@@ -31,9 +31,10 @@ inside their parents. Opening a folder moves the camera into it.
 The address bar, navigation pane, file operations and Windows Shell menus
 remain familiar. The canvas gives you another way to find and move your files.
 
-Hover over files for content previews. **Ctrl+Space** or **Quick Look** opens
+Hover over files for content previews. **Select a file and tap Space**, or choose **Quick Look**, to open
 the compact full view: PDF pages, interactive F3D models, mpv playback and a
 text/code editor with search, syntax highlighting and explicit saving.
+Hold Space and move the pointer to pan immediately. Text notes save when you close the preview; **Open** and **Open with** launch the full application.
 [Preview formats and controls](docs/UNIVERSAL_PREVIEWS.md).
 
 ## Same folder, two views

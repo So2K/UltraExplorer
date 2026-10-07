@@ -80,6 +80,7 @@ public partial class MainWindow
     /// </summary>
     private void OnSharedSelectionChanged(ItemSelection selection)
     {
+        CancelSpacePreview();
         ActivePane.OnSharedSelectionChanged(selection);
         if (IsPickerMode && IsNested && _picker is { } session)
         {

@@ -464,6 +464,7 @@ public partial class MainWindow
         }
 
         var outgoing = ActivePane;
+        CancelSpacePreview(disarm: true);
         outgoing.Deactivate();
         ActivePane = pane;
         _viewModel.Tree.SelectionHolder = pane;

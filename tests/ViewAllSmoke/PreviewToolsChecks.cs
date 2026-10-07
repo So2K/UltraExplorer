@@ -3,8 +3,10 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media.Imaging;
+using System.Windows.Media;
 using UltraExplorer.Controls;
 using UltraExplorer.Picker.Integration;
 using UltraExplorer.Services;
@@ -79,6 +81,8 @@ internal static partial class Program
                 catch { Console.Error.WriteLine("Native attachment diagnostic: " + host.LastNativeDiagnostic); throw; }
                 var modelPid = host.OwnedProcessId;
                 Check("F3D is embedded under this owned viewport HWND", modelPid is not null && host.ModelWindowHandle != IntPtr.Zero && PreviewToolsGetParent(host.ModelWindowHandle) == host.ViewportHandle);
+                var modelButtons = PreviewNativeDescendants(host).OfType<Button>().Where(b => b.IsVisible).ToArray();
+                Check("the 3D viewport exposes only its compact fit/reset control", modelButtons.Length == 1 && modelButtons[0].Content as string == "Fit / reset");
                 await Task.Delay(250);
                 host.RequestModelSnapshot();
                 var snapshot = host.ModelSnapshotPath!;
@@ -94,9 +98,41 @@ internal static partial class Program
                 Check("switching from model to media terminates only its previous F3D process", modelPid is not null && await PreviewToolsWaitForExit(modelPid.Value) && host.OwnedProcessId is not null && host.ModelWindowHandle == IntPtr.Zero);
                 var pause = await host.MpvCommandAsync(["get_property", "pause"]);
                 Check("media starts paused and its own named pipe answers JSON IPC", pause is { } response && response.TryGetProperty("data", out var paused) && paused.ValueKind == System.Text.Json.JsonValueKind.True);
+                var osc = await host.MpvCommandAsync(["get_property", "options/osc"]);
+                var shortcuts = await host.MpvCommandAsync(["get_property", "options/input-default-bindings"]);
+                Check("the media engine has no foreign OSC or default shortcut interface", osc is { } osd && osd.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.False
+                    && shortcuts is { } keys && keys.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.False);
+                var mediaControls = PreviewNativeDescendants(host).ToArray();
+                Check("the compact player provides its own timeline, volume and six speed choices", mediaControls.OfType<Slider>().Count(s => s.IsVisible) == 2
+                    && mediaControls.OfType<ComboBox>().Single().Items.Count == 6 && mediaControls.OfType<Button>().Any(b => b.Content as string == "Stop"));
+                host.UpdateLayout();
+                var controlsPicture = new RenderTargetBitmap(Math.Max(1, (int)Math.Ceiling(host.ActualWidth)),
+                    Math.Max(1, (int)Math.Ceiling(host.ActualHeight)), 96, 96, PixelFormats.Pbgra32);
+                controlsPicture.Render(host);
+                PreviewToolsSavePicture(controlsPicture, Path.Combine(artifacts, "native-controls.png"));
+                await host.SetSpeedAsync(2); await host.SetVolumeAsync(35);
+                var speed = await host.MpvCommandAsync(["get_property", "speed"]);
+                var volume = await host.MpvCommandAsync(["get_property", "volume"]);
+                Check("custom speed and volume controls update only their owned media engine", speed is { } rate && Math.Abs(rate.GetProperty("data").GetDouble() - 2) < 0.001
+                    && volume is { } loudness && Math.Abs(loudness.GetProperty("data").GetDouble() - 35) < 0.001);
                 var frame = Path.Combine(artifacts, "native-media-viewport.png");
                 var screenshot = await host.MpvCommandAsync(["screenshot-to-file", frame, "video"]);
                 Check("the embedded mpv viewport can export its actual decoded video pixels", screenshot is { } shot && shot.GetProperty("error").GetString() == "success" && File.Exists(frame));
+                await host.SeekAsync(0.5); await Task.Delay(180);
+                var seekPosition = await host.MpvCommandAsync(["get_property", "time-pos"]);
+                var stillPaused = await host.MpvCommandAsync(["get_property", "pause"]);
+                var scrubFrame = Path.Combine(artifacts, "native-media-scrubbed.png");
+                await host.MpvCommandAsync(["screenshot-to-file", scrubFrame, "video"]);
+                Check("scrubbing a paused timeline shows the actual sought video frame", seekPosition is { } seeked && Math.Abs(seeked.GetProperty("data").GetDouble() - 0.5) < 0.075
+                    && stillPaused is { } stopped && stopped.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.True
+                    && File.Exists(scrubFrame) && !File.ReadAllBytes(frame).SequenceEqual(File.ReadAllBytes(scrubFrame)));
+                await host.StopPlaybackAsync(); await Task.Delay(100);
+                var resetPosition = await host.MpvCommandAsync(["get_property", "time-pos"]);
+                var resetPause = await host.MpvCommandAsync(["get_property", "pause"]);
+                Check("Stop resets the file to its first frame and keeps playback paused", resetPosition is { } reset && reset.GetProperty("data").GetDouble() < 0.05
+                    && resetPause is { } resetState && resetState.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.True);
+                var polls = host.PlaybackPollCount; await Task.Delay(550);
+                Check("playback status polling runs at a bounded four updates per second", host.IsPlaybackTimerRunning && host.PlaybackPollCount > polls && host.PlaybackPollCount - polls <= 3);
                 await host.LoadAsync(wave);
                 var duration = await host.MpvCommandAsync(["get_property", "duration"]);
                 var wavePause = await host.MpvCommandAsync(["get_property", "pause"]);
@@ -105,6 +141,8 @@ internal static partial class Program
                 var mediaPid = host.OwnedProcessId;
                 window.Close();
                 Check("closing disposes the native host and terminates its owned media process", mediaPid is not null && await PreviewToolsWaitForExit(mediaPid.Value) && host.OwnedProcessId is null);
+                var closedPolls = host.PlaybackPollCount; await Task.Delay(300);
+                Check("closing stops playback polling and prevents stale UI updates", !host.IsPlaybackTimerRunning && host.PlaybackPollCount == closedPolls);
             }
             finally { host.Dispose(); window.Close(); }
             Check("native preview never edits the original model or video bytes", (await File.ReadAllBytesAsync(model)).SequenceEqual(modelBefore) && (await File.ReadAllBytesAsync(video)).SequenceEqual(videoBefore));
@@ -116,6 +154,13 @@ internal static partial class Program
     {
         try { using var process = Process.GetProcessById(id); return !process.HasExited; }
         catch (ArgumentException) { return false; }
+    }
+
+    private static IEnumerable<DependencyObject> PreviewNativeDescendants(DependencyObject root)
+    {
+        yield return root;
+        for (var index = 0; index < VisualTreeHelper.GetChildrenCount(root); index++)
+            foreach (var child in PreviewNativeDescendants(VisualTreeHelper.GetChild(root, index))) yield return child;
     }
 
     private static async Task<bool> PreviewToolsWaitForExit(int id)

@@ -25,7 +25,7 @@ public partial class MainWindow
     private QuickPreviewWindow? _quickPreview;
     private bool _quickPreviewClosingOwner;
 
-    internal void OpenQuickPreview(string path)
+    internal void OpenQuickPreview(string path, bool readOnly = false)
     {
         if (_previewDetached || _closeRequested) return;
         ClearHoverPreview();
@@ -33,14 +33,29 @@ public partial class MainWindow
         {
             _quickPreview = new QuickPreviewWindow { Owner = this };
             _quickPreview.Closed += (_, _) => _quickPreview = null;
-            _quickPreview.OpenFile(path);
+            _quickPreview.SetFileSequence(readOnly ? [path] : PreviewSiblingFiles(path));
+            _quickPreview.OpenFile(path, readOnly);
             _quickPreview.Show();
         }
         else
         {
-            _quickPreview.OpenFile(path);
+            _quickPreview.SetFileSequence(readOnly ? [path] : PreviewSiblingFiles(path));
+            _quickPreview.OpenFile(path, readOnly);
             _quickPreview.Activate();
         }
+    }
+
+    private IReadOnlyList<string> PreviewSiblingFiles(string path)
+    {
+        var parent = System.IO.Path.GetDirectoryName(path);
+        var list = _viewModel.Tree.FolderList;
+        if (list.HasCurrentRows && string.Equals(parent, list.FolderPath, StringComparison.OrdinalIgnoreCase))
+            return FolderListItems.Items.OfType<FolderListItem>().Where(item => !item.IsDirectory).Select(item => item.FullPath).ToArray();
+        if (IsNested && parent is not null && ActivePane.Tree.Find(parent) is { } folder)
+            return folder.Files.Select(file => System.IO.Path.Combine(folder.FullPath, file.Name)).ToArray();
+        if (_viewModel.Tree.TryGetNode(path, out var node) && node.Parent is { } parentNode)
+            return parentNode.Children.Where(child => child.IsFile && child.IsTreeVisible).Select(child => child.FullPath).ToArray();
+        return [path];
     }
 
     private bool TryQuickPreviewKey(Key key, ModifierKeys modifiers)
@@ -74,6 +89,8 @@ public partial class MainWindow
         AddHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(PreviewHoverRelease), handledEventsToo: true);
         AddHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler(PreviewHoverWheel), handledEventsToo: true);
         AddHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler(PreviewHoverKey), handledEventsToo: true);
+        AddHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(SpacePreviewFocusLost), handledEventsToo: true);
+        AddHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler(SpacePreviewCaptureLost), handledEventsToo: true);
         AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(PreviewHoverScroll), handledEventsToo: true);
         AddHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(PreviewHoverMenu), handledEventsToo: true);
         AddHandler(ToolTipService.ToolTipOpeningEvent, new ToolTipEventHandler(PreviewHoverTooltip), handledEventsToo: true);
@@ -92,6 +109,7 @@ public partial class MainWindow
     private void PreviewHoverMove(object sender, MouseEventArgs args)
     {
         if (_previewDetached) return;
+        if (HandleSpacePointerMove(args)) { args.Handled = true; ClearHoverPreview(); return; }
         if (!_viewModel.ShowHoverPreviews || _closeRequested || args.LeftButton == MouseButtonState.Pressed
             || args.MiddleButton == MouseButtonState.Pressed || args.RightButton == MouseButtonState.Pressed
             || Mouse.Captured is not null || _isSpaceHeld || _isSpacePanning)
@@ -191,6 +209,8 @@ public partial class MainWindow
 
     private void PreviewPreferenceChanged(object? sender, PropertyChangedEventArgs args)
     {
+        if (args.PropertyName is nameof(MainViewModel.Layout) or nameof(MainViewModel.IsSplit)
+            or nameof(MainViewModel.SplitOrientation) or nameof(MainViewModel.SplitRatio)) CancelSpacePreview(disarm: true);
         if (args.PropertyName is nameof(MainViewModel.ShowHoverPreviews) or nameof(MainViewModel.Layout)
             or nameof(MainViewModel.Layers) or nameof(MainViewModel.IsSplit)
             or nameof(MainViewModel.SplitOrientation) or nameof(MainViewModel.SplitRatio)) ClearHoverPreview();
@@ -207,7 +227,7 @@ public partial class MainWindow
             || file.StartsWith(path.TrimEnd('\\', '/') + "\\", StringComparison.OrdinalIgnoreCase))) ClearHoverPreview();
     }
 
-    private void PreviewHoverPress(object sender, MouseButtonEventArgs args) => ClearHoverPreview();
+    private void PreviewHoverPress(object sender, MouseButtonEventArgs args) { StopSpacePointerPan(); CancelSpacePreview(); ClearHoverPreview(); }
     private void PreviewHoverRelease(object sender, MouseButtonEventArgs args)
     {
         // After a click, holding still over the selected item is a hover too.
@@ -238,10 +258,14 @@ public partial class MainWindow
             reevaluate();
         });
     }
-    private void PreviewHoverWheel(object sender, MouseWheelEventArgs args) => ClearHoverPreview();
-    private void PreviewHoverKey(object sender, KeyEventArgs args) => ClearHoverPreview();
-    private void PreviewHoverDrag(object sender, DragEventArgs args) => ClearHoverPreview();
-    private void PreviewHoverMenu(object sender, ContextMenuEventArgs args) => ClearHoverPreview();
+    private void PreviewHoverWheel(object sender, MouseWheelEventArgs args) { CancelSpacePreview(); ClearHoverPreview(); }
+    private void PreviewHoverKey(object sender, KeyEventArgs args)
+    {
+        if ((args.Key == Key.System ? args.SystemKey : args.Key) != Key.Space) CancelSpacePreview();
+        ClearHoverPreview();
+    }
+    private void PreviewHoverDrag(object sender, DragEventArgs args) { CancelSpacePreview(); ClearHoverPreview(); }
+    private void PreviewHoverMenu(object sender, ContextMenuEventArgs args) { CancelSpacePreview(); ClearHoverPreview(); }
     private void PreviewHoverTooltip(object sender, ToolTipEventArgs args)
     {
         if (_hoverPreview.IsLoading || _hoverPreview.Result is not null) args.Handled = true;
@@ -257,13 +281,14 @@ public partial class MainWindow
     }
     private void PreviewHoverLeave(object sender, MouseEventArgs args) => ClearHoverPreview();
     private void PreviewHoverUnloaded(object sender, RoutedEventArgs args) => ClearHoverPreview();
-    private void PreviewHoverDeactivate(object? sender, EventArgs args) => ClearHoverPreview();
-    private void PreviewHoverResize(object sender, SizeChangedEventArgs args) => ClearHoverPreview();
-    private void PreviewHoverClosing(object? sender, CancelEventArgs args) => ClearHoverPreview();
+    private void PreviewHoverDeactivate(object? sender, EventArgs args) { CancelSpacePreview(disarm: true); ClearHoverPreview(); }
+    private void PreviewHoverResize(object sender, SizeChangedEventArgs args) { CancelSpacePreview(); ClearHoverPreview(); }
+    private void PreviewHoverClosing(object? sender, CancelEventArgs args) { CancelSpacePreview(disarm: true); ClearHoverPreview(); }
 
     private void PreviewHoverClosed(object? sender, EventArgs args)
     {
         _previewDetached = true;
+        CancelSpacePreview(disarm: true);
         ClearHoverPreview();
         _hoverPreview.Dispose();
         _thumbnails?.Dispose();
@@ -276,6 +301,8 @@ public partial class MainWindow
         RemoveHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(PreviewHoverRelease));
         RemoveHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler(PreviewHoverWheel));
         RemoveHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler(PreviewHoverKey));
+        RemoveHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(SpacePreviewFocusLost));
+        RemoveHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler(SpacePreviewCaptureLost));
         RemoveHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(PreviewHoverScroll));
         RemoveHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(PreviewHoverMenu));
         RemoveHandler(ToolTipService.ToolTipOpeningEvent, new ToolTipEventHandler(PreviewHoverTooltip));

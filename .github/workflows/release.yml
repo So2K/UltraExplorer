@@ -36,7 +36,8 @@ jobs:
 
       - name: Prepare pinned preview engines
         shell: pwsh
-        run: ./scripts/setup-preview-tools.ps1
+        run: |
+          ./scripts/setup-preview-tools.ps1
 
       - name: Prepare pinned archive engine
         shell: pwsh
@@ -93,7 +94,7 @@ jobs:
         shell: pwsh
         run: |
           $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-preview-checks'
-          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only DocumentPreviewChecks,UniversalThumbnailChecks,QuickPreviewChecks
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only DocumentPreviewChecks,UniversalThumbnailChecks,QuickPreviewChecks,PreviewSpaceGestureChecks,SpacePreviewWindowChecks,ImmediatePanChecks,PreviewImageChecks,LightTextPreviewChecks
           if ($LASTEXITCODE -ne 0) { throw "Universal preview checks failed with exit code $LASTEXITCODE." }
 
       - name: Check manifest-safe local update and rollback

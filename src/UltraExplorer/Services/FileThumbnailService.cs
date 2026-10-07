@@ -369,48 +369,14 @@ internal sealed class FileThumbnailService : IDisposable
     private static ThumbnailResult? ExtractThumbnail(string path, CancellationToken token)
     {
         token.ThrowIfCancellationRequested();
-        if (UniversalThumbnail.UsesContentProvider(path))
+        if (PreviewImageService.Supports(path))
+        {
+            var image = PreviewImageService.Read(path, MaximumDimension, token);
+            if (image is not null) return new ThumbnailResult(image.Image, image.OriginalWidth, image.OriginalHeight);
+        }
+        else if (UniversalThumbnail.UsesContentProvider(path))
             return UniversalThumbnail.Extract(path, MaximumDimension, token);
 
-        // Only the codec hint is trimmed. The file opened below keeps its exact
-        // literal name, including dots/spaces after an image extension.
-        var extension = Path.GetExtension(path.TrimEnd(' ', '.')).ToLowerInvariant();
-        if (extension is ".png" or ".jpg" or ".jpeg" or ".bmp" or ".gif" or ".tif" or ".tiff" or ".ico" or ".wdp" or ".jxr")
-        {
-            try
-            {
-                // Read sharing permits images currently exported by another
-                // app; OnLoad detaches the resulting thumbnail from its file.
-                using var stream = new FileStream(path, FileMode.Open, FileAccess.Read,
-                    FileShare.ReadWrite | FileShare.Delete, 16 * 1024, FileOptions.SequentialScan);
-                var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnDemand);
-                var frame = decoder.Frames[0];
-                var width = frame.PixelWidth;
-                var height = frame.PixelHeight;
-                var orientation = ReadOrientation(frame);
-                if (width <= 0 || height <= 0 || width > 100_000 || height > 100_000 || (long)width * height > 200_000_000)
-                    return UniversalThumbnail.ReadFallback(path, MaximumDimension, token, "Image exceeds the preview size limit");
-                stream.Position = 0;
-                var bitmap = new BitmapImage();
-                bitmap.BeginInit();
-                bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                // StreamSource has no URI cache. IgnoreImageCache is a URI
-                // option and WPF attempts to remove a null URI when used here.
-                if (Math.Max(width, height) > MaximumDimension)
-                {
-                    if (width >= height) bitmap.DecodePixelWidth = MaximumDimension;
-                    else bitmap.DecodePixelHeight = MaximumDimension;
-                }
-                bitmap.StreamSource = stream;
-                bitmap.EndInit();
-                bitmap.Freeze();
-                var oriented = OrientImage(bitmap, orientation);
-                return orientation is >= 5 and <= 8
-                    ? new ThumbnailResult(oriented, height, width)
-                    : new ThumbnailResult(oriented, width, height);
-            }
-            catch (Exception) { /* Other installed Windows codecs may support it through the Shell. */ }
-        }
         token.ThrowIfCancellationRequested();
         ThumbnailResult? shell;
         try { shell = ExtractShellThumbnail(path); }

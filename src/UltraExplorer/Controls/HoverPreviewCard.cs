@@ -17,7 +17,7 @@ internal sealed class HoverPreviewCard : Border
     };
     private readonly TextBlock _name = new() { FontSize = 13, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _detail = new() { FontSize = 11, Margin = new Thickness(0, 4, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis };
-    private readonly TextBlock _hint = new() { Text = "Ctrl+Space  ·  Quick Look", FontSize = 11, Margin = new Thickness(0, 7, 0, 0) };
+    private readonly TextBlock _hint = new() { Text = "Select file · Tap Space for Quick Look", FontSize = 11, Margin = new Thickness(0, 7, 0, 0) };
     private readonly Grid _picture = new() { Margin = new Thickness(0, 0, 0, 10) };
 
     internal HoverPreviewCard()

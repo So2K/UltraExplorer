@@ -2,8 +2,8 @@
 
 The hover service renders actual 3D models with F3D and video frames with mpv.
 Quick Look embeds an owned native viewport: F3D supports orbit, pan, zoom,
-camera reset, edges and model animation; mpv supports paused initial playback,
-its on-screen controller, play/pause, seeking, audio, subtitles and mute.
+camera fit/reset; mpv provides paused initial playback behind the compact
+play/pause, Stop, timeline/seeked-frame, speed and volume controls.
 These viewers do not modify source model/media files. Model geometry editing
 is outside the capability of F3D; the Quick Look text editor handles text edits.
 
@@ -51,8 +51,8 @@ fallback. TypeScript `.ts` stays a text document; `.mts` and `.m2ts` are media.
 
 `Controls/NativePreviewHost.cs` owns a WPF `HwndHost` child and one engine
 process. mpv uses its documented [native `--wid` embedding and JSON IPC](https://mpv.io/manual/stable/)
-through a fresh named pipe. Playback starts paused. Built-in mpv OSC remains
-enabled, while external user configuration and scripts are disabled. F3D's
+through a fresh named pipe. Playback starts paused. Built-in mpv OSC, console and default shortcuts are disabled. Only the
+compact host controls are exposed; user configuration and scripts are disabled. F3D's
 CLI has no parent-HWND option: the host finds only the new process's window,
 removes its desktop border, reparents it into the viewport and resizes it with
 the host. Native interactions use the engine's own mouse/keyboard handlers;

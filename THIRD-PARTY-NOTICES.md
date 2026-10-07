@@ -2,6 +2,8 @@
 
 ## Quick Look and universal previews
 
+- Magick.NET-Q8-x64 14.17.2 / ImageMagick 7.1.2-32 — Apache-2.0 for the .NET bindings, ImageMagick license and bundled dependency notices in `preview/licenses/magick-net/Notice.txt`, https://github.com/dlemstra/Magick.NET/releases/tag/14.17.2. This is the image decoding library also used by ImageGlass; no ImageGlass application source is included.
+
 - AvalonEdit 6.3.1.120 — MIT, https://github.com/icsharpcode/AvalonEdit/tree/v6.3.1
 - PDFium build 157.0.8086 through bblanchon.PDFium.Win32 — PDFium BSD license and bundled third-party notices; NuGet metadata declares Apache-2.0 for the package, while the binary release includes the distributor's MIT license, https://github.com/bblanchon/pdfium-binaries
 - F3D 3.5.0 — BSD-3-Clause and bundled dependency notices, https://github.com/f3d-app/f3d/releases/tag/v3.5.0

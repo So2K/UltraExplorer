@@ -232,6 +232,12 @@ internal static partial class Program
         await Group(UniversalThumbnailChecks);
         await Group(PreviewToolsChecks);
         await Group(QuickPreviewChecks);
+        await Group(PreviewSpaceGestureChecks);
+        await Group(SpacePreviewWindowChecks);
+        await Group(ImmediatePanChecks);
+        await Group(PreviewImageChecks);
+        await Group(LightTextPreviewChecks);
+        await Group(QuickPreviewActionRaceChecks);
         await Group(HoverPreviewPreferenceChecks);
         await Group(HoverIntegrationChecks);
     }

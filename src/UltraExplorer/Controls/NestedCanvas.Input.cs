@@ -15,6 +15,7 @@ public sealed partial class NestedCanvas
 {
     /// <summary>What the left press under way turns into once it moves; the right and middle presses always pan.</summary>
     private PressIntent _pressIntent;
+    private bool _pressSpacePan;
 
     /// <summary>The modifiers held when the button went down, which decide a click and a rectangle whatever is held later.</summary>
     private ModifierKeys _pressModifiers;
@@ -361,13 +362,15 @@ public sealed partial class NestedCanvas
 
     private void PressLeft(Point point, ModifierKeys modifiers, int clickCount)
     {
+        var spacePan = SpacePanHeld;
+        _pressSpacePan = spacePan;
         // The copy-path button acts as it is pressed, and starts nothing else.
-        if (!SpacePanHeld && TryPressCopyButton(point))
+        if (!spacePan && TryPressCopyButton(point))
         {
             return;
         }
 
-        if (clickCount == 2 && !SpacePanHeld)
+        if (clickCount == 2 && !spacePan)
         {
             if (HotspotAt(point) is { } shortcut)
             {
@@ -395,11 +398,21 @@ public sealed partial class NestedCanvas
 
         _press = PressKind.Left;
         _pressPoint = point;
-        _pressMoved = false;
+        _pressMoved = spacePan;
         _pressModifiers = modifiers;
-        _pressHotspot = SpacePanHeld ? null : HotspotAt(point);
-        _pressHit = PointerHit(point);
+        _pressHotspot = spacePan ? null : HotspotAt(point);
+        _pressHit = spacePan ? null : PointerHit(point);
         (_pressIntent, _pressContainer) = ClassifyLeftPress(_pressHit, point, modifiers);
+        if (spacePan)
+        {
+            // Space already states the user's intent. Generic file/selection
+            // drag thresholds would add a dead zone, then jump by the entire
+            // accumulated delta. Track the very first nonzero move instead.
+            _panLast = point;
+            StopFlight();
+            Cursor = Cursors.SizeAll;
+            _hover = null;
+        }
         TakeMouse();
         RequestFrame(Layers.Overlay);
     }
@@ -427,7 +440,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private (PressIntent Intent, NestedFolder? Container) ClassifyLeftPress(NestedHit? hit, Point point, ModifierKeys modifiers)
     {
-        if (SpacePanHeld)
+        if (_pressSpacePan)
         {
             return (PressIntent.Pan, null);
         }
@@ -704,6 +717,12 @@ public sealed partial class NestedCanvas
     /// A file dialog takes the folder the user brings it to for where it is.
     /// </summary>
     public event Action? UserCameraMoved;
+
+    internal void SpacePointerPan(Vector delta)
+    {
+        Pan(delta);
+        UserCameraMoved?.Invoke();
+    }
 
     /// <summary>A zoom key or the window's zoom buttons: a step in or out about the middle of the view.</summary>
     internal void ZoomStep(bool zoomIn)

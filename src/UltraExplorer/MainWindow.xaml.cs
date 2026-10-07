@@ -459,6 +459,23 @@ public partial class MainWindow : Window
         _closeRequested = true;
         try
         {
+            if (_quickPreview is { HasUnsavedChanges: true } preview)
+            {
+                var noteSave = preview.CommitForCloseAsync();
+                if (!noteSave.IsCompleted)
+                {
+                    var noteFrame = new DispatcherFrame();
+                    _ = noteSave.ContinueWith(_ => noteFrame.Continue = false, TaskScheduler.Default);
+                    using var noteTimeout = new Timer(_ => noteFrame.Continue = false, null, SessionEndSaveTimeout, Timeout.InfiniteTimeSpan);
+                    Dispatcher.PushFrame(noteFrame);
+                }
+                if (!noteSave.IsCompletedSuccessfully || !noteSave.Result)
+                {
+                    e.Cancel = true;
+                    _closeRequested = false;
+                    return;
+                }
+            }
             CaptureStateForSave();
             var saving = _viewModel.SaveNowAsync();
             if (!saving.IsCompleted)
@@ -481,7 +498,7 @@ public partial class MainWindow : Window
         finally
         {
             // The Closing that follows only tidies up.
-            _allowClose = true;
+            _allowClose = !e.Cancel;
         }
     }
 
@@ -535,7 +552,7 @@ public partial class MainWindow : Window
     private void ConfigureAutoPanning()
     {
         Editor.DisableAutoPanning = true;
-        Editor.IsMouseCaptureWithinChanged += (_, e) => Editor.DisableAutoPanning = e.NewValue is not true;
+        Editor.IsMouseCaptureWithinChanged += (_, e) => Editor.DisableAutoPanning = _isSpacePanning || e.NewValue is not true;
     }
 
     private void SetSpacePanArmed(bool armed)
@@ -567,6 +584,8 @@ public partial class MainWindow : Window
             _isSpacePanning = true;
             _panPointerAnchor = e.GetPosition(Editor);
             _panViewportAnchor = Editor.ViewportLocation;
+            Editor.BeginPanning();
+            Editor.DisableAutoPanning = true;
             Editor.Cursor = Cursors.SizeAll;
             Editor.CaptureMouse();
             e.Handled = true;
@@ -650,7 +669,7 @@ public partial class MainWindow : Window
 
         var moved = e.GetPosition(Editor) - _panPointerAnchor;
         Editor.ViewportLocation = _panViewportAnchor - moved / Math.Max(Editor.ViewportZoom, 0.001);
-        PushViewport();
+        // The viewport dependency-property callback updates the model once.
         e.Handled = true;
     }
 
@@ -673,7 +692,9 @@ public partial class MainWindow : Window
             return;
         }
 
+        Editor.EndPanning();
         Editor.ReleaseMouseCapture();
+        Editor.DisableAutoPanning = !Editor.IsMouseCaptureWithin;
         Editor.Cursor = _isSpaceHeld ? Cursors.Hand : null;
         e.Handled = true;
     }
@@ -681,7 +702,9 @@ public partial class MainWindow : Window
     /// <summary>A drag that loses capture - Alt+Tab, a dialog - must still end.</summary>
     private void Editor_LostMouseCapture(object sender, MouseEventArgs e)
     {
+        if (_isSpacePanning) Editor.EndPanning();
         _isSpacePanning = false;
+        Editor.DisableAutoPanning = !Editor.IsMouseCaptureWithin;
         EndOverviewDrag(committed: false);
     }
 
@@ -730,6 +753,7 @@ public partial class MainWindow : Window
 
     private void PushViewport()
     {
+        if (!IsNested) CancelSpacePreview();
         if (_hoverPreview is not null) ClearHoverPreview();
         using var frame = PerfLog.Measure("viewport");
 
@@ -2213,6 +2237,10 @@ public partial class MainWindow : Window
                 e.OriginalSource as DependencyObject, () => e.Handled = true))
             return;
 
+        if (TryBeginSpacePreview(key, modifiers, e.IsRepeat,
+                e.OriginalSource as DependencyObject, () => e.Handled = true))
+            return;
+
         // The nested canvas moves between cells with the arrows and goes in and
         // out with Enter and Backspace; the tree's meanings for those keys
         // (open, expand, collapse) do not exist there.
@@ -2307,11 +2335,6 @@ public partial class MainWindow : Window
             case (ModifierKeys.Control, Key.Subtract):
                 _viewModel.ZoomOutCommand.Execute(null);
                 break;
-            // Space is a button's own key too; the grab hand is for the canvas.
-            case (ModifierKeys.None, Key.Space) when onSelection:
-                SetSpacePanArmed(true);
-                break;
-
             // The Menu key is the other way Windows has always had to ask for
             // the menu of what has the keyboard.
             case (ModifierKeys.Shift, Key.F10) when onSelection:
@@ -2407,6 +2430,12 @@ public partial class MainWindow : Window
 
     private void Window_Deactivated(object? sender, EventArgs e)
     {
+        CancelSpacePreview(disarm: true);
+        if (_isSpacePanning)
+        {
+            Editor.EndPanning();
+            Editor.ReleaseMouseCapture();
+        }
         // Alt+Tab while space is held would otherwise leave the grab hand on.
         _isSpacePanning = false;
         SetSpacePanArmed(false);
@@ -2421,9 +2450,13 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Space)
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key == Key.Space)
         {
-            SetSpacePanArmed(false);
+            var owned = _spacePreviewGesture.IsPressed;
+            var path = FinishSpacePreview(Keyboard.Modifiers, e.OriginalSource as DependencyObject);
+            if (owned) e.Handled = true;
+            if (path is not null) OpenQuickPreview(path);
         }
     }
 

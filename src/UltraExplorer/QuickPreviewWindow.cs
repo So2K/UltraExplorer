@@ -11,14 +11,14 @@ using UltraExplorer.Services;
 using ICSharpCode.AvalonEdit;
 using ICSharpCode.AvalonEdit.Highlighting;
 using ICSharpCode.AvalonEdit.Search;
-using UltraExplorer.Dialogs;
+using System.Windows.Controls.Primitives;
 
 namespace UltraExplorer;
 
 /// <summary>One owned, resizable Quick Look window; all file work stays off the dispatcher.</summary>
 internal sealed class QuickPreviewWindow : Window
 {
-    private readonly Grid _body = new();
+    private readonly Grid _body = new() { Focusable = true };
     private readonly StackPanel _tools = new() { Orientation = Orientation.Horizontal };
     private readonly StackPanel _zoomTools = new() { Orientation = Orientation.Horizontal };
     private readonly TextBlock _status = new() { Margin = new Thickness(14, 9, 14, 9), TextTrimming = TextTrimming.CharacterEllipsis };
@@ -32,9 +32,16 @@ internal sealed class QuickPreviewWindow : Window
         HorizontalScrollBarVisibility = ScrollBarVisibility.Auto, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
         BorderThickness = new Thickness(0), Padding = new Thickness(18), WordWrap = false
     };
-    private readonly Button _edit, _save, _previous, _next;
+    private readonly Button _save, _discard, _previous, _next;
+    private Task<bool>? _pendingSave;
+    private long _openRequest;
+    private IReadOnlyList<string> _files = [];
+    private readonly Button _previousFile, _nextFile;
+    private readonly Button _delete;
+    private bool _forceReadOnly;
+    private bool _deleting;
+    private bool _activatedOnce;
     private readonly SearchPanel _search;
-    private readonly Func<string, PreviewSaveChoice> _closeDecision;
     private CancellationTokenSource _load = new();
     private NativePreviewHost? _native;
     private PreviewTextEditSession? _editor;
@@ -47,9 +54,8 @@ internal sealed class QuickPreviewWindow : Window
     private double _zoom = 1;
     private bool _fit = true;
 
-    internal QuickPreviewWindow(Func<string, PreviewSaveChoice>? closeDecision = null)
+    internal QuickPreviewWindow()
     {
-        _closeDecision = closeDecision ?? (filename => PreviewSaveChangesDialog.Ask(this, filename));
         Title = "Quick Look — UltraExplorer";
         Width = 880; Height = 640; MinWidth = 480; MinHeight = 340;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
@@ -71,8 +77,18 @@ internal sealed class QuickPreviewWindow : Window
         root.RowDefinitions.Add(new RowDefinition());
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         var top = new DockPanel { Margin = new Thickness(10, 6, 10, 6), LastChildFill = true };
-        var open = Button("Open in app", () => { try { NativeShellService.Open(_path, false); } catch (Exception e) { Status(e.Message); } });
-        DockPanel.SetDock(open, Dock.Right); top.Children.Add(open);
+        var openGroup = new StackPanel { Orientation = Orientation.Horizontal };
+        var open = Button("Open", () => _ = OpenExternalAsync(false));
+        var openWith = Button("▾", () => OpenWithMenu(openGroup));
+        openWith.ToolTip = "Open with another application";
+        openGroup.Children.Add(open); openGroup.Children.Add(openWith);
+        DockPanel.SetDock(openGroup, Dock.Right); top.Children.Add(openGroup);
+        _delete = Button("Delete", () => _ = DeleteCurrentAsync());
+        _delete.ToolTip = "Move this file to the Recycle Bin";
+        DockPanel.SetDock(_delete, Dock.Right); top.Children.Add(_delete);
+        _previousFile = Button("‹ File", () => _ = NavigateFileAsync(-1));
+        _nextFile = Button("File ›", () => _ = NavigateFileAsync(1));
+        _tools.Children.Add(_previousFile); _tools.Children.Add(_nextFile);
         _previous = Button("‹", () => _ = LoadPdfAsync(_page - 1)); _previous.ToolTip = "Previous page (Left)";
         _next = Button("›", () => _ = LoadPdfAsync(_page + 1)); _next.ToolTip = "Next page (Right)";
         _tools.Children.Add(_previous); _tools.Children.Add(_pageLabel); _tools.Children.Add(_next);
@@ -80,15 +96,21 @@ internal sealed class QuickPreviewWindow : Window
         _zoomTools.Children.Add(Button("+", () => ZoomBy(1.25)));
         _zoomTools.Children.Add(Button("Fit", () => { _fit = true; ApplyImageSize(); }));
         _tools.Children.Add(_zoomTools);
-        _edit = Button("Edit text", () => _ = BeginEditAsync());
         _save = Button("Save", () => _ = SaveAsync());
-        _tools.Children.Add(_edit); _tools.Children.Add(_save);
+        _discard = Button("Discard changes", () => { _allowClose = true; _dirty = false; Close(); });
+        _tools.Children.Add(_save); _tools.Children.Add(_discard);
         top.Children.Add(_tools);
         root.Children.Add(top); Grid.SetRow(_body, 1); root.Children.Add(_body);
         Grid.SetRow(_status, 2); root.Children.Add(_status); Content = root;
         _text.TextChanged += (_, _) => { if (!_text.IsReadOnly && _editor is not null) { _dirty = _text.Text != _editor.Text; UpdateSave(); } };
         _picture.SizeChanged += (_, _) => { if (_fit) ApplyImageSize(); };
         PreviewKeyDown += OnKey;
+        Loaded += (_, _) => { if (_editor is null) _body.Focus(); else _text.Focus(); };
+        Activated += (_, _) =>
+        {
+            if (!_activatedOnce) { _activatedOnce = true; return; }
+            _ = RefreshTextAfterActivationAsync();
+        };
         Closing += OnClosing;
         Closed += (_, _) => { _closed = true; _load.Cancel(); _load.Dispose(); _native?.Dispose(); };
         ResetTools();
@@ -103,12 +125,54 @@ internal sealed class QuickPreviewWindow : Window
     }
 
     internal string FilePath => _path;
+    internal void SetFileSequence(IReadOnlyList<string> files) { _files = files.ToArray(); UpdateFileNavigation(); }
+    private int CurrentFileIndex()
+    {
+        for (var index = 0; index < _files.Count; index++)
+            if (string.Equals(_files[index], _path, StringComparison.Ordinal)) return index;
+        return -1;
+    }
+    private void UpdateFileNavigation()
+    {
+        var index = CurrentFileIndex();
+        _previousFile.Visibility = _nextFile.Visibility = _files.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
+        _previousFile.IsEnabled = index > 0;
+        _nextFile.IsEnabled = index >= 0 && index + 1 < _files.Count;
+    }
+    internal async Task NavigateFileAsync(int direction)
+    {
+        var current = CurrentFileIndex();
+        if (current < 0) return;
+        var index = current + Math.Sign(direction);
+        if (index < 0 || index >= _files.Count || direction == 0) return;
+        OpenFile(_files[index], readOnly: _forceReadOnly);
+        await Loading;
+    }
+    internal Task RefreshTextAfterActivationAsync()
+    {
+        if (!_closed && !_dirty && !_saving && _document is not null)
+        { OpenFile(_path, readOnly: _forceReadOnly); return Loading; }
+        return Task.CompletedTask;
+    }
     internal bool HasUnsavedChanges => _dirty || _saving;
     internal Task Loading { get; private set; } = Task.CompletedTask;
-    internal void OpenFile(string path)
+    internal void OpenFile(string path, bool readOnly = false)
     {
-        if (_dirty || _saving) { Status("Save your text edits or close this preview before viewing another file."); return; }
+        var request = ++_openRequest;
+        Loading = _dirty || _saving ? SaveAndOpenAsync(path, request, readOnly) : StartOpenFile(path, readOnly);
+    }
+    private async Task SaveAndOpenAsync(string path, long request, bool readOnly)
+    {
+        if (!await CommitForCloseAsync() || _closed || request != _openRequest) return;
+        await StartOpenFile(path, readOnly);
+    }
+    private Task StartOpenFile(string path, bool readOnly = false)
+    {
+        _forceReadOnly = readOnly;
+        _delete.Visibility = readOnly ? Visibility.Collapsed : Visibility.Visible;
+        _delete.IsEnabled = !readOnly && !_deleting;
         _path = path; Title = Path.GetFileName(path) + " — Quick Look";
+        UpdateFileNavigation();
         _load.Cancel(); _load.Dispose(); _load = new CancellationTokenSource();
         _generation++; _native?.Dispose(); _native = null; _editor = null; _document = null;
         _dirty = false; _renderingPdf = false; _page = 0; _pageCount = 0; _fit = true; _zoom = 1;
@@ -126,7 +190,7 @@ internal sealed class QuickPreviewWindow : Window
             }
         _text.SyntaxHighlighting = syntax;
         _body.Children.Clear(); Status("Loading preview…");
-        Loading = LoadFileAsync(path, _generation, _load.Token);
+        return LoadFileAsync(path, _generation, _load.Token);
     }
 
     private async Task LoadFileAsync(string path, int generation, CancellationToken token)
@@ -142,6 +206,17 @@ internal sealed class QuickPreviewWindow : Window
             {
                 await LoadPdfAsync(0); return;
             }
+            if (PreviewImageService.Supports(path))
+            {
+                var image = await PreviewImageService.ReadAsync(path, 4096, token);
+                if (!Current(generation)) return;
+                if (image is not null && !image.IsAnimated)
+                {
+                    ShowImage(image.Image);
+                    Status($"{image.OriginalWidth:N0} × {image.OriginalHeight:N0} · Ctrl+wheel to zoom");
+                    return;
+                }
+            }
             if (PreviewTools.IsModel(path) || PreviewTools.IsMedia(path))
             {
                 _native = new NativePreviewHost(); _body.Children.Add(_native);
@@ -149,20 +224,15 @@ internal sealed class QuickPreviewWindow : Window
                 if (Current(generation)) Status(PreviewTools.IsModel(path) ? "Drag to orbit · Wheel to zoom · F3D" : "Playback controls appear over the video · mpv");
                 return;
             }
-            if (IsImage(path))
-            {
-                var image = await Task.Run(() => ReadImage(path), token);
-                if (!Current(generation)) return;
-                ShowImage(image); Status($"{image.PixelWidth:N0} × {image.PixelHeight:N0} · Wheel to scroll · Ctrl+wheel to zoom");
-                return;
-            }
             var document = await DocumentPreviewService.ReadAsync(path, 2 * 1024 * 1024, token);
             if (!Current(generation)) return;
             if (document is not null)
             {
                 _document = document; _text.Text = document.Text; _body.Children.Add(_text);
-                _edit.Visibility = document.CanEdit && !document.Truncated && !document.IsBinary ? Visibility.Visible : Visibility.Collapsed;
-                Status(document.Detail); return;
+                Status(document.Detail);
+                if (!_forceReadOnly && document.CanEdit && !document.Truncated && !document.IsBinary)
+                    await PrepareTextEditorAsync(path, document, generation, token);
+                return;
             }
             using var thumbnails = new FileThumbnailService();
             var thumbnail = await thumbnails.GetAsync(path, token).WaitAsync(TimeSpan.FromSeconds(8), token);
@@ -198,6 +268,7 @@ internal sealed class QuickPreviewWindow : Window
     private void ShowImage(BitmapSource image)
     {
         _body.Children.Clear(); _body.Children.Add(_picture); _image.Source = image;
+        if (IsActive) _body.Focus();
         _zoomTools.Visibility = Visibility.Visible;
         ApplyImageSize();
     }
@@ -213,47 +284,113 @@ internal sealed class QuickPreviewWindow : Window
 
     private void ZoomBy(double factor) { _fit = false; _zoom = Math.Clamp(_zoom * factor, 0.05, 8); ApplyImageSize(); }
 
-    private async Task BeginEditAsync()
+    private async Task PrepareTextEditorAsync(string path, DocumentPreviewData document, int generation, CancellationToken token)
     {
-        if (_document is not { CanEdit: true, Truncated: false, IsBinary: false } document || _editor is not null) return;
-        _edit.IsEnabled = false;
-        var generation = _generation;
-        var path = _path;
         try
         {
-            var editor = await PreviewTextEditSession.OpenAsync(path, document.EncodingName ?? "utf-8", document.HasBom, _load.Token);
+            var editor = await Task.Run(() => PreviewTextEditSession.OpenAsync(path, document.EncodingName ?? "utf-8", document.HasBom, token), token);
             if (!Current(generation)) return;
-            _editor = editor;
-            _text.Text = _editor.Text; _text.IsReadOnly = false; _text.Focus();
-            _edit.Visibility = Visibility.Collapsed; _save.Visibility = Visibility.Visible; UpdateSave();
-            Status("Editing text · Ctrl+S to save · Original encoding is preserved");
+            _editor = editor; _text.Text = editor.Text; _text.IsReadOnly = false;
+            _save.Visibility = Visibility.Visible; UpdateSave();
+            _text.Focus();
+            Status("Text · Changes save when you close · Ctrl+S to save now");
         }
         catch (OperationCanceledException) { }
-        catch (Exception e) { if (Current(generation)) { Status(e.Message); _edit.IsEnabled = true; } }
+        catch (Exception e) { if (Current(generation)) Status("Read-only preview · " + e.Message); }
     }
 
-    private async Task<bool> SaveAsync()
+    private Task<bool> SaveAsync()
     {
-        if (_editor is null || !_dirty) return true;
-        if (_saving) return false;
+        if (_pendingSave is { IsCompleted: false } pending) return pending;
+        if (_editor is null || !_dirty) return Task.FromResult(true);
+        return _pendingSave = SaveCoreAsync();
+    }
+    private async Task<bool> SaveCoreAsync()
+    {
         _saving = true; UpdateSave();
         try
         {
             var text = _text.Text;
-            await _editor.SaveAsync(text, _load.Token);
-            _dirty = _text.Text != _editor.Text; Status("Saved · " + Path.GetFileName(_path));
+            var editor = _editor!;
+            await Task.Run(() => editor.SaveAsync(text, _load.Token), _load.Token);
+            _dirty = _text.Text != editor.Text;
+            _discard.Visibility = Visibility.Collapsed;
+            Status("Saved · " + Path.GetFileName(_path));
             return !_dirty;
         }
-        catch (Exception e) { Status(e.Message); return false; }
+        catch (Exception e) { Status(e.Message); _discard.Visibility = Visibility.Visible; return false; }
         finally { _saving = false; UpdateSave(); }
     }
-
-    private void UpdateSave() { _save.IsEnabled = _dirty && !_saving; Title = (_dirty ? "● " : "") + Path.GetFileName(_path) + " — Quick Look"; }
+    internal async Task<bool> CommitForCloseAsync()
+    {
+        var request = _openRequest; var editor = _editor;
+        var saved = await SaveAsync();
+        return saved && !_dirty && !_saving && request == _openRequest && ReferenceEquals(editor, _editor);
+    }
+    internal Task<bool> ConfirmCloseAsync() => CommitForCloseAsync();
+    private async Task OpenExternalAsync(bool chooseApp)
+    {
+        var path = _path; var request = _openRequest;
+        if (!await CommitForCloseAsync() || _closed) return;
+        if (request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal)) return;
+        try
+        {
+            if (chooseApp) await NativeShellService.OpenWithAsync(path);
+            else NativeShellService.Open(path, false);
+        }
+        catch (Exception e) { if (request == _openRequest) Status(e.Message); }
+    }
+    private void OpenWithMenu(FrameworkElement target)
+    {
+        var menu = new ContextMenu { PlacementTarget = target };
+        var choose = new MenuItem { Header = "Open with…" };
+        choose.Click += (_, _) => _ = OpenExternalAsync(true);
+        menu.Items.Add(choose); menu.IsOpen = true;
+    }
+    internal async Task DeleteCurrentAsync(Func<string, Task>? recycleForChecks = null)
+    {
+        if (_forceReadOnly || _deleting) return;
+        var path = _path; var request = _openRequest;
+        if (!await CommitForCloseAsync() || _closed) return;
+        if (request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal) || _forceReadOnly || _deleting) return;
+        _deleting = true;
+        _delete.IsEnabled = false;
+        var wasReadOnly = _text.IsReadOnly;
+        _text.IsReadOnly = true;
+        Status("Moving to the Recycle Bin…");
+        try
+        {
+            _native?.Dispose(); _native = null;
+            if (recycleForChecks is not null) await recycleForChecks(path);
+            else await new NativeShellService().DeleteAsync([path], permanently: false);
+            if (_closed || request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal)) return;
+            var at = CurrentFileIndex();
+            var remaining = _files.Where(file => !string.Equals(file, path, StringComparison.Ordinal)).ToArray();
+            if (remaining.Length > 0)
+            { _files = remaining; OpenFile(remaining[Math.Clamp(at, 0, remaining.Length - 1)]); }
+            else { _allowClose = true; Close(); }
+        }
+        catch (Exception e)
+        {
+            if (_closed || request != _openRequest) return;
+            await StartOpenFile(path);
+            Status(e.Message);
+        }
+        finally
+        {
+            _deleting = false;
+            if (!_closed)
+            {
+                _delete.IsEnabled = !_forceReadOnly;
+                if (request == _openRequest) _text.IsReadOnly = wasReadOnly;
+            }
+        }
+    }
+    private void UpdateSave() { _save.IsEnabled = _dirty && !_saving; _discard.IsEnabled = _dirty && !_saving; Title = (_dirty ? "● " : "") + Path.GetFileName(_path) + " — Quick Look"; }
     private void ResetTools()
     {
-        _edit.Visibility = _save.Visibility = _previous.Visibility = _next.Visibility = _pageLabel.Visibility = Visibility.Collapsed;
+        _save.Visibility = _discard.Visibility = _previous.Visibility = _next.Visibility = _pageLabel.Visibility = Visibility.Collapsed;
         _zoomTools.Visibility = Visibility.Collapsed;
-        _edit.IsEnabled = true;
     }
     private void Status(string message) { _status.Text = message; _status.ToolTip = message; }
     private void ShowError(string message)
@@ -268,10 +405,19 @@ internal sealed class QuickPreviewWindow : Window
     private void OnKey(object sender, KeyEventArgs e)
     {
         if (e.Key == Key.Escape && !_search.IsClosed) { _search.Close(); e.Handled = true; }
-        else if (e.Key == Key.Escape || (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.Control)) { e.Handled = true; Close(); }
+        else if (e.Key == Key.Escape || (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.Control)
+            || (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None && (_text.IsReadOnly || (!_text.IsKeyboardFocusWithin && !IsInsideTextEditor(e.OriginalSource as DependencyObject)))
+                && !MainWindow.IsFocusTextInput(e.OriginalSource as DependencyObject)
+                && !IsInsideButton(e.OriginalSource as DependencyObject))) { e.Handled = true; Close(); }
         else if (e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control) { e.Handled = true; _ = SaveAsync(); }
         else if (_pageCount > 0 && Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Left or Key.Right)
         { e.Handled = true; _ = LoadPdfAsync(_page + (e.Key == Key.Right ? 1 : -1)); }
+        else if (Keyboard.Modifiers == ModifierKeys.Alt && e.SystemKey is Key.Left or Key.Right)
+        { e.Handled = true; _ = NavigateFileAsync(e.SystemKey == Key.Right ? 1 : -1); }
+        else if (Keyboard.Modifiers == ModifierKeys.None && e.Key is Key.Left or Key.Right && PreviewSurfaceKey(e.OriginalSource as DependencyObject))
+        { e.Handled = true; _ = NavigateFileAsync(e.Key == Key.Right ? 1 : -1); }
+        else if (Keyboard.Modifiers == ModifierKeys.None && e.Key == Key.Delete && PreviewSurfaceKey(e.OriginalSource as DependencyObject))
+        { e.Handled = true; _ = DeleteCurrentAsync(); }
     }
     protected override void OnPreviewMouseWheel(MouseWheelEventArgs e)
     {
@@ -283,24 +429,42 @@ internal sealed class QuickPreviewWindow : Window
     {
         if (_allowClose || (!_dirty && !_saving)) return;
         e.Cancel = true;
-        if (_saving || _askingClose) return;
-        if (!await ConfirmCloseAsync()) return;
-        _allowClose = true; Close();
-    }
-    internal async Task<bool> ConfirmCloseAsync()
-    {
-        if (!_dirty) return !_saving;
-        if (_saving || _askingClose) return false;
+        if (_askingClose) return;
         _askingClose = true;
+        var request = _openRequest;
         try
         {
-        var answer = _closeDecision(Path.GetFileName(_path));
-        if (answer == PreviewSaveChoice.Cancel) return false;
-        if (answer == PreviewSaveChoice.Save && !await SaveAsync()) return false;
-        _dirty = false;
-        return true;
+            if (!await CommitForCloseAsync() || request != _openRequest || _dirty || _saving) return;
+            _ = Dispatcher.InvokeAsync(() =>
+            {
+                if (_closed || request != _openRequest || _dirty || _saving) return;
+                _allowClose = true;
+                Close();
+            });
         }
         finally { _askingClose = false; }
+    }
+    private bool IsInsideTextEditor(DependencyObject? source)
+    {
+        for (var current = source; current is not null; current = current is Visual or System.Windows.Media.Media3D.Visual3D
+                 ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current))
+            if (ReferenceEquals(current, _text) || ReferenceEquals(current, _text.TextArea)) return true;
+        return false;
+    }
+    private bool PreviewSurfaceKey(DependencyObject? source)
+    {
+        if (!_text.IsReadOnly && (_text.IsKeyboardFocusWithin || IsInsideTextEditor(source))) return false;
+        if (MainWindow.IsFocusTextInput(source) || IsInsideButton(source)) return false;
+        for (var current = source; current is Visual; current = VisualTreeHelper.GetParent(current))
+            if (current is Slider or ComboBox) return false;
+        return true;
+    }
+    private static bool IsInsideButton(DependencyObject? source)
+    {
+        for (var current = source; current is not null; current = current is Visual or System.Windows.Media.Media3D.Visual3D
+                 ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current))
+            if (current is ButtonBase) return true;
+        return false;
     }
     protected override void OnSourceInitialized(EventArgs e)
     {
@@ -310,23 +474,4 @@ internal sealed class QuickPreviewWindow : Window
     }
     [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
 
-    private static bool IsImage(string path) => Path.GetExtension(path.TrimEnd(' ', '.')).ToLowerInvariant() is ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".tif" or ".tiff" or ".ico" or ".wdp" or ".jxr";
-    private static BitmapSource ReadImage(string path)
-    {
-        using var stream = new FileStream(DocumentPreviewService.LiteralPath(path), FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnDemand);
-        var frame = decoder.Frames[0];
-        if (frame.PixelWidth > 100000 || frame.PixelHeight > 100000 || (long)frame.PixelWidth * frame.PixelHeight > 200000000)
-            throw new IOException("This image is too large for the mini viewer.");
-        var orientation = 1;
-        if (frame.Metadata is BitmapMetadata metadata)
-            foreach (var query in new[] { "/app1/ifd/{ushort=274}", "/ifd/{ushort=274}" })
-                try { if (metadata.GetQuery(query) is ushort value && value is >= 1 and <= 8) { orientation = value; break; } } catch (Exception) { }
-        stream.Position = 0;
-        var image = new BitmapImage(); image.BeginInit(); image.CacheOption = BitmapCacheOption.OnLoad;
-        if (Math.Max(frame.PixelWidth, frame.PixelHeight) > 4096)
-        { if (frame.PixelWidth >= frame.PixelHeight) image.DecodePixelWidth = 4096; else image.DecodePixelHeight = 4096; }
-        image.StreamSource = stream; image.EndInit(); image.Freeze();
-        return FileThumbnailService.OrientImage(image, orientation);
-    }
 }

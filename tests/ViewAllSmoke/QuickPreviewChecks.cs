@@ -7,7 +7,6 @@ using System.Windows.Media.Imaging;
 using ICSharpCode.AvalonEdit;
 using UltraExplorer;
 using UltraExplorer.Services;
-using UltraExplorer.Dialogs;
 
 namespace ViewAllSmoke;
 
@@ -61,14 +60,18 @@ internal static partial class Program
             Check("unrepresentable characters do not silently corrupt legacy text", unmappable && Encoding.GetEncoding(1251).GetString(File.ReadAllBytes(legacy)).EndsWith("Добавлено"));
 
             await File.WriteAllTextAsync(utf8, source, new UTF8Encoding(true));
-            var choice = PreviewSaveChoice.Cancel;
-            var window = new QuickPreviewWindow(_ => choice);
+            var window = new QuickPreviewWindow();
             try
             {
                 window.OpenFile(utf8); await window.Loading;
                 var editors = QuickDescendants((DependencyObject)window.Content).OfType<TextEditor>().ToArray();
-                Check("Quick Look shows actual text with a ready syntax editor", editors.Length == 1 && editors[0].Text == source && editors[0].IsReadOnly && editors[0].SyntaxHighlighting is not null);
-                Check("preview starts read only and never modifies its source", File.ReadAllText(utf8) == source && !window.HasUnsavedChanges);
+                Check("Quick Look shows actual text with a ready syntax editor", editors.Length == 1 && editors[0].Text == source && !editors[0].IsReadOnly && editors[0].SyntaxHighlighting is not null);
+                Check("opening the mini editor does not modify its source", File.ReadAllText(utf8) == source && !window.HasUnsavedChanges);
+                await File.WriteAllTextAsync(utf8, source + "// external editor save\r\n", new UTF8Encoding(true));
+                await window.RefreshTextAfterActivationAsync();
+                Check("returning from an external editor refreshes the actual read-only text preview", editors[0].Text == source + "// external editor save\r\n" && !editors[0].IsReadOnly);
+                await File.WriteAllTextAsync(utf8, source, new UTF8Encoding(true));
+                await window.RefreshTextAfterActivationAsync();
                 var output = Path.Combine(Environment.CurrentDirectory, "artifacts", "universal-preview", "shots");
                 Directory.CreateDirectory(output);
                 QuickRender(window, Path.Combine(output, "quick-text.png"));
@@ -93,15 +96,20 @@ internal static partial class Program
                 await Task.WhenAll(staleModel, newest).WaitAsync(TimeSpan.FromSeconds(5));
                 Check("a rapid model-to-text switch creates no stale native host or background renderer", window.FilePath == utf8
                     && !QuickDescendants((DependencyObject)window.Content).OfType<UltraExplorer.Controls.NativePreviewHost>().Any());
-                var edit = QuickDescendants((DependencyObject)window.Content).OfType<Button>().Single(b => Equals(b.Content, "Edit text"));
-                edit.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
                 var codeEditor = QuickDescendants((DependencyObject)window.Content).OfType<TextEditor>().Single();
-                Check("Edit text enters editing through the actual toolbar control", await HoverWait(() => !codeEditor.IsReadOnly));
+                Check("plain text is immediately editable without a separate edit action", !codeEditor.IsReadOnly);
                 codeEditor.Text += "// edited in Quick Look\r\n";
-                Check("canceling an unsaved close preserves the editor and original file", !await window.ConfirmCloseAsync() && window.HasUnsavedChanges && File.ReadAllText(utf8) == source);
-                choice = PreviewSaveChoice.Save;
-                Check("confirming save on close commits the actual editor text and clears dirty state", await window.ConfirmCloseAsync()
+                Check("closing commits the actual mini buffer without an extra confirmation", await window.CommitForCloseAsync()
                     && !window.HasUnsavedChanges && File.ReadAllText(utf8) == codeEditor.Text);
+                var nextNote = Path.Combine(fixture, "next-note.txt");
+                await File.WriteAllTextAsync(nextNote, "next note", new UTF8Encoding(false));
+                window.SetFileSequence([utf8, nextNote]);
+                codeEditor.Text += "// saved before next file\r\n";
+                var beforeSwitch = codeEditor.Text;
+                await window.NavigateFileAsync(1);
+                Check("browsing to the next file saves the current mini note and shows the next editable file",
+                    File.ReadAllText(utf8) == beforeSwitch && window.FilePath == nextNote
+                    && QuickDescendants((DependencyObject)window.Content).OfType<TextEditor>().Single() is { IsReadOnly: false, Text: "next note" });
                 var binary = Path.Combine(fixture, "unknown.bin"); await File.WriteAllBytesAsync(binary, [0, 1, 2, 0xff, 0xfe, 0x10]);
                 window.OpenFile(binary); await window.Loading;
                 Check("unknown files have a read-only content/hex preview", QuickDescendants((DependencyObject)window.Content).OfType<TextEditor>().Single().Text.Contains("00 01 02") && !window.HasUnsavedChanges);
