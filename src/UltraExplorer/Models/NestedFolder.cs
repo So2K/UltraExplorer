@@ -248,8 +248,9 @@ public sealed class NestedFolder
     }
 
     /// <summary>A sub-folder as its parent's listing names it, with no path of its own until one is asked for.</summary>
-    private NestedFolder(NestedFolder parent, string name, bool isHidden, bool isReparsePoint, long modifiedTicks)
+    private NestedFolder(NestedFolder parent, string name, bool isHidden, bool isReparsePoint, long modifiedTicks, bool isArchive)
     {
+        IsArchive = isArchive;
         Name = name;
         Kind = NestedFolderKind.Folder;
         Parent = parent;
@@ -270,8 +271,8 @@ public sealed class NestedFolder
     /// comes from the parent's hash carried on over the name - the same number
     /// the whole path gives.
     /// </summary>
-    internal static NestedFolder ChildOf(NestedFolder parent, string name, bool isHidden, bool isReparsePoint, long modifiedTicks) =>
-        new(parent, name, isHidden, isReparsePoint, modifiedTicks);
+    internal static NestedFolder ChildOf(NestedFolder parent, string name, bool isHidden, bool isReparsePoint, long modifiedTicks, bool isArchive = false) =>
+        new(parent, name, isHidden, isReparsePoint, modifiedTicks, isArchive);
 
     /// <summary>The folder's path; for a sub-folder, its parent's joined with its name the first time it is asked for.</summary>
     public string FullPath => _fullPath ??= Path.Combine(Parent!.FullPath, Name);
@@ -290,6 +291,12 @@ public sealed class NestedFolder
     /// so it is never read on its own.
     /// </summary>
     public bool IsReparsePoint { get; }
+
+    /// <summary>An archive file - a zip, a 7z - shown as the folder it holds: read through 7-Zip, never written to.</summary>
+    public bool IsArchive { get; }
+
+    /// <summary>The archive itself or anything inside one: read-only, and not on disk as a folder.</summary>
+    public bool IsInArchive => IsArchive || Parent is { } parent && parent.IsInArchive;
 
     /// <summary>Free space for a drive; empty for a folder.</summary>
     public string SecondaryText { get; internal set; }
@@ -437,6 +444,7 @@ public sealed class NestedFolder
     /// pass over the whole tree reaches it, whichever comes first.
     /// </summary>
     internal int LayoutSortGeneration { get; set; } = -1;
+    internal int ArchivesGeneration { get; set; }
 
     /// <summary>
     /// The order this folder's children and files were last placed in.  A

@@ -8,6 +8,7 @@ using UltraExplorer.Controls;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Archives;
 using UltraExplorer.Services.Watch;
 
 namespace UltraExplorer.ViewModels;
@@ -33,7 +34,7 @@ public enum CanvasLayout
 /// command bar, search and status bar.  Everything that concerns the graph
 /// itself is delegated to <see cref="ViewAllViewModel"/>.
 /// </summary>
-public sealed class MainViewModel : ObservableObject, IDisposable
+public sealed partial class MainViewModel : ObservableObject, IDisposable
 {
     private readonly ShellIconService _iconService = new();
     private readonly NativeShellService _shellService = new();
@@ -81,6 +82,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CanvasLayer _layers = CanvasLayer.All;
     private bool _showFavoriteLinks;
     private bool _favoriteLinksChanged;
+    private bool _showHoverPreviews = true;
+    private bool _hoverPreviewsChanged;
     private bool _favoritesChanged;
 
     /// <summary>
@@ -342,6 +345,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
 
             _savedLayout = value.ToString();
+            Tree.BrowseArchives = BrowseArchives && IsNestedLayout;
             OnPropertyChanged(nameof(IsNestedLayout));
             OnPropertyChanged(nameof(IsTreeLayout));
             OnPropertyChanged(nameof(ZoomLabel));
@@ -465,6 +469,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (SetProperty(ref _showFavoriteLinks, value))
             {
                 _favoriteLinksChanged = true;
+                _ = SaveNowAsync();
+            }
+        }
+    }
+
+    /// <summary>Whether hovering a file shows its content thumbnail, in the canvases and folder list.</summary>
+    public bool ShowHoverPreviews
+    {
+        get => _showHoverPreviews;
+        set
+        {
+            if (SetProperty(ref _showHoverPreviews, value))
+            {
+                _hoverPreviewsChanged = true;
                 _ = SaveNowAsync();
             }
         }
@@ -798,6 +816,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             _layers = NormalizePickerLayers(CanvasLayers.Parse(state.CanvasLayersOff));
             _showFavoriteLinks = state.ShowFavoriteLinks;
             OnPropertyChanged(nameof(ShowFavoriteLinks));
+            // Settings are usable while the workspace is still loading.
+            // Keep a deliberate click made during that read.
+            if (!_hoverPreviewsChanged)
+            {
+                _showHoverPreviews = state.ShowHoverPreviews;
+                OnPropertyChanged(nameof(ShowHoverPreviews));
+            }
+
+            ApplyOptionalFeaturePreferences(state);
 
             // A file dialog shows the tree and never splits, and writes back
             // whatever the file says (see SaveNowAsync).
@@ -926,6 +953,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (_isDisposed) return;
         Address.SetPath(Tree.ActivePath);
         UpdateSidebarSelection();
+
+        // An early Settings click could not save before the user's workspace
+        // was loaded. Flush that preference now, with the same save gate,
+        // without writing the canvas's newly initialized view.
+        if (_hoverPreviewsChanged)
+        {
+            await _stateSaving.WaitAsync();
+            try { await SaveNavigationPreferencesCoreAsync(); }
+            finally { _stateSaving.Release(); }
+        }
     }
 
     public void ShowContextMenuFor(IReadOnlyList<string> paths, FrameworkElement origin, Point point)
@@ -1128,6 +1165,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return Task.FromResult(false);
         }
 
+        // Out of an archive is always a copy: the archive keeps what it has.
+        if (ArchiveService.AnyInsideArchive(paths))
+        {
+            return ExtractIntoAsync(paths, targetDirectory);
+        }
+
         return TransferAsync(paths, targetDirectory, move, move ? "Moving" : "Copying");
     }
 
@@ -1163,10 +1206,16 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (_isDisposed) return;
         var state = await _workspaceStore.LoadAsync();
         if (state is null || _isDisposed) return;
+        ApplyOptionalFeaturePreferences(state);
         if (!_favoriteLinksChanged && _showFavoriteLinks != state.ShowFavoriteLinks)
         {
             _showFavoriteLinks = state.ShowFavoriteLinks;
             OnPropertyChanged(nameof(ShowFavoriteLinks));
+        }
+        if (!_hoverPreviewsChanged && _showHoverPreviews != state.ShowHoverPreviews)
+        {
+            _showHoverPreviews = state.ShowHoverPreviews;
+            OnPropertyChanged(nameof(ShowHoverPreviews));
         }
         if (_favoritesChanged) return;
         foreach (var item in QuickAccess.Where(item => item.IsCustom).ToArray()) QuickAccess.Remove(item);
@@ -1233,6 +1282,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var before = _savedWorkspace!;
         var favoritesBefore = _savedFavorites;
         var ownLinks = _favoriteLinksChanged;
+        var ownHoverPreviews = _hoverPreviewsChanged;
+        var ownOptionalFeatures = _optionalFeaturesChanged;
         var ownFavorites = _favoritesChanged;
         try
         {
@@ -1251,23 +1302,26 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 // Nothing of this window's to write - a window closed after
                 // another saved its change must not write that file back as
                 // it read it a moment before.
-                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownFavorites);
+                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownHoverPreviews, ownFavorites, ownOptionalFeatures);
                 return JsonSerializer.SerializeToUtf8Bytes(state).AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(current))
                     ? null
                     : state;
             });
 
             _savedWorkspace = here;
+            FinishOptionalFeatureSave(here, ownOptionalFeatures);
             if (ownFavorites)
             {
                 _savedFavorites = here.Favorites;
             }
 
             if (_showFavoriteLinks == here.ShowFavoriteLinks) _favoriteLinksChanged = false;
+            if (_showHoverPreviews == here.ShowHoverPreviews) _hoverPreviewsChanged = false;
             if (FavoriteSnapshot().SequenceEqual(here.Favorites)) _favoritesChanged = false;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            if (!_isDisposed) Toast.ShowError(ex.Message);
         }
 
         await Tree.SaveAsync();
@@ -1292,6 +1346,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         NestedLeftDragHintShown = _leftDragHintShown,
         CanvasLayersOff = CanvasLayers.OffSetting(_layers),
         ShowFavoriteLinks = _showFavoriteLinks,
+        ShowHoverPreviews = _showHoverPreviews,
+        BrowseArchives = _browseArchives,
+        ShowDropShelf = _showDropShelf,
+        ShowCopyPathButton = _showCopyPathButton,
         IsSplit = _isSplit,
         SplitOrientation = SplitLayout.OrientationSetting(_splitOrientation),
         SplitRatio = _splitRatio,
@@ -1318,7 +1376,9 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         WorkspaceState there,
         List<FavoriteState> favoritesBefore,
         bool ownLinks,
-        bool ownFavorites)
+        bool ownHoverPreviews,
+        bool ownFavorites,
+        byte ownOptionalFeatures)
     {
         var settings = !_isPickerSession;
         var view = !_isPickerSession && !_isFolderWindow;
@@ -1342,6 +1402,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 ? here.CanvasLayersOff
                 : there.CanvasLayersOff,
             ShowFavoriteLinks = ownLinks ? here.ShowFavoriteLinks : there.ShowFavoriteLinks,
+            ShowHoverPreviews = ownHoverPreviews ? here.ShowHoverPreviews : there.ShowHoverPreviews,
+            BrowseArchives = settings && (ownOptionalFeatures & ArchivesPreference) != 0 ? here.BrowseArchives : there.BrowseArchives,
+            ShowDropShelf = settings && (ownOptionalFeatures & ShelfPreference) != 0 ? here.ShowDropShelf : there.ShowDropShelf,
+            ShowCopyPathButton = settings && (ownOptionalFeatures & CopyPathPreference) != 0 ? here.ShowCopyPathButton : there.ShowCopyPathButton,
             IsSplit = view ? Own(here.IsSplit, before.IsSplit, there.IsSplit) : there.IsSplit,
             SplitOrientation = view ? Own(here.SplitOrientation, before.SplitOrientation, there.SplitOrientation) : there.SplitOrientation,
             SplitRatio = view ? Own(here.SplitRatio, before.SplitRatio, there.SplitRatio) : there.SplitRatio,
@@ -1430,11 +1494,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task SaveNavigationPreferencesCoreAsync()
     {
-        if (_isDisposed || !_favoriteLinksChanged && !_favoritesChanged) return;
+        if (_isDisposed || !_favoriteLinksChanged && !_hoverPreviewsChanged && !_favoritesChanged) return;
         var links = _showFavoriteLinks;
+        var hoverPreviews = _showHoverPreviews;
         var favorites = FavoriteSnapshot();
         var favoritesBefore = _savedFavorites;
         var saveLinks = _favoriteLinksChanged;
+        var saveHoverPreviews = _hoverPreviewsChanged;
         var saveFavorites = _favoritesChanged;
         try
         {
@@ -1443,10 +1509,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 if (_isDisposed) return null;
                 current ??= new WorkspaceState();
                 if (saveLinks) current.ShowFavoriteLinks = links;
+                if (saveHoverPreviews) current.ShowHoverPreviews = hoverPreviews;
                 if (saveFavorites) current.Favorites = MergeFavorites(favorites, favoritesBefore, current.Favorites);
                 return current;
             });
             if (saveLinks && _showFavoriteLinks == links) _favoriteLinksChanged = false;
+            if (saveHoverPreviews && _showHoverPreviews == hoverPreviews) _hoverPreviewsChanged = false;
             if (saveFavorites)
             {
                 _savedFavorites = favorites;
@@ -1666,6 +1734,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        if (RefuseArchiveTarget(target))
+        {
+            return;
+        }
+
         var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder", false);
         if (name is null)
         {
@@ -1694,6 +1767,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (Tree.TargetDirectory is not { } target)
         {
             Toast.ShowError("Select a folder on the canvas first.");
+            return;
+        }
+
+        if (RefuseArchiveTarget(target))
+        {
             return;
         }
 
@@ -1740,6 +1818,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var paths = Tree.SelectedPaths.ToArray();
         if (paths.Length == 0)
         {
+            return;
+        }
+
+        // Out of an archive, what goes on the clipboard is a copy taken out first.
+        if (ArchiveService.AnyInsideArchive(paths))
+        {
+            if (!cut || !RefuseInsideArchive(paths, "Cutting"))
+            {
+                await CopyFromArchiveAsync(paths);
+            }
+
             return;
         }
 
@@ -1830,6 +1919,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         await TransferAsync(payload.Paths, target, payload.Cut, payload.Cut ? "Moving" : "Copying");
+
+        // What was cut is gone from where it was: a second paste would only
+        // fail, so the clipboard lets go of it, as Explorer's does.
+        if (payload.Cut && payload.Paths.All(path => !File.Exists(path) && !Directory.Exists(path)))
+        {
+            try
+            {
+                Clipboard.Clear();
+            }
+            catch (ExternalException)
+            {
+            }
+        }
     }
 
     /// <summary>
@@ -1848,6 +1950,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task<bool> TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
     {
+        if (RefuseArchiveTarget(targetDirectory))
+        {
+            return false;
+        }
+
         var given = paths.ToArray();
         var safePaths = await Task.Run(() => given
             .Where(ItemExists)
@@ -1981,6 +2088,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         var path = paths[0];
+        if (RefuseInsideArchive(paths, "Renaming"))
+        {
+            return;
+        }
+
         var currentName = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
         var isFolder = Tree.Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : Directory.Exists(path);
         var newName = PromptRequested?.Invoke("Rename", "Enter a new name", currentName, !isFolder);
@@ -2022,7 +2134,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task DuplicateSelectionAsync()
     {
         var paths = Tree.SelectedPaths;
-        if (paths.Count == 0)
+        if (paths.Count == 0 || RefuseInsideArchive(paths, "Duplicating"))
         {
             return;
         }
@@ -2087,7 +2199,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task DeleteSelectionAsync(bool permanently)
     {
-        if (!ConfirmUnshownSelection())
+        if (RefuseInsideArchive(Tree.SelectedPaths, "Deleting") || !ConfirmUnshownSelection())
         {
             return;
         }
@@ -2195,6 +2307,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var files = Tree.Selection.Items.Where(item => !item.IsDirectory).Select(item => item.Path).ToArray();
             if (files.Length > 0)
             {
+                // Files inside an archive are taken out and opened through 7-Zip.
+                var inArchives = files.Where(ArchiveService.IsInsideArchive).ToArray();
+                foreach (var file in inArchives)
+                {
+                    _ = OpenFromArchiveAsync(file);
+                }
+
+                files = [.. files.Except(inArchives)];
+                if (files.Length == 0)
+                {
+                    return;
+                }
+
                 if (files.Length > OpenWithoutAsking
                     && ConfirmRequested?.Invoke("Open", $"Open all {files.Length:N0} selected files?", "Open") != true)
                 {

@@ -762,13 +762,28 @@ public partial class MainWindow
         var selection = _viewModel.Tree.Selection;
         var focus = selection.Focus is { } focused && paths.Contains(focused, StringComparer.OrdinalIgnoreCase) ? focused : paths[0];
         var isFolder = selection.TryGetItem(focus, out var item) ? item.IsDirectory : Directory.Exists(focus);
-        var entries = OtherPaneEntries(paths, isFolder ? focus : null);
-        if (entries.Count > 0)
+        var entries = new List<ShellMenuEntry>();
+
+        // Archives among the items: unpacked by the app itself, on every core.
+        var archives = paths.Where(path => Services.Archives.ArchiveService.IsArchiveFile(path, _viewModel.BrowseArchives)).ToArray();
+        if (archives.Length > 0)
+        {
+            entries.Add(new ShellMenuEntry("Extract here", () => _ = _viewModel.ExtractArchivesAsync(archives, ownFolder: false)) { Glyph = "" });
+            entries.Add(new ShellMenuEntry(archives.Length == 1 ? $"Extract to \"{Services.Archives.ArchiveService.StemOf(archives[0])}\\\"" : "Extract each to its own folder",
+                () => _ = _viewModel.ExtractArchivesAsync(archives, ownFolder: true)) { Glyph = "" });
+            entries.Add(new ShellMenuEntry("Extract to…", () => _ = _viewModel.ExtractToChosenFolderAsync(archives)) { Glyph = "" });
+            entries.Add(ShellMenuEntry.Separator);
+        }
+
+        entries.AddRange(OtherPaneEntries(paths, isFolder ? focus : null));
+        if (entries.Count > 0 && !entries[^1].IsSeparator)
         {
             entries.Add(ShellMenuEntry.Separator);
         }
 
         entries.Add(ColourEntry(paths));
+        if (!isFolder)
+            entries.Add(new ShellMenuEntry("Quick Look", () => OpenQuickPreview(focus)) { Glyph = "\uE890", Shortcut = "Space" });
         entries.Add(NoteEntry(focus, FolderDisplayName(focus)));
         if (!IsPickerMode && isFolder)
         {

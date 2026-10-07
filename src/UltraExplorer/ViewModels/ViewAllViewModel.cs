@@ -70,6 +70,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     private long _heldActiveVersion;
 
     private bool _isDisposed;
+    public bool BrowseArchives { get; set; }
     private bool _isBusy;
     private bool _isSyncingSelection;
     private bool _treeSelectionPending;
@@ -1926,7 +1927,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         var selected = Selection.Contains(path);
-        var isDirectory = TryGetNode(path, out var known) ? known.IsDirectory : Directory.Exists(path);
+        var isDirectory = TryGetNode(path, out var known) ? known.IsDirectory : BrowseArchives
+            ? Services.Archives.ArchiveService.IsFolderLike(path, BrowseArchives) : Directory.Exists(path);
         Selection.Apply(new SelectionEdit
         {
             Added = selected ? [] : [new SelectionItem(path, isDirectory, known?.Entry.SizeBytes ?? 0)],
@@ -2083,7 +2085,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             {
                 // Not given its node yet: what the selection says it is, or
                 // else what the disk does.
-                var isDirectory = Selection.TryGetItem(pending, out var item) ? item.IsDirectory : Directory.Exists(pending);
+                var isDirectory = Selection.TryGetItem(pending, out var item) ? item.IsDirectory : BrowseArchives
+                    ? Services.Archives.ArchiveService.IsFolderLike(pending, BrowseArchives) : Directory.Exists(pending);
                 return isDirectory ? pending : Path.GetDirectoryName(pending);
             }
 
@@ -3253,8 +3256,10 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             // Asked off this thread, and gone only when the disk says it is
             // not there: a share that has stopped answering would hold the
             // window up for as long as the network takes to say so, and what
-            // is selected in it is not to be let go of meanwhile.
-            if (await IsGoneAsync(path) && ticket == _selectTicket && !_isDisposed)
+            // is selected in it is not to be let go of meanwhile.  Inside an
+            // archive nothing is on disk, and the tree has no node for it:
+            // it is still there, and stays selected.
+            if (await IsGoneAsync(path) && !(BrowseArchives && Services.Archives.ArchiveService.IsInsideArchive(path)) && ticket == _selectTicket && !_isDisposed)
             {
                 var parent = Path.GetDirectoryName(path);
                 var focused = ViewAllPath.Equals(Selection.Focus ?? string.Empty, path);

@@ -12,6 +12,37 @@
         AllowsTransparency="True"
         Background="Transparent"
         KeyDown="Window_KeyDown">
+    <Window.Resources>
+        <Style TargetType="PasswordBox">
+            <Setter Property="Foreground" Value="{StaticResource TextBrush}" />
+            <Setter Property="CaretBrush" Value="{StaticResource AccentBrightBrush}" />
+            <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
+            <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="Height" Value="32" />
+            <Setter Property="Padding" Value="9,5" />
+            <Setter Property="SelectionBrush" Value="{StaticResource AccentSoftBrush}" />
+            <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusVisual}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="PasswordBox">
+                        <Border x:Name="Chrome"
+                                CornerRadius="4"
+                                Background="{TemplateBinding Background}"
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}">
+                            <ScrollViewer x:Name="PART_ContentHost" Margin="{TemplateBinding Padding}" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsKeyboardFocusWithin" Value="True">
+                                <Setter TargetName="Chrome" Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+    </Window.Resources>
     <Border Margin="16"
             Padding="22"
             CornerRadius="12"
@@ -31,6 +62,8 @@
             <TextBlock x:Name="TitleText" FontSize="17" FontWeight="SemiBold" />
             <TextBlock x:Name="PromptText" Grid.Row="1" Margin="0,7,0,14" Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" />
             <TextBox x:Name="ValueTextBox" Grid.Row="2" MinHeight="38" />
+            <PasswordBox x:Name="ValuePasswordBox" Grid.Row="2" MinHeight="38"
+                         Visibility="Collapsed" PasswordChar="●" AutomationProperties.Name="Password" />
             <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
                 <Button Style="{StaticResource FlatButton}" Content="Cancel" MinWidth="82" Margin="0,0,8,0" Click="Cancel_Click" />
                 <Button Style="{StaticResource AccentButton}" Content="OK" MinWidth="82" IsDefault="True" Click="Ok_Click" />

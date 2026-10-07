@@ -23,7 +23,8 @@ public sealed record NestedListing(
 
 /// <summary>A sub-folder as a listing names it.</summary>
 /// <param name="ModifiedTicks">When it was last written, as UTC ticks; zero when the reader did not say.</param>
-public readonly record struct NestedEntry(string Name, bool IsHidden, bool IsReparsePoint, long ModifiedTicks = 0);
+/// <param name="IsArchive">An archive file shown as a folder (see <see cref="Archives.ArchiveService"/>).</param>
+public readonly record struct NestedEntry(string Name, bool IsHidden, bool IsReparsePoint, long ModifiedTicks = 0, bool IsArchive = false);
 
 /// <summary>A drive or extra root, as the canvas should name it.</summary>
 public sealed record NestedRoot(string FullPath, string Name, NestedFolderKind Kind, string SecondaryText = "");
@@ -73,10 +74,12 @@ public sealed partial class NestedTree : IDisposable
     private int _knownCount;
     private bool _includeHidden;
     private Func<string, bool>? _fileNameFilter;
+    private bool _archivesEnabled;
+    private int _archivesGeneration;
 
     public NestedTree(Func<string, CancellationToken, NestedListing>? reader = null)
     {
-        _reader = reader ?? NestedDirectoryReader.Read;
+        _reader = reader ?? ((path, cancellation) => NestedDirectoryReader.Read(path, cancellation, _archivesEnabled));
 
         // Taken once: a disposed source throws on every later read of its token.
         _lifetimeToken = _lifetime.Token;
@@ -210,6 +213,21 @@ public sealed partial class NestedTree : IDisposable
         }
     }
 
+    /// <summary>Opt-in archive folders. Existing physical branches are refreshed without losing their expansion.</summary>
+    public bool ArchivesEnabled
+    {
+        get => _archivesEnabled;
+        set
+        {
+            if (_archivesEnabled == value || _disposed) return;
+            _archivesEnabled = value;
+            _archivesGeneration++;
+            // Generation stamps make visible/explicitly opened folders refresh lazily.
+            // Toggling a tree with thousands of cached branches queues no blanket reread.
+            RaiseChanged();
+        }
+    }
+
     /// <summary>A picker's selected file type. Folder tiles remain visible;
     /// switching types reuses listings already read from disk.  The same
     /// filter's method bound again - a new delegate each time the window
@@ -271,7 +289,11 @@ public sealed partial class NestedTree : IDisposable
         var children = new List<NestedFolder>(roots.Count);
         foreach (var root in roots)
         {
-            if (existing.Remove(root.FullPath, out var kept) && kept.Name == root.Name && kept.Kind == root.Kind)
+            // A drive unplugged and plugged back in before this ran has a new
+            // watch: the old cell, still on the dropped one, would never hear
+            // of a change on it again, so it is made afresh.
+            if (existing.Remove(root.FullPath, out var kept) && kept.Name == root.Name && kept.Kind == root.Kind
+                && kept.Watch is not { IsDropped: true })
             {
                 kept.SecondaryText = root.SecondaryText;
                 children.Add(kept);

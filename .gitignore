@@ -8,3 +8,5 @@ TestResults/
 artifacts/check/
 artifacts/testcheck/
 artifacts/perf/
+runtime/preview/
+runtime/archives/

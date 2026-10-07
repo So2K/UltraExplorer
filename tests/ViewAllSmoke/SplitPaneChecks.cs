@@ -1024,6 +1024,13 @@ internal static partial class Program
                 await LiveWait(() => !selection.Contains(moveMe) && !second.KeptSelection.Contains(moveMe), 5_000) >= 0);
             await LiveWait(() => shell.Toast.Message == "Moved 1 item(s) to right", 5_000);
 
+            // File effects and the toast arrive before the asynchronous
+            // transfer's finally releases its duplicate-command guard.
+            var pendingSends = (HashSet<NestedPane>)typeof(MainWindow)
+                .GetField("_paneSendsAsking", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(main)!;
+            Check("the preceding pane transfer finishes before the next independent command",
+                await LiveWait(() => pendingSends.Count == 0, 5_000) >= 0);
+
             second.KeptSelection.ReplaceSingle(right, true, 0, SelectionSource.Navigation);
             await main.SendToOtherPaneAsync([Path.Combine(right, "copy-me.txt")], move: true);
             Check("what is in the other pane's folder already goes nowhere, and the toast says why",

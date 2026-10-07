@@ -13,6 +13,7 @@ See the structure, fly into a folder, and keep your bearings.
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [Download for Windows](https://github.com/So2K/UltraExplorer/releases/latest) ·
+[Try v1.3.0 beta](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.1) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -23,6 +24,12 @@ See the structure, fly into a folder, and keep your bearings.
 
 </div>
 
+**v1.3.0-beta.1 is available for testing:** Space Quick Look, quick text notes,
+compact media/3D previews and optional archive, shelf and copy-path tools.
+See the [beta testing guide](docs/BETA_TESTING.md) for short sample workflows
+and reporting steps. Archive browsing, the shelf and copy-path button start
+off; enable each in Settings when you want to test it.
+
 You remember roughly where something lives: a project inside a client folder,
 an export beside its source, a reference tucked several levels down. UltraExplorer
 makes that structure visible. Every drive is a root; folders and files sit
@@ -30,6 +37,12 @@ inside their parents. Opening a folder moves the camera into it.
 
 The address bar, navigation pane, file operations and Windows Shell menus
 remain familiar. The canvas gives you another way to find and move your files.
+
+Hover over files for content previews. **Select a file and tap Space**, or choose **Quick Look**, to open
+the compact full view: PDF pages, interactive F3D models, mpv playback and a
+text/code editor with search, syntax highlighting and explicit saving.
+Hold Space and move the pointer to pan immediately. Text notes save when you close the preview; **Open** and **Open with** launch the full application.
+[Preview formats and controls](docs/UNIVERSAL_PREVIEWS.md).
 
 ## Same folder, two views
 
@@ -122,6 +135,7 @@ pane, or use `Shift+F5` to copy and `Shift+F6` to move the selection there.
 | Visual landmarks | Colors, notes and pins; canvas beacons help locate marks outside the current view. |
 | Local name filter | Highlight names and wildcard matches in loaded branches without rearranging the map. |
 | Layers | Hide files, icons, details or marks to focus on the structure you need. |
+| Optional features | Independently enable archive folders, the drop shelf or hover copy-path buttons in Settings. All start off. See [how to try them](docs/OPTIONAL_FEATURES.md). |
 
 The map shows **directory structure**, not storage usage: sibling folder cells
 have equal sizes. It is useful for navigating a hierarchy, rather than judging
@@ -219,6 +233,8 @@ On Windows x64 with the [.NET 10 SDK](https://dotnet.microsoft.com/download):
 ```powershell
 git clone https://github.com/So2K/UltraExplorer.git
 cd UltraExplorer
+./scripts/setup-preview-tools.ps1
+./scripts/setup-archive-tools.ps1
 dotnet build UltraExplorer.sln -c Release
 dotnet run --project src/UltraExplorer/UltraExplorer.csproj -c Release
 ```

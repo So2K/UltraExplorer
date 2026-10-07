@@ -192,6 +192,16 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         set => _main.ShowFavoriteLinks = value;
     }
 
+    public bool ShowHoverPreviews
+    {
+        get => _main.ShowHoverPreviews;
+        set => _main.ShowHoverPreviews = value;
+    }
+
+    public bool BrowseArchives { get => _main.BrowseArchives; set => _main.BrowseArchives = value; }
+    public bool ShowDropShelf { get => _main.ShowDropShelf; set => _main.ShowDropShelf = value; }
+    public bool ShowCopyPathButton { get => _main.ShowCopyPathButton; set => _main.ShowCopyPathButton = value; }
+
     public bool IsTreeLayout
     {
         get => _main.IsTreeLayout;
@@ -682,6 +692,14 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
                 break;
             case nameof(MainViewModel.ShowFavoriteLinks):
                 OnPropertyChanged(nameof(ShowFavoriteLinks));
+                break;
+            case nameof(MainViewModel.ShowHoverPreviews):
+                OnPropertyChanged(nameof(ShowHoverPreviews));
+                break;
+            case nameof(MainViewModel.BrowseArchives):
+            case nameof(MainViewModel.ShowDropShelf):
+            case nameof(MainViewModel.ShowCopyPathButton):
+                OnPropertyChanged(e.PropertyName);
                 break;
             case nameof(MainViewModel.Layers):
                 Raise(LayerProperties);
