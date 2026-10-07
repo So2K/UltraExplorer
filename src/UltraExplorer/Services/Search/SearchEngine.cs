@@ -186,10 +186,10 @@ internal sealed class SearchEngine
             starting = complete || query.PrefixExcluding(excluded) is not { } prefix
                 ? none
                 : await _everything.QueryAsync(prefix, PrefixLimit, cancellationToken).ConfigureAwait(false);
-            if (under is null || starting is null)
-            {
-                return false;
-            }
+            // A side question that timed out costs only its own part: what
+            // came back for everywhere is still the answer, not a walk.
+            under ??= none;
+            starting ??= none;
         }
         catch (OperationCanceledException)
         {

@@ -127,6 +127,7 @@ public sealed partial class NestedCanvas
         }
 
         _flight = Flight.Create(target, current.Value, end, _viewWidth, _viewHeight);
+        _flightStarted = System.Diagnostics.Stopwatch.GetTimestamp();
         _cameraTouched = true;
         RequestFrame(Layers.All);
         return true;

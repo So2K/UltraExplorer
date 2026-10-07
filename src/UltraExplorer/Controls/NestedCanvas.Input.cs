@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Windows;
 using System.Windows.Input;
 using UltraExplorer.Models;
@@ -360,7 +361,7 @@ public sealed partial class NestedCanvas
 
     private void PressLeft(Point point, ModifierKeys modifiers, int clickCount)
     {
-        if (clickCount == 2 && !IsSpacePanArmed)
+        if (clickCount == 2 && !SpacePanHeld)
         {
             if (HotspotAt(point) is { } shortcut)
             {
@@ -390,7 +391,7 @@ public sealed partial class NestedCanvas
         _pressPoint = point;
         _pressMoved = false;
         _pressModifiers = modifiers;
-        _pressHotspot = IsSpacePanArmed ? null : HotspotAt(point);
+        _pressHotspot = SpacePanHeld ? null : HotspotAt(point);
         _pressHit = PointerHit(point);
         (_pressIntent, _pressContainer) = ClassifyLeftPress(_pressHit, point, modifiers);
         TakeMouse();
@@ -420,7 +421,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private (PressIntent Intent, NestedFolder? Container) ClassifyLeftPress(NestedHit? hit, Point point, ModifierKeys modifiers)
     {
-        if (IsSpacePanArmed)
+        if (SpacePanHeld)
         {
             return (PressIntent.Pan, null);
         }
@@ -665,6 +666,14 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        // A touchpad goes on sending its scroll for a moment after the fingers
+        // stop, and a free-spinning wheel its last ticks: right after a double-
+        // click those would cancel the flight into the folder before it began.
+        if (_flight is not null && Stopwatch.GetElapsedTime(_flightStarted).TotalMilliseconds < FlightWheelGraceMilliseconds)
+        {
+            return;
+        }
+
         if ((modifiers & ModifierKeys.Control) != 0)
         {
             ZoomAt(point, Math.Pow(1.2, delta / 120.0));
@@ -695,6 +704,28 @@ public sealed partial class NestedCanvas
     {
         ZoomBy(zoomIn ? 1.5 : 1 / 1.5);
         UserCameraMoved?.Invoke();
+    }
+
+    /// <summary>How long after a flight starts the wheel is not allowed to stop it.</summary>
+    private const double FlightWheelGraceMilliseconds = 300;
+
+    /// <summary>
+    /// Space is armed and really still down.  Its release can be lost - a
+    /// Shell menu's own message loop swallows the key-up - and a pan left
+    /// armed would turn every double-click and drag into a pan until Space
+    /// was pressed again; a real press finds it gone and lets it go.
+    /// </summary>
+    private bool SpacePanHeld
+    {
+        get
+        {
+            if (IsSpacePanArmed && !_pressSynthetic && !Keyboard.IsKeyDown(Key.Space))
+            {
+                IsSpacePanArmed = false;
+            }
+
+            return IsSpacePanArmed;
+        }
     }
 
     /// <summary>For tests: what the press under way is, in words.</summary>
