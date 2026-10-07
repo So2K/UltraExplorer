@@ -1,4 +1,5 @@
 using System.IO;
+using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -6,6 +7,7 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
+using System.Windows.Threading;
 using ICSharpCode.AvalonEdit;
 using UltraExplorer;
 using UltraExplorer.Controls;
@@ -85,15 +87,58 @@ internal static partial class Program
                 var returned = 0;
                 nint foreground = 0;
                 PreviewOwnerActivation.Attach(preview, owner, () => false, () => foreground, () => returned++);
+                var loadingClock = Stopwatch.StartNew();
                 preview.OpenFile(path); preview.Show(); await preview.Loading.WaitAsync(TimeSpan.FromSeconds(25));
+                // Loading assigns the decoded image and adds its ScrollViewer.
+                // A cloaked HWND can still have that viewer's template pending;
+                // complete real layout before inspecting its visual descendants.
+                preview.UpdateLayout();
+                if (path == image)
+                {
+                    var picture = (ScrollViewer)typeof(QuickPreviewWindow)
+                        .GetField("_picture", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(preview)!;
+                    picture.ApplyTemplate();
+                    for (var layoutPass = 0; layoutPass < 2; layoutPass++)
+                    {
+                        await Dispatcher.Yield(DispatcherPriority.ContextIdle);
+                        preview.UpdateLayout();
+                    }
+                }
                 var native = QuickDescendants((DependencyObject)preview.Content).OfType<NativePreviewHost>().SingleOrDefault();
                 var nativePid = native?.OwnedProcessId;
+                var bodyForDiagnostic = (Grid)(typeof(QuickPreviewWindow).GetField("_body", BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?? throw new MissingFieldException("_body")).GetValue(preview)!;
+                var expectsNative = path != image;
+                var actualRenderer = expectsNative
+                    ? native is not null && nativePid is not null && native.LastError is null && native.ViewportHandle != 0
+                        && (path == model ? native.ModelWindowHandle != 0 : native.IsMediaLoaded)
+                    : QuickDescendants((DependencyObject)preview.Content).OfType<Image>()
+                        .Any(picture => picture.Source is System.Windows.Media.Imaging.BitmapSource { PixelWidth: 320, PixelHeight: 180 });
+                actualRenderer &= !bodyForDiagnostic.Children.OfType<TextBlock>().Any();
+                if (!actualRenderer)
+                {
+                    var retainedNative = (NativePreviewHost?)typeof(QuickPreviewWindow)
+                        .GetField("_native", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(preview);
+                    var status = (TextBlock)typeof(QuickPreviewWindow)
+                        .GetField("_status", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(preview)!;
+                    var privateImage = (Image)typeof(QuickPreviewWindow)
+                        .GetField("_image", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(preview)!;
+                    var bitmap = privateImage.Source as System.Windows.Media.Imaging.BitmapSource;
+                    Console.WriteLine($"Owner renderer diagnostic: state={state}; kind={Path.GetExtension(path)}; elapsedMs={loadingClock.ElapsedMilliseconds}; "
+                        + $"nativeInBody={native is not null}; pid={retainedNative?.OwnedProcessId}; viewport={retainedNative?.ViewportHandle}; "
+                        + $"modelHwnd={retainedNative?.ModelWindowHandle}; error={retainedNative?.LastError}; attach={retainedNative?.LastNativeDiagnostic}; "
+                        + $"status={status.Text}; body={string.Join(',', bodyForDiagnostic.Children.Cast<UIElement>().Select(child => child.GetType().Name))}; "
+                        + $"privateBitmap={bitmap?.PixelWidth}x{bitmap?.PixelHeight}; frozen={bitmap?.IsFrozen}; "
+                        + $"imageVisualCount={QuickDescendants((DependencyObject)preview.Content).OfType<Image>().Count()}");
+                }
                 foreground = native is null ? new WindowInteropHelper(preview).Handle
                     : native.ModelWindowHandle != 0 ? native.ModelWindowHandle : native.ViewportHandle;
                 Check($"{state} {Path.GetExtension(path)} fixture uses real owned HWNDs and the actual preview renderer",
                     foreground != 0 && PreviewOwnerGetAncestor(foreground, 2) == new WindowInteropHelper(preview).Handle
                     && PreviewOwnerIsZoomed(ownerHandle) == (state == WindowState.Maximized)
-                    && (native is null || nativePid is not null && native.LastError is null));
+                    && actualRenderer);
+                if (!actualRenderer)
+                    throw new InvalidOperationException($"The {state} {Path.GetExtension(path)} owner fixture did not load its required real renderer; error previews cannot qualify owner/native lifecycle checks.");
                 if (state == WindowState.Normal && path == audio && native is not null)
                 {
                     var inputSource = HwndSource.FromHwnd(new WindowInteropHelper(preview).Handle)

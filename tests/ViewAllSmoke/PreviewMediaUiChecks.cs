@@ -92,8 +92,17 @@ internal static partial class Program
                 // media host once its caption, top actions and status are laid out.
                 // Set an exact host height to include its own playback controls.
                 host.Height = 230; host.UpdateLayout(); window.UpdateLayout();
-                Check("the audio card and all controls fit a minimum-height preview without clipping", MediaUiAudioCardFits(host)
-                    && MediaUiControlsFit(host) && host.AudioDisplayName == "Recorded voice note.wav" && host.AudioDetail.Contains("0:02", StringComparison.Ordinal));
+                var minimumCardFits = MediaUiAudioCardFits(host);
+                var minimumControlsFit = MediaUiControlsFit(host);
+                var minimumNameMatches = host.AudioDisplayName == "Recorded voice note.wav";
+                var minimumDurationMatches = host.AudioDetail.Contains("0:02", StringComparison.Ordinal);
+                if (!minimumCardFits || !minimumControlsFit || !minimumNameMatches || !minimumDurationMatches)
+                {
+                    Console.WriteLine($"Media minimum failure: card={minimumCardFits}; controls={minimumControlsFit}; name={minimumNameMatches}; durationLabel={minimumDurationMatches}; nameText={host.AudioDisplayName}; detailText={host.AudioDetail}");
+                    Console.WriteLine("Media minimum layout: " + MediaUiLayoutDiagnostic(host));
+                    await MediaUiEngineDiagnostic(host, "minimum");
+                }
+                Check("the audio card and all controls fit a minimum-height preview without clipping", minimumCardFits && minimumControlsFit && minimumNameMatches && minimumDurationMatches);
                 MediaUiSave(host, Path.Combine(artifacts, "media-audio-minimum-height.png"));
                 host.Height = double.NaN; window.UpdateLayout();
                 await host.SetVolumeAsync(0); await host.RefreshPlaybackAsync();
@@ -112,11 +121,25 @@ internal static partial class Program
                 Check("Play updates to an accessible Pause action", AutomationProperties.GetName(host.PlayPauseControl) == "Pause");
                 await host.StopPlaybackAsync();
                 await MediaUiWaitAsync(() => AutomationProperties.GetName(host.PlayPauseControl) == "Play");
-                Check("Stop pauses and rewinds audio through its own IPC", MediaUiBool(await host.MpvCommandAsync(["get_property", "pause"]))
-                    && MediaUiNumber(await host.MpvCommandAsync(["get_property", "time-pos"])) < 0.05 && AutomationProperties.GetName(host.PlayPauseControl) == "Play");
+                var stopPause = await host.MpvCommandAsync(["get_property", "pause"]);
+                var stopPosition = await host.MpvCommandAsync(["get_property", "time-pos"]);
+                var stopUiName = AutomationProperties.GetName(host.PlayPauseControl);
+                if (!MediaUiBool(stopPause) || !(MediaUiNumber(stopPosition) < 0.05) || stopUiName != "Play")
+                {
+                    Console.WriteLine($"Media Stop failure: pause={MediaUiJson(stopPause)}; time-pos={MediaUiJson(stopPosition)}; action={stopUiName}");
+                    await MediaUiEngineDiagnostic(host, "stop");
+                }
+                Check("Stop pauses and rewinds audio through its own IPC", MediaUiBool(stopPause) && MediaUiNumber(stopPosition) < 0.05 && stopUiName == "Play");
                 await host.LoadAsync(video); host.UpdateLayout();
+                var audioExited = audioPid is not null && await PreviewToolsWaitForExit(audioPid.Value);
+                if (host.IsAudioOnly || !host.IsNativeViewportVisible || host.IsMediaHeaderVisible || !audioExited)
+                {
+                    Console.WriteLine($"Media video switch failure: audioOnly={host.IsAudioOnly}; nativeVisible={host.IsNativeViewportVisible}; headerVisible={host.IsMediaHeaderVisible}; cardVisible={host.AudioCard.Visibility}; oldPid={audioPid}; oldPidExited={audioExited}; newPid={host.OwnedProcessId}; error={host.LastError}");
+                    Console.WriteLine("Media video switch initial tracks: " + MediaUiJson(host.InitialMediaTracks));
+                    await MediaUiEngineDiagnostic(host, "video-switch");
+                }
                 Check("a real video with an audio suffix restores the native viewport and removes the card", !host.IsAudioOnly && host.IsNativeViewportVisible
-                    && !host.IsMediaHeaderVisible && audioPid is not null && await PreviewToolsWaitForExit(audioPid.Value));
+                    && !host.IsMediaHeaderVisible && audioExited);
                 window.Width = 900; window.Height = 550; window.UpdateLayout();
                 Check("resizing preserves compact controls and lets the video canvas dominate", MediaUiControlsFit(host)
                     && host.PlaybackControls.ActualHeight <= 82 && PreviewNativeDescendants(host).OfType<HwndHost>().Single().ActualHeight > host.ActualHeight * 0.7);
@@ -178,6 +201,26 @@ internal static partial class Program
         var clock = Stopwatch.StartNew();
         while (!condition() && clock.Elapsed < TimeSpan.FromSeconds(3)) await Task.Delay(30);
     }
+
+    private static string MediaUiLayoutDiagnostic(NativePreviewHost host)
+    {
+        object Bounds(FrameworkElement element) => new { width = element.ActualWidth, height = element.ActualHeight,
+            rect = element.TransformToAncestor(host).TransformBounds(new Rect(element.RenderSize)).ToString(System.Globalization.CultureInfo.InvariantCulture) };
+        var viewport = PreviewNativeDescendants(host).OfType<HwndHost>().Single();
+        var scale = VisualTreeHelper.GetDpi(host);
+        return JsonSerializer.Serialize(new { host = new { width = host.ActualWidth, height = host.ActualHeight }, dpiX = scale.DpiScaleX, dpiY = scale.DpiScaleY,
+            body = Bounds(viewport), card = Bounds(host.AudioCard), cardPadding = ((Border)host.AudioCard).Padding.ToString(), cardMargin = host.AudioCard.Margin.ToString(),
+            controls = Bounds(host.PlaybackControls), timeline = Bounds(host.TimelineControl), volume = Bounds(host.VolumeControl),
+            text = PreviewNativeDescendants(host.AudioCard).OfType<TextBlock>().Select(block => new { text = block.Text, bounds = Bounds(block) }).ToArray() });
+    }
+
+    private static async Task MediaUiEngineDiagnostic(NativePreviewHost host, string stage)
+    {
+        foreach (var property in new[] { "duration", "time-pos", "pause", "seeking", "eof-reached", "idle-active", "core-idle", "track-list", "audio-params", "video-params" })
+            Console.WriteLine($"Media {stage} {property}: {MediaUiJson(await host.MpvCommandAsync(["get_property", property]))}");
+    }
+
+    private static string MediaUiJson(JsonElement? response) => response?.GetRawText() ?? "<missing reply>";
 
     private static double MediaUiNumber(JsonElement? response) => response is { } root && root.TryGetProperty("data", out var data)
         && data.ValueKind == JsonValueKind.Number ? data.GetDouble() : double.NaN;

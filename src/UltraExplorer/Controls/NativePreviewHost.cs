@@ -67,6 +67,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
     internal bool IsPlaybackTimerRunning => _playbackTimer.IsEnabled;
     internal long PlaybackPollCount => _playbackPolls;
     internal bool IsAudioOnly { get; private set; }
+    internal JsonElement? InitialMediaTracks { get; private set; }
     internal bool IsMediaLoaded => !_disposed && _pipeName is not null && _mediaControls.Visibility == Visibility.Visible && _mediaControls.IsEnabled;
     internal bool IsMediaHeaderVisible => _header.Visibility == Visibility.Visible;
     internal bool IsNativeViewportVisible => _surface.Visibility == Visibility.Visible;
@@ -117,6 +118,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         var generation = ++_generation;
         LastError = null;
         IsAudioOnly = false;
+        InitialMediaTracks = null;
         _surface.Visibility = Visibility.Visible;
         _audioCard.Visibility = Visibility.Collapsed;
         _header.Visibility = Visibility.Visible;
@@ -216,6 +218,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 }
                 var tracks = await MpvCommandAsync(["get_property", "track-list"], loading.Token);
                 if (generation != _generation) throw new OperationCanceledException(session.Token);
+                InitialMediaTracks = tracks;
                 IsAudioOnly = HasOnlyAudio(tracks, path);
                 _mediaExtension = Path.GetExtension(path.TrimEnd(' ', '.')).TrimStart('.').ToUpperInvariant();
                 _audioName.Text = Path.GetFileName(path.TrimEnd(' ', '.'));

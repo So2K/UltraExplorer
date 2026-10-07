@@ -111,6 +111,15 @@ jobs:
           & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only PreviewOpenWithChecks,PreviewMediaUiChecks,PreviewOwnerActivationChecks,PreviewInteractionChecks
           if ($LASTEXITCODE -ne 0) { throw "Preview usability checks failed with exit code $LASTEXITCODE." }
 
+      - name: Keep preview diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Preview-diagnostics-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/preview-usability/shots/*
+          if-no-files-found: ignore
+          retention-days: 3
+
       - name: Check optional features and PR4 corrections
         timeout-minutes: 5
         shell: pwsh
