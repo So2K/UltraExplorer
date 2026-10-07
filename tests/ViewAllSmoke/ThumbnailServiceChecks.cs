@@ -473,17 +473,17 @@ internal static partial class Program
             using (var locked = new FileStream(lockPath, FileMode.Open, FileAccess.Read, FileShare.None))
                 Check("locked files cannot fault the service", await ThumbnailAwait(service.GetAsync(lockPath)) is null);
 
-            const string realFolder = @"J:\Granny2Work\church\statueraw";
-            if (Directory.Exists(realFolder))
+            var realFolder = Environment.GetEnvironmentVariable("ULTRAEXPLORER_PREVIEW_SAMPLE_FOLDER");
+            if (!string.IsNullOrWhiteSpace(realFolder) && Directory.Exists(realFolder))
             {
                 var real = Directory.EnumerateFiles(realFolder, "*.png").Take(3).ToArray();
                 var previews = await Task.WhenAll(real.Select(file => service.GetAsync(file))).WaitAsync(TimeSpan.FromSeconds(10));
-                Check("user statueraw PNGs decode read-only into frozen content thumbnails",
+                Check("optional external PNG samples decode read-only into frozen content thumbnails",
                     real.Length != 0 && previews.All(preview => preview is not null && preview.Image.IsFrozen
                         && Math.Max(preview.Image.PixelWidth, preview.Image.PixelHeight) <= 512));
-                Console.WriteLine($"  statueraw: {string.Join(", ", real.Select(Path.GetFileName))}");
+                Console.WriteLine($"  external PNG samples checked: {real.Length}");
             }
-            else Console.WriteLine("  statueraw fixture is absent on this machine; real PNG fixture covered decoding");
+            else Console.WriteLine("  optional external PNG samples not configured; generated PNG fixture covered decoding");
         }
         finally { TryDelete(directory); }
     }
