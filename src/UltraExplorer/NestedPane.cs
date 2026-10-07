@@ -538,11 +538,14 @@ internal sealed class NestedPane
                 ? kept.FirstOrDefault().Path ?? PhysicalParent(selection.Focus) ?? viewed?.FullPath ?? string.Empty
                 : selection.Focus;
             var anchor = IsVirtual(selection.Anchor) ? focus ?? string.Empty : selection.Anchor;
-            if (kept.Length != selection.Count || kept.Any(item => selection.TryGetItem(item.Path, out var old) && old.IsDirectory != item.IsDirectory)
+            var replacements = kept.Where(item => selection.TryGetItem(item.Path, out var old)
+                && (old.IsDirectory != item.IsDirectory || old.Size != item.Size)).Select(item => item.Path).ToArray();
+            if (kept.Length != selection.Count || replacements.Length > 0
                 || !string.Equals(focus, selection.Focus, StringComparison.OrdinalIgnoreCase)
                 || !string.Equals(anchor, selection.Anchor, StringComparison.OrdinalIgnoreCase))
             {
-                selection.Apply(new SelectionEdit { Clear = true, Added = kept,
+                // Explicit replacements bypass ItemSelection's path-only no-op optimization.
+                selection.Apply(new SelectionEdit { Clear = true, Removed = replacements, Added = kept,
                     // Null means "leave unchanged" to ItemSelection. Empty explicitly clears a ghost focus.
                     Focus = focus ?? string.Empty, Anchor = anchor ?? string.Empty,
                     Source = SelectionSource.Command, RecordsNavigation = false });
