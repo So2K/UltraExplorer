@@ -459,10 +459,14 @@ internal static partial class Program
 
             var corrupt = Path.Combine(directory, "corrupt.png");
             await File.WriteAllTextAsync(corrupt, "not a PNG");
-            Check("corrupt real files finish with an absent preview", await ThumbnailAwait(service.GetAsync(corrupt)) is null);
+            var corruptResult = await ThumbnailAwait(service.GetAsync(corrupt));
+            Check("a damaged image falls back to its actual readable contents", corruptResult is { Detail: not null }
+                && corruptResult.Image.IsFrozen);
             var unsupported = Path.Combine(directory, "notes.txt");
             await File.WriteAllTextAsync(unsupported, "plain text does not have an image thumbnail");
-            Check("Shell fallback never displays a file type icon as a content thumbnail", await ThumbnailAwait(service.GetAsync(unsupported)) is null);
+            var textResult = await ThumbnailAwait(service.GetAsync(unsupported));
+            Check("text uses its real content instead of a Shell file type icon", textResult is { Detail: not null }
+                && textResult.Image.IsFrozen);
 
             var lockPath = Path.Combine(directory, "locked.png");
             File.Copy(corrupt, lockPath);

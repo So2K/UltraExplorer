@@ -769,6 +769,8 @@ public partial class MainWindow
         }
 
         entries.Add(ColourEntry(paths));
+        if (!isFolder)
+            entries.Add(new ShellMenuEntry("Quick Look", () => OpenQuickPreview(focus)) { Glyph = "\uE890", Shortcut = "Ctrl+Space" });
         entries.Add(NoteEntry(focus, FolderDisplayName(focus)));
         if (!IsPickerMode && isFolder)
         {

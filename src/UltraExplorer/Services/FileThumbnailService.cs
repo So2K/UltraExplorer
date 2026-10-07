@@ -8,7 +8,7 @@ using System.Windows.Media.Imaging;
 namespace UltraExplorer.Services;
 
 /// <summary>A content thumbnail which is safe to display from any thread.</summary>
-internal sealed record ThumbnailResult(BitmapSource Image, int? OriginalWidth = null, int? OriginalHeight = null);
+internal sealed record ThumbnailResult(BitmapSource Image, int? OriginalWidth = null, int? OriginalHeight = null, string? Detail = null);
 
 /// <summary>
 /// Hover-only thumbnail extraction. All metadata, image decoding and Shell calls
@@ -28,7 +28,7 @@ internal sealed class FileThumbnailService : IDisposable
     private readonly LinkedList<CacheEntry> _lru = new();
     private readonly FileThumbnailOptions _options;
     private readonly Func<string, ThumbnailFileStamp?> _metadata;
-    private readonly Func<string, ThumbnailResult?> _extract;
+    private readonly Func<string, CancellationToken, ThumbnailResult?> _extract;
     private int _workers, _active;
     private long _cacheBytes, _extractions, _metadataReads;
     private bool _disposed;
@@ -40,7 +40,8 @@ internal sealed class FileThumbnailService : IDisposable
     {
         _options = options;
         _metadata = options.MetadataReader ?? ReadMetadata;
-        _extract = options.ThumbnailReader ?? ExtractThumbnail;
+        _extract = options.CancellableThumbnailReader
+            ?? (options.ThumbnailReader is { } reader ? (path, _) => reader(path) : ExtractThumbnail);
     }
 
     /// <summary>
@@ -89,6 +90,7 @@ internal sealed class FileThumbnailService : IDisposable
                 oldest.Node = null;
                 _pending.Remove(oldest.Path);
                 (displaced ??= []).AddRange(TakeWaiters(oldest));
+                oldest.DisposeCancellation();
             }
             StartWorkers();
             Monitor.PulseAll(_gate);
@@ -121,6 +123,8 @@ internal sealed class FileThumbnailService : IDisposable
 
     private void Cancel(Work work, Waiter waiter)
     {
+        var retire = false;
+        var queued = false;
         lock (_gate)
         {
             if (waiter.Finished) return;
@@ -128,8 +132,10 @@ internal sealed class FileThumbnailService : IDisposable
             work.Waiters.Remove(waiter);
             if (work.Waiters.Count == 0)
             {
+                retire = true;
                 if (work.Node is not null)
                 {
+                    queued = true;
                     _queue.Remove(work.Node);
                     work.Node = null;
                 }
@@ -142,6 +148,13 @@ internal sealed class FileThumbnailService : IDisposable
         }
         waiter.Completion.TrySetCanceled(waiter.Token);
         waiter.Unregister();
+        if (retire)
+        {
+            // Callbacks can kill native renderers. Keep those callbacks off
+            // the input/dispatcher thread while immediately signaling cancel.
+            if (queued) work.DisposeCancellation();
+            else CancelContent(work);
+        }
     }
 
     private void WorkerLoop()
@@ -176,6 +189,7 @@ internal sealed class FileThumbnailService : IDisposable
                     waiters = TakeWaiters(work);
                 }
                 Complete(waiters, result);
+                work.DisposeCancellation();
             }
         }
         finally
@@ -212,7 +226,7 @@ internal sealed class FileThumbnailService : IDisposable
         if (!StillWanted(work)) return null;
         Interlocked.Increment(ref _extractions);
         ThumbnailResult? result;
-        try { result = Prepare(_extract(work.Path)); }
+        try { result = Prepare(_extract(work.Path, work.Cancellation.Token)); }
         catch (Exception) { result = null; }
         if (!StillWanted(work)) return null;
 
@@ -282,10 +296,12 @@ internal sealed class FileThumbnailService : IDisposable
     public void Dispose()
     {
         List<Waiter> waiters = [];
+        List<Work> retired;
         lock (_gate)
         {
             if (_disposed) return;
             _disposed = true;
+            retired = [.. _pending.Values];
             foreach (var work in _pending.Values) waiters.AddRange(TakeWaiters(work));
             _pending.Clear();
             _queue.Clear();
@@ -293,6 +309,11 @@ internal sealed class FileThumbnailService : IDisposable
             _lru.Clear();
             _cacheBytes = 0;
             Monitor.PulseAll(_gate);
+        }
+        foreach (var work in retired)
+        {
+            if (work.Node is not null) work.DisposeCancellation();
+            else CancelContent(work);
         }
         Complete(waiters, null);
         // A Shell call cannot safely be interrupted; the background thread
@@ -345,8 +366,12 @@ internal sealed class FileThumbnailService : IDisposable
         return false;
     }
 
-    private static ThumbnailResult? ExtractThumbnail(string path)
+    private static ThumbnailResult? ExtractThumbnail(string path, CancellationToken token)
     {
+        token.ThrowIfCancellationRequested();
+        if (UniversalThumbnail.UsesContentProvider(path))
+            return UniversalThumbnail.Extract(path, MaximumDimension, token);
+
         // Only the codec hint is trimmed. The file opened below keeps its exact
         // literal name, including dots/spaces after an image extension.
         var extension = Path.GetExtension(path.TrimEnd(' ', '.')).ToLowerInvariant();
@@ -364,7 +389,7 @@ internal sealed class FileThumbnailService : IDisposable
                 var height = frame.PixelHeight;
                 var orientation = ReadOrientation(frame);
                 if (width <= 0 || height <= 0 || width > 100_000 || height > 100_000 || (long)width * height > 200_000_000)
-                    return null;
+                    return UniversalThumbnail.ReadFallback(path, MaximumDimension, token, "Image exceeds the preview size limit");
                 stream.Position = 0;
                 var bitmap = new BitmapImage();
                 bitmap.BeginInit();
@@ -386,7 +411,12 @@ internal sealed class FileThumbnailService : IDisposable
             }
             catch (Exception) { /* Other installed Windows codecs may support it through the Shell. */ }
         }
-        return ExtractShellThumbnail(path);
+        token.ThrowIfCancellationRequested();
+        ThumbnailResult? shell;
+        try { shell = ExtractShellThumbnail(path); }
+        catch (Exception) { shell = null; }
+        token.ThrowIfCancellationRequested();
+        return shell ?? UniversalThumbnail.ReadFallback(path, MaximumDimension, token);
     }
 
     private static ThumbnailResult? ExtractShellThumbnail(string path)
@@ -503,9 +533,41 @@ internal sealed class FileThumbnailService : IDisposable
 
     private sealed class Work(string path)
     {
+        private readonly object _cancellationGate = new();
+        private Task? _cancelCallbacks;
+        private bool _cancellationDisposed;
         public string Path { get; } = path;
+        public CancellationTokenSource Cancellation { get; } = new();
         public LinkedListNode<Work>? Node;
         public List<Waiter> Waiters { get; } = [];
+
+        public void CancelContent()
+        {
+            lock (_cancellationGate)
+                if (!_cancellationDisposed) _cancelCallbacks ??= Cancellation.CancelAsync();
+        }
+
+        public void DisposeCancellation()
+        {
+            Task? callbacks;
+            lock (_cancellationGate)
+            {
+                if (_cancellationDisposed) return;
+                _cancellationDisposed = true;
+                callbacks = _cancelCallbacks;
+            }
+            // Cancellation callbacks can still be killing a renderer while
+            // its waiter finishes. Dispose the source after those callbacks.
+            if (callbacks is { IsCompleted: false })
+                _ = callbacks.ContinueWith(_ => Cancellation.Dispose(), CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            else Cancellation.Dispose();
+        }
+    }
+
+    private static void CancelContent(Work work)
+    {
+        work.CancelContent();
     }
 
     private sealed class Waiter(CancellationToken token)
@@ -603,6 +665,7 @@ internal sealed class FileThumbnailOptions
     public Func<long> TickCount { get; init; } = () => Environment.TickCount64;
     public Func<string, ThumbnailFileStamp?>? MetadataReader { get; init; }
     public Func<string, ThumbnailResult?>? ThumbnailReader { get; init; }
+    public Func<string, CancellationToken, ThumbnailResult?>? CancellableThumbnailReader { get; init; }
 }
 
 internal readonly record struct FileThumbnailDiagnostics(int Queued, int ActiveWorkers, int WorkerCount,

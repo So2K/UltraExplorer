@@ -216,6 +216,10 @@ internal static partial class Program
         await Group(DriveGateChecks);
         await Group(ThumbnailServiceChecks);
         await Group(HoverPreviewChecks);
+        await Group(DocumentPreviewChecks);
+        await Group(UniversalThumbnailChecks);
+        await Group(PreviewToolsChecks);
+        await Group(QuickPreviewChecks);
         await Group(HoverPreviewPreferenceChecks);
         await Group(HoverIntegrationChecks);
     }

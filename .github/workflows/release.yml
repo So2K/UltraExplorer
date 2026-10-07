@@ -34,6 +34,10 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Prepare pinned preview engines
+        shell: pwsh
+        run: ./scripts/setup-preview-tools.ps1
+
       # A tag v1.2.3 is version 1.2.3 (v1.2.3-beta.1 is 1.2.3-beta.1, file
       # version 1.2.3); any other build is 0.0.0-ci.<run number>.  The ref
       # comes in through the environment, never pasted into the script.
@@ -80,6 +84,13 @@ jobs:
           $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-tags-checks'
           & tests/FolderTagsSmoke/bin/Release/net10.0-windows/win-x64/FolderTagsSmoke.exe
           if ($LASTEXITCODE -ne 0) { throw "Folder Tags checks failed with exit code $LASTEXITCODE." }
+
+      - name: Check universal document previews and Quick Look
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-preview-checks'
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only DocumentPreviewChecks,UniversalThumbnailChecks,QuickPreviewChecks
+          if ($LASTEXITCODE -ne 0) { throw "Universal preview checks failed with exit code $LASTEXITCODE." }
 
       - name: Check manifest-safe local update and rollback
         shell: pwsh

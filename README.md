@@ -31,6 +31,11 @@ inside their parents. Opening a folder moves the camera into it.
 The address bar, navigation pane, file operations and Windows Shell menus
 remain familiar. The canvas gives you another way to find and move your files.
 
+Hover over files for content previews. **Ctrl+Space** or **Quick Look** opens
+the compact full view: PDF pages, interactive F3D models, mpv playback and a
+text/code editor with search, syntax highlighting and explicit saving.
+[Preview formats and controls](docs/UNIVERSAL_PREVIEWS.md).
+
 ## Same folder, two views
 
 | Navigation | Windows Explorer | UltraExplorer |

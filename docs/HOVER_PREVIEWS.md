@@ -1,5 +1,11 @@
 # Hover previews
 
+Universal content providers and the compact full-view/editor are described in
+[UNIVERSAL_PREVIEWS.md](UNIVERSAL_PREVIEWS.md). PDF, text/document content, F3D
+models and mpv media now have providers independent of Windows' thumbnails;
+unknown readable files get content/hex information. The original scheduling,
+case/literal-path/cache/input rules below still apply.
+
 Hover a file for 220 ms to see a passive content thumbnail. Selection is
 independent: hovering one of several selected files previews that particular
 file without opening it or changing the selection. This works on the nested

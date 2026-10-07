@@ -2,6 +2,16 @@
 
 Requires the .NET 10 SDK on Windows x64.
 
+Before the first build, prepare the pinned portable 3D/media engines:
+
+```powershell
+pwsh -File scripts/setup-preview-tools.ps1
+```
+
+The build/publish output includes a `preview/` folder with F3D, mpv and license
+notices. Keep it with the executable. The local install script and CI prepare
+these engines automatically. See [UNIVERSAL_PREVIEWS.md](docs/UNIVERSAL_PREVIEWS.md).
+
 ## Build
 
 ```powershell

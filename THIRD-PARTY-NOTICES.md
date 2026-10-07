@@ -1,5 +1,17 @@
 # Third-party components
 
+## Quick Look and universal previews
+
+- AvalonEdit 6.3.1.120 — MIT, https://github.com/icsharpcode/AvalonEdit/tree/v6.3.1
+- PDFium build 157.0.8086 through bblanchon.PDFium.Win32 — PDFium BSD license and bundled third-party notices; NuGet metadata declares Apache-2.0 for the package, while the binary release includes the distributor's MIT license, https://github.com/bblanchon/pdfium-binaries
+- F3D 3.5.0 — BSD-3-Clause and bundled dependency notices, https://github.com/f3d-app/f3d/releases/tag/v3.5.0
+- mpv 20261006 / 6c092d978b — GPL-2.0-or-later with its bundled codec/dependency notices, https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20261006 and https://github.com/mpv-player/mpv/tree/6c092d978b
+
+F3D and mpv are separate portable executables invoked only for previews. Their
+complete distributions, attribution, source links and license texts accompany
+the app under `preview/`; AvalonEdit and PDFium notices are in
+`preview/licenses/`. The download script pins the archive SHA256 values.
+
 The Windows dialog-integration build includes the following MIT-licensed components:
 
 - FlaUI.Core and FlaUI.UIA3 5.0.0 — https://github.com/FlaUI/FlaUI

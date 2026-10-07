@@ -336,6 +336,18 @@ public partial class MainWindow : Window
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        if (!_allowClose && _quickPreview is { HasUnsavedChanges: true } preview)
+        {
+            e.Cancel = true;
+            if (_quickPreviewClosingOwner) return;
+            _quickPreviewClosingOwner = true;
+            try
+            {
+                if (await preview.ConfirmCloseAsync()) _ = Dispatcher.InvokeAsync(Close);
+            }
+            finally { _quickPreviewClosingOwner = false; }
+            return;
+        }
         // However the window goes away, the caller gets an answer.
         CompletePickerOnClose();
 
@@ -2128,6 +2140,12 @@ public partial class MainWindow : Window
 
         // Whatever the key, it is for the pane the keyboard is in.
         FollowKeyboardToPane();
+
+        if (TryQuickPreviewKey(key, modifiers))
+        {
+            e.Handled = true;
+            return;
+        }
 
         // Ctrl+L and Alt+D are both "put the path in a line I can type in";
         // Windows has answered to either for twenty years.

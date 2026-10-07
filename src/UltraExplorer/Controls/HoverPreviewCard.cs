@@ -17,6 +17,7 @@ internal sealed class HoverPreviewCard : Border
     };
     private readonly TextBlock _name = new() { FontSize = 13, FontWeight = FontWeights.SemiBold, TextTrimming = TextTrimming.CharacterEllipsis };
     private readonly TextBlock _detail = new() { FontSize = 11, Margin = new Thickness(0, 4, 0, 0), TextTrimming = TextTrimming.CharacterEllipsis };
+    private readonly TextBlock _hint = new() { Text = "Ctrl+Space  ·  Quick Look", FontSize = 11, Margin = new Thickness(0, 7, 0, 0) };
     private readonly Grid _picture = new() { Margin = new Thickness(0, 0, 0, 10) };
 
     internal HoverPreviewCard()
@@ -31,6 +32,7 @@ internal sealed class HoverPreviewCard : Border
         SetResourceReference(BorderBrushProperty, "BorderStrongBrush");
         _name.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
         _detail.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        _hint.SetResourceReference(TextBlock.ForegroundProperty, "AccentBrush");
         _loading.SetResourceReference(TextBlock.ForegroundProperty, "TextMutedBrush");
         _picture.Background = new SolidColorBrush(Color.FromRgb(0x18, 0x18, 0x18));
         _picture.Children.Add(_image);
@@ -39,6 +41,7 @@ internal sealed class HoverPreviewCard : Border
         body.Children.Add(_picture);
         body.Children.Add(_name);
         body.Children.Add(_detail);
+        body.Children.Add(_hint);
         Child = body;
         RenderOptions.SetBitmapScalingMode(_image, BitmapScalingMode.HighQuality);
         AutomationProperties.SetName(this, "File preview");
@@ -47,12 +50,12 @@ internal sealed class HoverPreviewCard : Border
     internal void Show(string path, ThumbnailResult? result, double availableWidth, double availableHeight)
     {
         Width = Math.Min(344, Math.Max(150, availableWidth - 16));
-        _picture.Height = Math.Min(240, Math.Max(24, availableHeight - 112));
+        _picture.Height = Math.Min(240, Math.Max(24, availableHeight - 136));
         _name.Text = System.IO.Path.GetFileName(path);
         _image.Source = result?.Image;
         _loading.Visibility = result is null ? Visibility.Visible : Visibility.Collapsed;
-        _detail.Text = result is { OriginalWidth: { } width, OriginalHeight: { } height }
-            ? $"{width:N0} × {height:N0}" : "Preview";
+        _detail.Text = result?.Detail ?? (result is { OriginalWidth: { } width, OriginalHeight: { } height }
+            ? $"{width:N0} × {height:N0}" : "Preview");
         AutomationProperties.SetName(this, $"Preview of {_name.Text}");
         Visibility = Visibility.Visible;
         Measure(new Size(Width, double.PositiveInfinity));

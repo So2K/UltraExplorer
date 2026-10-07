@@ -22,6 +22,41 @@ public partial class MainWindow
     private Point _previewPointer;
     private bool _previewDetached;
     private long _previewGeneration;
+    private QuickPreviewWindow? _quickPreview;
+    private bool _quickPreviewClosingOwner;
+
+    internal void OpenQuickPreview(string path)
+    {
+        if (_previewDetached || _closeRequested) return;
+        ClearHoverPreview();
+        if (_quickPreview is null)
+        {
+            _quickPreview = new QuickPreviewWindow { Owner = this };
+            _quickPreview.Closed += (_, _) => _quickPreview = null;
+            _quickPreview.OpenFile(path);
+            _quickPreview.Show();
+        }
+        else
+        {
+            _quickPreview.OpenFile(path);
+            _quickPreview.Activate();
+        }
+    }
+
+    private bool TryQuickPreviewKey(Key key, ModifierKeys modifiers)
+    {
+        if (key != Key.Space || modifiers != ModifierKeys.Control || Keyboard.FocusedElement is TextBox) return false;
+        var target = _hoverPreview.Path;
+        if (target is null && IsSelectionSurfaceFocused())
+        {
+            var selection = _viewModel.Tree.Selection;
+            target = selection.Focus ?? _viewModel.Tree.SelectedPaths.FirstOrDefault();
+            if (target is not null && selection.TryGetItem(target, out var item) && item.IsDirectory) target = null;
+        }
+        if (target is null) return false;
+        OpenQuickPreview(target);
+        return true;
+    }
 
     private void AttachHoverPreviews()
     {
