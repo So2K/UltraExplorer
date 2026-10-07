@@ -130,11 +130,17 @@ jobs:
             -p:IncludeNativeLibrariesForSelfExtract=false -p:EnableCompressionInSingleFile=false `
             "-p:Version=$env:VERSION" "-p:FileVersion=$env:FILE_VERSION" -nologo
           if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE." }
-          foreach ($file in @('UltraExplorer.exe', 'UltraExplorer.dll', 'coreclr.dll', 'hostfxr.dll', 'PresentationNative_cor3.dll')) {
+          foreach ($file in @('UltraExplorer.exe', 'UltraExplorer.dll', 'coreclr.dll', 'hostfxr.dll', 'PresentationNative_cor3.dll',
+              'pdfium.dll', 'Magick.Native-Q8-x64.dll',
+              'preview/f3d/bin/f3d.exe', 'preview/f3d/distribution.json',
+              'preview/mpv/mpv.exe', 'preview/mpv/distribution.json', 'preview/mpv/licenses/LICENSE.GPL',
+              'preview/licenses/pdfium/licenses/pdfium.txt', 'preview/licenses/magick-net/Notice.txt',
+              'archives/7z.dll', 'archives/7z.exe', 'archives/License.txt', 'archives/readme.txt')) {
             if (-not (Test-Path -LiteralPath (Join-Path 'publish' $file) -PathType Leaf)) {
               throw "Self-contained publish is missing $file."
             }
           }
+          if (Test-Path -LiteralPath 'publish/preview/zed') { throw 'The lightweight preview package must not contain a full Zed runtime.' }
 
       # The packages carry no version in their names, so a link to
       # releases/latest/download/<name> always gets the newest one.
@@ -215,9 +221,9 @@ jobs:
           path: packages
 
       - name: Check planned release notes
-        if: github.ref_name == 'v1.2.1' || github.ref_name == 'v1.2.0' || github.ref_name == 'v1.2.0-beta.1'
+        if: github.ref_name == 'v1.3.0-beta.1' || github.ref_name == 'v1.2.1' || github.ref_name == 'v1.2.0' || github.ref_name == 'v1.2.0-beta.1'
         env:
-          NOTES_PATH: ${{ github.ref_name == 'v1.2.1' && 'docs/RELEASE_NOTES_v1.2.1.md' || github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' }}
+          NOTES_PATH: ${{ github.ref_name == 'v1.3.0-beta.1' && 'docs/RELEASE_NOTES_v1.3.0-beta.1.md' || github.ref_name == 'v1.2.1' && 'docs/RELEASE_NOTES_v1.2.1.md' || github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' }}
         run: test -s "$NOTES_PATH"
 
       - name: Create the release
@@ -230,7 +236,7 @@ jobs:
           make_latest: ${{ needs.build.outputs.prerelease == 'false' }}
           # action-gh-release reads body_path first; body is only a fallback
           # for other tags. The planned tag notes must exist before this step.
-          body_path: ${{ github.ref_name == 'v1.2.1' && 'docs/RELEASE_NOTES_v1.2.1.md' || github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || github.ref_name == 'v1.2.0-beta.1' && 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' || '' }}
+          body_path: ${{ github.ref_name == 'v1.3.0-beta.1' && 'docs/RELEASE_NOTES_v1.3.0-beta.1.md' || github.ref_name == 'v1.2.1' && 'docs/RELEASE_NOTES_v1.2.1.md' || github.ref_name == 'v1.2.0' && 'docs/RELEASE_NOTES_v1.2.0.md' || github.ref_name == 'v1.2.0-beta.1' && 'docs/RELEASE_NOTES_v1.2.0-beta.1.md' || '' }}
           body: |
             ## Download
 
