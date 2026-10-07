@@ -9,6 +9,11 @@ start off in new and existing profiles, apply immediately, and are saved in
   location and open it; copy/drag out to obtain real files. Context menus offer
   extraction. Writes into archives are refused. Turning it off returns archive
   files to their usual application and exits any archive folder currently in view.
+  Space or Quick Look on an entry opens an extracted copy as a read-only preview
+  with its archive origin displayed. Editing, autosave and Delete are disabled
+  there; Open/Open with deliberately open the temporary copy. Passive hover
+  never extracts archive contents. Switching to Tree view treats archives as
+  ordinary files; returning to Nested restores the saved ON preference.
 - **Drop shelf**: enable the board at the right edge, then drag files onto it.
   Drag a card to take its files out, Shift+drag to arrange cards, Ctrl+wheel to
   zoom, and pull the left edge to resize. The shelf normally keeps path links;
@@ -34,18 +39,36 @@ https://github.com/So2K/UltraExplorer/pull/4. Review corrections preserve settin
 when the real UpdateAsync save path cannot read them, keep OLE sources alive
 through shelf copies, restrict cache deletion to owned copy directories, and
 protect archive output/caches and encrypted nested archive resolution.
+Extracted files also inherit the archive's Windows origin metadata
+(`Zone.Identifier`), including cached and nested extraction. A known origin
+which cannot be preserved fails extraction instead of reporting an unmarked
+output as ready to open.
 
-Review qualification on the preview49de903 base: self-contained Release build
-with zero warnings/errors; PR4 combined gate147/147 (including separate process
-wrappers; Masked8/8, Optional18/18, ShelfDrop9/9 child totals are not added again),
-adjacent workspace/selection/camera/read/split/layers/order280/280. The final
-per-operation password owner correction passed the focused73/73 gate. Logs
-are `artifacts/pr4-review/`. Final combined preview qualification follows after
-the other agent's exact frozen commit is incorporated.
+The combined source includes the complete lightweight preview commit74dd485,
+with the Space/copy-path conflict resolved using one press-time Space snapshot.
+Self-contained Release builds have zero warnings/errors. Final verification:
 
-Automatic nested archive viewing has a512MiB extracted-size limit; explicit
+| Gate | Result |
+| --- | --- |
+| PR4 and adjacent workspace/camera/selection/read/split/layer/order regressions | 429/429 |
+| Preview, text save, image, Space/pan, selected-item focus and hover integration | 174/174 |
+| Settings | 308/308 |
+| Actual embedded F3D/mpv controls and lifecycle | 25/25 |
+| Tags | 35/35 |
+| Manifest-safe update/rollback | 47/47 |
+| Picker contracts and panes | 212/212 |
+| New critical integration gate | 22/22 root checks |
+
+The critical gate includes separate process wrappers: archive backend31/31,
+actual read-only archive window9/9, owner-close/system-end recovery17/17,
+layout10/10 and optional switch18/18; these child counts are not added again
+to the root total. Its origin-metadata checks are17/17 in-process. Source logs
+are retained under `artifacts/pr4-review/`, including original failures and
+the corrected fixtures. No full-suite all-green claim is made.
+
+Automatic nested archive viewing has a 512 MiB extracted-size limit; explicit
 extraction is available for larger files. Archive lists use the ordinary canvas
-limits of50,000 file tiles and100,000 child folders while retaining complete
+limits of 50,000 file tiles and 100,000 child folders while retaining complete
 counts and extraction indexes. Whole extraction refuses case-colliding output
 names; individual copies preserve both using numbered names. Local fixtures
 covered ZIP/7z/tar/gzip/encryption/nested archives, including a real NTFS junction

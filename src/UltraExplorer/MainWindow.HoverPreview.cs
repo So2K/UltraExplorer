@@ -28,20 +28,36 @@ public partial class MainWindow
     internal void OpenQuickPreview(string path, bool readOnly = false)
     {
         if (_previewDetached || _closeRequested) return;
+        if (!readOnly && TryBeginArchiveQuickPreview(path, PresentPhysicalQuickPreview)) return;
+        CancelArchiveQuickPreview();
+        PresentPhysicalQuickPreview(path, readOnly, null);
+    }
+
+    internal QuickPreviewWindow? QuickPreviewForChecks => _quickPreview;
+    internal bool SuppressQuickPreviewPresentationForChecks { get; set; }
+
+    private void PresentPhysicalQuickPreview(string path, bool readOnly, string? originPath)
+    {
+        if (_previewDetached || _closeRequested || _viewModel.IsDisposed) return;
         ClearHoverPreview();
         if (_quickPreview is null)
         {
-            _quickPreview = new QuickPreviewWindow { Owner = this };
-            _quickPreview.Closed += (_, _) => _quickPreview = null;
+            var preview = new QuickPreviewWindow { Owner = this };
+            _quickPreview = preview;
+            preview.Closed += (_, _) =>
+            {
+                CancelArchiveQuickPreview();
+                if (ReferenceEquals(_quickPreview, preview)) _quickPreview = null;
+            };
             _quickPreview.SetFileSequence(readOnly ? [path] : PreviewSiblingFiles(path));
-            _quickPreview.OpenFile(path, readOnly);
-            _quickPreview.Show();
+            _quickPreview.OpenFile(path, readOnly, originPath);
+            if (!IsTestWindow || !SuppressQuickPreviewPresentationForChecks) _quickPreview.Show();
         }
         else
         {
             _quickPreview.SetFileSequence(readOnly ? [path] : PreviewSiblingFiles(path));
-            _quickPreview.OpenFile(path, readOnly);
-            _quickPreview.Activate();
+            _quickPreview.OpenFile(path, readOnly, originPath);
+            if (!IsTestWindow || !SuppressQuickPreviewPresentationForChecks) _quickPreview.Activate();
         }
     }
 

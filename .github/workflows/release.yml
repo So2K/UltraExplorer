@@ -109,7 +109,7 @@ jobs:
         run: |
           $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-optional-checks'
           $env:ULTRAEXPLORER_TEST_WINDOW = '1'
-          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only Pr4WorkspaceFixChecks,Pr4SearchFixChecks,Pr4ShelfSafetyChecks,Pr4ShelfDropChecks,OptionalFeatureChecks,ArchiveToggleChecks,ArchivePreviewChecks,MaskedPasswordChecks
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only Pr4WorkspaceFixChecks,Pr4SearchFixChecks,Pr4ShelfSafetyChecks,Pr4ShelfDropChecks,OptionalFeatureChecks,ArchiveToggleChecks,ArchivePreviewChecks,ArchiveQuickLookWindowChecks,ArchiveLayoutChecks,ArchiveZoneChecks,OwnerClosePreviewChecks,MaskedPasswordChecks
           if ($LASTEXITCODE -ne 0) { throw "Optional feature checks failed with exit code $LASTEXITCODE." }
 
       - name: Check file-dialog contracts

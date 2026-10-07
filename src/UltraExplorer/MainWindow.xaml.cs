@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Runtime.CompilerServices;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -41,6 +42,8 @@ public partial class MainWindow : Window
 
     /// <summary>How long a session that Windows is ending may take to save.</summary>
     private static readonly TimeSpan SessionEndSaveTimeout = TimeSpan.FromSeconds(3);
+    private static readonly ConditionalWeakTable<SessionEndingCancelEventArgs, SessionCloseTransaction> SessionCloseTransactions = new();
+    private SessionCloseTransaction? _sessionCloseTransaction;
     private bool _maximizeHover;
     private bool _sidebarCollapsed;
     private double _restoredSidebarWidth = 240;
@@ -118,6 +121,7 @@ public partial class MainWindow : Window
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
         _viewModel.PromptRequested += ShowInputDialog;
+        Closed += (_, _) => { _quickPreview?.CompleteOwnerClose(); _sessionCloseTransaction?.Remove(this); };
 
         // The shelf comes out for any drag over the window - one of its own or
         // one from outside - and goes back once the drag is over.
@@ -344,23 +348,10 @@ public partial class MainWindow : Window
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
-        if (!_allowClose && _quickPreview is { HasUnsavedChanges: true } preview)
-        {
-            e.Cancel = true;
-            if (_quickPreviewClosingOwner) return;
-            _quickPreviewClosingOwner = true;
-            try
-            {
-                if (await preview.ConfirmCloseAsync()) _ = Dispatcher.InvokeAsync(Close);
-            }
-            finally { _quickPreviewClosingOwner = false; }
-            return;
-        }
-        // However the window goes away, the caller gets an answer.
-        CompletePickerOnClose();
-
         if (_allowClose)
         {
+            // However the window goes away, the caller gets an answer.
+            CompletePickerOnClose();
             if (Application.Current is { } application)
             {
                 application.SessionEnding -= OnSessionEnding;
@@ -383,14 +374,22 @@ public partial class MainWindow : Window
 
         // One save per close: a second click on the close button while the
         // first save is still being written waits for that one.
-        if (_closeRequested)
+        if (_closeRequested || _quickPreviewClosingOwner)
         {
             return;
         }
 
         _closeRequested = true;
+        _quickPreviewClosingOwner = true;
+        var preview = _quickPreview;
+        preview?.BeginOwnerClose();
+        var readyToClose = false;
         try
         {
+            // An owned modeless window does not receive Closing when its
+            // owner closes. Keep its editor and actions frozen throughout
+            // both the note commit and the asynchronous workspace save.
+            if (preview is not null && !await preview.CommitForCloseAsync()) return;
             // A nested drop pumps UI messages while its transfer completes.
             // A Close received there must not dispose the model/dispatcher
             // before it has acquired and copied an archive source's bytes.
@@ -402,24 +401,31 @@ public partial class MainWindow : Window
                 try { await transfer; }
                 catch (Exception) { /* The drop handler reports the transfer error; still save the window. */ }
             }
-            CaptureStateForSave();
-            await _viewModel.SaveNowAsync();
-        }
-        catch (Exception exception)
-        {
-            // A window that cannot be closed is worse than a session that
-            // could not be written, so the failure is recorded and the close
-            // goes on.
-            CrashReporter.Log("saving the session on close", exception);
+            try
+            {
+                CaptureStateForSave();
+                await _viewModel.SaveNowAsync();
+            }
+            catch (Exception exception)
+            {
+                // A failed profile write must not trap a window open. A
+                // failed note commit, in contrast, retains the user's buffer.
+                CrashReporter.Log("saving the session on close", exception);
+            }
+            if (preview is not null && !await preview.CommitForCloseAsync()) return;
+            readyToClose = true;
+            _allowClose = true;
+            // Posted because Close cannot be called from inside Closing.
+            _ = Dispatcher.InvokeAsync(Close);
         }
         finally
         {
-            _allowClose = true;
-
-            // Posted, never called from here: the save returns at once when
-            // there is nothing to save yet, and Close() from inside Closing
-            // throws.
-            _ = Dispatcher.InvokeAsync(Close);
+            _quickPreviewClosingOwner = false;
+            if (!readyToClose)
+            {
+                _closeRequested = false;
+                preview?.EndOwnerClose();
+            }
         }
     }
 
@@ -451,55 +457,124 @@ public partial class MainWindow : Window
     /// </summary>
     private void OnSessionEnding(object? sender, SessionEndingCancelEventArgs e)
     {
-        if (_allowClose || _closeRequested)
-        {
-            return;
-        }
+        var transaction = SessionCloseTransactions.GetValue(e, args => new SessionCloseTransaction(args, Dispatcher));
+        if (e.Cancel) { transaction.Cancel(); return; }
+        if (_allowClose) return;
+        // The regular close may still be saving. Windows must not bypass
+        // that pending note transaction simply because close was requested.
+        if (_closeRequested) { transaction.Cancel(); return; }
 
         _closeRequested = true;
+        var preview = _quickPreview;
+        preview?.BeginOwnerClose();
+        transaction.Add(this, preview);
+        var started = Stopwatch.GetTimestamp();
         try
         {
-            if (_quickPreview is { HasUnsavedChanges: true } preview)
+            if (_pendingExternalDrop is { IsCompleted: false }) { e.Cancel = true; return; }
+            if (preview is not null)
             {
                 var noteSave = preview.CommitForCloseAsync();
-                if (!noteSave.IsCompleted)
-                {
-                    var noteFrame = new DispatcherFrame();
-                    _ = noteSave.ContinueWith(_ => noteFrame.Continue = false, TaskScheduler.Default);
-                    using var noteTimeout = new Timer(_ => noteFrame.Continue = false, null, SessionEndSaveTimeout, Timeout.InfiniteTimeSpan);
-                    Dispatcher.PushFrame(noteFrame);
-                }
-                if (!noteSave.IsCompletedSuccessfully || !noteSave.Result)
+                if (!WaitForSessionEndSave(noteSave, started) || !noteSave.Result)
                 {
                     e.Cancel = true;
-                    _closeRequested = false;
                     return;
                 }
             }
             CaptureStateForSave();
             var saving = _viewModel.SaveNowAsync();
-            if (!saving.IsCompleted)
-            {
-                var frame = new DispatcherFrame();
-                _ = saving.ContinueWith(_ => frame.Continue = false, TaskScheduler.Default);
-                using var giveUp = new Timer(_ => frame.Continue = false, null, SessionEndSaveTimeout, Timeout.InfiniteTimeSpan);
-                Dispatcher.PushFrame(frame);
-            }
-
+            if (!WaitForSessionEndSave(saving, started)) e.Cancel = true;
             if (saving.IsFaulted)
             {
                 CrashReporter.Log("saving the session as Windows ends it", saving.Exception);
             }
+            if (!e.Cancel && preview is not null)
+            {
+                var lastNoteSave = preview.CommitForCloseAsync();
+                if (!WaitForSessionEndSave(lastNoteSave, started) || !lastNoteSave.Result) e.Cancel = true;
+            }
         }
         catch (Exception exception) when (exception is InvalidOperationException or IOException or UnauthorizedAccessException)
         {
+            e.Cancel = true;
             CrashReporter.Log("saving the session as Windows ends it", exception);
         }
         finally
         {
             // The Closing that follows only tidies up.
             _allowClose = !e.Cancel;
+            if (e.Cancel) transaction.Cancel();
         }
+    }
+
+    /// <summary>
+    /// All main windows receive the same event args. A one-shot dispatcher
+    /// callback can run in a later handler's nested save frame before that
+    /// handler refuses shutdown. Keep observing the args until cancellation
+    /// or window teardown, and broadcast our own refusals synchronously.
+    /// </summary>
+    private sealed class SessionCloseTransaction
+    {
+        private readonly SessionEndingCancelEventArgs _args;
+        private readonly Dictionary<MainWindow, QuickPreviewWindow?> _owners = new();
+        private readonly DispatcherTimer _watch;
+
+        internal SessionCloseTransaction(SessionEndingCancelEventArgs args, Dispatcher dispatcher)
+        {
+            _args = args;
+            _watch = new DispatcherTimer(DispatcherPriority.Background, dispatcher) { Interval = TimeSpan.FromMilliseconds(50) };
+            _watch.Tick += Observe;
+        }
+
+        internal void Add(MainWindow owner, QuickPreviewWindow? preview)
+        {
+            owner._sessionCloseTransaction?.Remove(owner);
+            owner._sessionCloseTransaction = this;
+            _owners[owner] = preview;
+            _watch.Start();
+        }
+
+        internal void Remove(MainWindow owner)
+        {
+            _owners.Remove(owner);
+            if (ReferenceEquals(owner._sessionCloseTransaction, this)) owner._sessionCloseTransaction = null;
+            if (_owners.Count == 0) _watch.Stop();
+        }
+
+        internal void Cancel()
+        {
+            _args.Cancel = true;
+            _watch.Stop();
+            foreach (var (owner, preview) in _owners.ToArray())
+            {
+                Remove(owner);
+                if (owner._viewModel.IsDisposed) continue;
+                owner._allowClose = false;
+                owner._closeRequested = false;
+                preview?.EndOwnerClose();
+            }
+        }
+
+        private void Observe(object? sender, EventArgs args)
+        {
+            if (_args.Cancel) { Cancel(); return; }
+            foreach (var owner in _owners.Keys.Where(owner => owner._viewModel.IsDisposed).ToArray()) Remove(owner);
+            if (_watch.Dispatcher.HasShutdownStarted) _watch.Stop();
+        }
+    }
+
+    private static bool WaitForSessionEndSave(Task saving, long started)
+    {
+        if (!saving.IsCompleted)
+        {
+            var remaining = SessionEndSaveTimeout - Stopwatch.GetElapsedTime(started);
+            if (remaining <= TimeSpan.Zero) return false;
+            var frame = new DispatcherFrame();
+            _ = saving.ContinueWith(_ => frame.Continue = false, TaskScheduler.Default);
+            using var giveUp = new Timer(_ => frame.Continue = false, null, remaining, Timeout.InfiniteTimeSpan);
+            Dispatcher.PushFrame(frame);
+        }
+        return saving.IsCompletedSuccessfully;
     }
 
     /// <summary>

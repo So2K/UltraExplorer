@@ -40,6 +40,7 @@ internal sealed class QuickPreviewWindow : Window
     private readonly Button _delete;
     private bool _forceReadOnly;
     private bool _deleting;
+    private bool _ownerCloseFrozen, _ownerCloseWasEnabled;
     private bool _activatedOnce;
     private readonly SearchPanel _search;
     private CancellationTokenSource _load = new();
@@ -47,6 +48,7 @@ internal sealed class QuickPreviewWindow : Window
     private PreviewTextEditSession? _editor;
     private DocumentPreviewData? _document;
     private string _path = "";
+    private string? _originPath;
     private int _page, _pageCount, _generation;
     private bool _dirty, _closed, _saving, _allowClose;
     private bool _askingClose;
@@ -97,15 +99,15 @@ internal sealed class QuickPreviewWindow : Window
         _zoomTools.Children.Add(Button("Fit", () => { _fit = true; ApplyImageSize(); }));
         _tools.Children.Add(_zoomTools);
         _save = Button("Save", () => _ = SaveAsync());
-        _discard = Button("Discard changes", () => { _allowClose = true; _dirty = false; Close(); });
+        _discard = Button("Discard changes", () => { if (_ownerCloseFrozen) return; _allowClose = true; _dirty = false; Close(); });
         _tools.Children.Add(_save); _tools.Children.Add(_discard);
         top.Children.Add(_tools);
         root.Children.Add(top); Grid.SetRow(_body, 1); root.Children.Add(_body);
         Grid.SetRow(_status, 2); root.Children.Add(_status); Content = root;
-        _text.TextChanged += (_, _) => { if (!_text.IsReadOnly && _editor is not null) { _dirty = _text.Text != _editor.Text; UpdateSave(); } };
+        _text.TextChanged += (_, _) => { if (_editor is not null) { _dirty = _text.Text != _editor.Text; UpdateSave(); } };
         _picture.SizeChanged += (_, _) => { if (_fit) ApplyImageSize(); };
         PreviewKeyDown += OnKey;
-        Loaded += (_, _) => { if (_editor is null) _body.Focus(); else _text.Focus(); };
+        Loaded += (_, _) => { if (_ownerCloseFrozen) return; if (_editor is null) _body.Focus(); else _text.Focus(); };
         Activated += (_, _) =>
         {
             if (!_activatedOnce) { _activatedOnce = true; return; }
@@ -125,7 +127,7 @@ internal sealed class QuickPreviewWindow : Window
     }
 
     internal string FilePath => _path;
-    internal void SetFileSequence(IReadOnlyList<string> files) { _files = files.ToArray(); UpdateFileNavigation(); }
+    internal void SetFileSequence(IReadOnlyList<string> files) { if (_ownerCloseFrozen || _closed) return; _files = files.ToArray(); UpdateFileNavigation(); }
     private int CurrentFileIndex()
     {
         for (var index = 0; index < _files.Count; index++)
@@ -136,42 +138,47 @@ internal sealed class QuickPreviewWindow : Window
     {
         var index = CurrentFileIndex();
         _previousFile.Visibility = _nextFile.Visibility = _files.Count > 1 ? Visibility.Visible : Visibility.Collapsed;
-        _previousFile.IsEnabled = index > 0;
-        _nextFile.IsEnabled = index >= 0 && index + 1 < _files.Count;
+        _previousFile.IsEnabled = !_ownerCloseFrozen && index > 0;
+        _nextFile.IsEnabled = !_ownerCloseFrozen && index >= 0 && index + 1 < _files.Count;
     }
     internal async Task NavigateFileAsync(int direction)
     {
+        if (_ownerCloseFrozen || _closed) return;
         var current = CurrentFileIndex();
         if (current < 0) return;
         var index = current + Math.Sign(direction);
         if (index < 0 || index >= _files.Count || direction == 0) return;
-        OpenFile(_files[index], readOnly: _forceReadOnly);
+        var origin = string.IsNullOrEmpty(_originPath) ? null
+            : Path.Combine(Path.GetDirectoryName(_originPath) ?? "", Path.GetFileName(_files[index]));
+        OpenFile(_files[index], readOnly: _forceReadOnly, originPath: origin);
         await Loading;
     }
     internal Task RefreshTextAfterActivationAsync()
     {
-        if (!_closed && !_dirty && !_saving && _document is not null)
-        { OpenFile(_path, readOnly: _forceReadOnly); return Loading; }
+        if (!_closed && !_ownerCloseFrozen && !_dirty && !_saving && _document is not null)
+        { OpenFile(_path, readOnly: _forceReadOnly, originPath: _originPath); return Loading; }
         return Task.CompletedTask;
     }
     internal bool HasUnsavedChanges => _dirty || _saving;
     internal Task Loading { get; private set; } = Task.CompletedTask;
-    internal void OpenFile(string path, bool readOnly = false)
+    internal void OpenFile(string path, bool readOnly = false, string? originPath = null)
     {
+        if (_closed || _ownerCloseFrozen) return;
         var request = ++_openRequest;
-        Loading = _dirty || _saving ? SaveAndOpenAsync(path, request, readOnly) : StartOpenFile(path, readOnly);
+        Loading = _dirty || _saving ? SaveAndOpenAsync(path, request, readOnly, originPath) : StartOpenFile(path, readOnly, originPath);
     }
-    private async Task SaveAndOpenAsync(string path, long request, bool readOnly)
+    private async Task SaveAndOpenAsync(string path, long request, bool readOnly, string? originPath)
     {
-        if (!await CommitForCloseAsync() || _closed || request != _openRequest) return;
-        await StartOpenFile(path, readOnly);
+        if (!await CommitForCloseAsync() || _closed || _ownerCloseFrozen || request != _openRequest) return;
+        await StartOpenFile(path, readOnly, originPath);
     }
-    private Task StartOpenFile(string path, bool readOnly = false)
+    private Task StartOpenFile(string path, bool readOnly = false, string? originPath = null)
     {
         _forceReadOnly = readOnly;
+        _originPath = readOnly ? originPath : null;
         _delete.Visibility = readOnly ? Visibility.Collapsed : Visibility.Visible;
         _delete.IsEnabled = !readOnly && !_deleting;
-        _path = path; Title = Path.GetFileName(path) + " — Quick Look";
+        _path = path; UpdateTitle();
         UpdateFileNavigation();
         _load.Cancel(); _load.Dispose(); _load = new CancellationTokenSource();
         _generation++; _native?.Dispose(); _native = null; _editor = null; _document = null;
@@ -290,9 +297,9 @@ internal sealed class QuickPreviewWindow : Window
         {
             var editor = await Task.Run(() => PreviewTextEditSession.OpenAsync(path, document.EncodingName ?? "utf-8", document.HasBom, token), token);
             if (!Current(generation)) return;
-            _editor = editor; _text.Text = editor.Text; _text.IsReadOnly = false;
+            _editor = editor; _text.Text = editor.Text; _text.IsReadOnly = _ownerCloseFrozen;
             _save.Visibility = Visibility.Visible; UpdateSave();
-            _text.Focus();
+            if (!_ownerCloseFrozen) _text.Focus();
             Status("Text · Changes save when you close · Ctrl+S to save now");
         }
         catch (OperationCanceledException) { }
@@ -328,11 +335,43 @@ internal sealed class QuickPreviewWindow : Window
         return saved && !_dirty && !_saving && request == _openRequest && ReferenceEquals(editor, _editor);
     }
     internal Task<bool> ConfirmCloseAsync() => CommitForCloseAsync();
+    internal bool IsOwnerCloseFrozen => _ownerCloseFrozen;
+    internal string? SourceOriginForChecks => _originPath;
+    internal void BeginOwnerClose()
+    {
+        if (_closed || _ownerCloseFrozen) return;
+        _ownerCloseFrozen = true;
+        _ownerCloseWasEnabled = IsEnabled;
+        // Invalidate actions which were already awaiting a save when the
+        // owner began closing. The current editor/session remains available
+        // for its own final commit.
+        _openRequest++;
+        IsEnabled = false;
+        _text.IsReadOnly = true;
+        _delete.IsEnabled = false;
+        UpdateFileNavigation(); UpdateSave();
+    }
+    internal void EndOwnerClose()
+    {
+        if (_closed || !_ownerCloseFrozen) return;
+        _ownerCloseFrozen = false;
+        IsEnabled = _ownerCloseWasEnabled;
+        _text.IsReadOnly = _editor is null || _forceReadOnly || _deleting;
+        _delete.IsEnabled = !_forceReadOnly && !_deleting;
+        UpdateFileNavigation(); UpdateSave();
+    }
+    internal void CompleteOwnerClose()
+    {
+        if (_closed) return;
+        _allowClose = true;
+        Close();
+    }
     private async Task OpenExternalAsync(bool chooseApp)
     {
+        if (_ownerCloseFrozen || _closed) return;
         var path = _path; var request = _openRequest;
         if (!await CommitForCloseAsync() || _closed) return;
-        if (request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal)) return;
+        if (_ownerCloseFrozen || request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal)) return;
         try
         {
             if (chooseApp) await NativeShellService.OpenWithAsync(path);
@@ -342,6 +381,7 @@ internal sealed class QuickPreviewWindow : Window
     }
     private void OpenWithMenu(FrameworkElement target)
     {
+        if (_ownerCloseFrozen || _closed) return;
         var menu = new ContextMenu { PlacementTarget = target };
         var choose = new MenuItem { Header = "Open with…" };
         choose.Click += (_, _) => _ = OpenExternalAsync(true);
@@ -349,13 +389,13 @@ internal sealed class QuickPreviewWindow : Window
     }
     internal async Task DeleteCurrentAsync(Func<string, Task>? recycleForChecks = null)
     {
-        if (_forceReadOnly || _deleting) return;
+        if (_forceReadOnly || _deleting || _ownerCloseFrozen || _closed) return;
         var path = _path; var request = _openRequest;
         if (!await CommitForCloseAsync() || _closed) return;
-        if (request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal) || _forceReadOnly || _deleting) return;
+        if (_ownerCloseFrozen || request != _openRequest || !string.Equals(path, _path, StringComparison.Ordinal) || _forceReadOnly || _deleting) return;
         _deleting = true;
         _delete.IsEnabled = false;
-        var wasReadOnly = _text.IsReadOnly;
+        var editor = _editor;
         _text.IsReadOnly = true;
         Status("Moving to the Recycle Bin…");
         try
@@ -381,18 +421,24 @@ internal sealed class QuickPreviewWindow : Window
             _deleting = false;
             if (!_closed)
             {
-                _delete.IsEnabled = !_forceReadOnly;
-                if (request == _openRequest) _text.IsReadOnly = wasReadOnly;
+                _delete.IsEnabled = !_forceReadOnly && !_ownerCloseFrozen;
+                // Owner-close cancellation changes the request number without
+                // replacing the current editor. Restore that editor's current
+                // capability after a late recycle failure as well.
+                if (ReferenceEquals(editor, _editor) && string.Equals(path, _path, StringComparison.Ordinal))
+                    _text.IsReadOnly = _editor is null || _forceReadOnly || _ownerCloseFrozen;
             }
         }
     }
-    private void UpdateSave() { _save.IsEnabled = _dirty && !_saving; _discard.IsEnabled = _dirty && !_saving; Title = (_dirty ? "● " : "") + Path.GetFileName(_path) + " — Quick Look"; }
+    private void UpdateSave() { _save.IsEnabled = _dirty && !_saving && !_ownerCloseFrozen; _discard.IsEnabled = _dirty && !_saving && !_ownerCloseFrozen; UpdateTitle(); }
+    private void UpdateTitle() => Title = (_dirty ? "● " : "") + Path.GetFileName(_originPath ?? _path)
+        + (string.IsNullOrEmpty(_originPath) ? " — Quick Look" : " — Archive preview (read-only)");
     private void ResetTools()
     {
         _save.Visibility = _discard.Visibility = _previous.Visibility = _next.Visibility = _pageLabel.Visibility = Visibility.Collapsed;
         _zoomTools.Visibility = Visibility.Collapsed;
     }
-    private void Status(string message) { _status.Text = message; _status.ToolTip = message; }
+    private void Status(string message) { var label = string.IsNullOrEmpty(_originPath) ? message : $"Read-only archive preview · {_originPath} · {message}"; _status.Text = label; _status.ToolTip = label; }
     private void ShowError(string message)
     {
         Status(message);
@@ -404,6 +450,7 @@ internal sealed class QuickPreviewWindow : Window
 
     private void OnKey(object sender, KeyEventArgs e)
     {
+        if (_ownerCloseFrozen) { e.Handled = true; return; }
         if (e.Key == Key.Escape && !_search.IsClosed) { _search.Close(); e.Handled = true; }
         else if (e.Key == Key.Escape || (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.Control)
             || (e.Key == Key.Space && Keyboard.Modifiers == ModifierKeys.None && (_text.IsReadOnly || (!_text.IsKeyboardFocusWithin && !IsInsideTextEditor(e.OriginalSource as DependencyObject)))
@@ -427,6 +474,7 @@ internal sealed class QuickPreviewWindow : Window
     }
     private async void OnClosing(object? sender, CancelEventArgs e)
     {
+        if (_ownerCloseFrozen && !_allowClose) { e.Cancel = true; return; }
         if (_allowClose || (!_dirty && !_saving)) return;
         e.Cancel = true;
         if (_askingClose) return;
