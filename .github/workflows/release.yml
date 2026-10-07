@@ -103,13 +103,57 @@ jobs:
           pwsh -NoProfile -File tests/InstallPayloadChecks.ps1
           if ($LASTEXITCODE -ne 0) { throw "Installer payload checks failed with exit code $LASTEXITCODE." }
 
+      # F3D's own Windows CI uses Mesa for hosted machines without a modern
+      # OpenGL driver. Keep that test-only driver outside the published tree.
+      - name: Prepare an isolated F3D runner copy
+        shell: pwsh
+        run: |
+          $testRoot = Join-Path $env:RUNNER_TEMP 'UltraExplorer-f3d-test'
+          if (Test-Path -LiteralPath $testRoot) { throw 'F3D fixture destination must be fresh.' }
+          New-Item -ItemType Directory -Path $testRoot | Out-Null
+          Get-ChildItem -LiteralPath runtime/preview/f3d -Force | Copy-Item -Destination $testRoot -Recurse
+
+      - name: Provide the upstream F3D Windows test renderer
+        uses: f3d-app/install-mesa-windows-action@fd2fbbbc179ba55b0208093b05d653f2cb22741c # v2
+        with:
+          version: '23.3.5'
+          path: ${{ runner.temp }}\UltraExplorer-f3d-test\bin
+
       - name: Check Quick Look interaction, app choices and compact media
         timeout-minutes: 5
         shell: pwsh
         run: |
+          $testBin = Join-Path $env:RUNNER_TEMP 'UltraExplorer-f3d-test/bin'
+          $mesaPins = @{
+            'opengl32.dll' = 'b49b87248f6bb496318a7cbde469dd60c9ff6938b2a11bdb01fd9777c1d884a3'
+            'libglapi.dll' = '326ab75e17a20d74707cb3e5fa96790a054c1891cc72f27648075f9ca5fd8077'
+            'libgallium_wgl.dll' = 'bab7ee113066b97e4732ec6359759bb1c209cc2afaaa66494ea98be496814b6f'
+          }
+          foreach ($name in $mesaPins.Keys) {
+            if ((Get-FileHash -LiteralPath (Join-Path $testBin $name) -Algorithm SHA256).Hash.ToLowerInvariant() -cne $mesaPins[$name]) { throw "F3D test renderer hash mismatch: $name" }
+            if (Test-Path -LiteralPath (Join-Path runtime/preview/f3d/bin $name)) { throw 'Test renderer must not enter the published F3D runtime.' }
+          }
+          $env:ULTRAEXPLORER_F3D = Join-Path $testBin 'f3d.exe'
+          $env:GALLIUM_DRIVER = 'llvmpipe'
           $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-preview-usability-checks'
-          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only PreviewOpenWithChecks,PreviewMediaUiChecks,PreviewOwnerActivationChecks,PreviewInteractionChecks
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only PreviewOpenWithChecks,PreviewMediaUiChecks,PreviewOwnerActivationChecks,PreviewInteractionChecks,PreviewToolsChecks
           if ($LASTEXITCODE -ne 0) { throw "Preview usability checks failed with exit code $LASTEXITCODE." }
+
+      - name: Clear the test renderer environment
+        if: always()
+        shell: pwsh
+        run: |
+          'GALLIUM_DRIVER=' >> $env:GITHUB_ENV
+
+      - name: Keep native runner crash metadata
+        if: failure()
+        shell: pwsh
+        run: |
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName='Application'; Id=1000,1001; StartTime=(Get-Date).AddMinutes(-20) } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match '(?i)f3d\.exe' } | Select-Object -First 6)
+          $diagnosticRoot = 'artifacts/preview-usability/shots'
+          New-Item -ItemType Directory -Path $diagnosticRoot -Force | Out-Null
+          ($events | Format-List TimeCreated,Id,ProviderName,Message | Out-String -Width 240) | Set-Content -LiteralPath "$diagnosticRoot/f3d-runner-event-errors.log"
 
       - name: Keep preview diagnostics on failure
         if: failure()
@@ -194,6 +238,9 @@ jobs:
             }
           }
           if (Test-Path -LiteralPath 'publish/preview/zed') { throw 'The lightweight preview package must not contain a full Zed runtime.' }
+          foreach ($name in @('opengl32.dll', 'libglapi.dll', 'libgallium_wgl.dll')) {
+            if (Test-Path -LiteralPath (Join-Path 'publish/preview/f3d/bin' $name)) { throw 'The CI software renderer must not enter the release package.' }
+          }
 
       # The packages carry no version in their names, so a link to
       # releases/latest/download/<name> always gets the newest one.

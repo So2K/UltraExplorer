@@ -46,6 +46,10 @@ fixtures, so these tests do not claim every installed application was launched.
 Normal/maximized owner state, caption close, cancellation, dirty-note saves,
 toolbar keyboard behavior, image pointer geometry and stale menu actions are
 covered. Offscreen renders check the actual theme and compact layouts.
+Hosted Windows checks use F3D's upstream Mesa software-rendering recipe in an
+isolated test copy and a null audio output for generated muted media. They still
+require real decoded content, rendering, IPC and native process teardown. The
+downloaded application keeps its regular graphics and audio drivers.
 
 Format, archive, GPU and native-call limits from beta.1 still apply. The
 conditional activation fix addresses the owner handoff; it does not force a
