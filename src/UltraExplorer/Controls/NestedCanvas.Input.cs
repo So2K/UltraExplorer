@@ -361,6 +361,12 @@ public sealed partial class NestedCanvas
 
     private void PressLeft(Point point, ModifierKeys modifiers, int clickCount)
     {
+        // The copy-path button acts as it is pressed, and starts nothing else.
+        if (!SpacePanHeld && TryPressCopyButton(point))
+        {
+            return;
+        }
+
         if (clickCount == 2 && !SpacePanHeld)
         {
             if (HotspotAt(point) is { } shortcut)
@@ -894,6 +900,25 @@ public sealed partial class NestedCanvas
 
     private void UpdateHover(Point point)
     {
+        // On the copy-path button the item it belongs to stays the hovered
+        // one - the button would go with it - and only its highlight changes.
+        var wasOnCopy = IsOnCopyButton(_hoverPoint);
+        if (IsOnCopyButton(point))
+        {
+            _hoverPoint = point;
+            if (!wasOnCopy)
+            {
+                RenderOverlay();
+            }
+
+            return;
+        }
+
+        if (wasOnCopy)
+        {
+            RequestFrame(Layers.Overlay);
+        }
+
         var wasOnTip = HotspotAt(_hoverPoint) is { Tip: not null };
         _hoverPoint = point;
         var spot = HotspotAt(point);

@@ -339,6 +339,7 @@ internal sealed class NestedPane
         Canvas.ContextMenuRequested += OnContextMenuRequested;
         Canvas.ContextMenuPressed += OnContextMenuPressed;
         Canvas.DragRequested += OnDragRequested;
+        Canvas.CopyPathRequested += OnCopyPathRequested;
         Canvas.CameraChanged += OnCameraChanged;
         Canvas.UserCameraMoved += OnUserCameraMoved;
         Canvas.FilterChanged += OnFilterChanged;
@@ -1838,6 +1839,20 @@ internal sealed class NestedPane
         var rest = path.Length > folder.Length ? path[(folder.Length + 1)..] : string.Empty;
         var slash = rest.IndexOf('\\');
         return rest.Length == 0 ? null : Path.Combine(folder, slash < 0 ? rest : rest[..slash]);
+    }
+
+    /// <summary>The copy-path button on a folder's title or a file's tile: its full path on the clipboard.</summary>
+    private void OnCopyPathRequested(string path)
+    {
+        try
+        {
+            Clipboard.SetText(path);
+            _ = _viewModel.Toast.ShowSuccessAsync($"Copied: {path}");
+        }
+        catch (System.Runtime.InteropServices.ExternalException)
+        {
+            _viewModel.Toast.ShowError("Another application is holding the clipboard — try again.");
+        }
     }
 
     // ---- drag and drop ---------------------------------------------------------

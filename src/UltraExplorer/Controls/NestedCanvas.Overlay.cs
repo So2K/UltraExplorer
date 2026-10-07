@@ -678,6 +678,7 @@ public sealed partial class NestedCanvas
         using (var dc = _overlay.RenderOpen())
         {
             DrawHover(dc);
+            DrawCopyButton(dc);
             DrawHoverTip(dc);
             DrawMarquee(dc);
             DrawMarqueeCount(dc);
