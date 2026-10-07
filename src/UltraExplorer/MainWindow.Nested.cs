@@ -518,6 +518,8 @@ public partial class MainWindow : INestedPaneHost
         switch (e.PropertyName)
         {
             case nameof(MainViewModel.IsNestedLayout):
+                _viewModel.Tree.BrowseArchives = _viewModel.BrowseArchives && IsNested;
+                foreach (var pane in _panes) pane.ApplyArchivePreference();
                 // Switching pictures keeps the place: the other canvas opens on
                 // whatever is selected.
                 _pictureSwitches++;

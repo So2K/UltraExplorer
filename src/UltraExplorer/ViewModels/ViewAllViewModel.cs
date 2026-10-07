@@ -3259,7 +3259,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             // is selected in it is not to be let go of meanwhile.  Inside an
             // archive nothing is on disk, and the tree has no node for it:
             // it is still there, and stays selected.
-            if (await IsGoneAsync(path) && !Services.Archives.ArchiveService.IsInsideArchive(path) && ticket == _selectTicket && !_isDisposed)
+            if (await IsGoneAsync(path) && !(BrowseArchives && Services.Archives.ArchiveService.IsInsideArchive(path)) && ticket == _selectTicket && !_isDisposed)
             {
                 var parent = Path.GetDirectoryName(path);
                 var focused = ViewAllPath.Equals(Selection.Focus ?? string.Empty, path);

@@ -483,7 +483,7 @@ internal sealed class NestedPane
     /// <summary>Applies the opt-in mode and leaves a virtual archive before its tile becomes a regular file.</summary>
     public void ApplyArchivePreference()
     {
-        var enabled = _viewModel.BrowseArchives && !_host.IsPickerMode;
+        var enabled = _viewModel.BrowseArchives && IsNested && !_host.IsPickerMode;
         if (!enabled)
         {
             _flightTicket++;
@@ -493,16 +493,35 @@ internal sealed class NestedPane
                 Canvas.FlyTo(viewed, animated: false);
 
             var selection = Selection;
-            var kept = selection.Items.Where(item => Tree.FindNearest(item.Path) is not { IsInArchive: true } container
-                    || container.IsArchive && container.FullPath.Equals(item.Path, StringComparison.OrdinalIgnoreCase) && container.Parent?.IsInArchive != true)
+            bool IsVirtual(string? path)
+            {
+                if (string.IsNullOrEmpty(path) || Tree.FindNearest(path) is not { IsInArchive: true } container) return false;
+                return !container.IsArchive || !container.FullPath.Equals(path, StringComparison.OrdinalIgnoreCase) || container.Parent?.IsInArchive == true;
+            }
+
+            string? PhysicalParent(string? path)
+            {
+                var folder = string.IsNullOrEmpty(path) ? null : Tree.FindNearest(path);
+                while (folder is { IsInArchive: true }) folder = folder.Parent;
+                return folder is { IsComputer: false } ? folder.FullPath : null;
+            }
+
+            var kept = selection.Items.Where(item => !IsVirtual(item.Path))
                 .Select(item => item.IsDirectory && Tree.Find(item.Path) is { IsArchive: true }
-                    ? item with { IsDirectory = false, Size = 0 }
+                    ? item with { IsDirectory = false, Size = _viewModel.Tree.TryGetNode(item.Path, out var node) ? node.Entry.SizeBytes ?? 0 : 0 }
                     : item).ToArray();
-            if (kept.Length != selection.Count || kept.Any(item => selection.TryGetItem(item.Path, out var old) && old.IsDirectory != item.IsDirectory))
+            var focus = IsVirtual(selection.Focus)
+                ? kept.FirstOrDefault().Path ?? PhysicalParent(selection.Focus) ?? viewed?.FullPath ?? string.Empty
+                : selection.Focus;
+            var anchor = IsVirtual(selection.Anchor) ? focus ?? string.Empty : selection.Anchor;
+            if (kept.Length != selection.Count || kept.Any(item => selection.TryGetItem(item.Path, out var old) && old.IsDirectory != item.IsDirectory)
+                || !string.Equals(focus, selection.Focus, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(anchor, selection.Anchor, StringComparison.OrdinalIgnoreCase))
             {
                 selection.Apply(new SelectionEdit { Clear = true, Added = kept,
-                    Focus = selection.Focus is { } focus && kept.Any(item => item.Path == focus) ? focus : kept.FirstOrDefault().Path,
-                    Source = SelectionSource.Command });
+                    // Null means "leave unchanged" to ItemSelection. Empty explicitly clears a ghost focus.
+                    Focus = focus ?? string.Empty, Anchor = anchor ?? string.Empty,
+                    Source = SelectionSource.Command, RecordsNavigation = false });
             }
         }
 

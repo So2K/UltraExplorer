@@ -248,7 +248,11 @@ public static class ArchiveService
         {
             cancellation.ThrowIfCancellationRequested();
             EnsureSafeOutput(copy);
-            if (File.Exists(copy) && new FileInfo(copy).Length == item.Size) return copy;
+            if (File.Exists(copy) && new FileInfo(copy).Length == item.Size)
+            {
+                ArchiveZoneHelper.Propagate(outer.Path, copy);
+                return copy;
+            }
             Directory.CreateDirectory(folder);
             var staging = Path.Combine(folder, Guid.NewGuid().ToString("N") + ".partial");
             try
@@ -433,6 +437,7 @@ public static class ArchiveService
                 EnsureSafeOutput(target);
                 if (File.Exists(target) && new FileInfo(target).Length == item.Size)
                 {
+                    ArchiveZoneHelper.Propagate(location.Index.Path, target);
                     return target;
                 }
 
@@ -679,6 +684,7 @@ public static class ArchiveService
         for (var attempt = 0; ; attempt++)
         {
             var archiveFile = index.Path;
+            var zone = ArchiveZoneHelper.Capture(archiveFile);
             using var session = ArchiveSession.Open(archiveFile, Passwords.GetValueOrDefault(archiveFile), cancellation, index.Format);
             var targets = new Dictionary<uint, (string Output, long Ticks, long Size)>(files.Count);
             foreach (var (item, output) in files)
@@ -691,7 +697,7 @@ public static class ArchiveService
             }
 
             var indices = targets.Keys.Order().ToArray();
-            var callback = new ExtractCallback(targets, () => PasswordFor(archiveFile, allowPrompt, passwordPrompt), progress, cancellation);
+            var callback = new ExtractCallback(targets, () => PasswordFor(archiveFile, allowPrompt, passwordPrompt), progress, cancellation, zone);
             int result;
             try
             {
@@ -885,7 +891,8 @@ internal sealed class ExtractCallback(
     Dictionary<uint, (string Output, long Ticks, long Size)> targets,
     Func<string?> password,
     ArchiveService.ProgressSum progress,
-    CancellationToken cancellation) : IArchiveExtractCallback, ICryptoGetTextPassword
+    CancellationToken cancellation,
+    ArchiveZoneHelper? zone = null) : IArchiveExtractCallback, ICryptoGetTextPassword
 {
     private FileStream? _current;
     private (string Output, long Ticks, long Size) _target;
@@ -1014,10 +1021,38 @@ internal sealed class ExtractCallback(
             stream.Dispose();
         }
 
+        if (!failed && zone is not null)
+        {
+            try
+            {
+                // Mark the completed file before staging can publish it or
+                // an Open/drag operation can return a physical path.
+                zone.Apply(_target.Output);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+            {
+                failed = true;
+                Failed++;
+                if (FirstProblem.Length == 0)
+                    FirstProblem = $"Could not preserve the archive's Windows origin metadata: {ex.Message}";
+            }
+            if (!failed && _target.Ticks > 0)
+            {
+                try { File.SetLastWriteTimeUtc(_target.Output, new DateTime(_target.Ticks, DateTimeKind.Utc)); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException) { }
+            }
+        }
+
         if (failed)
         {
             try
             {
+                ArchiveService.EnsureSafeOutput(_target.Output);
+                // Callback targets are fresh UniquePath outputs or private
+                // staging files. Only these failed outputs may be removed.
+                var attributes = File.GetAttributes(_target.Output);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                    File.SetAttributes(_target.Output, attributes & ~FileAttributes.ReadOnly);
                 File.Delete(_target.Output);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)

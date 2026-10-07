@@ -208,6 +208,8 @@ internal static partial class Program
         await Group(ArchiveChecks);
         await Group(ArchiveToggleChecks);
         await Group(ArchivePreviewChecks);
+        await Group(ArchiveLayoutChecks);
+        await Group(ArchiveZoneChecks);
         await Group(Pr4WorkspaceFixChecks);
         await Group(Pr4SearchFixChecks);
         await Group(MaskedPasswordChecks);

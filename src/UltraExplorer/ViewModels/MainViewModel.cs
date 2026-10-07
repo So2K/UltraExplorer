@@ -345,6 +345,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             }
 
             _savedLayout = value.ToString();
+            Tree.BrowseArchives = BrowseArchives && IsNestedLayout;
             OnPropertyChanged(nameof(IsNestedLayout));
             OnPropertyChanged(nameof(IsTreeLayout));
             OnPropertyChanged(nameof(ZoomLabel));

@@ -18,7 +18,7 @@ public sealed partial class MainViewModel
             if (_isPickerSession || _browseArchives == value) return;
             _browseArchives = value;
             ArchiveService.BrowseArchives = value;
-            Tree.BrowseArchives = value;
+            Tree.BrowseArchives = value && IsNestedLayout;
             _optionalFeaturesChanged |= ArchivesPreference;
             OnPropertyChanged();
             _ = SaveNowAsync();
@@ -58,7 +58,7 @@ public sealed partial class MainViewModel
         {
             _browseArchives = state.BrowseArchives;
             ArchiveService.BrowseArchives = _browseArchives;
-            Tree.BrowseArchives = _browseArchives;
+            Tree.BrowseArchives = _browseArchives && IsNestedLayout;
             OnPropertyChanged(nameof(BrowseArchives));
         }
         if ((_optionalFeaturesChanged & ShelfPreference) == 0)
