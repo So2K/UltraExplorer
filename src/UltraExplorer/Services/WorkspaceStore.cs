@@ -91,27 +91,49 @@ public sealed class WorkspaceStore
             return null;
         }
 
-        try
+        for (var attempt = 1; ; attempt++)
         {
-            await using var stream = File.OpenRead(_statePath);
-            return await JsonSerializer.DeserializeAsync<WorkspaceState>(stream, JsonOptions, cancellationToken);
-        }
-        catch (JsonException)
-        {
-            // The window starts with its defaults, and its first save would
-            // write them over the damaged file - the pinned folders and every
-            // folder's order with it.  Set aside, it can still be mended.
-            StateFiles.Quarantine(_statePath);
-            return null;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return null;
+            try
+            {
+                await using var stream = File.OpenRead(_statePath);
+                return await JsonSerializer.DeserializeAsync<WorkspaceState>(stream, JsonOptions, cancellationToken);
+            }
+            catch (JsonException)
+            {
+                // The window starts with its defaults, and its first save would
+                // write them over the damaged file - the pinned folders and every
+                // folder's order with it.  Set aside, it can still be mended.
+                StateFiles.Quarantine(_statePath);
+                return null;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Held by a scanner or a sync client for a moment: tried again.
+                // Still unreadable, it is there but unknown - and a save of the
+                // defaults would write over the pins and orders it holds, so
+                // nothing is saved this session.
+                if (ex is IOException and not FileNotFoundException && attempt < 4)
+                {
+                    await Task.Delay(150 * attempt, cancellationToken);
+                    continue;
+                }
+
+                _unreadable = ex is not FileNotFoundException;
+                return null;
+            }
         }
     }
 
+    /// <summary>The workspace is on disk but could not be read: saving would lose it.</summary>
+    private bool _unreadable;
+
     public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
     {
+        if (_unreadable)
+        {
+            return;
+        }
+
         await _saving.WaitAsync(cancellationToken);
 
         // A temporary file of this save's own: another store over the same

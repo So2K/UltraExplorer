@@ -332,6 +332,9 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
 
     private Flight? _flight;
 
+    /// <summary>When <see cref="_flight"/> began, as a <see cref="System.Diagnostics.Stopwatch"/> timestamp.</summary>
+    private long _flightStarted;
+
     private PressKind _press;
     private Point _pressPoint;
     private Point _panLast;
