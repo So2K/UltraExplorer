@@ -5,6 +5,7 @@ namespace UltraExplorer.ViewModels;
 
 public sealed partial class MainViewModel
 {
+    internal bool IsDisposed => _isDisposed;
     private const byte ArchivesPreference = 1, ShelfPreference = 2, CopyPathPreference = 4;
     private byte _optionalFeaturesChanged;
     private bool _browseArchives, _showDropShelf, _showCopyPathButton;

@@ -8,7 +8,7 @@ New-Item -ItemType Directory -Path $archiveWork -Force | Out-Null
 function Get-PinnedArchiveFile([string]$Name, [string]$Hash) {
     $file = Join-Path $archiveWork $Name
     if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $Hash) {
-        Invoke-WebRequest "https://github.com/ip7z/7zip/releases/download/$version/$Name" -OutFile $file
+        Invoke-WebRequest "https://github.com/ip7z/7zip/releases/download/$version/$Name" -OutFile $file -UseBasicParsing
     }
     if ((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $Hash) { throw "Archive runtime SHA-256 mismatch: $Name" }
     return $file
