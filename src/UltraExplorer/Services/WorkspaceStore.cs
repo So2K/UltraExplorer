@@ -86,39 +86,58 @@ public sealed class WorkspaceStore
     public async Task<WorkspaceState?> LoadAsync(CancellationToken cancellationToken = default)
     {
         StateFiles.SweepTemporaries(_statePath, hidden: false);
-        if (!File.Exists(_statePath))
+        await _saving.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
         {
-            return null;
+            return await ReadAsync(cancellationToken).ConfigureAwait(false);
         }
+        finally
+        {
+            _saving.Release();
+        }
+    }
 
+    private async Task<WorkspaceState?> ReadAsync(CancellationToken cancellationToken)
+    {
+        // Unknown until the read finishes. Cancellation during a retry must
+        // not leave a later save free to replace the original with defaults.
+        _unreadable = true;
         for (var attempt = 1; ; attempt++)
         {
             try
             {
                 await using var stream = File.OpenRead(_statePath);
-                return await JsonSerializer.DeserializeAsync<WorkspaceState>(stream, JsonOptions, cancellationToken);
+                var state = await JsonSerializer.DeserializeAsync<WorkspaceState>(stream, JsonOptions, cancellationToken).ConfigureAwait(false);
+                _unreadable = false;
+                return state;
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                _unreadable = false;
+                return null;
             }
             catch (JsonException)
             {
                 // The window starts with its defaults, and its first save would
                 // write them over the damaged file - the pinned folders and every
                 // folder's order with it.  Set aside, it can still be mended.
-                StateFiles.Quarantine(_statePath);
+                _unreadable = true;
+                QuarantineUnreadableState();
                 return null;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                _unreadable = true;
                 // Held by a scanner or a sync client for a moment: tried again.
                 // Still unreadable, it is there but unknown - and a save of the
                 // defaults would write over the pins and orders it holds, so
                 // nothing is saved this session.
-                if (ex is IOException and not FileNotFoundException && attempt < 4)
+                if (ex is IOException && attempt < 4)
                 {
-                    await Task.Delay(150 * attempt, cancellationToken);
+                    await Task.Delay(150 * attempt, cancellationToken).ConfigureAwait(false);
                     continue;
                 }
 
-                _unreadable = ex is not FileNotFoundException;
                 return null;
             }
         }
@@ -127,13 +146,32 @@ public sealed class WorkspaceStore
     /// <summary>The workspace is on disk but could not be read: saving would lose it.</summary>
     private bool _unreadable;
 
-    public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
+    private void QuarantineUnreadableState()
+    {
+        try
+        {
+            // A collision or a denied rename must not be mistaken for a
+            // successful backup. Only a completed move permits a new save.
+            File.Move(_statePath, $"{_statePath}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid():N}");
+            _unreadable = false;
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            _unreadable = false;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+        }
+    }
+
+    private void RequireReadableState()
     {
         if (_unreadable)
-        {
-            return;
-        }
+            throw new IOException("The saved workspace could not be read or backed up; it has been kept unchanged. Reopen the window when the file is accessible to save changes.");
+    }
 
+    public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
+    {
         await _saving.WaitAsync(cancellationToken);
 
         // A temporary file of this save's own: another store over the same
@@ -144,6 +182,7 @@ public sealed class WorkspaceStore
         var tempPath = _statePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
         try
         {
+            RequireReadableState();
             Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
 
             // On disk before the move, not only in the cache: a power cut
@@ -186,8 +225,9 @@ public sealed class WorkspaceStore
     /// store over it, in this process and in others: another window's save
     /// cannot land between this one's reading and its writing, to be written
     /// over with the file as it was before it.  <paramref name="merge"/> is
-    /// given null for a workspace that is not there or cannot be read, and
-    /// gives back null to write nothing.  It runs on a thread of its own -
+    /// given null for a workspace that is not there or was safely quarantined,
+    /// and gives back null to write nothing. An inaccessible workspace or a
+    /// failed quarantine stops the save before the merge is called. It runs on a thread of its own -
     /// the turn is a mutex, which belongs to the thread that took it - so it
     /// must touch nothing of the window's.  A turn not had within three
     /// seconds is gone ahead without, as a save does (see <see cref="Replace"/>).
@@ -197,7 +237,8 @@ public sealed class WorkspaceStore
         await _saving.WaitAsync(cancellationToken);
         try
         {
-            await Task.Run(() => Update(merge), cancellationToken);
+            RequireReadableState();
+            await Task.Run(() => Update(merge, cancellationToken), cancellationToken);
         }
         finally
         {
@@ -205,7 +246,7 @@ public sealed class WorkspaceStore
         }
     }
 
-    private void Update(Func<WorkspaceState?, WorkspaceState?> merge)
+    private void Update(Func<WorkspaceState?, WorkspaceState?> merge, CancellationToken cancellationToken)
     {
         Mutex? turn = null;
         var entered = false;
@@ -219,7 +260,13 @@ public sealed class WorkspaceStore
             catch (AbandonedMutexException) { entered = true; }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException) { }
 
-            if (merge(Read()) is not { } state)
+            // The mutex belongs to this worker thread. ReadAsync may resume
+            // elsewhere while the worker waits, so the read/merge/write still
+            // holds one turn without moving mutex ownership to a continuation.
+            var current = ReadAsync(cancellationToken).GetAwaiter().GetResult();
+            RequireReadableState();
+            cancellationToken.ThrowIfCancellationRequested();
+            if (merge(current) is not { } state)
             {
                 return;
             }
@@ -260,30 +307,6 @@ public sealed class WorkspaceStore
             }
 
             turn?.Dispose();
-        }
-    }
-
-    /// <summary>The workspace as it is now, for <see cref="Update"/>; null as <see cref="LoadAsync"/> gives it.</summary>
-    private WorkspaceState? Read()
-    {
-        if (!File.Exists(_statePath))
-        {
-            return null;
-        }
-
-        try
-        {
-            using var stream = File.OpenRead(_statePath);
-            return JsonSerializer.Deserialize<WorkspaceState>(stream, JsonOptions);
-        }
-        catch (JsonException)
-        {
-            StateFiles.Quarantine(_statePath);
-            return null;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return null;
         }
     }
 

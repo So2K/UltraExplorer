@@ -13,7 +13,7 @@ namespace UltraExplorer.Controls;
 /// it, so a glance says what it is.  A copy-path button shows on the band
 /// while the pointer is over the card.
 /// </summary>
-public sealed class ShelfCard : Border
+public sealed class ShelfCard : Border, IDisposable
 {
     private const int ShownChildren = 8;
 
@@ -30,12 +30,19 @@ public sealed class ShelfCard : Border
 
     private readonly StackPanel _children;
     private readonly TextBlock _detail;
+    private readonly Border _band;
+    private readonly TextBlock _typeIcon;
+    private readonly TaskCompletionSource _metadataReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private bool _hasMetadata;
+    private string _fileDetail = "Reading…";
+    private readonly bool _browseArchives;
+    private static readonly SemaphoreSlim PreviewSlots = new(2);
+    private readonly CancellationTokenSource _previewStop = new();
 
-    public ShelfCard(ShelfEntry entry, ImageSource? icon)
+    public ShelfCard(ShelfEntry entry, ImageSource? icon, bool browseArchives = false)
     {
         Entry = entry;
-        IsFolder = Directory.Exists(entry.Path);
-        IsArchive = !IsFolder && Services.Archives.ArchiveService.IsArchiveFile(entry.Path);
+        _browseArchives = browseArchives;
         Width = CardWidth;
         CornerRadius = new CornerRadius(7);
         Background = CardBrush;
@@ -44,8 +51,9 @@ public sealed class ShelfCard : Border
         SnapsToDevicePixels = true;
         Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 10, ShadowDepth = 2, Opacity = 0.35 };
 
-        var band = new Border { Width = 3, CornerRadius = new CornerRadius(2), Margin = new Thickness(0, 2, 7, 2), Background = IsFolder ? FolderBand : IsArchive ? ArchiveBand : FileBand };
-        var image = new Image { Source = icon, Width = 16, Height = 16, VerticalAlignment = VerticalAlignment.Center };
+        _band = new Border { Width = 3, CornerRadius = new CornerRadius(2), Margin = new Thickness(0, 2, 7, 2), Background = FileBand };
+        _typeIcon = new TextBlock { Text = "", FontFamily = Icons, FontSize = 13, Width = 16, Foreground = DimText, VerticalAlignment = VerticalAlignment.Center };
+        FrameworkElement image = icon is null ? _typeIcon : new Image { Source = icon, Width = 16, Height = 16, VerticalAlignment = VerticalAlignment.Center };
         var name = new TextBlock
         {
             Text = MiddleTrim(
@@ -78,10 +86,10 @@ public sealed class ShelfCard : Border
         CopyButton.MouseLeave += (_, _) => CopyButton.Background = Brushes.Transparent;
 
         var header = new DockPanel { LastChildFill = true };
-        DockPanel.SetDock(band, Dock.Left);
+        DockPanel.SetDock(_band, Dock.Left);
         DockPanel.SetDock(image, Dock.Left);
         DockPanel.SetDock(CopyButton, Dock.Right);
-        header.Children.Add(band);
+        header.Children.Add(_band);
         header.Children.Add(image);
         header.Children.Add(CopyButton);
         header.Children.Add(name);
@@ -103,10 +111,7 @@ public sealed class ShelfCard : Border
         MouseEnter += (_, _) => CopyButton.Visibility = Visibility.Visible;
         MouseLeave += (_, _) => CopyButton.Visibility = Visibility.Hidden;
         UpdateDetail(null);
-        if (IsFolder || IsArchive)
-        {
-            _ = LoadChildrenAsync();
-        }
+        PreviewReady = LoadChildrenAsync();
     }
 
     public ShelfEntry Entry { get; set; }
@@ -117,7 +122,10 @@ public sealed class ShelfCard : Border
     private const double NameRoom = CardWidth - 3 - 7 - 16 - 7 - 4 - 22 - 6 - 4 - 4;
 
     /// <summary>The room a card is laid out with: a folder's grows when what is inside it has been read.</summary>
-    public double ReservedHeight => IsFolder || IsArchive ? 210 : 62;
+    public double ReservedHeight => !_hasMetadata || IsFolder || IsArchive ? 210 : 62;
+
+    internal Task PreviewReady { get; }
+    internal Task MetadataReady => _metadataReady.Task;
 
     /// <summary>
     /// A long name cut in the middle, not at the end: files dropped together
@@ -165,9 +173,9 @@ public sealed class ShelfCard : Border
         return name[..head] + "…" + name[^(length - 1 - head)..];
     }
 
-    public bool IsFolder { get; }
+    public bool IsFolder { get; private set; }
 
-    public bool IsArchive { get; }
+    public bool IsArchive { get; private set; }
 
     /// <summary>The copy-path button on the card's band.</summary>
     public Border CopyButton { get; }
@@ -197,6 +205,8 @@ public sealed class ShelfCard : Border
 
     public Rect Bounds => new(X, Y, ActualWidth > 0 ? ActualWidth : Width, ActualHeight > 0 ? ActualHeight : 60);
 
+    internal Rect ReservedBounds => new(X, Y, Width, Math.Max(ActualHeight, ReservedHeight));
+
     private void UpdateDetail(int? count)
     {
         var age = DateTime.UtcNow - Entry.AddedUtc;
@@ -209,7 +219,7 @@ public sealed class ShelfCard : Border
         }
         else
         {
-            what = File.Exists(Entry.Path) ? ShelfStore.SizeText(new FileInfo(Entry.Path).Length) : "gone";
+            what = _fileDetail;
         }
 
         _detail.Text = $"{what} · {(Entry.IsCopy ? "copy" : "link")} · {keeps}";
@@ -218,35 +228,74 @@ public sealed class ShelfCard : Border
     /// <summary>The first things inside a folder or an archive, read off the window's thread.</summary>
     private async Task LoadChildrenAsync()
     {
-        var path = Entry.Path;
-        var listing = await Task.Run(() => NestedDirectoryReader.Read(path, CancellationToken.None));
-        if (!string.IsNullOrEmpty(listing.ErrorMessage))
+        var cancellation = _previewStop.Token;
+        bool acquired = false;
+        try
         {
-            _children.Children.Add(Line("", listing.ErrorMessage));
-            return;
-        }
+            await PreviewSlots.WaitAsync(cancellation);
+            acquired = true;
+            var path = Entry.Path;
+            var metadata = await Task.Run(() =>
+            {
+                cancellation.ThrowIfCancellationRequested();
+                var folder = Directory.Exists(path);
+                var archive = !folder && Services.Archives.ArchiveService.IsArchiveFile(path, _browseArchives);
+                var detail = folder || archive ? string.Empty : File.Exists(path) ? ShelfStore.SizeText(new FileInfo(path).Length) : "gone";
+                return (folder, archive, detail);
+            }, cancellation);
+            cancellation.ThrowIfCancellationRequested();
+            IsFolder = metadata.folder;
+            IsArchive = metadata.archive;
+            _hasMetadata = true;
+            _fileDetail = metadata.detail;
+            _band.Background = IsFolder ? FolderBand : IsArchive ? ArchiveBand : FileBand;
+            _typeIcon.Text = IsFolder ? "" : IsArchive ? "" : "";
+            _typeIcon.Foreground = _band.Background;
+            UpdateDetail(null);
+            _metadataReady.TrySetResult();
+            if (!IsFolder && !IsArchive) return;
+            var listing = await Task.Run(() => NestedDirectoryReader.Read(path, cancellation, _browseArchives), cancellation);
+            cancellation.ThrowIfCancellationRequested();
+            if (!string.IsNullOrEmpty(listing.ErrorMessage))
+            {
+                _children.Children.Add(Line("", listing.ErrorMessage));
+                return;
+            }
 
-        var shown = 0;
-        foreach (var folder in listing.Folders.Take(ShownChildren))
+            var shown = 0;
+            foreach (var folder in listing.Folders.Take(ShownChildren))
+            {
+                _children.Children.Add(Line(folder.IsArchive ? "" : "", folder.Name));
+                shown++;
+            }
+
+            foreach (var file in listing.Files.Take(ShownChildren - shown))
+            {
+                _children.Children.Add(Line("", file.Name));
+                shown++;
+            }
+
+            var total = listing.Folders.Count + listing.FileCount;
+            if (total > shown)
+            {
+                _children.Children.Add(new TextBlock { Text = $"+{total - shown:N0} more", FontSize = 10.5, Foreground = DimText, Margin = new Thickness(18, 2, 0, 0) });
+            }
+
+            UpdateDetail(total);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or NotSupportedException)
         {
-            _children.Children.Add(Line(folder.IsArchive ? "" : "", folder.Name));
-            shown++;
+            if (!cancellation.IsCancellationRequested) _children.Children.Add(Line("", "Preview unavailable"));
         }
-
-        foreach (var file in listing.Files.Take(ShownChildren - shown))
+        finally
         {
-            _children.Children.Add(Line("", file.Name));
-            shown++;
+            _metadataReady.TrySetResult();
+            if (acquired) PreviewSlots.Release();
         }
-
-        var total = listing.Folders.Count + listing.FileCount;
-        if (total > shown)
-        {
-            _children.Children.Add(new TextBlock { Text = $"+{total - shown:N0} more", FontSize = 10.5, Foreground = DimText, Margin = new Thickness(18, 2, 0, 0) });
-        }
-
-        UpdateDetail(total);
     }
+
+    public void Dispose() => _previewStop.Cancel();
 
     private static FrameworkElement Line(string glyph, string text) => new StackPanel
     {
@@ -357,8 +406,29 @@ public sealed class ShelfBoard : Grid
 
     public void RemoveCard(ShelfCard card)
     {
+        card.Dispose();
         _cards.Remove(card);
         _world.Children.Remove(card);
+    }
+
+    /// <summary>Stops gestures and previews when the optional shelf is disabled.</summary>
+    public void ClearCards()
+    {
+        _press = Press.None;
+        ReleaseMouseCapture();
+        _marquee.Visibility = Visibility.Collapsed;
+        _pressCard = null;
+        _marqueeBase.Clear();
+        ClearValue(CursorProperty);
+        foreach (var card in _cards) card.Dispose();
+        _cards.Clear();
+        _world.Children.Clear();
+    }
+
+    protected override void OnQueryContinueDrag(QueryContinueDragEventArgs e)
+    {
+        base.OnQueryContinueDrag(e);
+        if (IsDraggingOut && _cards.Count == 0) { e.Action = DragAction.Cancel; e.Handled = true; }
     }
 
     /// <summary>A point on the board, from one on screen.</summary>
@@ -404,7 +474,7 @@ public sealed class ShelfBoard : Grid
         var right = ToWorld(new Point(Math.Max(ActualWidth, width), 0)).X - gap;
         var x0 = Math.Clamp(origin.X, left, Math.Max(left, right - width));
         var columns = Math.Clamp((int)((right - x0 + gap) / (width + gap)), 1, Math.Max(1, (int)Math.Ceiling(Math.Sqrt(group.Count * 2.0))));
-        var obstacles = _cards.Where(card => !group.Contains(card)).Select(card => card.Bounds).ToList();
+        var obstacles = _cards.Where(card => !group.Contains(card)).Select(card => card.ReservedBounds).ToList();
         var bottoms = Enumerable.Repeat(origin.Y, columns).ToArray();
         foreach (var card in group)
         {
@@ -441,8 +511,8 @@ public sealed class ShelfBoard : Grid
         {
             for (var column = 0; column < columns; column++)
             {
-                var spot = new Rect(12 + column * step, 12 + row * 150, 210, 140);
-                if (!_cards.Any(card => card.Bounds.IntersectsWith(spot)))
+                var spot = new Rect(12 + column * step, 12 + row * 222, 210, 210);
+                if (!_cards.Any(card => card.ReservedBounds.IntersectsWith(spot)))
                 {
                     return spot.TopLeft;
                 }
@@ -653,10 +723,7 @@ public sealed class ShelfBoard : Grid
             CardsMoved?.Invoke([.. Selected]);
         }
 
-        if (_press != Press.DragPending)
-        {
-            _press = Press.None;
-        }
+        _press = Press.None;
 
         _marquee.Visibility = Visibility.Collapsed;
         ClearValue(CursorProperty);

@@ -17,12 +17,27 @@ public partial class NestedCanvas
 
     private Rect _copySpot = Rect.Empty;
     private string? _copyPath;
+    private bool _showCopyPathButton;
+
+    /// <summary>Opt-in hover action. Changing it clears the old hit target immediately.</summary>
+    public bool ShowCopyPathButton
+    {
+        get => _showCopyPathButton;
+        set
+        {
+            if (_showCopyPathButton == value) return;
+            _showCopyPathButton = value;
+            _copySpot = Rect.Empty;
+            _copyPath = null;
+            RequestFrame(Layers.Overlay);
+        }
+    }
 
     /// <summary>The copy-path button was pressed: the path to put on the clipboard.</summary>
     public event Action<string>? CopyPathRequested;
 
     /// <summary>Whether the point is on the copy-path button now shown.</summary>
-    private bool IsOnCopyButton(Point point) => _copyPath is not null && _copySpot.Contains(point);
+    private bool IsOnCopyButton(Point point) => ShowCopyPathButton && _copyPath is not null && _copySpot.Contains(point);
 
     /// <summary>Presses the copy-path button if the point is on it; true when it was.</summary>
     private bool TryPressCopyButton(Point point)
@@ -40,7 +55,7 @@ public partial class NestedCanvas
     {
         _copySpot = Rect.Empty;
         _copyPath = null;
-        if (_hover is not { } hover || _press != PressKind.None || hover.Folder.IsComputer || _marquee is not null)
+        if (!ShowCopyPathButton || _hover is not { } hover || _press != PressKind.None || hover.Folder.IsComputer || _marquee is not null)
         {
             return;
         }

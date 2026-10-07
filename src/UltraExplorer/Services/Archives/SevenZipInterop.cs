@@ -192,6 +192,7 @@ internal static unsafe class SevenZipLibrary
 
     private static IEnumerable<string> Candidates()
     {
+        yield return System.IO.Path.Combine(AppContext.BaseDirectory, "archives", "7z.dll");
         foreach (var view in new[] { RegistryView.Registry64, RegistryView.Default })
         {
             foreach (var hive in new[] { RegistryHive.LocalMachine, RegistryHive.CurrentUser })

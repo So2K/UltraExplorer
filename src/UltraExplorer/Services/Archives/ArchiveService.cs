@@ -26,16 +26,20 @@ public readonly record struct ArchiveProgress(long Done, long Total);
 public static class ArchiveService
 {
     private const int CachedIndexes = 48;
+    internal const long MaximumAutomaticNestedBytes = 512L << 20;
 
     private static readonly object Gate = new();
-    private static readonly Dictionary<string, (ArchiveIndex Index, long Used)> Indexes = new(StringComparer.OrdinalIgnoreCase);
-    private static readonly ConcurrentDictionary<string, string> Passwords = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Dictionary<string, (ArchiveIndex Index, long Used)> Indexes = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, string> Passwords = new(StringComparer.Ordinal);
     private static readonly object PasswordGate = new();
     private static long _uses;
     private static int _sweptTemp;
+    private static readonly string TempSession = Guid.NewGuid().ToString("N");
+    private static readonly ConcurrentDictionary<string, object> ExtractionLocks = new(StringComparer.Ordinal);
+    private static readonly ConcurrentDictionary<string, ArchiveIndex> LocatedArchives = new(StringComparer.Ordinal);
 
     /// <summary>Whether archives are shown as folders at all (Settings).  When off, they are files again.</summary>
-    public static bool BrowseArchives { get; set; } = true;
+    public static bool BrowseArchives { get; set; }
 
     /// <summary>Whether 7-Zip's library was found.  Without it archives stay files.</summary>
     public static bool IsAvailable => SevenZipLibrary.IsAvailable;
@@ -46,6 +50,8 @@ public static class ArchiveService
     /// brings the question to the window's own.
     /// </summary>
     public static Func<string, string?>? PasswordPrompt { get; set; }
+    private static readonly Func<string, string?> NoPasswordPrompt = static _ => null;
+    private static Func<string, string?> CapturePrompt(Func<string, string?>? prompt) => prompt ?? PasswordPrompt ?? NoPasswordPrompt;
 
     /// <summary>Where files taken out to be opened, dragged or copied are put.</summary>
     public static string TempRoot { get; } = Path.Combine(Path.GetTempPath(), "UltraExplorer", "Archives");
@@ -58,7 +64,12 @@ public static class ArchiveService
     /// </summary>
     public static bool MayInvolveArchive(string path)
     {
-        if (!BrowseArchives || path.Length < 4)
+        return BrowseArchives && MayContainArchiveName(path);
+    }
+
+    internal static bool MayContainArchiveName(string path)
+    {
+        if (path.Length < 4)
         {
             return false;
         }
@@ -88,7 +99,7 @@ public static class ArchiveService
     /// <summary>Whether the path is inside an archive - a file or a folder that is not on disk itself, but in one.</summary>
     public static bool IsInsideArchive(string path)
     {
-        if (!MayInvolveArchive(path) || !IsAvailable || File.Exists(path) || Directory.Exists(path))
+        if (!MayContainArchiveName(path) || !IsAvailable || File.Exists(path) || Directory.Exists(path))
         {
             return false;
         }
@@ -100,8 +111,9 @@ public static class ArchiveService
     public static bool AnyInsideArchive(IEnumerable<string> paths) => paths.Any(IsInsideArchive);
 
     /// <summary>Whether the file on disk is an archive the canvas opens as a folder.</summary>
-    public static bool IsArchiveFile(string path) =>
-        BrowseArchives && IsAvailable && ArchiveFormats.IsBrowsable(Path.GetFileName(path.AsSpan())) && File.Exists(path);
+    public static bool IsArchiveFile(string path) => IsArchiveFile(path, BrowseArchives);
+    public static bool IsArchiveFile(string path, bool archivesEnabled) =>
+        archivesEnabled && IsAvailable && ArchiveFormats.IsBrowsable(Path.GetFileName(path.AsSpan())) && File.Exists(path);
 
     /// <summary>The archive on disk a path goes through, or null: the first part of it that is a file named like one.</summary>
     private static string? ArchiveFileOf(string path)
@@ -137,16 +149,17 @@ public static class ArchiveService
     /// through.  False when the path goes through no archive.  Slow the
     /// first time for each archive; off the UI thread.
     /// </summary>
-    internal static bool TryLocate(string path, out ArchiveLocation location, CancellationToken cancellation = default)
+    internal static bool TryLocate(string path, out ArchiveLocation location, CancellationToken cancellation = default, bool allowPrompt = true, bool acceptedOperation = false, Func<string, string?>? passwordPrompt = null)
     {
         location = default;
-        if (!MayInvolveArchive(path) || !IsAvailable || ArchiveFileOf(path) is not { } file)
+        if ((!acceptedOperation && !BrowseArchives) || !MayContainArchiveName(path) || !IsAvailable || ArchiveFileOf(path) is not { } file)
         {
             return false;
         }
 
         var index = IndexOf(file, cancellation);
         var archivePath = file;
+        LocatedArchives[archivePath] = index;
         var rest = path.Length > file.Length ? path[(file.Length + 1)..].TrimEnd('\\') : string.Empty;
 
         // An archive inside this one: taken out, and gone on into.
@@ -176,9 +189,10 @@ public static class ArchiveService
             }
 
             var inner = rest[..nested];
-            var copy = TakeOutNested(index, inner, cancellation);
+            var copy = TakeOutNested(index, inner, cancellation, allowPrompt, passwordPrompt);
             index = IndexOf(copy, cancellation);
             archivePath = archivePath + '\\' + inner;
+            LocatedArchives[archivePath] = index;
             rest = nested < rest.Length ? rest[(nested + 1)..] : string.Empty;
         }
 
@@ -212,7 +226,10 @@ public static class ArchiveService
             if (Indexes.Count > CachedIndexes)
             {
                 var oldest = Indexes.MinBy(pair => pair.Value.Used).Key;
+                var removedIndex = Indexes[oldest].Index;
                 Indexes.Remove(oldest);
+                foreach (var pair in LocatedArchives.Where(pair => ReferenceEquals(pair.Value, removedIndex)))
+                    LocatedArchives.TryRemove(pair.Key, out _);
             }
         }
 
@@ -220,19 +237,32 @@ public static class ArchiveService
     }
 
     /// <summary>An archive inside an archive, taken out to the temporary folder once and kept there while its outer one does not change.</summary>
-    private static string TakeOutNested(ArchiveIndex outer, string inner, CancellationToken cancellation)
+    private static string TakeOutNested(ArchiveIndex outer, string inner, CancellationToken cancellation, bool allowPrompt, Func<string, string?>? passwordPrompt)
     {
         outer.TryGetItem(inner, out var item);
-        var folder = Path.Combine(TempRoot, "nested", Stamp(outer.Path, outer.WriteTicks, inner));
+        if (!allowPrompt && item.Size > MaximumAutomaticNestedBytes)
+            throw new InvalidDataException("This nested archive is larger than 512 MiB. Extract it to a folder first to browse it.");
+        var folder = Path.Combine(TempRoot, "nested", TempSession + "-" + Stamp(outer.Path, outer.WriteTicks, inner, outer.Length));
         var copy = Path.Combine(folder, Path.GetFileName(inner));
-        if (File.Exists(copy) && new FileInfo(copy).Length == item.Size)
+        lock (ExtractionLocks.GetOrAdd(folder, static _ => new object()))
         {
+            cancellation.ThrowIfCancellationRequested();
+            EnsureSafeOutput(copy);
+            if (File.Exists(copy) && new FileInfo(copy).Length == item.Size) return copy;
+            Directory.CreateDirectory(folder);
+            var staging = Path.Combine(folder, Guid.NewGuid().ToString("N") + ".partial");
+            try
+            {
+                ExtractItems(outer, [(item, staging)], cancellation, null, allowPrompt, passwordPrompt);
+                File.Move(staging, copy, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(staging)) File.Delete(staging);
+            }
+
             return copy;
         }
-
-        Directory.CreateDirectory(folder);
-        ExtractItems(outer, [(item, copy)], cancellation, null);
-        return copy;
     }
 
     // ---- reading -----------------------------------------------------------------------
@@ -242,16 +272,18 @@ public static class ArchiveService
     /// itself; null for a path that goes through no archive, which is read
     /// from disk as always.
     /// </summary>
-    public static NestedListing? TryRead(string path, CancellationToken cancellation)
+    public static NestedListing? TryRead(string path, CancellationToken cancellation) => TryRead(path, cancellation, BrowseArchives);
+
+    public static NestedListing? TryRead(string path, CancellationToken cancellation, bool archivesEnabled)
     {
-        if (!MayInvolveArchive(path) || !IsAvailable)
+        if (!archivesEnabled || !MayContainArchiveName(path) || !IsAvailable)
         {
             return null;
         }
 
         try
         {
-            if (!TryLocate(path, out var location, cancellation))
+            if (!TryLocate(path, out var location, cancellation, allowPrompt: false, acceptedOperation: true))
             {
                 return null;
             }
@@ -273,10 +305,10 @@ public static class ArchiveService
     }
 
     /// <summary>Asks for the password of an archive whose names are encrypted, and keeps it; true when one was given.</summary>
-    public static bool AskPassword(string archivePath)
+    public static bool AskPassword(string archivePath, Func<string, string?>? passwordPrompt = null)
     {
         var file = ArchiveFileOf(archivePath) ?? archivePath;
-        if (PasswordPrompt?.Invoke(Path.GetFileName(archivePath)) is not { } password)
+        if ((passwordPrompt ?? PasswordPrompt)?.Invoke(Path.GetFileName(archivePath)) is not { } password)
         {
             return false;
         }
@@ -290,13 +322,31 @@ public static class ArchiveService
         return true;
     }
 
+    /// <summary>Resolves encrypted nested headers off the window thread, then stores the password against their physical cache file.</summary>
+    public static async Task<bool> AskPasswordAsync(string archivePath, Func<string, string?>? passwordPrompt = null)
+    {
+        var prompt = CapturePrompt(passwordPrompt);
+        var file = await Task.Run(() =>
+        {
+            try
+            {
+                return TryLocate(archivePath, out var location, allowPrompt: false, acceptedOperation: true) ? location.Index.Path : archivePath;
+            }
+            catch (ArchivePasswordException protectedArchive)
+            {
+                return protectedArchive.ArchivePath;
+            }
+        });
+        return AskPassword(file, prompt);
+    }
+
     /// <summary>The size and date of a file inside an archive, for a selection that wants to show them.</summary>
     public static bool TryGetFile(string path, out long size, out long modifiedTicks)
     {
         size = modifiedTicks = 0;
         try
         {
-            if (TryLocate(path, out var location) && location.Index.TryGetItem(location.Inner, out var item))
+            if (TryLocateCached(path, out var location) && location.Index.TryGetItem(location.Inner, out var item))
             {
                 size = item.Size;
                 modifiedTicks = item.ModifiedTicks;
@@ -314,20 +364,46 @@ public static class ArchiveService
     /// Whether a path is something the canvas shows as a folder: a folder on
     /// disk, an archive, or a folder inside an archive.
     /// </summary>
-    public static bool IsFolderLike(string path) =>
-        Directory.Exists(path) || IsArchiveFile(path) || IsInsideArchive(path) && IsFolderInArchive(path);
+    public static bool IsFolderLike(string path) => IsFolderLike(path, BrowseArchives);
+    public static bool IsFolderLike(string path, bool archivesEnabled) =>
+        Directory.Exists(path) || IsArchiveFile(path, archivesEnabled) || archivesEnabled && IsInsideArchive(path) && IsFolderInArchive(path);
 
     /// <summary>Whether a path inside an archive is a folder there.</summary>
     public static bool IsFolderInArchive(string path)
     {
         try
         {
-            return TryLocate(path, out var location) && location.Index.IsFolder(location.Inner);
+            return TryLocateCached(path, out var location) && location.Index.IsFolder(location.Inner);
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or InvalidOperationException or COMException)
         {
             return false;
         }
+    }
+
+    /// <summary>Used only on a worker for direct navigation before a folder's listing has been cached.</summary>
+    internal static bool IsFolderLikeForNavigation(string path) => Directory.Exists(path) || IsArchiveFile(path, archivesEnabled: true)
+        || IsInsideArchive(path) && TryLocate(path, out var location, allowPrompt: false, acceptedOperation: true) && location.Index.IsFolder(location.Inner);
+
+    private static bool TryLocateCached(string path, out ArchiveLocation location)
+    {
+        // Selection and context-menu metadata runs on the window thread. It must never extract a nested archive or wait on a password worker.
+        location = default;
+        var best = string.Empty;
+        ArchiveIndex? index = null;
+        foreach (var pair in LocatedArchives)
+        {
+            if (pair.Key.Length > best.Length && (path.Equals(pair.Key, StringComparison.Ordinal)
+                || path.StartsWith(pair.Key + '\\', StringComparison.Ordinal)))
+            {
+                best = pair.Key;
+                index = pair.Value;
+            }
+        }
+
+        if (index is null) return false;
+        location = new ArchiveLocation(index, path.Length == best.Length ? string.Empty : path[(best.Length + 1)..].TrimEnd('\\'), best);
+        return true;
     }
 
     // ---- taking things out ---------------------------------------------------------------
@@ -338,40 +414,64 @@ public static class ArchiveService
     /// folder, the way it would run unpacked.  Taken out again only when the
     /// archive has changed.
     /// </summary>
-    public static async Task<string> ExtractForOpenAsync(string path, IProgress<ArchiveProgress>? progress, CancellationToken cancellation)
+    public static async Task<string> ExtractForOpenAsync(string path, IProgress<ArchiveProgress>? progress, CancellationToken cancellation, Func<string, string?>? passwordPrompt = null)
     {
+        var prompt = CapturePrompt(passwordPrompt);
         return await Task.Run(() =>
         {
             SweepTempOnce();
-            if (!TryLocate(path, out var location, cancellation) || !location.Index.TryGetItem(location.Inner, out var item))
+            if (!TryLocate(path, out var location, cancellation, acceptedOperation: true, passwordPrompt: prompt) || !location.Index.TryGetItem(location.Inner, out var item))
             {
                 throw new FileNotFoundException("Not found in the archive.", path);
             }
 
-            var root = Path.Combine(TempRoot, "open", Stamp(location.Index.Path, location.Index.WriteTicks, string.Empty));
+            var root = Path.Combine(TempRoot, "open", TempSession + "-" + Stamp(location.Index.Path, location.Index.WriteTicks, string.Empty, location.Index.Length));
             var target = Path.Combine(root, location.Inner);
-            if (File.Exists(target) && new FileInfo(target).Length == item.Size)
+            lock (ExtractionLocks.GetOrAdd(root, static _ => new object()))
             {
-                return target;
-            }
-
-            var slash = location.Inner.LastIndexOf('\\');
-            var parent = slash < 0 ? string.Empty : location.Inner[..slash];
-            var work = new List<(ArchiveItem, string)>();
-            if (NativeShellService.IsExecutable(path) || IsInstaller(path))
-            {
-                foreach (var (inner, below) in location.Index.Below(parent))
+                cancellation.ThrowIfCancellationRequested();
+                EnsureSafeOutput(target);
+                if (File.Exists(target) && new FileInfo(target).Length == item.Size)
                 {
-                    work.Add((below, Path.Combine(root, inner)));
+                    return target;
+                }
+
+                var staging = root + ".partial-" + Guid.NewGuid().ToString("N");
+                var slash = location.Inner.LastIndexOf('\\');
+                var parent = slash < 0 ? string.Empty : location.Inner[..slash];
+                var work = new List<(ArchiveItem, string)>();
+                if (NativeShellService.IsExecutable(path) || IsInstaller(path))
+                {
+                    foreach (var (inner, below) in location.Index.Below(parent))
+                        work.Add((below, Path.Combine(staging, inner)));
+                }
+                else
+                {
+                    work.Add((item, Path.Combine(staging, location.Inner)));
+                }
+
+                try
+                {
+                    ExtractItems(location.Index, work, cancellation, progress, passwordPrompt: prompt);
+                    foreach (var (_, staged) in work)
+                    {
+                        var output = Path.Combine(root, Path.GetRelativePath(staging, staged));
+                        EnsureSafeOutput(output);
+                        if (Directory.Exists(staged)) Directory.CreateDirectory(output);
+                        else
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+                            File.Move(staged, output, overwrite: true);
+                        }
+                    }
+
+                    return target;
+                }
+                finally
+                {
+                    if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
                 }
             }
-            else
-            {
-                work.Add((item, target));
-            }
-
-            ExtractItems(location.Index, work, cancellation, progress);
-            return target;
         }, cancellation);
     }
 
@@ -385,15 +485,17 @@ public static class ArchiveService
     /// below it.  The items can come from different archives.  Returns what
     /// was made, one path per item.
     /// </summary>
-    public static Task<IReadOnlyList<string>> ExtractToAsync(IReadOnlyList<string> paths, string destination, IProgress<ArchiveProgress>? progress, CancellationToken cancellation) =>
-        Task.Run<IReadOnlyList<string>>(() =>
+    public static Task<IReadOnlyList<string>> ExtractToAsync(IReadOnlyList<string> paths, string destination, IProgress<ArchiveProgress>? progress, CancellationToken cancellation, Func<string, string?>? passwordPrompt = null)
+    {
+        var prompt = CapturePrompt(passwordPrompt);
+        return Task.Run<IReadOnlyList<string>>(() =>
         {
             var made = new List<string>();
             var groups = new Dictionary<ArchiveIndex, List<(ArchiveItem, string)>>(ReferenceEqualityComparer.Instance);
             var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             foreach (var path in paths)
             {
-                if (!TryLocate(path, out var location, cancellation))
+                if (!TryLocate(path, out var location, cancellation, acceptedOperation: true, passwordPrompt: prompt))
                 {
                     throw new FileNotFoundException("Not inside an archive.", path);
                 }
@@ -422,11 +524,12 @@ public static class ArchiveService
             var total = new ProgressSum(progress, groups.Values.Sum(work => work.Sum(entry => entry.Item1.Size)));
             foreach (var (index, work) in groups)
             {
-                ExtractItems(index, work, cancellation, total);
+                ExtractItems(index, work, cancellation, total, passwordPrompt: prompt);
             }
 
             return made;
         }, cancellation);
+    }
 
     /// <summary>
     /// A whole archive unpacked next to it (or into <paramref name="destination"/>):
@@ -435,10 +538,12 @@ public static class ArchiveService
     /// never scatters files, and never makes a folder in a folder.
     /// Returns the folder or file that came out.
     /// </summary>
-    public static Task<string> ExtractArchiveAsync(string archivePath, string? destination, bool alwaysOwnFolder, IProgress<ArchiveProgress>? progress, CancellationToken cancellation) =>
-        Task.Run(() =>
+    public static Task<string> ExtractArchiveAsync(string archivePath, string? destination, bool alwaysOwnFolder, IProgress<ArchiveProgress>? progress, CancellationToken cancellation, Func<string, string?>? passwordPrompt = null)
+    {
+        var prompt = CapturePrompt(passwordPrompt);
+        return Task.Run(() =>
         {
-            if (!TryLocate(archivePath, out var location, cancellation) || location.Inner.Length != 0)
+            if (!TryLocate(archivePath, out var location, cancellation, acceptedOperation: true, passwordPrompt: prompt) || location.Inner.Length != 0)
             {
                 throw new InvalidDataException("Not an archive.");
             }
@@ -471,17 +576,19 @@ public static class ArchiveService
                 }
             }
 
-            ExtractItems(index, work, cancellation, new ProgressSum(progress, work.Sum(entry => entry.Item1.Size)));
+            ExtractItems(index, work, cancellation, new ProgressSum(progress, work.Sum(entry => entry.Item1.Size)), passwordPrompt: prompt);
             return result;
         }, cancellation);
+    }
 
     /// <summary>Items inside archives taken out to a fresh temporary folder: what a drag or a copy to the clipboard carries.</summary>
-    public static async Task<IReadOnlyList<string>> ExtractToTempAsync(IReadOnlyList<string> paths, IProgress<ArchiveProgress>? progress, CancellationToken cancellation)
+    public static async Task<IReadOnlyList<string>> ExtractToTempAsync(IReadOnlyList<string> paths, IProgress<ArchiveProgress>? progress, CancellationToken cancellation, Func<string, string?>? passwordPrompt = null)
     {
+        var prompt = CapturePrompt(passwordPrompt);
         SweepTempOnce();
         var folder = Path.Combine(TempRoot, "out", Guid.NewGuid().ToString("N")[..12]);
         Directory.CreateDirectory(folder);
-        return await ExtractToAsync(paths, folder, progress, cancellation);
+        return await ExtractToAsync(paths, folder, progress, cancellation, prompt);
     }
 
     /// <summary>
@@ -491,12 +598,17 @@ public static class ArchiveService
     /// and its share of the bytes - the biggest files dealt out first, so the
     /// threads finish together.
     /// </summary>
-    private static void ExtractItems(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> work, CancellationToken cancellation, IProgress<ArchiveProgress>? progress)
+    private static void ExtractItems(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> work, CancellationToken cancellation, IProgress<ArchiveProgress>? progress, bool allowPrompt = true, Func<string, string?>? passwordPrompt = null)
     {
         var files = new List<(ArchiveItem Item, string Output)>(work.Count);
         var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var outputNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (var (item, output) in work)
         {
+            cancellation.ThrowIfCancellationRequested();
+            EnsureSafeOutput(output);
+            if (!outputNames.Add(output))
+                throw new InvalidDataException("Archive entries have conflicting output names. Extract them individually to preserve both files.");
             if (item.IsDirectory || item.Index == uint.MaxValue)
             {
                 folders.Add(output);
@@ -526,7 +638,7 @@ public static class ArchiveService
         var threads = index.IsSolid ? 1 : Math.Min(Math.Min(Environment.ProcessorCount, 8), Math.Max(1, (int)Math.Min(files.Count / 4, bytes / (8L << 20))));
         if (threads <= 1)
         {
-            RunExtract(index, files, cancellation, sum);
+            RunExtract(index, files, cancellation, sum, allowPrompt, passwordPrompt);
             return;
         }
 
@@ -545,7 +657,7 @@ public static class ArchiveService
         {
             try
             {
-                RunExtract(index, share, stop.Token, sum);
+                RunExtract(index, share, stop.Token, sum, allowPrompt, passwordPrompt);
             }
             catch (Exception ex)
             {
@@ -562,7 +674,7 @@ public static class ArchiveService
     }
 
     /// <summary>One handle on the archive, one call to 7-Zip for every file of a share - in the archive's own order, which is the fast one.</summary>
-    private static void RunExtract(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> files, CancellationToken cancellation, ProgressSum progress)
+    private static void RunExtract(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> files, CancellationToken cancellation, ProgressSum progress, bool allowPrompt, Func<string, string?>? passwordPrompt)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -571,11 +683,15 @@ public static class ArchiveService
             var targets = new Dictionary<uint, (string Output, long Ticks, long Size)>(files.Count);
             foreach (var (item, output) in files)
             {
-                targets[item.Index] = (output, item.ModifiedTicks, item.Size);
+                if (!targets.TryAdd(item.Index, (output, item.ModifiedTicks, item.Size)))
+                {
+                    // Parent+child or duplicate selections can request the same archive entry at multiple destinations.
+                    RunExtract(index, [(item, output)], cancellation, progress, allowPrompt, passwordPrompt);
+                }
             }
 
             var indices = targets.Keys.Order().ToArray();
-            var callback = new ExtractCallback(targets, () => PasswordFor(archiveFile), progress, cancellation);
+            var callback = new ExtractCallback(targets, () => PasswordFor(archiveFile, allowPrompt, passwordPrompt), progress, cancellation);
             int result;
             try
             {
@@ -613,12 +729,14 @@ public static class ArchiveService
     }
 
     /// <summary>The password for an archive, asked for once and shared by every thread taking files out of it.</summary>
-    private static string? PasswordFor(string archiveFile)
+    private static string? PasswordFor(string archiveFile, bool allowPrompt, Func<string, string?>? passwordPrompt)
     {
         if (Passwords.TryGetValue(archiveFile, out var known))
         {
             return known;
         }
+
+        if (!allowPrompt) return null;
 
         lock (PasswordGate)
         {
@@ -627,7 +745,7 @@ public static class ArchiveService
                 return known;
             }
 
-            if (PasswordPrompt?.Invoke(Path.GetFileName(archiveFile)) is not { } given)
+            if (passwordPrompt?.Invoke(Path.GetFileName(archiveFile)) is not { } given)
             {
                 return null;
             }
@@ -672,9 +790,32 @@ public static class ArchiveService
         return path;
     }
 
-    private static string Stamp(string path, long ticks, string inner)
+    /// <summary>Never follow a pre-existing file, junction or symbolic-link output to another location.</summary>
+    internal static void EnsureSafeOutput(string output)
     {
-        var text = $"{path.ToUpperInvariant()}|{ticks}|{inner.ToUpperInvariant()}";
+        for (var current = Path.GetFullPath(output); !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
+        {
+            try
+            {
+                var attributes = File.GetAttributes(current);
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    // OneDrive placeholders and projected folders carry a reparse point too,
+                    // but remain ordinary paths. Only actual links/junctions report a target.
+                    FileSystemInfo entry = (attributes & FileAttributes.Directory) != 0
+                        ? new DirectoryInfo(current) : new FileInfo(current);
+                    if (entry.LinkTarget is not null)
+                        throw new IOException($"Cannot extract through a symbolic link or junction: {current}");
+                }
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+        }
+    }
+
+    private static string Stamp(string path, long ticks, string inner, long length)
+    {
+        var text = $"{path}|{ticks}|{length}|{inner}";
         var hash = System.Security.Cryptography.SHA1.HashData(System.Text.Encoding.UTF8.GetBytes(text));
         return Convert.ToHexString(hash, 0, 8).ToLowerInvariant();
     }
@@ -786,19 +927,22 @@ internal sealed class ExtractCallback(
 
         try
         {
+            if (cancellation.IsCancellationRequested) return HResult.Abort;
+            ArchiveService.EnsureSafeOutput(target.Output);
             var stream = new FileStream(target.Output, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
+            _current = stream;
+            _target = target;
             if (target.Size > 0)
             {
                 stream.SetLength(target.Size);
             }
 
-            _current = stream;
-            _target = target;
             outStream = new StreamOutStream(stream);
             return HResult.Ok;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            CloseCurrent(failed: true);
             Failed++;
             if (FirstProblem.Length == 0)
             {

@@ -75,6 +75,7 @@ internal sealed class SearchEngine
     private const int WalkReportMilliseconds = 120;
 
     private readonly EverythingClient _everything;
+    private readonly Func<string, int, CancellationToken, uint, Task<EverythingPage?>> _askEverything;
     private readonly Func<char, VolumeResolver.Letter> _letters;
     private (long Stamp, IReadOnlyList<(string Letter, string Target)> Substs) _substs = (long.MinValue, []);
 
@@ -83,9 +84,11 @@ internal sealed class SearchEngine
     {
     }
 
-    internal SearchEngine(EverythingClient everything, Func<char, VolumeResolver.Letter> letters)
+    internal SearchEngine(EverythingClient everything, Func<char, VolumeResolver.Letter> letters,
+        Func<string, int, CancellationToken, uint, Task<EverythingPage?>>? askEverything = null)
     {
         _everything = everything;
+        _askEverything = askEverything ?? everything.QueryAsync;
         _letters = letters;
     }
 
@@ -173,7 +176,7 @@ internal sealed class SearchEngine
         var none = new EverythingPage(0, []);
         try
         {
-            everywhere = await _everything.QueryAsync(query.Excluding(excluded), EverywhereLimit, cancellationToken, EverythingClient.SortNewestFirst).ConfigureAwait(false);
+            everywhere = await _askEverything(query.Excluding(excluded), EverywhereLimit, cancellationToken, EverythingClient.SortNewestFirst).ConfigureAwait(false);
             if (everywhere is null)
             {
                 return false;
@@ -182,10 +185,10 @@ internal sealed class SearchEngine
             var complete = everywhere.Items.Count >= everywhere.Total;
             under = here is null || complete
                 ? none
-                : await _everything.QueryAsync(query.Under(here), HereLimit, cancellationToken, EverythingClient.SortNewestFirst).ConfigureAwait(false);
+                : await _askEverything(query.Under(here), HereLimit, cancellationToken, EverythingClient.SortNewestFirst).ConfigureAwait(false);
             starting = complete || query.PrefixExcluding(excluded) is not { } prefix
                 ? none
-                : await _everything.QueryAsync(prefix, PrefixLimit, cancellationToken).ConfigureAwait(false);
+                : await _askEverything(prefix, PrefixLimit, cancellationToken, EverythingClient.SortNameAscending).ConfigureAwait(false);
             // A side question that timed out costs only its own part: what
             // came back for everywhere is still the answer, not a walk.
             under ??= none;

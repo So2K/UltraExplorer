@@ -331,7 +331,7 @@ public sealed partial class NestedTree
         var frame = Frame;
         folder.LastDrawnFrame = frame;
         folder.LastDrawnWidth = (float)priority;
-        if (folder.IsComputer || folder.IsReparsePoint && !folder.IsLoaded || !IsReadingOnDemand || _disposed
+        if (folder.IsComputer || folder.IsInArchive && !ArchivesEnabled || folder.IsReparsePoint && !folder.IsLoaded || !IsReadingOnDemand || _disposed
             || folder.HasPartialListing && PartialListingReadAllowed?.Invoke(folder) == false)
         {
             return;
@@ -339,6 +339,7 @@ public sealed partial class NestedTree
 
         folder.RequestedFrame = frame;
         folder.Priority = priority;
+        if (folder.ArchivesGeneration != _archivesGeneration) folder.IsStale = true;
         if (folder.QueuedRead != ReadKind.None)
         {
             return;
@@ -458,6 +459,9 @@ public sealed partial class NestedTree
         {
             return Task.FromCanceled(cancellationToken);
         }
+
+        if (folder.IsLoaded && folder.ArchivesGeneration != _archivesGeneration)
+            return RefreshAsync(folder, cancellationToken);
 
         ReadWaiter waiter;
         lock (_gate)
@@ -704,7 +708,7 @@ public sealed partial class NestedTree
             folder.LoadState = NestedLoadState.Loading;
         }
 
-        pick = new ReadPick(folder, folder.QueuedRead, folder.ReadTicket, local ? null : lane, lane);
+        pick = new ReadPick(folder, folder.QueuedRead, folder.ReadTicket, local ? null : lane, lane, _archivesGeneration);
         return true;
     }
 
@@ -1108,6 +1112,7 @@ public sealed partial class NestedTree
 
         /// <summary>The read was cancelled: the tree is going away, or the reader gave up.</summary>
         public bool IsCancelled { get; init; }
+        public int ArchivesGeneration { get; init; }
     }
 
     /// <summary>
@@ -1175,6 +1180,7 @@ public sealed partial class NestedTree
             return new ReadResult(folder, pick.Kind, NestedListing.Failed("Cancelled"), basis, [], basis, 0)
             {
                 Ticket = pick.Ticket,
+                ArchivesGeneration = pick.ArchivesGeneration,
                 IsCancelled = true
             };
         }
@@ -1186,6 +1192,7 @@ public sealed partial class NestedTree
         return new ReadResult(folder, pick.Kind, listing, children, removed, basis, Stopwatch.GetElapsedTime(started).TotalMilliseconds)
         {
             Ticket = pick.Ticket,
+            ArchivesGeneration = pick.ArchivesGeneration,
             DirectoryWriteTicks = directoryTicks
         };
     }
@@ -1318,6 +1325,15 @@ public sealed partial class NestedTree
                 return false;
             }
 
+            if (read.ArchivesGeneration != _archivesGeneration && !IsDetached(folder))
+            {
+                // A read begun before a toggle cannot restore archive tiles from the old mode.
+                folder.QueuedRead = ReadKind.None;
+                if (folder.LoadState == NestedLoadState.Loading) folder.LoadState = NestedLoadState.NotLoaded;
+                EnqueueLocked(folder, folder.IsLoaded ? ReadKind.Refresh : ReadKind.Load, sticky: true);
+                return false;
+            }
+
             folder.QueuedRead = ReadKind.None;
             folder.IsSticky = false;
             _explicit.Remove(folder, out request);
@@ -1390,6 +1406,7 @@ public sealed partial class NestedTree
         }
 
         folder.DirWriteTicks = read.DirectoryWriteTicks;
+        folder.ArchivesGeneration = read.ArchivesGeneration;
         var listing = read.Listing;
         if (!string.IsNullOrEmpty(listing.ErrorMessage))
         {
@@ -1651,7 +1668,7 @@ public sealed partial class NestedTree
     }
 
     /// <summary>A read a slot has begun: the folder, which read, its ticket, and the share whose lane it holds (null: local).</summary>
-    private readonly record struct ReadPick(NestedFolder Folder, ReadKind Kind, int Ticket, string? Share, string Lane);
+    private readonly record struct ReadPick(NestedFolder Folder, ReadKind Kind, int Ticket, string? Share, string Lane, int ArchivesGeneration);
 
     /// <summary>Who is waiting on one folder's read, and whether a read already under way will not do.</summary>
     private sealed class ExplicitRead

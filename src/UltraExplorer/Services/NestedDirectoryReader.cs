@@ -34,10 +34,13 @@ public static class NestedDirectoryReader
     [ThreadStatic]
     private static List<NestedFile>? t_files;
 
-    public static NestedListing Read(string path, CancellationToken cancellationToken)
+    public static NestedListing Read(string path, CancellationToken cancellationToken) =>
+        Read(path, cancellationToken, ArchiveService.BrowseArchives);
+
+    public static NestedListing Read(string path, CancellationToken cancellationToken, bool archivesEnabled)
     {
         // An archive, or a folder inside one, is read through 7-Zip.
-        if (ArchiveService.TryRead(path, cancellationToken) is { } inArchive)
+        if (archivesEnabled && ArchiveService.TryRead(path, cancellationToken, archivesEnabled) is { } inArchive)
         {
             return inArchive;
         }
@@ -46,7 +49,7 @@ public static class NestedDirectoryReader
         var listed = t_files ??= [];
         try
         {
-            return Read(path, folders, listed, cancellationToken);
+            return Read(path, folders, listed, cancellationToken, archivesEnabled);
         }
         finally
         {
@@ -56,9 +59,9 @@ public static class NestedDirectoryReader
         }
     }
 
-    private static NestedListing Read(string path, List<NestedEntry> folders, List<NestedFile> listed, CancellationToken cancellationToken)
+    private static NestedListing Read(string path, List<NestedEntry> folders, List<NestedFile> listed, CancellationToken cancellationToken, bool archivesEnabled)
     {
-        var archivesAsFolders = ArchiveService.BrowseArchives && ArchiveService.IsAvailable;
+        var archivesAsFolders = archivesEnabled && ArchiveService.IsAvailable;
         var options = new EnumerationOptions
         {
             IgnoreInaccessible = false,
@@ -116,6 +119,12 @@ public static class NestedDirectoryReader
                 var isHidden = (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
                 if (!isDirectory && archivesAsFolders && ArchiveFormats.IsBrowsable(name))
                 {
+                    if (folders.Count >= NestedTree.MaximumChildren)
+                    {
+                        truncated = true;
+                        continue;
+                    }
+
                     folders.Add(new NestedEntry(name, isHidden, false, modifiedTicks, IsArchive: true));
                     continue;
                 }

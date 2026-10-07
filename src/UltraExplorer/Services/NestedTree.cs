@@ -74,10 +74,12 @@ public sealed partial class NestedTree : IDisposable
     private int _knownCount;
     private bool _includeHidden;
     private Func<string, bool>? _fileNameFilter;
+    private bool _archivesEnabled;
+    private int _archivesGeneration;
 
     public NestedTree(Func<string, CancellationToken, NestedListing>? reader = null)
     {
-        _reader = reader ?? NestedDirectoryReader.Read;
+        _reader = reader ?? ((path, cancellation) => NestedDirectoryReader.Read(path, cancellation, _archivesEnabled));
 
         // Taken once: a disposed source throws on every later read of its token.
         _lifetimeToken = _lifetime.Token;
@@ -208,6 +210,21 @@ public sealed partial class NestedTree : IDisposable
 
             _includeHidden = value;
             RefilterAll();
+        }
+    }
+
+    /// <summary>Opt-in archive folders. Existing physical branches are refreshed without losing their expansion.</summary>
+    public bool ArchivesEnabled
+    {
+        get => _archivesEnabled;
+        set
+        {
+            if (_archivesEnabled == value || _disposed) return;
+            _archivesEnabled = value;
+            _archivesGeneration++;
+            // Generation stamps make visible/explicitly opened folders refresh lazily.
+            // Toggling a tree with thousands of cached branches queues no blanket reread.
+            RaiseChanged();
         }
     }
 

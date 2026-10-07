@@ -180,6 +180,7 @@ public partial class MainWindow
         pane.Canvas.ShownLayers = _viewModel.Layers;
         pane.Canvas.IsSpacePanArmed = _isSpaceHeld;
         pane.Initialize(NestedRoots());
+        pane.Canvas.ShowCopyPathButton = _viewModel.ShowCopyPathButton && !IsPickerMode;
 
         var tree = _viewModel.Tree;
         var saved = tree.SecondPane;

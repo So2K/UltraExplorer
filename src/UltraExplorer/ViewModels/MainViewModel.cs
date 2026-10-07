@@ -823,6 +823,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(ShowHoverPreviews));
             }
 
+            ApplyOptionalFeaturePreferences(state);
+
             // A file dialog shows the tree and never splits, and writes back
             // whatever the file says (see SaveNowAsync).
             if (!_isPickerSession)
@@ -1203,6 +1205,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         if (_isDisposed) return;
         var state = await _workspaceStore.LoadAsync();
         if (state is null || _isDisposed) return;
+        ApplyOptionalFeaturePreferences(state);
         if (!_favoriteLinksChanged && _showFavoriteLinks != state.ShowFavoriteLinks)
         {
             _showFavoriteLinks = state.ShowFavoriteLinks;
@@ -1279,6 +1282,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         var favoritesBefore = _savedFavorites;
         var ownLinks = _favoriteLinksChanged;
         var ownHoverPreviews = _hoverPreviewsChanged;
+        var ownOptionalFeatures = _optionalFeaturesChanged;
         var ownFavorites = _favoritesChanged;
         try
         {
@@ -1297,13 +1301,14 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 // Nothing of this window's to write - a window closed after
                 // another saved its change must not write that file back as
                 // it read it a moment before.
-                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownHoverPreviews, ownFavorites);
+                var state = MergeWorkspace(here, before, current, favoritesBefore, ownLinks, ownHoverPreviews, ownFavorites, ownOptionalFeatures);
                 return JsonSerializer.SerializeToUtf8Bytes(state).AsSpan().SequenceEqual(JsonSerializer.SerializeToUtf8Bytes(current))
                     ? null
                     : state;
             });
 
             _savedWorkspace = here;
+            FinishOptionalFeatureSave(here, ownOptionalFeatures);
             if (ownFavorites)
             {
                 _savedFavorites = here.Favorites;
@@ -1315,6 +1320,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            if (!_isDisposed) Toast.ShowError(ex.Message);
         }
 
         await Tree.SaveAsync();
@@ -1340,6 +1346,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         CanvasLayersOff = CanvasLayers.OffSetting(_layers),
         ShowFavoriteLinks = _showFavoriteLinks,
         ShowHoverPreviews = _showHoverPreviews,
+        BrowseArchives = _browseArchives,
+        ShowDropShelf = _showDropShelf,
+        ShowCopyPathButton = _showCopyPathButton,
         IsSplit = _isSplit,
         SplitOrientation = SplitLayout.OrientationSetting(_splitOrientation),
         SplitRatio = _splitRatio,
@@ -1367,7 +1376,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         List<FavoriteState> favoritesBefore,
         bool ownLinks,
         bool ownHoverPreviews,
-        bool ownFavorites)
+        bool ownFavorites,
+        byte ownOptionalFeatures)
     {
         var settings = !_isPickerSession;
         var view = !_isPickerSession && !_isFolderWindow;
@@ -1392,6 +1402,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 : there.CanvasLayersOff,
             ShowFavoriteLinks = ownLinks ? here.ShowFavoriteLinks : there.ShowFavoriteLinks,
             ShowHoverPreviews = ownHoverPreviews ? here.ShowHoverPreviews : there.ShowHoverPreviews,
+            BrowseArchives = settings && (ownOptionalFeatures & ArchivesPreference) != 0 ? here.BrowseArchives : there.BrowseArchives,
+            ShowDropShelf = settings && (ownOptionalFeatures & ShelfPreference) != 0 ? here.ShowDropShelf : there.ShowDropShelf,
+            ShowCopyPathButton = settings && (ownOptionalFeatures & CopyPathPreference) != 0 ? here.ShowCopyPathButton : there.ShowCopyPathButton,
             IsSplit = view ? Own(here.IsSplit, before.IsSplit, there.IsSplit) : there.IsSplit,
             SplitOrientation = view ? Own(here.SplitOrientation, before.SplitOrientation, there.SplitOrientation) : there.SplitOrientation,
             SplitRatio = view ? Own(here.SplitRatio, before.SplitRatio, there.SplitRatio) : there.SplitRatio,

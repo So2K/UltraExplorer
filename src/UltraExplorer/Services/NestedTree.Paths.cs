@@ -145,16 +145,17 @@ public sealed partial class NestedTree
                 current = known;
                 next++;
             }
+            if (!ArchivesEnabled && current.IsInArchive) return null;
             if (next == chain.Count) return IsOnCanvas(current) && !IsDetached(current) ? current : null;
 
             // Through an archive there is nothing on disk to describe: the
             // rest of the way is read, a folder at a time, as the canvas reads
             // them - the reader opens archives (see Archives.ArchiveService).
-            if (Archives.ArchiveService.MayInvolveArchive(target))
+            if (ArchivesEnabled && Archives.ArchiveService.MayContainArchiveName(target))
             {
                 while (next < chain.Count)
                 {
-                    if (!current.IsLoaded)
+                    if (!current.IsLoaded || current.ArchivesGeneration != _archivesGeneration)
                     {
                         await LoadAsync(current, cancellationToken);
                     }

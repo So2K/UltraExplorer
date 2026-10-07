@@ -439,6 +439,7 @@ internal sealed class NestedPane
         Canvas.ContextMenuRequested -= OnContextMenuRequested;
         Canvas.ContextMenuPressed -= OnContextMenuPressed;
         Canvas.DragRequested -= OnDragRequested;
+        Canvas.CopyPathRequested -= OnCopyPathRequested;
         Canvas.CameraChanged -= OnCameraChanged;
         Canvas.UserCameraMoved -= OnUserCameraMoved;
         Canvas.FilterChanged -= OnFilterChanged;
@@ -469,6 +470,7 @@ internal sealed class NestedPane
     /// </summary>
     public void Initialize(IReadOnlyList<NestedRoot> roots)
     {
+        ApplyArchivePreference();
         Tree.Orders = _viewModel.Orders;
         Tree.SetRoots(roots);
         Tree.IncludeHidden = _viewModel.Tree.ShowHiddenItems;
@@ -476,6 +478,35 @@ internal sealed class NestedPane
         IsReady = true;
         Canvas.ShowFavoriteLinks = _viewModel.ShowFavoriteLinks;
         RebuildBeacons();
+    }
+
+    /// <summary>Applies the opt-in mode and leaves a virtual archive before its tile becomes a regular file.</summary>
+    public void ApplyArchivePreference()
+    {
+        var enabled = _viewModel.BrowseArchives && !_host.IsPickerMode;
+        if (!enabled)
+        {
+            _flightTicket++;
+            var viewed = Canvas.FolderInView;
+            while (viewed is { IsInArchive: true }) viewed = viewed.Parent;
+            if (viewed is not null && Canvas.FolderInView?.IsInArchive == true)
+                Canvas.FlyTo(viewed, animated: false);
+
+            var selection = Selection;
+            var kept = selection.Items.Where(item => Tree.FindNearest(item.Path) is not { IsInArchive: true } container
+                    || container.IsArchive && container.FullPath.Equals(item.Path, StringComparison.OrdinalIgnoreCase) && container.Parent?.IsInArchive != true)
+                .Select(item => item.IsDirectory && Tree.Find(item.Path) is { IsArchive: true }
+                    ? item with { IsDirectory = false, Size = 0 }
+                    : item).ToArray();
+            if (kept.Length != selection.Count || kept.Any(item => selection.TryGetItem(item.Path, out var old) && old.IsDirectory != item.IsDirectory))
+            {
+                selection.Apply(new SelectionEdit { Clear = true, Added = kept,
+                    Focus = selection.Focus is { } focus && kept.Any(item => item.Path == focus) ? focus : kept.FirstOrDefault().Path,
+                    Source = SelectionSource.Command });
+            }
+        }
+
+        Tree.ArchivesEnabled = enabled;
     }
 
     private async void OnFavoriteLinkRequested(string path)
@@ -839,7 +870,8 @@ internal sealed class NestedPane
             // about off the interface thread, where a share gone to sleep holds
             // up this flight alone, not the window.  An archive, and a folder
             // inside one, is a folder here.
-            var folderPath = isDirectory || Tree.Find(path) is not null || await Task.Run(() => ArchiveService.IsFolderLike(path))
+            var folderPath = isDirectory || Tree.Find(path) is not null || await Task.Run(() => Tree.ArchivesEnabled
+                ? ArchiveService.IsFolderLikeForNavigation(path) : Directory.Exists(path))
                 ? path
                 : Path.GetDirectoryName(path) ?? path;
 
@@ -1213,23 +1245,28 @@ internal sealed class NestedPane
     private async void OnOpenRequested(NestedHit hit)
     {
         // A file inside an archive: taken out to the temporary folder, opened from there.
-        if (hit.IsFile && hit.Folder.IsInArchive)
+        if (Tree.ArchivesEnabled && hit.IsFile && hit.Folder.IsInArchive)
         {
             await _viewModel.OpenFromArchiveAsync(hit.Path);
             return;
         }
 
         // An archive whose names are encrypted lists once it has its password.
-        if (!hit.IsFile && hit.Folder.IsInArchive && hit.Folder.LoadState == NestedLoadState.Failed
+        if (Tree.ArchivesEnabled && !hit.IsFile && hit.Folder.IsInArchive && hit.Folder.LoadState == NestedLoadState.Failed
             && hit.Folder.ErrorMessage.Contains("Password", StringComparison.OrdinalIgnoreCase))
         {
-            if (ArchiveService.AskPassword(hit.Folder.FullPath))
+            try
             {
-                await Tree.RefreshAsync(hit.Folder);
+                if (await ArchiveService.AskPasswordAsync(hit.Folder.FullPath, _viewModel.AskArchivePassword))
+                    await Tree.RefreshAsync(hit.Folder);
             }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or OperationCanceledException)
+            { _viewModel.Toast.ShowError(ex.Message); }
 
             return;
         }
+
+        if (!Tree.ArchivesEnabled && hit.Folder.IsInArchive) return;
 
         if (hit.IsFile)
         {
@@ -1796,7 +1833,7 @@ internal sealed class NestedPane
     {
         var entries = new List<ShellMenuEntry>();
         var single = paths.Count == 1 ? paths[0] : null;
-        var isArchiveItself = single is not null && ArchiveService.IsArchiveFile(single);
+        var isArchiveItself = single is not null && ArchiveService.IsArchiveFile(single, Tree.ArchivesEnabled);
         var isFile = single is not null && !isArchiveItself && !isFolderArea && !ArchiveService.IsFolderInArchive(single);
         if (isFile)
         {

@@ -118,11 +118,12 @@ public partial class MainWindow : Window
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
         _viewModel.PromptRequested += ShowInputDialog;
-        Services.Archives.ArchiveService.PasswordPrompt = _viewModel.AskArchivePassword;
 
         // The shelf comes out for any drag over the window - one of its own or
         // one from outside - and goes back once the drag is over.
         Shelf.Initialize(new ShelfStore(), _viewModel);
+        Shelf.CompleteDrop = CompleteExternalDrop;
+        Shelf.Enabled = _viewModel.ShowDropShelf && !IsPickerMode;
         AddHandler(DragDrop.PreviewDragEnterEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
         AddHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
         _viewModel.ConfirmRequested += ShowConfirmDialog;
@@ -2463,7 +2464,8 @@ public partial class MainWindow : Window
 
     private string? ShowInputDialog(string title, string prompt, string initialValue, bool selectStem)
     {
-        var dialog = new InputDialog(title, prompt, initialValue, selectStem) { Owner = this };
+        var dialog = new InputDialog(title, prompt, initialValue, selectStem,
+            password: title.Equals("Password", StringComparison.Ordinal)) { Owner = this };
         return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 

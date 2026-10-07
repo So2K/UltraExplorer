@@ -765,7 +765,7 @@ public partial class MainWindow
         var entries = new List<ShellMenuEntry>();
 
         // Archives among the items: unpacked by the app itself, on every core.
-        var archives = paths.Where(Services.Archives.ArchiveService.IsArchiveFile).ToArray();
+        var archives = paths.Where(path => Services.Archives.ArchiveService.IsArchiveFile(path, _viewModel.BrowseArchives)).ToArray();
         if (archives.Length > 0)
         {
             entries.Add(new ShellMenuEntry("Extract here", () => _ = _viewModel.ExtractArchivesAsync(archives, ownFolder: false)) { Glyph = "" });

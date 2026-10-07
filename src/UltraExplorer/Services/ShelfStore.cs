@@ -8,7 +8,7 @@ namespace UltraExplorer.Services;
 public sealed record ShelfEntry(string Path, DateTime AddedUtc, bool IsCopy, double X = double.NaN, double Y = double.NaN)
 {
     [System.Text.Json.Serialization.JsonIgnore]
-    public bool HasPosition => !double.IsNaN(X) && !double.IsNaN(Y);
+    public bool HasPosition => double.IsFinite(X) && double.IsFinite(Y);
 }
 
 /// <summary>
@@ -38,9 +38,12 @@ public sealed class ShelfStore
     private readonly NativeShellService _shell = new();
     private List<ShelfEntry> _entries = [];
 
-    public ShelfStore()
+    public ShelfStore() : this(System.IO.Path.Combine(AppPaths.StateDirectory, "Shelf")) { }
+
+    /// <summary>Explicit state directory for isolated checks and portable profiles.</summary>
+    internal ShelfStore(string root)
     {
-        Root = System.IO.Path.Combine(AppPaths.StateDirectory, "Shelf");
+        Root = System.IO.Path.GetFullPath(root);
         Load();
     }
 
@@ -88,48 +91,62 @@ public sealed class ShelfStore
         var added = 0;
         var placed = new List<string>();
         var temp = System.IO.Path.GetFullPath(System.IO.Path.GetTempPath());
-        foreach (var raw in paths)
+        try
         {
-            var path = System.IO.Path.GetFullPath(raw);
-            if (!File.Exists(path) && !Directory.Exists(path))
+            foreach (var raw in paths)
             {
-                continue;
-            }
-
-            if (FindEntry(path) is { } already)
-            {
-                placed.Add(already.Path);
-                continue;
-            }
-
-            var entry = new ShelfEntry(path, DateTime.UtcNow, IsCopy: false);
-            if (path.StartsWith(temp, StringComparison.OrdinalIgnoreCase) || path.StartsWith(ArchiveService.TempRoot, StringComparison.OrdinalIgnoreCase))
-            {
-                // Each copy in a folder of its own: let go of, it goes with it.
-                var copies = System.IO.Path.Combine(Root, "copies", Guid.NewGuid().ToString("N")[..12]);
-                Directory.CreateDirectory(copies);
-                await _shell.CopyOrMoveAsync([path], copies, move: false);
-                var copy = System.IO.Path.Combine(copies, System.IO.Path.GetFileName(path));
-                if (!File.Exists(copy) && !Directory.Exists(copy))
+                var path = System.IO.Path.TrimEndingDirectorySeparator(System.IO.Path.GetFullPath(raw));
+                if (!File.Exists(path) && !Directory.Exists(path))
                 {
                     continue;
                 }
 
-                entry = entry with { Path = copy, IsCopy = true };
-            }
+                if (FindEntry(path) is { } already)
+                {
+                    placed.Add(already.Path);
+                    continue;
+                }
 
-            lock (_gate)
-            {
-                _entries.Add(entry);
-            }
+                var entry = new ShelfEntry(path, DateTime.UtcNow, IsCopy: false);
+                if (IsWithin(path, temp) || IsWithin(path, ArchiveService.TempRoot))
+                {
+                    // Each copy in a folder of its own: let go of, it goes with it.
+                    var copies = System.IO.Path.Combine(Root, "copies", Guid.NewGuid().ToString("N")[..12]);
+                    Directory.CreateDirectory(copies);
+                    try
+                    {
+                        await _shell.CopyOrMoveAsync([path], copies, move: false);
+                    }
+                    catch
+                    {
+                        DeleteCopyDirectory(copies);
+                        throw;
+                    }
+                    var copy = System.IO.Path.Combine(copies, System.IO.Path.GetFileName(path));
+                    if (!File.Exists(copy) && !Directory.Exists(copy))
+                    {
+                        DeleteCopyDirectory(copies);
+                        continue;
+                    }
 
-            placed.Add(entry.Path);
-            added++;
+                    entry = entry with { Path = copy, IsCopy = true };
+                }
+
+                lock (_gate)
+                {
+                    _entries.Add(entry);
+                }
+
+                placed.Add(entry.Path);
+                added++;
+            }
+            return (added, placed);
         }
-
-        Save();
-        Changed?.Invoke();
-        return (added, placed);
+        finally
+        {
+            // Earlier accepted items remain durable if a later input fails.
+            if (added > 0) { Save(); Changed?.Invoke(); }
+        }
     }
 
     private ShelfEntry? FindEntry(string path)
@@ -173,7 +190,7 @@ public sealed class ShelfStore
     /// <summary>The shelf pulled wider or narrower.</summary>
     public void SetWidth(double width)
     {
-        Width = width;
+        Width = double.IsFinite(width) ? Math.Clamp(width, 300, 4000) : 520;
         Save();
     }
 
@@ -215,22 +232,50 @@ public sealed class ShelfStore
     /// <summary>Lets go of what is past its week, or gone from where it was.  True when anything went.</summary>
     public bool Prune()
     {
-        List<ShelfEntry> gone;
+        List<ShelfEntry> snapshot;
         lock (_gate)
         {
-            gone = _entries.Where(entry => DateTime.UtcNow - entry.AddedUtc > KeepFor || !File.Exists(entry.Path) && !Directory.Exists(entry.Path)).ToList();
-            if (gone.Count == 0)
-            {
-                return false;
-            }
+            snapshot = [.. _entries];
+        }
 
+        // A disconnected share can wait a long time. Its disk query never
+        // owns the entries lock that the UI needs for its count and cards.
+        var now = DateTime.UtcNow;
+        var gone = snapshot.Where(entry => now - entry.AddedUtc > KeepFor || DefinitelyMissing(entry.Path)).ToList();
+        if (gone.Count == 0) return false;
+        var candidates = gone.ToDictionary(entry => entry.Path, StringComparer.OrdinalIgnoreCase);
+        lock (_gate)
+        {
+            gone = _entries.Where(entry => candidates.TryGetValue(entry.Path, out var candidate)
+                && entry.AddedUtc == candidate.AddedUtc && entry.IsCopy == candidate.IsCopy).ToList();
             _entries = _entries.Except(gone).ToList();
         }
+        if (gone.Count == 0) return false;
 
         DeleteCopies(gone);
         Save();
         Changed?.Invoke();
         return true;
+    }
+
+    internal static bool DefinitelyMissing(string path)
+    {
+        try { _ = File.GetAttributes(path); return false; }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // A missing path is conclusive only while its volume/share is
+            // available. Ejecting a USB drive does not remove its shelf card.
+            try
+            {
+                var root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(path));
+                return !string.IsNullOrEmpty(root) && Directory.Exists(root);
+            }
+            catch (Exception invalid) when (invalid is ArgumentException or NotSupportedException or IOException) { return false; }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            return false;
+        }
     }
 
     private sealed class Saved
@@ -252,8 +297,8 @@ public sealed class ShelfStore
                 }
                 else if (JsonSerializer.Deserialize<Saved>(text, JsonOptions) is { } saved)
                 {
-                    _entries = saved.Entries;
-                    Width = saved.Width;
+                    _entries = saved.Entries ?? [];
+                    Width = double.IsFinite(saved.Width) ? Math.Clamp(saved.Width, 300, 4000) : 520;
                 }
             }
         }
@@ -262,41 +307,67 @@ public sealed class ShelfStore
             _entries = [];
         }
 
-        _entries = _entries.Where(entry => !string.IsNullOrWhiteSpace(entry.Path)).ToList();
+        _entries = _entries.Where(entry => entry is not null && !string.IsNullOrWhiteSpace(entry.Path))
+            .DistinctBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     private void Save()
     {
-        var saved = new Saved { Width = Width };
         lock (_gate)
-        {
-            saved.Entries = [.. _entries];
-        }
-
-        try
-        {
-            Directory.CreateDirectory(Root);
-            var temporary = ListPath + ".tmp";
-            File.WriteAllText(temporary, JsonSerializer.Serialize(saved, JsonOptions));
-            File.Move(temporary, ListPath, overwrite: true);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-        }
-    }
-
-    private void DeleteCopies(IEnumerable<ShelfEntry> entries)
-    {
-        foreach (var entry in entries.Where(entry => entry.IsCopy && entry.Path.StartsWith(Root, StringComparison.OrdinalIgnoreCase)))
         {
             try
             {
-                Directory.Delete(System.IO.Path.GetDirectoryName(entry.Path)!, recursive: true);
+                Directory.CreateDirectory(Root);
+                var temporary = ListPath + ".tmp";
+                File.WriteAllText(temporary, JsonSerializer.Serialize(new Saved { Width = Width, Entries = [.. _entries] }, JsonOptions));
+                File.Move(temporary, ListPath, overwrite: true);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
             }
         }
+    }
+
+    private void DeleteCopies(IEnumerable<ShelfEntry> entries)
+    {
+        foreach (var entry in entries.Where(entry => entry.IsCopy))
+        {
+            try
+            {
+                var fullPath = System.IO.Path.GetFullPath(entry.Path);
+                if (System.IO.Path.GetDirectoryName(fullPath) is { } parent)
+                    DeleteCopyDirectory(parent);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+            {
+            }
+        }
+    }
+
+    private void DeleteCopyDirectory(string directory)
+    {
+        try
+        {
+            var full = System.IO.Path.GetFullPath(directory).TrimEnd(System.IO.Path.DirectorySeparatorChar);
+            var copies = System.IO.Path.Combine(Root, "copies");
+            var leaf = System.IO.Path.GetFileName(full);
+            // A persisted flag never authorizes deleting a link's parent, a
+            // prefix sibling, the shelf root, or a reparse-point destination.
+            if (!string.Equals(System.IO.Path.GetDirectoryName(full), copies, StringComparison.OrdinalIgnoreCase)
+                || leaf.Length != 12 || !leaf.All(Uri.IsHexDigit) || !Directory.Exists(full)) return;
+            if (new[] { Root, copies, full }.Any(path => (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0)) return;
+            Directory.Delete(full, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+        }
+    }
+
+    internal static bool IsWithin(string path, string directory)
+    {
+        var prefix = System.IO.Path.GetFullPath(directory).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+            + System.IO.Path.DirectorySeparatorChar;
+        return System.IO.Path.GetFullPath(path).StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     internal static string SizeText(long bytes) => bytes switch

@@ -76,6 +76,11 @@ public sealed class WorkspaceState
     /// <summary>Show a content thumbnail when hovering a file; older workspaces enable it by default.</summary>
     public bool ShowHoverPreviews { get; set; } = true;
 
+    /// <summary>Optional PR4 features are opt-in; older workspaces keep their existing behavior.</summary>
+    public bool BrowseArchives { get; set; }
+    public bool ShowDropShelf { get; set; }
+    public bool ShowCopyPathButton { get; set; }
+
     /// <summary>
     /// The canvas layers switched off, by name - "Files", "Icons", "Details",
     /// "FolderCounts", "Marks" (see <see cref="CanvasLayers"/>).  Missing or

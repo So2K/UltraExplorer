@@ -26,6 +26,8 @@ internal static partial class Program
         }
 
         Console.WriteLine($"  7z.dll: {SevenZipLibrary.LoadedFrom}");
+        var previousMode = ArchiveService.BrowseArchives;
+        ArchiveService.BrowseArchives = true;
         var root = Path.Combine(Path.GetTempPath(), "UltraExplorerArchives", Guid.NewGuid().ToString("N")[..8]);
         var source = Path.Combine(root, "source");
         try
@@ -46,11 +48,14 @@ internal static partial class Program
         finally
         {
             ArchiveService.PasswordPrompt = null;
+            ArchiveService.BrowseArchives = previousMode;
             TryDelete(root);
         }
     }
 
-    private static readonly string SevenZipExe = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "7-Zip", "7z.exe");
+    private static readonly string SevenZipExe = File.Exists(Path.Combine(AppContext.BaseDirectory, "archives", "7z.exe"))
+        ? Path.Combine(AppContext.BaseDirectory, "archives", "7z.exe")
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "7-Zip", "7z.exe");
 
     private static void BuildArchiveSource(string source)
     {
@@ -309,7 +314,7 @@ internal static partial class Program
     private static async Task ArchiveRevealChecks(string zip)
     {
         Section("archives: going there");
-        using var tree = new NestedTree();
+        using var tree = new NestedTree { ArchivesEnabled = true };
         var drive = Path.GetPathRoot(zip)!;
         tree.SetRoots([new NestedRoot(drive, drive.TrimEnd('\\'), UltraExplorer.Models.NestedFolderKind.Drive)]);
         var target = Path.Combine(zip, "docs", "deep", "deeper");

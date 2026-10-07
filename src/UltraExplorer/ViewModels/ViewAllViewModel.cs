@@ -70,6 +70,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     private long _heldActiveVersion;
 
     private bool _isDisposed;
+    public bool BrowseArchives { get; set; }
     private bool _isBusy;
     private bool _isSyncingSelection;
     private bool _treeSelectionPending;
@@ -1926,7 +1927,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         }
 
         var selected = Selection.Contains(path);
-        var isDirectory = TryGetNode(path, out var known) ? known.IsDirectory : Services.Archives.ArchiveService.IsFolderLike(path);
+        var isDirectory = TryGetNode(path, out var known) ? known.IsDirectory : BrowseArchives
+            ? Services.Archives.ArchiveService.IsFolderLike(path, BrowseArchives) : Directory.Exists(path);
         Selection.Apply(new SelectionEdit
         {
             Added = selected ? [] : [new SelectionItem(path, isDirectory, known?.Entry.SizeBytes ?? 0)],
@@ -2083,7 +2085,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             {
                 // Not given its node yet: what the selection says it is, or
                 // else what the disk does.
-                var isDirectory = Selection.TryGetItem(pending, out var item) ? item.IsDirectory : Services.Archives.ArchiveService.IsFolderLike(pending);
+                var isDirectory = Selection.TryGetItem(pending, out var item) ? item.IsDirectory : BrowseArchives
+                    ? Services.Archives.ArchiveService.IsFolderLike(pending, BrowseArchives) : Directory.Exists(pending);
                 return isDirectory ? pending : Path.GetDirectoryName(pending);
             }
 

@@ -18,7 +18,7 @@ namespace UltraExplorer.Controls;
 /// each where it was dropped or moved to (see <see cref="ShelfBoard"/>); its
 /// left edge pulls it wider.
 /// </summary>
-public partial class DropShelf : UserControl
+public partial class DropShelf : UserControl, IDisposable
 {
     private readonly DispatcherTimer _dragWatch;
     private ShelfStore? _store;
@@ -27,11 +27,16 @@ public partial class DropShelf : UserControl
     private bool _isShown;
     private bool _isPinned;
     private bool _fitted;
+    private bool _enabled;
+    private bool _disposed;
+    private int _generation;
+    private ContextMenu? _menu;
 
     public DropShelf()
     {
         InitializeComponent();
         _dragWatch = new DispatcherTimer(TimeSpan.FromMilliseconds(150), DispatcherPriority.Background, OnDragWatch, Dispatcher);
+        _dragWatch.Stop();
         Board.OpenRequested += OnOpenRequested;
         Board.CopyPathRequested += OnCopyPathRequested;
         Board.RemoveRequested += paths => _store?.Remove(paths);
@@ -41,20 +46,88 @@ public partial class DropShelf : UserControl
 
     private double HiddenOffset => Panel.Width + 40;
 
+    /// <summary>Opt-in shelf. Hiding it preserves its entries and stops all card previews.</summary>
+    public bool Enabled
+    {
+        get => _enabled;
+        set
+        {
+            Dispatcher.VerifyAccess();
+            if (_enabled == value || _disposed) return;
+            _enabled = value;
+            _generation++;
+            if (value)
+            {
+                Visibility = Visibility.Visible;
+                Ready = ActivateAsync();
+            }
+            else
+            {
+                _dragWatch.Stop();
+                if (_menu is not null) { _menu.IsOpen = false; _menu = null; }
+                _isShown = _isPinned = _fitted = false;
+                Slide.BeginAnimation(TranslateTransform.XProperty, null);
+                Panel.Visibility = Tab.Visibility = DropHighlight.Visibility = Visibility.Collapsed;
+                Board.ClearCards();
+                Visibility = Visibility.Collapsed;
+            }
+        }
+    }
+
+    internal Task Ready { get; private set; } = Task.CompletedTask;
+
+    /// <summary>The window's OLE lifetime and close tracking, shared with its other drop targets.</summary>
+    public Func<IDataObject, IReadOnlyList<string>, DragDropEffects, Func<Task<bool>>, bool>? CompleteDrop { get; set; }
+
     public void Initialize(ShelfStore store, MainViewModel viewModel)
     {
+        if (_store is not null) _store.Changed -= OnStoreChanged;
         _store = store;
         _viewModel = viewModel;
         Panel.Width = Math.Max(Panel.MinWidth, store.Width);
         Slide.X = HiddenOffset;
-        store.Prune();
-        store.Changed += () => Dispatcher.BeginInvoke(SyncCards);
+        store.Changed += OnStoreChanged;
+        if (Enabled) Ready = ActivateAsync();
+    }
+
+    private void OnStoreChanged()
+    {
+        if (_disposed || !Enabled || Dispatcher.HasShutdownStarted) return;
+        Dispatcher.BeginInvoke(SyncCards);
+    }
+
+    private async Task ActivateAsync()
+    {
+        var generation = _generation;
+        // Cards need no disk IO to be built; an unavailable share must not
+        // delay every other saved card while background pruning checks it.
+        if (Enabled && !_disposed) SyncCards();
+        if (_store is { } store) await Task.Run(store.Prune);
+        if (Enabled && !_disposed && generation == _generation) SyncCards();
+    }
+
+    public void RefreshCards()
+    {
+        if (!Enabled || _disposed) return;
+        Board.ClearCards();
         SyncCards();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        Enabled = false;
+        _disposed = true;
+        if (_store is not null) _store.Changed -= OnStoreChanged;
+        _dragWatch.Stop();
+        _dragWatch.Tick -= OnDragWatch;
+        CompleteDrop = null;
     }
 
     /// <summary>A drag is over the window: out it comes, and stays while the drag goes on.</summary>
     public void NotifyDragOver()
     {
+        if (!Enabled || _disposed) return;
         _lastDragTicks = Environment.TickCount64;
         if (!_isShown)
         {
@@ -67,6 +140,7 @@ public partial class DropShelf : UserControl
     /// <summary>Opens or closes the shelf by hand.</summary>
     public void Toggle()
     {
+        if (!Enabled || _disposed) return;
         if (_isShown && _isPinned)
         {
             Hide();
@@ -85,12 +159,13 @@ public partial class DropShelf : UserControl
             return;
         }
 
-        _dragWatch.Stop();
         DropHighlight.Visibility = Visibility.Collapsed;
         if (!_isPinned && !Board.IsDraggingOut && !Panel.IsMouseOver)
         {
+            _dragWatch.Stop();
             Hide();
         }
+        else if (_isPinned) _dragWatch.Stop();
     }
 
     private void Show()
@@ -98,7 +173,7 @@ public partial class DropShelf : UserControl
         _isShown = true;
         Panel.Visibility = Visibility.Visible;
         Tab.Visibility = Visibility.Collapsed;
-        _store?.Prune();
+        Ready = ActivateAsync();
         if (!_fitted)
         {
             _fitted = true;
@@ -131,7 +206,7 @@ public partial class DropShelf : UserControl
     /// </summary>
     private void SyncCards()
     {
-        if (_store is null || _viewModel is null)
+        if (!Enabled || _disposed || _store is null || _viewModel is null)
         {
             return;
         }
@@ -162,7 +237,7 @@ public partial class DropShelf : UserControl
                 continue;
             }
 
-            var card = new ShelfCard(entry, SafeIcon(entry.Path));
+            var card = new ShelfCard(entry, null, _viewModel.BrowseArchives);
             if (entry.HasPosition)
             {
                 card.X = entry.X;
@@ -187,18 +262,6 @@ public partial class DropShelf : UserControl
         UpdateCounts();
     }
 
-    private ImageSource? SafeIcon(string path)
-    {
-        try
-        {
-            return _viewModel?.Icons.GetSmallIcon(path, Directory.Exists(path));
-        }
-        catch (Exception ex) when (ex is System.Runtime.InteropServices.COMException or ArgumentException or IOException)
-        {
-            return null;
-        }
-    }
-
     private void UpdateCounts()
     {
         var count = _store?.Count ?? 0;
@@ -212,17 +275,13 @@ public partial class DropShelf : UserControl
 
     private void Panel_DragOver(object sender, DragEventArgs e)
     {
+        if (!Enabled) { e.Effects = DragDropEffects.None; e.Handled = true; return; }
         NotifyDragOver();
         e.Handled = true;
-        if (!Board.IsDraggingOut && e.Data.GetData(DataFormats.FileDrop) is string[] { Length: > 0 })
+        if (!Board.IsDraggingOut && TryGetPaths(e.Data, reportError: false, out _))
         {
-            e.Effects = (DragDropEffects.Link | DragDropEffects.Copy) & e.AllowedEffects;
-            if (e.Effects == DragDropEffects.None)
-            {
-                e.Effects = DragDropEffects.Copy;
-            }
-
-            DropHighlight.Visibility = Visibility.Visible;
+            e.Effects = ShelfEffect(e.AllowedEffects);
+            DropHighlight.Visibility = e.Effects == DragDropEffects.None ? Visibility.Collapsed : Visibility.Visible;
         }
         else
         {
@@ -232,20 +291,64 @@ public partial class DropShelf : UserControl
 
     private void Panel_DragLeave(object sender, DragEventArgs e) => DropHighlight.Visibility = Visibility.Collapsed;
 
-    private async void Panel_Drop(object sender, DragEventArgs e)
+    private void Panel_Drop(object sender, DragEventArgs e)
     {
         e.Handled = true;
         DropHighlight.Visibility = Visibility.Collapsed;
-        if (Board.IsDraggingOut || _store is null || e.Data.GetData(DataFormats.FileDrop) is not string[] { Length: > 0 } paths)
+        var effect = ShelfEffect(e.AllowedEffects);
+        e.Effects = DragDropEffects.None;
+        if (!Enabled || Board.IsDraggingOut || _store is null || effect == DragDropEffects.None || !TryGetPaths(e.Data, reportError: true, out var paths))
         {
             return;
         }
 
         _isPinned = true;
         var at = Board.ToWorld(e.GetPosition(Board));
+        bool done = CompleteDrop is { } complete
+            ? complete(e.Data, paths, effect, () => PutOnShelfAsync(paths, at))
+            : ExternalFileDrop.Complete(Dispatcher, () => PutOnShelfAsync(paths, at));
+        e.Effects = done ? effect : DragDropEffects.None;
+    }
+
+    private bool TryGetPaths(IDataObject data, bool reportError, out string[] paths)
+    {
+        paths = [];
         try
         {
-            var (added, placed) = await _store.AddAsync(paths);
+            if (data.GetData(DataFormats.FileDrop) is not string[] { Length: > 0 } found) return false;
+            paths = found;
+            return true;
+        }
+        catch (Exception ex) when (ex is System.Runtime.InteropServices.ExternalException or IOException
+            or UnauthorizedAccessException or InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            if (reportError && Enabled && !_disposed) _viewModel?.Toast.ShowError($"Could not read dropped files: {ex.Message}");
+            return false;
+        }
+    }
+
+    internal static DragDropEffects ShelfEffect(DragDropEffects allowed) =>
+        (allowed & DragDropEffects.Link) != 0 ? DragDropEffects.Link
+        : (allowed & DragDropEffects.Copy) != 0 ? DragDropEffects.Copy : DragDropEffects.None;
+
+    private async Task<bool> PutOnShelfAsync(string[] paths, Point at)
+    {
+        if (_store is null) return false;
+        try
+        {
+            // Every temporary input must be durable before releasing the OLE
+            // source. The shared helper normally observes one Shell batch;
+            // this shelf may copy several inputs into separate owned folders.
+            var observer = NativeShellService.CopyStarted.Value;
+            Task<(int Added, IReadOnlyList<string> Paths)> transfer;
+            try
+            {
+                NativeShellService.CopyStarted.Value = null;
+                transfer = _store.AddAsync(paths);
+            }
+            finally { NativeShellService.CopyStarted.Value = observer; }
+            var (added, placed) = await transfer;
+            if (!Enabled || _disposed) return placed.Count > 0;
 
             // The cards made now, then laid out together from where they were dropped.
             SyncCards();
@@ -258,17 +361,21 @@ public partial class DropShelf : UserControl
             _ = _viewModel?.Toast.ShowSuccessAsync(added == 0
                 ? "Moved on the shelf"
                 : $"Put {added} item(s) on the shelf — kept for 7 days");
+            return placed.Count > 0;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException or InvalidOperationException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or OperationCanceledException or InvalidOperationException or ArgumentException or NotSupportedException)
         {
-            _viewModel?.Toast.ShowError($"Could not put it on the shelf: {ex.Message}");
+            if (Enabled && !_disposed) _viewModel?.Toast.ShowError($"Could not put it on the shelf: {ex.Message}");
+            return false;
         }
     }
 
     // ---- what the board asks for -------------------------------------------------------
 
-    private void OnOpenRequested(ShelfCard card)
+    private async void OnOpenRequested(ShelfCard card)
     {
+        await card.MetadataReady;
+        if (!Enabled || _disposed || !Board.Cards.Contains(card)) return;
         // A folder or an archive is gone to on the canvas; a file opens.
         if ((card.IsFolder || card.IsArchive) && _viewModel is not null)
         {
@@ -288,6 +395,7 @@ public partial class DropShelf : UserControl
 
     private void OnCopyPathRequested(string path)
     {
+        if (!Enabled || _disposed) return;
         try
         {
             Clipboard.SetText(path);
@@ -301,12 +409,14 @@ public partial class DropShelf : UserControl
 
     private void OnMenuRequested(ShelfCard? card, Point point)
     {
-        if (_store is null)
+        if (!Enabled || _disposed || _store is null)
         {
             return;
         }
 
-        var menu = new ContextMenu { PlacementTarget = Board };
+        if (_menu is not null) _menu.IsOpen = false;
+        var menu = _menu = new ContextMenu { PlacementTarget = Board };
+        menu.Closed += (_, _) => { if (ReferenceEquals(_menu, menu)) _menu = null; };
         if (card is not null)
         {
             var selected = Board.Selected.Select(chosen => chosen.Entry.Path).ToArray();
@@ -329,14 +439,14 @@ public partial class DropShelf : UserControl
         menu.IsOpen = true;
     }
 
-    private static void Add(ContextMenu menu, string header, string glyph, Action run)
+    private void Add(ContextMenu menu, string header, string glyph, Action run)
     {
         var item = new MenuItem
         {
             Header = header,
             Icon = new TextBlock { Text = glyph, FontFamily = new FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"), FontSize = 12 }
         };
-        item.Click += (_, _) => run();
+        item.Click += (_, _) => { if (Enabled && !_disposed) run(); };
         menu.Items.Add(item);
     }
 
@@ -352,7 +462,7 @@ public partial class DropShelf : UserControl
 
     private void Fit_Click(object sender, RoutedEventArgs e) => Board.FitAll();
 
-    private void Clear_Click(object sender, RoutedEventArgs e) => _store?.Clear();
+    private void Clear_Click(object sender, RoutedEventArgs e) { if (Enabled && !_disposed) _store?.Clear(); }
 
     private void Close_Click(object sender, RoutedEventArgs e) => Hide();
 

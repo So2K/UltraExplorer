@@ -121,6 +121,7 @@ public partial class MainWindow : INestedPaneHost
 
     private void DetachNested()
     {
+        Shelf.Dispose();
         _viewModel.ShownSelectionCount = null;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
         _viewModel.Tree.PropertyChanged -= OnTreePropertyChangedForNested;
@@ -265,6 +266,7 @@ public partial class MainWindow : INestedPaneHost
         {
             pane.Canvas.LoadUnfocusedRoots = !IsPickerMode && !_folderPaneRoots.ContainsKey(pane);
             pane.Initialize(roots);
+            pane.Canvas.ShowCopyPathButton = _viewModel.ShowCopyPathButton && !IsPickerMode;
             var initial = IsPickerMode ? _pickerStartFolder : _folderInitialPath;
             var start = initial is { Length: > 0 } ? await pane.Tree.MaterializePathAsync(initial) : null;
             if (_closeRequested) return;
@@ -567,6 +569,16 @@ public partial class MainWindow : INestedPaneHost
                         pane.RebuildBeacons();
                     }
                 }
+                break;
+            case nameof(MainViewModel.BrowseArchives):
+                foreach (var pane in _panes) pane.ApplyArchivePreference();
+                Shelf.RefreshCards();
+                break;
+            case nameof(MainViewModel.ShowDropShelf):
+                Shelf.Enabled = _viewModel.ShowDropShelf && !IsPickerMode;
+                break;
+            case nameof(MainViewModel.ShowCopyPathButton):
+                foreach (var pane in _panes) pane.Canvas.ShowCopyPathButton = _viewModel.ShowCopyPathButton && !IsPickerMode;
                 break;
         }
     }

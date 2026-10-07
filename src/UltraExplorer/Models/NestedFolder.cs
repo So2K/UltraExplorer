@@ -444,6 +444,7 @@ public sealed class NestedFolder
     /// pass over the whole tree reaches it, whichever comes first.
     /// </summary>
     internal int LayoutSortGeneration { get; set; } = -1;
+    internal int ArchivesGeneration { get; set; }
 
     /// <summary>
     /// The order this folder's children and files were last placed in.  A

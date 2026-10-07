@@ -75,7 +75,7 @@ internal sealed class ArchiveIndex
         var prefix = inner + '\\';
         foreach (var pair in _items)
         {
-            if (pair.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            if (pair.Key.StartsWith(prefix, StringComparison.Ordinal))
             {
                 yield return (pair.Key, pair.Value);
             }
@@ -102,26 +102,34 @@ internal sealed class ArchiveIndex
         var folders = new List<NestedEntry>();
         var files = new List<NestedFile>();
         var hidden = 0;
+        var fileCount = 0;
+        var truncated = false;
         foreach (var (name, item) in folder.Children)
         {
             if (item.IsDirectory)
             {
-                folders.Add(new NestedEntry(name, item.IsHidden, false, item.ModifiedTicks));
+                if (folders.Count < NestedTree.MaximumChildren)
+                    folders.Add(new NestedEntry(name, item.IsHidden, false, item.ModifiedTicks));
+                else truncated = true;
             }
-            else if (ArchiveService.BrowseArchives && ArchiveFormats.IsBrowsable(name))
+            else if (ArchiveFormats.IsBrowsable(name))
             {
-                folders.Add(new NestedEntry(name, item.IsHidden, false, item.ModifiedTicks, IsArchive: true));
+                if (folders.Count < NestedTree.MaximumChildren)
+                    folders.Add(new NestedEntry(name, item.IsHidden, false, item.ModifiedTicks, IsArchive: true));
+                else truncated = true;
             }
             else
             {
-                files.Add(new NestedFile(name, item.IsHidden, item.Size, item.ModifiedTicks));
+                fileCount++;
+                if (files.Count < NestedTree.MaximumFiles)
+                    files.Add(new NestedFile(name, item.IsHidden, item.Size, item.ModifiedTicks));
                 hidden += item.IsHidden ? 1 : 0;
             }
         }
 
         folders.Sort(static (left, right) => ByName(left.Name, right.Name));
         files.Sort(static (left, right) => ByName(left.Name, right.Name));
-        var listing = new NestedListing(folders, files.Count, hidden, false) { Files = files.ToArray() };
+        var listing = new NestedListing(folders, fileCount, hidden, truncated) { Files = files.ToArray() };
         folder.Listing = listing;
         return listing;
     }
@@ -148,8 +156,8 @@ internal sealed class ArchiveIndex
         using var session = ArchiveSession.Open(path, password, cancellation);
         var archive = session.Archive;
         Marshal.ThrowExceptionForHR(archive.GetNumberOfItems(out var count));
-        var items = new Dictionary<string, ArchiveItem>((int)Math.Min(count, 1_000_000), StringComparer.OrdinalIgnoreCase);
-        var folders = new Dictionary<string, Folder>(StringComparer.OrdinalIgnoreCase) { [string.Empty] = new Folder() };
+        var items = new Dictionary<string, ArchiveItem>((int)Math.Min(count, 1_000_000), StringComparer.Ordinal);
+        var folders = new Dictionary<string, Folder>(StringComparer.Ordinal) { [string.Empty] = new Folder() };
         var fallbackName = System.IO.Path.GetFileNameWithoutExtension(path);
         for (uint index = 0; index < count; index++)
         {
@@ -237,7 +245,7 @@ internal sealed class ArchiveIndex
         var name = slash < 0 ? inner : inner[(slash + 1)..];
         if (folders.TryGetValue(parent, out var folder))
         {
-            var at = folder.Children.FindIndex(child => string.Equals(child.Name, name, StringComparison.OrdinalIgnoreCase));
+            var at = folder.Children.FindIndex(child => string.Equals(child.Name, name, StringComparison.Ordinal));
             if (at >= 0)
             {
                 folder.Children[at] = (name, item);

@@ -5,6 +5,7 @@ using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using UltraExplorer.Controls;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Archives;
 
 namespace ViewAllSmoke;
 
@@ -38,8 +39,9 @@ internal static partial class Program
         var temporary = Path.Combine(Path.GetTempPath(), "shelf-temp-" + Guid.NewGuid().ToString("N")[..6] + ".txt");
         File.WriteAllText(temporary, "from temp");
 
-        var store = new ShelfStore();
-        store.Clear();
+        var previousArchives = ArchiveService.BrowseArchives;
+        ArchiveService.BrowseArchives = true;
+        var store = new ShelfStore(Path.Combine(fixture, "state", "Shelf"));
         try
         {
             var (added, _) = await store.AddAsync([project, notes, zip, temporary]);
@@ -57,7 +59,7 @@ internal static partial class Program
             board.Arrange(new Rect(0, 0, 520, 640));
             foreach (var entry in store.Entries)
             {
-                var card = new ShelfCard(entry, null);
+                var card = new ShelfCard(entry, null, browseArchives: true);
                 var spot = entry.HasPosition ? new Point(entry.X, entry.Y) : board.FreePlace();
                 card.X = spot.X;
                 card.Y = spot.Y;
@@ -65,12 +67,12 @@ internal static partial class Program
                 board.UpdateLayout();
             }
 
-            await Task.Delay(400);
+            await Task.WhenAll(board.Cards.Select(card => card.PreviewReady));
             board.UpdateLayout();
             Check("cards without a place are laid out where none overlaps",
                 board.Cards.SelectMany((a, i) => board.Cards.Skip(i + 1).Select(b => (a, b))).All(pair => !pair.a.Bounds.IntersectsWith(pair.b.Bounds)));
             Check("a folder and an archive are cards that show what is inside",
-                board.Cards.Count(card => card.IsFolder || card.IsArchive) == 2);
+                board.Cards.Count(card => card.IsFolder || card.IsArchive) == (ArchiveService.IsAvailable ? 2 : 1));
             // Eight files dropped at once onto a board with cards on it: laid out from the drop, none on another.
             var many = Enumerable.Range(0, 8).Select(index => new ShelfCard(new ShelfEntry(Path.Combine(fixture, $"TilesSquarePoolMixed001_{index}_4K_Normal.png"), DateTime.UtcNow, false), null)).ToList();
             foreach (var card in many)
@@ -89,7 +91,7 @@ internal static partial class Program
 
             store.SetPositions([(zip, 33, 44)]);
             store.SetWidth(640);
-            var reopened = new ShelfStore();
+            var reopened = new ShelfStore(store.Root);
             Check("each card's place and the shelf's width are kept across a restart",
                 reopened.Entries.First(entry => entry.Path == zip) is { X: 33, Y: 44 } && reopened.Width == 640);
 
@@ -103,7 +105,7 @@ internal static partial class Program
         finally
         {
             store.Clear();
-            store.SetWidth(520);
+            ArchiveService.BrowseArchives = previousArchives;
             TryDelete(fixture);
             File.Delete(temporary);
         }

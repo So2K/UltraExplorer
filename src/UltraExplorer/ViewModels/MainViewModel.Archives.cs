@@ -31,7 +31,7 @@ public sealed partial class MainViewModel
     /// <summary>True - and says why - when the folder is inside an archive or is one: nothing can be put there.</summary>
     internal bool RefuseArchiveTarget(string folder)
     {
-        if (!ArchiveService.IsInsideArchive(folder) && !ArchiveService.IsArchiveFile(folder))
+        if (!ArchiveService.IsInsideArchive(folder) && !ArchiveService.IsArchiveFile(folder, BrowseArchives))
         {
             return false;
         }
@@ -43,9 +43,11 @@ public sealed partial class MainViewModel
     /// <summary>A file inside an archive, taken out to the temporary folder and opened in its program.</summary>
     public async Task OpenFromArchiveAsync(string path)
     {
+        if (!ArchiveFeatureEnabled()) return;
         try
         {
-            var file = await ArchiveService.ExtractForOpenAsync(path, ArchiveProgressFor($"Opening {Path.GetFileName(path)}"), CancellationToken.None);
+            var file = await ArchiveService.ExtractForOpenAsync(path, ArchiveProgressFor($"Opening {Path.GetFileName(path)}"), CancellationToken.None, AskArchivePassword);
+            if (_isDisposed) return;
             Toast.Hide();
             NativeShellService.Open(file);
         }
@@ -61,6 +63,7 @@ public sealed partial class MainViewModel
     /// </summary>
     internal async Task<bool> ExtractIntoAsync(IReadOnlyList<string> paths, string targetDirectory)
     {
+        if (!ArchiveFeatureEnabled()) return false;
         if (RefuseArchiveTarget(targetDirectory))
         {
             return false;
@@ -69,7 +72,8 @@ public sealed partial class MainViewModel
         try
         {
             var watch = Stopwatch.StartNew();
-            var made = await ArchiveService.ExtractToAsync(paths, targetDirectory, ArchiveProgressFor("Extracting"), CancellationToken.None);
+            var made = await ArchiveService.ExtractToAsync(paths, targetDirectory, ArchiveProgressFor("Extracting"), CancellationToken.None, AskArchivePassword);
+            if (_isDisposed) return true;
             await Tree.RefreshPathAsync(targetDirectory);
             var name = Path.GetFileName(targetDirectory.TrimEnd(Path.DirectorySeparatorChar));
             _ = Toast.ShowSuccessAsync($"Extracted {made.Count} item(s) to {(name.Length == 0 ? targetDirectory : name)} in {Seconds(watch)}");
@@ -89,6 +93,7 @@ public sealed partial class MainViewModel
     /// </summary>
     public async Task ExtractArchivesAsync(IReadOnlyList<string> archives, bool ownFolder, string? destination = null)
     {
+        if (!ArchiveFeatureEnabled()) return;
         var made = new List<string>();
         var watch = Stopwatch.StartNew();
         foreach (var archive in archives)
@@ -96,7 +101,7 @@ public sealed partial class MainViewModel
             try
             {
                 made.Add(await ArchiveService.ExtractArchiveAsync(
-                    archive, destination, ownFolder, ArchiveProgressFor($"Extracting {Path.GetFileName(archive)}"), CancellationToken.None));
+                    archive, destination, ownFolder, ArchiveProgressFor($"Extracting {Path.GetFileName(archive)}"), CancellationToken.None, AskArchivePassword));
             }
             catch (Exception ex) when (IsArchiveFailure(ex))
             {
@@ -105,6 +110,7 @@ public sealed partial class MainViewModel
             }
         }
 
+        if (_isDisposed) return;
         foreach (var parent in made.Select(Path.GetDirectoryName).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             if (!string.IsNullOrEmpty(parent))
@@ -126,6 +132,7 @@ public sealed partial class MainViewModel
     /// <summary>Items inside archives, or whole archives, extracted into a folder the user picks.</summary>
     public async Task ExtractToChosenFolderAsync(IReadOnlyList<string> paths)
     {
+        if (!ArchiveFeatureEnabled()) return;
         var first = paths.FirstOrDefault();
         if (first is null)
         {
@@ -144,7 +151,7 @@ public sealed partial class MainViewModel
             return;
         }
 
-        if (paths.All(ArchiveService.IsArchiveFile))
+        if (paths.All(path => ArchiveService.IsArchiveFile(path, BrowseArchives)))
         {
             await ExtractArchivesAsync(paths, ownFolder: true, dialog.FolderName);
             return;
@@ -174,9 +181,10 @@ public sealed partial class MainViewModel
     /// <summary>Items inside archives taken out to the temporary folder and put on the clipboard, to paste anywhere.</summary>
     internal async Task CopyFromArchiveAsync(IReadOnlyList<string> paths)
     {
+        if (!ArchiveFeatureEnabled()) return;
         try
         {
-            var made = await ArchiveService.ExtractToTempAsync(paths, ArchiveProgressFor("Copying out of the archive"), CancellationToken.None);
+            var made = await ArchiveService.ExtractToTempAsync(paths, ArchiveProgressFor("Copying out of the archive"), CancellationToken.None, AskArchivePassword);
             if (!NativeShellService.CopyPathsToClipboard(made, cut: false))
             {
                 Toast.ShowError("Another application is holding the clipboard — try again.");
@@ -197,15 +205,17 @@ public sealed partial class MainViewModel
     /// </summary>
     internal string[]? ExtractForDrag(IReadOnlyList<string> paths)
     {
+        if (!ArchiveFeatureEnabled()) return null;
         try
         {
             // The drag has to start while the button is still down: waited
             // for here, pumping the window's messages so the toast still moves.
-            var task = ArchiveService.ExtractToTempAsync(paths, ArchiveProgressFor("Preparing the drag"), CancellationToken.None);
+            var task = ArchiveService.ExtractToTempAsync(paths, ArchiveProgressFor("Preparing the drag"), CancellationToken.None, AskArchivePassword);
             var frame = new System.Windows.Threading.DispatcherFrame();
             task.ContinueWith(_ => frame.Continue = false, TaskScheduler.Default);
             System.Windows.Threading.Dispatcher.PushFrame(frame);
             var made = task.GetAwaiter().GetResult();
+            if (_isDisposed) return null;
             Toast.Hide();
             return [.. made];
         }
@@ -240,6 +250,13 @@ public sealed partial class MainViewModel
     private static string Seconds(Stopwatch watch) =>
         watch.Elapsed.TotalSeconds < 1 ? $"{watch.ElapsedMilliseconds} ms" : $"{watch.Elapsed.TotalSeconds:N1} s";
 
+    private bool ArchiveFeatureEnabled()
+    {
+        if (BrowseArchives && !_isPickerSession) return true;
+        Toast.ShowError("Archive folders are disabled. Enable them in Settings to extract these items.");
+        return false;
+    }
+
     private static bool IsArchiveFailure(Exception ex) =>
         ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException
             or OperationCanceledException or System.Runtime.InteropServices.COMException or ArgumentException;
@@ -254,14 +271,14 @@ public sealed partial class MainViewModel
     /// <summary>Asks for an archive's password on the window's thread, from whichever thread 7-Zip asked on.</summary>
     internal string? AskArchivePassword(string archiveName)
     {
+        if (_isDisposed) return null;
         var dispatcher = Application.Current?.Dispatcher;
         if (dispatcher is null)
         {
             return null;
         }
 
-        return dispatcher.CheckAccess()
-            ? PromptRequested?.Invoke("Password", $"Password for {archiveName}", string.Empty, false)
-            : dispatcher.Invoke(() => PromptRequested?.Invoke("Password", $"Password for {archiveName}", string.Empty, false));
+        string? Ask() => _isDisposed ? null : PromptRequested?.Invoke("Password", $"Password for {archiveName}", string.Empty, false);
+        return dispatcher.CheckAccess() ? Ask() : dispatcher.Invoke(Ask);
     }
 }

@@ -38,6 +38,10 @@ jobs:
         shell: pwsh
         run: ./scripts/setup-preview-tools.ps1
 
+      - name: Prepare pinned archive engine
+        shell: pwsh
+        run: ./scripts/setup-archive-tools.ps1
+
       # A tag v1.2.3 is version 1.2.3 (v1.2.3-beta.1 is 1.2.3-beta.1, file
       # version 1.2.3); any other build is 0.0.0-ci.<run number>.  The ref
       # comes in through the environment, never pasted into the script.
@@ -97,6 +101,15 @@ jobs:
         run: |
           pwsh -NoProfile -File tests/InstallPayloadChecks.ps1
           if ($LASTEXITCODE -ne 0) { throw "Installer payload checks failed with exit code $LASTEXITCODE." }
+
+      - name: Check optional features and PR4 corrections
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-optional-checks'
+          $env:ULTRAEXPLORER_TEST_WINDOW = '1'
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only Pr4WorkspaceFixChecks,Pr4SearchFixChecks,Pr4ShelfSafetyChecks,Pr4ShelfDropChecks,OptionalFeatureChecks,ArchiveToggleChecks
+          if ($LASTEXITCODE -ne 0) { throw "Optional feature checks failed with exit code $LASTEXITCODE." }
 
       - name: Check file-dialog contracts
         shell: pwsh

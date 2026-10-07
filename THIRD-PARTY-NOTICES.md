@@ -40,6 +40,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
+7-Zip 26.04 (Copyright (C) Igor Pavlov) is distributed as separate replaceable
+`archives/7z.dll` and `archives/7z.exe`, used for optional archive browsing.
+7-Zip uses GNU LGPL 2.1 or later, with BSD notices and the unRAR restriction
+for parts of 7z.dll. Unmodified binaries and the full upstream license are
+in `archives/License.txt`; source is available from
+https://github.com/ip7z/7zip/releases/tag/26.04 and https://www.7-zip.org/.
+The pinned setup script verifies upstream SHA-256 digests before extraction.
+
 The application's existing graphics/canvas packages retain their own license
 metadata in their NuGet packages. This notice accompanies the newly added
 dialog-integration dependencies; it is not a relicensing of those components.
