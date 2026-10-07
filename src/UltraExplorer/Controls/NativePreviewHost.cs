@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Windows;
+using System.Windows.Automation;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Interop;
@@ -22,16 +23,25 @@ namespace UltraExplorer.Controls;
 internal sealed class NativePreviewHost : UserControl, IDisposable
 {
     private readonly NativeSurface _surface = new();
+    private readonly DockPanel _header = new() { LastChildFill = true, Height = 38 };
+    private readonly Border _audioCard = new() { Visibility = Visibility.Collapsed, MaxWidth = 480, Margin = new Thickness(24),
+        HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, CornerRadius = new CornerRadius(12),
+        Padding = new Thickness(24), BorderThickness = new Thickness(1) };
+    private readonly Border _audioIcon = new() { Width = 68, Height = 68, CornerRadius = new CornerRadius(20), HorizontalAlignment = HorizontalAlignment.Center };
+    private readonly TextBlock _audioName = new() { FontSize = 18, FontWeight = FontWeights.SemiBold, TextAlignment = TextAlignment.Center,
+        TextTrimming = TextTrimming.CharacterEllipsis, Margin = new Thickness(0, 16, 0, 8) };
+    private readonly TextBlock _audioDetail = new() { FontSize = 12, TextAlignment = TextAlignment.Center };
     private readonly TextBlock _status = new() { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 4, 0), FontSize = 12 };
     private readonly StackPanel _tools = new() { Orientation = Orientation.Horizontal };
-    private readonly Grid _mediaControls = new() { Margin = new Thickness(12, 5, 12, 10), Visibility = Visibility.Collapsed };
+    private readonly Grid _mediaControls = new() { Margin = new Thickness(16, 8, 16, 12), Visibility = Visibility.Collapsed };
     private readonly Slider _timeline = new() { Minimum = 0, Maximum = 1, IsMoveToPointEnabled = true, VerticalAlignment = VerticalAlignment.Center };
-    private readonly Slider _volume = new() { Minimum = 0, Maximum = 100, Value = 100, Width = 110, VerticalAlignment = VerticalAlignment.Center, ToolTip = "Volume" };
+    private readonly Slider _volume = new() { Minimum = 0, Maximum = 100, Value = 100, Width = 100, IsMoveToPointEnabled = true,
+        VerticalAlignment = VerticalAlignment.Center, ToolTip = "Volume" };
     private readonly TextBlock _position = new() { Text = "0:00", VerticalAlignment = VerticalAlignment.Center, MinWidth = 46 };
     private readonly TextBlock _duration = new() { Text = "0:00", VerticalAlignment = VerticalAlignment.Center, MinWidth = 46, TextAlignment = TextAlignment.Right };
-    private readonly Button _playPause = new() { Content = "Play" };
-    private readonly Button _mute = new() { Content = "Mute" };
-    private readonly ComboBox _speed = new() { Width = 76, Height = 28, ToolTip = "Playback speed" };
+    private readonly Button _playPause = new();
+    private readonly Button _mute = new();
+    private readonly ComboBox _speed = new() { Width = 76, Height = 32, ToolTip = "Playback speed" };
     private readonly DispatcherTimer _playbackTimer = new(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(250) };
     private readonly DispatcherTimer _seekTimer = new(DispatcherPriority.Input) { Interval = TimeSpan.FromMilliseconds(80) };
     private readonly CancellationTokenSource _lifetime = new();
@@ -44,6 +54,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
     private int _generation;
     private bool _disposed;
     private bool _refreshingPlayback, _syncingControls, _scrubbing, _resumeAfterScrub;
+    private bool _paused = true;
+    private string _mediaExtension = "";
     private double? _pendingSeek;
     private CancellationTokenSource? _seekRequest;
     private long _playbackPolls;
@@ -54,6 +66,19 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
     internal IntPtr ModelWindowHandle => _modelWindow;
     internal bool IsPlaybackTimerRunning => _playbackTimer.IsEnabled;
     internal long PlaybackPollCount => _playbackPolls;
+    internal bool IsAudioOnly { get; private set; }
+    internal bool IsMediaLoaded => !_disposed && _pipeName is not null && _mediaControls.Visibility == Visibility.Visible && _mediaControls.IsEnabled;
+    internal bool IsMediaHeaderVisible => _header.Visibility == Visibility.Visible;
+    internal bool IsNativeViewportVisible => _surface.Visibility == Visibility.Visible;
+    internal string AudioDisplayName => _audioName.Text;
+    internal string AudioDetail => _audioDetail.Text;
+    internal FrameworkElement AudioCard => _audioCard;
+    internal FrameworkElement PlaybackControls => _mediaControls;
+    internal Slider TimelineControl => _timeline;
+    internal Slider VolumeControl => _volume;
+    internal Button PlayPauseControl => _playPause;
+    internal Button MuteControl => _mute;
+    internal ComboBox SpeedControl => _speed;
     internal string? ModelSnapshotPath => _sessionDirectory is null ? null : Path.Combine(_sessionDirectory, "viewport.png");
     internal void RequestModelSnapshot() => _surface.ModelKey(0x7B); // F12, sent only to the owned viewport.
 
@@ -65,19 +90,21 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         grid.RowDefinitions.Add(new RowDefinition());
         grid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var header = new DockPanel { LastChildFill = true, Height = 42 };
-        header.SetResourceReference(Panel.BackgroundProperty, "SurfaceBrush");
+        _header.SetResourceReference(Panel.BackgroundProperty, "SurfaceBrush");
         DockPanel.SetDock(_tools, Dock.Right);
-        header.Children.Add(_tools);
-        header.Children.Add(_status);
-        grid.Children.Add(header);
+        _header.Children.Add(_tools);
+        _header.Children.Add(_status);
+        grid.Children.Add(_header);
         Grid.SetRow(_surface, 1);
         grid.Children.Add(_surface);
+        BuildAudioCard();
+        Grid.SetRow(_audioCard, 1); grid.Children.Add(_audioCard);
         BuildMediaControls();
         Grid.SetRow(_mediaControls, 2);
         grid.Children.Add(_mediaControls);
         _playbackTimer.Tick += PlaybackTick;
         _seekTimer.Tick += SeekTick;
+        _surface.SizeChanged += (_, _) => UpdateAudioCardSize();
         Content = grid;
         Unloaded += (_, _) => Dispose();
     }
@@ -89,7 +116,12 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         StopSession();
         var generation = ++_generation;
         LastError = null;
+        IsAudioOnly = false;
+        _surface.Visibility = Visibility.Visible;
+        _audioCard.Visibility = Visibility.Collapsed;
+        _header.Visibility = Visibility.Visible;
         _mediaControls.Visibility = Visibility.Collapsed;
+        _mediaControls.IsEnabled = true;
         _status.Text = "Loading preview…";
         var model = PreviewTools.IsModel(path);
         var executable = model ? PreviewTools.FindF3d() : PreviewTools.FindMpv();
@@ -139,6 +171,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 if (!_disposed && generation == _generation)
                 {
                     _status.Text = "Preview closed";
+                    _header.Visibility = Visibility.Visible;
+                    _mediaControls.IsEnabled = false;
                     _playbackTimer.Stop();
                     _seekTimer.Stop();
                     _surface.Detach();
@@ -180,7 +214,19 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                     if (response is { } reply && reply.TryGetProperty("data", out var idle) && idle.ValueKind == JsonValueKind.False) break;
                     await Task.Delay(80, loading.Token);
                 }
-                _status.Text = "Drag the timeline to preview a frame";
+                var tracks = await MpvCommandAsync(["get_property", "track-list"], loading.Token);
+                if (generation != _generation) throw new OperationCanceledException(session.Token);
+                IsAudioOnly = HasOnlyAudio(tracks, path);
+                _mediaExtension = Path.GetExtension(path.TrimEnd(' ', '.')).TrimStart('.').ToUpperInvariant();
+                _audioName.Text = Path.GetFileName(path.TrimEnd(' ', '.'));
+                _audioName.ToolTip = _audioName.Text;
+                _audioCard.Visibility = IsAudioOnly ? Visibility.Visible : Visibility.Collapsed;
+                UpdateAudioCardSize();
+                // Keep the existing HWND alive for IPC, but cover/hide its blank
+                // video canvas for audio. Switching back to video reuses this host.
+                _surface.Visibility = IsAudioOnly ? Visibility.Hidden : Visibility.Visible;
+                _header.Visibility = Visibility.Collapsed;
+                _status.Text = "";
                 _mediaControls.Visibility = Visibility.Visible;
                 await RefreshPlaybackAsync(loading.Token);
                 _playbackTimer.Start();
@@ -194,6 +240,9 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 LastError = ownTimeout
                     ? "The preview engine took too long to load this file." : ex.Message;
                 _status.Text = LastError;
+                _header.Visibility = Visibility.Visible;
+                _mediaControls.Visibility = Visibility.Collapsed;
+                _audioCard.Visibility = Visibility.Collapsed;
                 StopSession();
             }
             if (ownTimeout) throw new TimeoutException("The preview engine took too long to load this file.", ex);
@@ -238,48 +287,104 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         return null;
     }
 
+    private void BuildAudioCard()
+    {
+        _audioCard.SetResourceReference(Border.BackgroundProperty, "SurfaceBrush");
+        _audioCard.SetResourceReference(Border.BorderBrushProperty, "BorderBrush");
+        _audioName.SetResourceReference(TextBlock.ForegroundProperty, "TextBrush");
+        _audioDetail.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        var body = new StackPanel();
+        _audioIcon.SetResourceReference(Border.BackgroundProperty, "AccentSoftBrush");
+        var glyph = PlaybackGlyph("\uE8D6", 28);
+        glyph.SetResourceReference(TextBlock.ForegroundProperty, "AccentBrush");
+        _audioIcon.Child = glyph;
+        body.Children.Add(_audioIcon); body.Children.Add(_audioName); body.Children.Add(_audioDetail);
+        _audioCard.Child = body;
+    }
+
+    private void UpdateAudioCardSize()
+    {
+        if (!IsAudioOnly) return;
+        var compact = _surface.ActualHeight < 200;
+        _audioCard.Margin = compact ? new Thickness(16, 8, 16, 8) : new Thickness(24);
+        _audioCard.Padding = compact ? new Thickness(16, 12, 16, 12) : new Thickness(24);
+        _audioIcon.Width = _audioIcon.Height = compact ? 40 : 68;
+        _audioIcon.CornerRadius = new CornerRadius(compact ? 12 : 20);
+        if (_audioIcon.Child is TextBlock glyph) glyph.FontSize = compact ? 22 : 28;
+        _audioName.FontSize = compact ? 16 : 18;
+        _audioName.Margin = compact ? new Thickness(0, 10, 0, 6) : new Thickness(0, 16, 0, 8);
+    }
+
     private void BuildMediaControls()
     {
         _mediaControls.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         _mediaControls.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var seek = new Grid { Margin = new Thickness(0, 0, 0, 4) };
+        var seek = new Grid { Margin = new Thickness(0, 0, 0, 5) };
         seek.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
         seek.ColumnDefinitions.Add(new ColumnDefinition());
         seek.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-        _timeline.Margin = new Thickness(10, 0, 10, 0);
+        _position.FontSize = _duration.FontSize = 11;
+        _position.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        _duration.SetResourceReference(TextBlock.ForegroundProperty, "TextDimBrush");
+        _timeline.Margin = new Thickness(8, 0, 8, 0);
+        _timeline.Height = _volume.Height = 28;
+        _timeline.Template = _volume.Template = BuildSliderTemplate();
+        _timeline.ToolTip = "Seek";
+        AutomationProperties.SetName(_timeline, "Playback position");
+        AutomationProperties.SetName(_volume, "Volume");
         Grid.SetColumn(_timeline, 1); Grid.SetColumn(_duration, 2);
         seek.Children.Add(_position); seek.Children.Add(_timeline); seek.Children.Add(_duration);
         _mediaControls.Children.Add(seek);
-        var buttons = new DockPanel { LastChildFill = false };
+
+        var buttons = new Grid();
+        foreach (var width in new[] { GridLength.Auto, GridLength.Auto, GridLength.Auto, new GridLength(1, GridUnitType.Star), GridLength.Auto, GridLength.Auto })
+            buttons.ColumnDefinitions.Add(new ColumnDefinition { Width = width });
         Grid.SetRow(buttons, 1); _mediaControls.Children.Add(buttons);
-        StylePlaybackButton(_playPause); _playPause.Click += (_, _) => RunPlaybackAction(() => TogglePlaybackAsync());
-        var stop = new Button { Content = "Stop" }; StylePlaybackButton(stop); stop.Click += (_, _) => RunPlaybackAction(() => StopPlaybackAsync());
-        buttons.Children.Add(_playPause); buttons.Children.Add(stop);
-        buttons.Children.Add(new TextBlock { Text = "Speed", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(14, 0, 7, 0) });
+        StylePlaybackButton(_playPause, true); SetButtonGlyph(_playPause, "\uE768", "Play");
+        _playPause.Click += (_, _) => RunPlaybackAction(() => TogglePlaybackAsync());
+        var stop = new Button(); StylePlaybackButton(stop); SetButtonGlyph(stop, "\uE71A", "Stop");
+        stop.Click += (_, _) => RunPlaybackAction(() => StopPlaybackAsync());
+        Grid.SetColumn(stop, 1); buttons.Children.Add(_playPause); buttons.Children.Add(stop);
+        _speed.Margin = new Thickness(8, 0, 0, 0);
         _speed.SetResourceReference(Control.ForegroundProperty, "TextMutedBrush");
+        _speed.SetResourceReference(Control.FocusVisualStyleProperty, "AppFocusVisual");
+        AutomationProperties.SetName(_speed, "Playback speed");
         _speed.Template = (ControlTemplate)XamlReader.Parse("""
             <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ComboBox">
               <Grid>
                 <ToggleButton Foreground="{DynamicResource TextMutedBrush}" Focusable="False" IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}">
                   <ToggleButton.Template><ControlTemplate TargetType="ToggleButton">
-                    <Border Background="{DynamicResource SurfaceRaisedBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" CornerRadius="4" Padding="8,3">
-                      <DockPanel><TextBlock DockPanel.Dock="Right" Text="⌄" Foreground="{DynamicResource TextMutedBrush}" Margin="8,0,0,0"/>
+                    <Border Name="Chrome" Background="Transparent" BorderBrush="Transparent" BorderThickness="1" CornerRadius="6" Padding="10,3">
+                      <DockPanel VerticalAlignment="Center"><TextBlock DockPanel.Dock="Right" Text="⌄" Foreground="{DynamicResource TextDimBrush}" Margin="8,0,0,0"/>
                         <ContentPresenter Content="{Binding SelectionBoxItem, RelativeSource={RelativeSource AncestorType=ComboBox}}"/>
                       </DockPanel>
                     </Border>
+                    <ControlTemplate.Triggers>
+                      <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{DynamicResource SurfaceHoverBrush}"/></Trigger>
+                      <Trigger Property="IsChecked" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{DynamicResource SurfaceRaisedBrush}"/></Trigger>
+                    </ControlTemplate.Triggers>
                   </ControlTemplate></ToggleButton.Template>
                 </ToggleButton>
                 <Popup Name="PART_Popup" IsOpen="{TemplateBinding IsDropDownOpen}" Placement="Bottom" AllowsTransparency="True" Focusable="False">
-                  <Border Background="{DynamicResource SurfaceRaisedBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1" Padding="3">
+                  <Border Background="{DynamicResource SurfaceRaisedBrush}" BorderBrush="{DynamicResource BorderStrongBrush}" BorderThickness="1" CornerRadius="6" Padding="4" MinWidth="76">
                     <ScrollViewer CanContentScroll="True"><ItemsPresenter/></ScrollViewer>
                   </Border>
                 </Popup>
               </Grid>
             </ControlTemplate>
             """);
+        var itemTemplate = (ControlTemplate)XamlReader.Parse("""
+            <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="ComboBoxItem">
+              <Border Name="Row" Background="Transparent" CornerRadius="4" Padding="10,6"><ContentPresenter/></Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsHighlighted" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SurfaceHoverBrush}"/></Trigger>
+                <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource AccentSoftBrush}"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+            """);
         foreach (var value in new[] { 0.25, 0.5, 1, 1.5, 2, 3 })
         {
-            var item = new ComboBoxItem { Content = value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "×", Tag = value };
+            var item = new ComboBoxItem { Content = value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + "×", Tag = value, Template = itemTemplate };
             item.SetResourceReference(Control.ForegroundProperty, "TextMutedBrush");
             _speed.Items.Add(item);
         }
@@ -288,18 +393,16 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         {
             if (!_syncingControls && _speed.SelectedItem is ComboBoxItem { Tag: double value }) RunPlaybackAction(() => SetSpeedAsync(value));
         };
-        buttons.Children.Add(_speed);
-        DockPanel.SetDock(_mute, Dock.Right); StylePlaybackButton(_mute);
+        Grid.SetColumn(_speed, 2); buttons.Children.Add(_speed);
+        StylePlaybackButton(_mute); SetButtonGlyph(_mute, "\uE767", "Mute");
         _mute.Click += (_, _) => RunPlaybackAction(async () => { await MpvCommandAsync(["cycle", "mute"]); await RefreshPlaybackAsync(); });
-        buttons.Children.Add(_mute);
-        DockPanel.SetDock(_volume, Dock.Right); _volume.Margin = new Thickness(10, 0, 4, 0); buttons.Children.Add(_volume);
-        var volumeLabel = new TextBlock { Text = "Volume", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(12, 0, 0, 0) };
-        DockPanel.SetDock(volumeLabel, Dock.Right); buttons.Children.Add(volumeLabel);
+        Grid.SetColumn(_mute, 4); buttons.Children.Add(_mute);
+        _volume.Margin = new Thickness(6, 0, 0, 0); Grid.SetColumn(_volume, 5); buttons.Children.Add(_volume);
         _volume.ValueChanged += (_, _) => { if (!_syncingControls) RunPlaybackAction(() => SetVolumeAsync(_volume.Value)); };
         _timeline.ValueChanged += (_, _) => { if (!_syncingControls) QueueSeek(_timeline.Value); };
         _timeline.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) =>
         {
-            _scrubbing = true; _resumeAfterScrub = _playPause.Content as string == "Pause";
+            _scrubbing = true; _resumeAfterScrub = !_paused;
             RunPlaybackAction(async () => { await MpvCommandAsync(["set_property", "pause", true]); });
         }));
         _timeline.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) =>
@@ -311,10 +414,91 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         }));
     }
 
-    private static void StylePlaybackButton(Button button)
+    private static ControlTemplate BuildSliderTemplate() => (ControlTemplate)XamlReader.Parse("""
+        <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Slider">
+          <Grid Name="Root" Background="Transparent" MinHeight="28">
+            <Border Name="FocusRing" BorderBrush="Transparent" BorderThickness="1" CornerRadius="5"/>
+            <Track Name="PART_Track" Height="28" VerticalAlignment="Center" Minimum="{TemplateBinding Minimum}" Maximum="{TemplateBinding Maximum}" Value="{Binding Value, RelativeSource={RelativeSource TemplatedParent}, Mode=TwoWay}" IsDirectionReversed="{TemplateBinding IsDirectionReversed}">
+              <Track.DecreaseRepeatButton><RepeatButton Command="Slider.DecreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="{DynamicResource AccentBrush}" Height="4" CornerRadius="2"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.DecreaseRepeatButton>
+              <Track.IncreaseRepeatButton><RepeatButton Command="Slider.IncreaseLarge" Focusable="False"><RepeatButton.Template><ControlTemplate TargetType="RepeatButton"><Border Background="{DynamicResource BorderStrongBrush}" Height="4" CornerRadius="2"/></ControlTemplate></RepeatButton.Template></RepeatButton></Track.IncreaseRepeatButton>
+              <Track.Thumb><Thumb Width="12" Height="28" Focusable="False"><Thumb.Template><ControlTemplate TargetType="Thumb"><Border Width="12" Height="12" VerticalAlignment="Center" Background="{DynamicResource TextBrush}" CornerRadius="6" BorderBrush="{DynamicResource AccentBrush}" BorderThickness="2"/></ControlTemplate></Thumb.Template></Thumb></Track.Thumb>
+            </Track>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="FocusRing" Property="BorderBrush" Value="{DynamicResource AccentBrush}"/></Trigger>
+            <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Root" Property="Opacity" Value="0.4"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+        """);
+
+    private static TextBlock PlaybackGlyph(string glyph, double size = 16)
     {
-        button.Margin = new Thickness(0, 1, 5, 1); button.Padding = new Thickness(9, 4, 9, 4);
-        button.SetResourceReference(FrameworkElement.StyleProperty, "FlatButton");
+        var icon = new TextBlock { Text = glyph, FontSize = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
+        icon.SetResourceReference(TextBlock.FontFamilyProperty, "IconFont");
+        return icon;
+    }
+
+    private static void SetButtonGlyph(Button button, string glyph, string name)
+    {
+        if (button.Content is TextBlock icon) icon.Text = glyph;
+        else button.Content = PlaybackGlyph(glyph);
+        button.ToolTip = name;
+        AutomationProperties.SetName(button, name);
+    }
+
+    private static void StylePlaybackButton(Button button, bool primary = false)
+    {
+        button.Width = primary ? 42 : 34; button.Height = 34;
+        button.Margin = new Thickness(0, 0, 4, 0);
+        button.SetResourceReference(Control.ForegroundProperty, primary ? "CanvasBrush" : "TextMutedBrush");
+        button.SetResourceReference(Control.BackgroundProperty, primary ? "AccentBrush" : "CanvasBrush");
+        button.SetResourceReference(Control.FocusVisualStyleProperty, "AppFocusVisual");
+        button.Template = (ControlTemplate)XamlReader.Parse("""
+            <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" TargetType="Button">
+              <Border Name="Chrome" Background="{TemplateBinding Background}" CornerRadius="7" BorderThickness="1" BorderBrush="Transparent">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.8"/><Setter TargetName="Chrome" Property="BorderBrush" Value="{DynamicResource AccentBrightBrush}"/></Trigger>
+                <Trigger Property="IsPressed" Value="True"><Setter TargetName="Chrome" Property="Opacity" Value="0.65"/></Trigger>
+                <Trigger Property="IsEnabled" Value="False"><Setter TargetName="Chrome" Property="Opacity" Value="0.4"/></Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+            """);
+    }
+
+    internal bool OwnsPlaybackControl(DependencyObject? source)
+    {
+        var control = false;
+        for (var current = source; current is not null; current = current is Visual or System.Windows.Media.Media3D.Visual3D
+                 ? VisualTreeHelper.GetParent(current) : LogicalTreeHelper.GetParent(current))
+        {
+            // Popup visuals end at PopupRoot rather than the media panel. Use
+            // the item's actual ItemsControl owner, never a foreign dropdown.
+            if (current is ComboBoxItem item && ReferenceEquals(ItemsControl.ItemsControlFromItemContainer(item), _speed)) return true;
+            control |= current is Slider or ComboBox or ButtonBase;
+            if (ReferenceEquals(current, _mediaControls)) return control;
+        }
+        return false;
+    }
+
+    internal static bool HasOnlyAudio(JsonElement? response, string path)
+    {
+        if (response is { } reply && reply.TryGetProperty("data", out var tracks) && tracks.ValueKind == JsonValueKind.Array && tracks.GetArrayLength() > 0)
+        {
+            var audio = false;
+            foreach (var track in tracks.EnumerateArray())
+            {
+                if (track.ValueKind != JsonValueKind.Object || !track.TryGetProperty("type", out var type)) continue;
+                if (type.ValueKind != JsonValueKind.String) continue;
+                var kind = type.GetString();
+                if (kind == "video" && !(track.TryGetProperty("albumart", out var cover) && cover.ValueKind == JsonValueKind.True)) return false;
+                audio |= kind == "audio";
+            }
+            return audio;
+        }
+        return Path.GetExtension(path.TrimEnd(' ', '.')).ToLowerInvariant() is ".aac" or ".ac3" or ".aif" or ".aiff" or ".alac" or ".amr" or ".ape"
+            or ".dts" or ".flac" or ".m4a" or ".mka" or ".mp2" or ".mp3" or ".oga" or ".ogg" or ".opus" or ".wav" or ".wma" or ".wv";
     }
 
     private async void RunPlaybackAction(Func<Task> action)
@@ -380,10 +564,14 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 _timeline.Maximum = Math.Max(0.001, total); _timeline.IsEnabled = total > 0;
                 if (!_scrubbing && _pendingSeek is null) _timeline.Value = Math.Clamp(seconds, 0, _timeline.Maximum);
                 _position.Text = FormatTime(_scrubbing ? _timeline.Value : seconds); _duration.Text = FormatTime(total);
-                _playPause.Content = PropertyBool(pause) ? "Play" : "Pause";
-                _mute.Content = PropertyBool(mute) ? "Unmute" : "Mute";
+                _paused = PropertyBool(pause);
+                SetButtonGlyph(_playPause, _paused ? "\uE768" : "\uE769", _paused ? "Play" : "Pause");
+                var muted = PropertyBool(mute);
+                SetButtonGlyph(_mute, muted ? "\uE74F" : "\uE767", muted ? "Unmute" : "Mute");
                 _volume.Value = Math.Clamp(PropertyNumber(volume), 0, 100);
                 _volume.ToolTip = $"Volume: {_volume.Value:0}%";
+                if (IsAudioOnly) _audioDetail.Text = string.IsNullOrEmpty(_mediaExtension) ? $"Audio · {FormatTime(total)}" : $"{_mediaExtension} audio · {FormatTime(total)}";
+                AutomationProperties.SetHelpText(_timeline, $"{FormatTime(seconds)} of {FormatTime(total)}");
                 var currentSpeed = PropertyNumber(speed);
                 _speed.SelectedItem = _speed.Items.Cast<ComboBoxItem>().FirstOrDefault(item => item.Tag is double value && Math.Abs(value - currentSpeed) < 0.001);
                 _playbackPolls++;

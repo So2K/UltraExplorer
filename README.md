@@ -13,7 +13,7 @@ See the structure, fly into a folder, and keep your bearings.
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [Download for Windows](https://github.com/So2K/UltraExplorer/releases/latest) ·
-[Try v1.3.0 beta](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.2) ·
+[Try v1.3.0 beta](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.3) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -24,7 +24,7 @@ See the structure, fly into a folder, and keep your bearings.
 
 </div>
 
-**v1.3.0-beta.2 is available for testing:** quiet update checks with user-initiated
+**v1.3.0-beta.3 is available for testing:** quiet update checks with user-initiated
 installation, Space Quick Look, quick text notes, compact media/3D previews and
 optional archive, shelf and copy-path tools.
 See the [beta testing guide](docs/BETA_TESTING.md) for short sample workflows

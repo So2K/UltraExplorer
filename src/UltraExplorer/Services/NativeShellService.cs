@@ -306,10 +306,10 @@ public sealed class NativeShellService
     }
 
     public static void OpenWith(string path)
-        => ExecuteShellVerb(path, "openas");
+        => PreviewOpenWithService.ChooseAsync(path, IntPtr.Zero).GetAwaiter().GetResult();
 
     /// <summary>The Open with Shell dialog on its own STA, away from the shared WPF dispatcher.</summary>
-    public static Task OpenWithAsync(string path) => RunStaAsync(() => OpenWith(path));
+    public static Task OpenWithAsync(string path) => PreviewOpenWithService.ChooseAsync(path, IntPtr.Zero);
 
     /// <summary>
     /// Windows Explorer itself on <paramref name="path"/> - a folder opened,

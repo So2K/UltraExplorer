@@ -1,4 +1,4 @@
-# Try the v1.3.0-beta.2 beta
+# Try the v1.3.0-beta.3 beta
 
 The useful feedback is a short workflow that behaves unexpectedly: which file
 type, what you did, and what happened. Use copies in a small disposable folder
@@ -7,7 +7,7 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
 ## Get started
 
 1. Download the installer or portable ZIP from the
-   [v1.3.0-beta.2 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.2).
+   [v1.3.0-beta.3 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.3).
    For the ZIP, extract the entire folder before running `UltraExplorer.exe`.
 2. Keep a few sample files together: two text files, an image, a PDF and,
    if relevant to your work, a media file, a model or a small ZIP containing
@@ -47,9 +47,9 @@ extracting another copy does not create an isolated profile.
 | Close the preview. Hold `Space` and move the pointer; repeat with `Space+drag`. | The map follows the pointer immediately. Releasing Space stops the movement and does not open a preview. |
 | Rest the pointer over an image, then scroll or move away. | A passive preview appears without changing selection and disappears with the gesture. Turn **Hover previews** off and repeat: no content card appears. |
 | Open a copied text file with `Space`, edit it, then press Escape. Reopen it. | Editing is available immediately; the saved text returns. Repeat using **Next file** and Quick Look's close button to save. `Ctrl+S` saves while keeping the preview open. |
-| Preview an image and a multi-page PDF. | Fit/zoom works for the image; PDF page navigation and zoom show the requested content. |
-| Preview media or a supported model, if you have samples. | Media starts paused; play/pause, Stop and timeline seeking behave predictably. A model can orbit/zoom/pan and reset with Fit. Closing or switching stops the previous media preview. |
-| Use **Open** and the **Open with** arrow on a copied file. | The requested file opens in the chosen application. |
+| Preview an image and a multi-page PDF. | Image wheel zoom needs no modifier and preserves the point under the pointer; drag pans. Ctrl+wheel pans vertically, Ctrl+Shift+wheel horizontally. PDF wheel scrolls and Ctrl+wheel zooms. |
+| Preview media or a supported model, if you have samples. | Media starts paused; audio uses a named card, video a viewport. Compact controls and Space on the media surface play/pause; sliders/buttons keep their keys. Timeline seeking shows actual video frames. A model can orbit/zoom/pan and reset with Fit. Closing stops the previous preview and leaves the owner visible in its prior normal/maximized state. |
+| Use **Open** and the **Open with** arrow on a copied file. | The accented Open uses the default app. Its arrow shows Windows programs with icons and Choose another app. A missing default opens that choice menu without the previous error dialog. |
 | Zoom away from a selected file, then press `F`; repeat in split view. | The active pane flies smoothly to that file. Selection and navigation history stay intact. |
 
 When a text field has focus, Space and arrow keys keep their editing meanings.

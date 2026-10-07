@@ -55,6 +55,10 @@ internal static partial class Program
             Check("F3D produces a frozen bounded actual OBJ thumbnail", modelBitmap is { IsFrozen: true, PixelWidth: 256, PixelHeight: 256 } && PreviewToolsVariedPixels(modelBitmap));
             Check("mpv decodes actual AVI pixels into a frozen bounded frame", mediaBitmap is { IsFrozen: true } && mediaBitmap.PixelWidth <= 256 && mediaBitmap.PixelHeight <= 256 && PreviewToolsVariedPixels(mediaBitmap));
             var portraitBitmap = await PreviewTools.RenderMediaAsync(portrait, 192);
+            if (portraitBitmap is null || portraitBitmap.PixelWidth >= portraitBitmap.PixelHeight
+                || portraitBitmap.PixelWidth > 192 || portraitBitmap.PixelHeight > 192)
+                Console.WriteLine(portraitBitmap is null ? "Portrait thumbnail diagnostic: null"
+                    : $"Portrait thumbnail diagnostic: {portraitBitmap.PixelWidth}x{portraitBitmap.PixelHeight}, frozen={portraitBitmap.IsFrozen}");
             Check("a portrait video preserves aspect ratio and both dimension bounds", portraitBitmap is { IsFrozen: true } && portraitBitmap.PixelWidth < portraitBitmap.PixelHeight && portraitBitmap.PixelWidth <= 192 && portraitBitmap.PixelHeight <= 192);
             if (modelBitmap is not null) PreviewToolsSavePicture(modelBitmap, Path.Combine(artifacts, "native-model-thumbnail.png"));
             if (mediaBitmap is not null) PreviewToolsSavePicture(mediaBitmap, Path.Combine(artifacts, "native-media-thumbnail.png"));
@@ -104,7 +108,8 @@ internal static partial class Program
                     && shortcuts is { } keys && keys.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.False);
                 var mediaControls = PreviewNativeDescendants(host).ToArray();
                 Check("the compact player provides its own timeline, volume and six speed choices", mediaControls.OfType<Slider>().Count(s => s.IsVisible) == 2
-                    && mediaControls.OfType<ComboBox>().Single().Items.Count == 6 && mediaControls.OfType<Button>().Any(b => b.Content as string == "Stop"));
+                    && mediaControls.OfType<ComboBox>().Single().Items.Count == 6
+                    && mediaControls.OfType<Button>().Any(b => System.Windows.Automation.AutomationProperties.GetName(b) == "Stop"));
                 host.UpdateLayout();
                 var controlsPicture = new RenderTargetBitmap(Math.Max(1, (int)Math.Ceiling(host.ActualWidth)),
                     Math.Max(1, (int)Math.Ceiling(host.ActualHeight)), 96, 96, PixelFormats.Pbgra32);

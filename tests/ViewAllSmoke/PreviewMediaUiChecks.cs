@@ -1,0 +1,230 @@
+using System.Diagnostics;
+using System.IO;
+using System.Text.Json;
+using System.Windows;
+using System.Windows.Automation;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using UltraExplorer.Controls;
+using UltraExplorer.Picker.Integration;
+using UltraExplorer.Services;
+
+namespace ViewAllSmoke;
+
+internal static partial class Program
+{
+    private static Task PreviewMediaUiChecks()
+    {
+        if (_only is not [var alone] || !alone.Equals(nameof(PreviewMediaUiChecks), StringComparison.OrdinalIgnoreCase))
+        { RunGroupInOwnProcess(nameof(PreviewMediaUiChecks)); return Task.CompletedTask; }
+        RunOnSta("compact media preview interface", PreviewMediaUiOnStaAsync);
+        return Task.CompletedTask;
+    }
+
+    private static async Task PreviewMediaUiOnStaAsync()
+    {
+        Section("media preview: actual track classification, compact controls, focus and owned IPC");
+        using var coverTracks = JsonDocument.Parse("""{"data":[{"type":"audio"},{"type":"video","albumart":true}]}""");
+        using var realVideoTracks = JsonDocument.Parse("""{"data":[{"type":"audio"},{"type":"video","albumart":false}]}""");
+        using var subtitleTracks = JsonDocument.Parse("""{"data":[{"type":"sub"}]}""");
+        Check("audio cover art is not mistaken for a moving video viewport", NativePreviewHost.HasOnlyAudio(coverTracks.RootElement, "cover.mp4"));
+        Check("actual video tracks override an audio file extension", !NativePreviewHost.HasOnlyAudio(realVideoTracks.RootElement, "renamed.wav"));
+        Check("a recognized track list with no audio never claims an audio preview", !NativePreviewHost.HasOnlyAudio(subtitleTracks.RootElement, "empty.wav"));
+        Check("the filename fallback handles literal uppercase audio and excludes movies", NativePreviewHost.HasOnlyAudio(null, "sound.WAV. ") && !NativePreviewHost.HasOnlyAudio(null, "movie.mp4"));
+        var mpv = PreviewTools.FindMpv();
+        Check("the media UI fixtures use the actual bundled mpv engine", mpv is not null);
+        if (mpv is null) return;
+        if (Application.Current is null)
+        {
+            var application = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
+            application.Resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri("/UltraExplorer;component/Themes/UltraTheme.xaml", UriKind.Relative) });
+        }
+        var directory = Path.Combine(Path.GetTempPath(), "UltraExplorerMediaUiChecks", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var artifacts = Path.Combine(Environment.CurrentDirectory, "artifacts", "preview-usability", "shots");
+        Directory.CreateDirectory(artifacts);
+        try
+        {
+            var audio = Path.Combine(directory, "Recorded voice note.wav"); PreviewToolsWriteWave(audio);
+            // Intentionally misleading suffix proves that the visible layout
+            // follows decoded tracks rather than the extension alone.
+            var video = Path.Combine(directory, "Moving colour sample.wav"); PreviewToolsWriteVideo(video, 160, 96);
+            var audioBefore = await File.ReadAllBytesAsync(audio);
+            var videoBefore = await File.ReadAllBytesAsync(video);
+            var host = new NativePreviewHost();
+            var window = new Window { Content = host, Width = 500, Height = 430, ShowActivated = false, ShowInTaskbar = false,
+                WindowStartupLocation = WindowStartupLocation.Manual, Left = -30000, Top = -30000 };
+            window.SourceInitialized += (_, _) => DialogNative.CloakOwn(new WindowInteropHelper(window).Handle, true);
+            try
+            {
+                window.Show(); await host.LoadAsync(audio); host.UpdateLayout();
+                var audioPid = host.OwnedProcessId;
+                Check("decoded WAV shows a named audio card and hides its unused native canvas", host.IsAudioOnly && !host.IsNativeViewportVisible
+                    && host.AudioDisplayName == "Recorded voice note.wav" && host.AudioDetail.Contains("WAV audio", StringComparison.Ordinal));
+                Check("audio has no video-frame help header", !host.IsMediaHeaderVisible);
+                Check("audio starts paused with an accessible glyph Play action", AutomationProperties.GetName(host.PlayPauseControl) == "Play"
+                    && host.PlayPauseControl.Content is TextBlock { Text.Length: 1 });
+                var sliderTrack = host.TimelineControl.Template.FindName("PART_Track", host.TimelineControl) as Track;
+                var volumeTrack = host.VolumeControl.Template.FindName("PART_Track", host.VolumeControl) as Track;
+                Check("both media sliders use custom tracks and round thumb templates", sliderTrack?.Thumb.Template is not null && volumeTrack?.Thumb.Template is not null
+                    && host.TimelineControl.IsMoveToPointEnabled && host.VolumeControl.IsMoveToPointEnabled);
+                Check("the two-row player fits the small preview without overlap or clipped controls", MediaUiControlsFit(host));
+                Check("the controls stay compact instead of occupying the audio canvas", host.PlaybackControls.ActualHeight <= 82 && host.PlaybackControls.ActualWidth <= host.ActualWidth);
+                Check("every media action has an accessible name and the speed list stays at six choices", PreviewNativeDescendants(host.PlaybackControls).OfType<Button>()
+                    .All(button => !string.IsNullOrEmpty(AutomationProperties.GetName(button))) && host.SpeedControl.Items.Count == 6
+                    && AutomationProperties.GetName(host.TimelineControl) == "Playback position" && AutomationProperties.GetName(host.VolumeControl) == "Volume");
+                var speedText = PreviewNativeDescendants(host.SpeedControl).OfType<TextBlock>().FirstOrDefault(text => text.Text == "1×");
+                Check("the visible playback speed has readable contrast on the actual dark canvas", speedText?.Foreground is SolidColorBrush textBrush
+                    && host.Background is SolidColorBrush canvasBrush && MediaUiContrast(textBrush.Color, canvasBrush.Color) >= 4.5);
+                Check("focused playback controls are identified without claiming the canvas or unrelated controls", host.OwnsPlaybackControl(host.TimelineControl)
+                    && host.OwnsPlaybackControl(host.VolumeControl) && host.OwnsPlaybackControl(host.SpeedControl)
+                    && host.OwnsPlaybackControl(host.PlayPauseControl.Content as DependencyObject)
+                    && !host.OwnsPlaybackControl(host) && !host.OwnsPlaybackControl(new Slider()));
+                var ownedSpeedItem = (ComboBoxItem)host.SpeedControl.Items[2];
+                var unrelatedSpeed = new ComboBox(); var unrelatedItem = new ComboBoxItem { Content = "1×" }; unrelatedSpeed.Items.Add(unrelatedItem);
+                Check("speed popup item ownership is recognized without swallowing a foreign dropdown", host.OwnsPlaybackControl(ownedSpeedItem)
+                    && !host.OwnsPlaybackControl(unrelatedItem));
+                MediaUiSave(host, Path.Combine(artifacts, "media-audio-compact.png"));
+                // A 340 DIP Quick Look leaves roughly 230 DIP for the native
+                // media host once its caption, top actions and status are laid out.
+                // Set an exact host height to include its own playback controls.
+                host.Height = 230; host.UpdateLayout(); window.UpdateLayout();
+                Check("the audio card and all controls fit a minimum-height preview without clipping", MediaUiAudioCardFits(host)
+                    && MediaUiControlsFit(host) && host.AudioDisplayName == "Recorded voice note.wav" && host.AudioDetail.Contains("0:02", StringComparison.Ordinal));
+                MediaUiSave(host, Path.Combine(artifacts, "media-audio-minimum-height.png"));
+                host.Height = double.NaN; window.UpdateLayout();
+                await host.SetVolumeAsync(0); await host.RefreshPlaybackAsync();
+                Check("zero volume reaches the owned engine without confusing mute state", MediaUiNumber(await host.MpvCommandAsync(["get_property", "volume"])) == 0);
+                host.MuteControl.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+                await MediaUiWaitAsync(() => AutomationProperties.GetName(host.MuteControl) == "Unmute");
+                Check("mute changes the icon name from the engine state", AutomationProperties.GetName(host.MuteControl) == "Unmute"
+                    && MediaUiBool(await host.MpvCommandAsync(["get_property", "mute"])));
+                await host.MpvCommandAsync(["set_property", "mute", false]);
+                await host.SetSpeedAsync(1.5);
+                await MediaUiWaitAsync(() => host.SpeedControl.SelectedItem is ComboBoxItem { Tag: 1.5 });
+                Check("playback speed remains bound to mpv and visible selection", MediaUiNumber(await host.MpvCommandAsync(["get_property", "speed"])) == 1.5
+                    && host.SpeedControl.SelectedItem is ComboBoxItem { Tag: 1.5 });
+                await host.TogglePlaybackAsync();
+                await MediaUiWaitAsync(() => AutomationProperties.GetName(host.PlayPauseControl) == "Pause");
+                Check("Play updates to an accessible Pause action", AutomationProperties.GetName(host.PlayPauseControl) == "Pause");
+                await host.StopPlaybackAsync();
+                await MediaUiWaitAsync(() => AutomationProperties.GetName(host.PlayPauseControl) == "Play");
+                Check("Stop pauses and rewinds audio through its own IPC", MediaUiBool(await host.MpvCommandAsync(["get_property", "pause"]))
+                    && MediaUiNumber(await host.MpvCommandAsync(["get_property", "time-pos"])) < 0.05 && AutomationProperties.GetName(host.PlayPauseControl) == "Play");
+                await host.LoadAsync(video); host.UpdateLayout();
+                Check("a real video with an audio suffix restores the native viewport and removes the card", !host.IsAudioOnly && host.IsNativeViewportVisible
+                    && !host.IsMediaHeaderVisible && audioPid is not null && await PreviewToolsWaitForExit(audioPid.Value));
+                window.Width = 900; window.Height = 550; window.UpdateLayout();
+                Check("resizing preserves compact controls and lets the video canvas dominate", MediaUiControlsFit(host)
+                    && host.PlaybackControls.ActualHeight <= 82 && PreviewNativeDescendants(host).OfType<HwndHost>().Single().ActualHeight > host.ActualHeight * 0.7);
+                var firstFrame = Path.Combine(artifacts, "media-video-first-frame.png");
+                await host.MpvCommandAsync(["screenshot-to-file", firstFrame, "video"]);
+                await host.SeekAsync(0.5); await Task.Delay(180);
+                var secondFrame = Path.Combine(artifacts, "media-video-scrubbed-frame.png");
+                await host.MpvCommandAsync(["screenshot-to-file", secondFrame, "video"]);
+                Check("the styled timeline still seeks an actual changed frame while paused", File.Exists(firstFrame) && File.Exists(secondFrame)
+                    && !File.ReadAllBytes(firstFrame).SequenceEqual(File.ReadAllBytes(secondFrame)) && MediaUiBool(await host.MpvCommandAsync(["get_property", "pause"])));
+                MediaUiSave(host, Path.Combine(artifacts, "media-video-controls.png"));
+                if (File.Exists(secondFrame)) MediaUiSaveVideoComposite(host, secondFrame, Path.Combine(artifacts, "media-video-interface.png"));
+                var polls = host.PlaybackPollCount; await Task.Delay(560);
+                Check("the restyled interface retains bounded four-per-second playback polling", host.IsPlaybackTimerRunning && host.PlaybackPollCount - polls is > 0 and <= 3);
+                var videoPid = host.OwnedProcessId; window.Close();
+                // A bare test Window unloads its content on the next dispatcher
+                // pass. Wait for that real lifecycle notification before checking
+                // disposal; never call Dispose to make this assertion succeed.
+                await MediaUiWaitAsync(() => !host.IsPlaybackTimerRunning);
+                var ownedExited = videoPid is not null && await PreviewToolsWaitForExit(videoPid.Value);
+                Check("closing the player stops its poller and only its owned process", !host.IsPlaybackTimerRunning && ownedExited && host.OwnedProcessId is null);
+            }
+            finally { host.Dispose(); window.Close(); }
+            var audioAfter = await File.ReadAllBytesAsync(audio);
+            var videoAfter = await File.ReadAllBytesAsync(video);
+            Check("media interaction leaves both original files byte-identical", audioBefore.AsSpan().SequenceEqual(audioAfter)
+                && videoBefore.AsSpan().SequenceEqual(videoAfter));
+        }
+        finally { TryDelete(directory); }
+    }
+
+    private static bool MediaUiControlsFit(NativePreviewHost host)
+    {
+        host.UpdateLayout();
+        var controls = new FrameworkElement[] { host.PlayPauseControl, host.SpeedControl, host.MuteControl, host.VolumeControl };
+        var rects = controls.Select(control => control.TransformToAncestor(host.PlaybackControls).TransformBounds(new Rect(control.RenderSize))).ToArray();
+        return rects.All(rect => rect.Left >= -0.5 && rect.Top >= -0.5 && rect.Right <= host.PlaybackControls.ActualWidth + 0.5 && rect.Bottom <= host.PlaybackControls.ActualHeight + 0.5)
+            && rects.Zip(rects.Skip(1), (left, right) => left.Right <= right.Left + 0.5).All(value => value)
+            && host.TimelineControl.ActualWidth > 180;
+    }
+
+    private static bool MediaUiAudioCardFits(NativePreviewHost host)
+    {
+        host.UpdateLayout();
+        var viewport = PreviewNativeDescendants(host).OfType<HwndHost>().Single();
+        var area = viewport.TransformToAncestor(host).TransformBounds(new Rect(viewport.RenderSize));
+        var card = host.AudioCard.TransformToAncestor(host).TransformBounds(new Rect(host.AudioCard.RenderSize));
+        return card.Left >= area.Left - 0.5 && card.Right <= area.Right + 0.5 && card.Top >= area.Top - 0.5 && card.Bottom <= area.Bottom + 0.5
+            && PreviewNativeDescendants(host.AudioCard).OfType<TextBlock>().Where(text => !string.IsNullOrEmpty(text.Text))
+                .All(text =>
+                {
+                    var bounds = text.TransformToAncestor(host.AudioCard).TransformBounds(new Rect(text.RenderSize));
+                    return bounds.Left >= -0.5 && bounds.Top >= -0.5 && bounds.Right <= card.Width + 0.5 && bounds.Bottom <= card.Height + 0.5;
+                });
+    }
+
+    private static async Task MediaUiWaitAsync(Func<bool> condition)
+    {
+        var clock = Stopwatch.StartNew();
+        while (!condition() && clock.Elapsed < TimeSpan.FromSeconds(3)) await Task.Delay(30);
+    }
+
+    private static double MediaUiNumber(JsonElement? response) => response is { } root && root.TryGetProperty("data", out var data)
+        && data.ValueKind == JsonValueKind.Number ? data.GetDouble() : double.NaN;
+    private static bool MediaUiBool(JsonElement? response) => response is { } root && root.TryGetProperty("data", out var data) && data.ValueKind == JsonValueKind.True;
+
+    private static void MediaUiSave(FrameworkElement host, string path)
+    {
+        // Rendering a centered element directly keeps its offset in the parent
+        // and clips the bottom. A visual brush renders its own complete bounds.
+        var visual = new DrawingVisual();
+        using (var canvas = visual.RenderOpen())
+            canvas.DrawRectangle(new VisualBrush(host) { Stretch = Stretch.Fill }, null, new Rect(0, 0, host.ActualWidth, host.ActualHeight));
+        var image = new RenderTargetBitmap((int)Math.Ceiling(host.ActualWidth), (int)Math.Ceiling(host.ActualHeight), 96, 96, PixelFormats.Pbgra32);
+        image.Render(visual); PreviewToolsSavePicture(image, path);
+    }
+
+    private static double MediaUiContrast(Color foreground, Color background)
+    {
+        static double Component(byte value)
+        {
+            var normalized = value / 255.0;
+            return normalized <= 0.04045 ? normalized / 12.92 : Math.Pow((normalized + 0.055) / 1.055, 2.4);
+        }
+        static double Luminance(Color color) => 0.2126 * Component(color.R) + 0.7152 * Component(color.G) + 0.0722 * Component(color.B);
+        var first = Luminance(foreground); var second = Luminance(background);
+        return (Math.Max(first, second) + 0.05) / (Math.Min(first, second) + 0.05);
+    }
+
+    private static void MediaUiSaveVideoComposite(NativePreviewHost host, string framePath, string path)
+    {
+        // RenderTargetBitmap cannot capture an HWND. Compose the actual decoded
+        // mpv screenshot over its corresponding WPF viewport for visual review.
+        var baseImage = new RenderTargetBitmap((int)Math.Ceiling(host.ActualWidth), (int)Math.Ceiling(host.ActualHeight), 96, 96, PixelFormats.Pbgra32);
+        baseImage.Render(host);
+        var frame = new BitmapImage(); frame.BeginInit(); frame.CacheOption = BitmapCacheOption.OnLoad; frame.UriSource = new Uri(framePath); frame.EndInit(); frame.Freeze();
+        var surface = PreviewNativeDescendants(host).OfType<HwndHost>().Single();
+        var viewport = surface.TransformToAncestor(host).TransformBounds(new Rect(surface.RenderSize));
+        var scale = Math.Min(viewport.Width / frame.PixelWidth, viewport.Height / frame.PixelHeight);
+        var decoded = new Rect(viewport.Left + (viewport.Width - frame.PixelWidth * scale) / 2, viewport.Top + (viewport.Height - frame.PixelHeight * scale) / 2,
+            frame.PixelWidth * scale, frame.PixelHeight * scale);
+        var visual = new DrawingVisual();
+        using (var canvas = visual.RenderOpen())
+        {
+            canvas.DrawImage(baseImage, new Rect(0, 0, host.ActualWidth, host.ActualHeight));
+            canvas.DrawRectangle(Brushes.Black, null, viewport); canvas.DrawImage(frame, decoded);
+        }
+        var image = new RenderTargetBitmap(baseImage.PixelWidth, baseImage.PixelHeight, 96, 96, PixelFormats.Pbgra32);
+        image.Render(visual); PreviewToolsSavePicture(image, path);
+    }
+}
