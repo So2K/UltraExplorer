@@ -48,6 +48,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
     private CancellationTokenSource? _session;
     private CancellationTokenRegistration _processCancellation;
     private Process? _process;
+    private ModelProcessDiagnostics? _modelDiagnostics;
     private MediaSession? _mediaSession;
     private Task? _mediaObserver;
     private string? _pipeName;
@@ -145,6 +146,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         using var loading = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
         loading.CancelAfter(TimeSpan.FromSeconds(20));
         MediaSession? media = null;
+        ModelProcessDiagnostics? modelDiagnostics = null;
         try
         {
             await _surface.Ready.WaitAsync(loading.Token);
@@ -175,7 +177,10 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 if (Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1")
                     arguments = arguments.Append("--ao=null");
             }
-            var process = PreviewTools.Start(executable, arguments, _sessionDirectory);
+            var process = model
+                ? StartModelProcess(executable, arguments, _sessionDirectory, out modelDiagnostics)
+                : PreviewTools.Start(executable, arguments, _sessionDirectory);
+            _modelDiagnostics = modelDiagnostics;
             _process = process;
             LastStartedProcessId = process.Id;
             _processCancellation = session.Token.Register(() => PreviewTools.Kill(process));
@@ -184,6 +189,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
             {
                 if (!_disposed && generation == _generation && ReferenceEquals(_process, process) && ReferenceEquals(_session, session))
                 {
+                    if (modelDiagnostics is not null) LastNativeDiagnostic = modelDiagnostics.Snapshot();
                     if (media is { } closedMedia && ReferenceEquals(closedMedia, _mediaSession))
                     {
                         closedMedia.Fail("The media engine closed its preview process.");
@@ -271,6 +277,24 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         {
             var mediaFailure = media?.Failure;
             var ownTimeout = ex is OperationCanceledException && !session.IsCancellationRequested;
+            if (modelDiagnostics is not null)
+            {
+                // Drain only the already-exited process, with a fixed bound. Capture
+                // before StopSession deletes this request's temporary directory.
+                var diagnostic = await modelDiagnostics.CaptureAsync();
+                if (generation == _generation)
+                {
+                    LastNativeDiagnostic = diagnostic;
+                    if (_surface.LastAttachDiagnostic is { } attachment)
+                        LastNativeDiagnostic += "\nAttachment: " + attachment;
+                    if (_sessionDirectory is { } diagnosticDirectory)
+                    {
+                        try { File.WriteAllText(Path.Combine(diagnosticDirectory, "engine-error.log"), LastNativeDiagnostic, Encoding.UTF8); }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                }
+            }
             if (generation == _generation)
             {
                 LastError = mediaFailure ?? (ownTimeout
@@ -294,6 +318,95 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         button.SetResourceReference(FrameworkElement.StyleProperty, "FlatButton");
         button.Click += (_, _) => action();
         _tools.Children.Add(button);
+    }
+
+    private static Process StartModelProcess(string executable, IEnumerable<string> arguments, string directory,
+        out ModelProcessDiagnostics diagnostics)
+    {
+        // Equivalent launch settings to PreviewTools.Start; only F3D's diagnostic
+        // streams differ. No renderer flags, input path or model bytes change.
+        var start = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = false, CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden,
+            WorkingDirectory = directory, RedirectStandardOutput = true, RedirectStandardError = true
+        };
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        var process = Process.Start(start) ?? throw new IOException("The preview engine did not start.");
+        try { diagnostics = new ModelProcessDiagnostics(process); return process; }
+        catch { PreviewTools.Kill(process); process.Dispose(); throw; }
+    }
+
+    private sealed class ModelProcessDiagnostics : IDisposable
+    {
+        // Each UTF-16 tail is below 8K characters; both streams plus labels and
+        // attachment diagnostics stay below 64KiB even when encoded as UTF-8.
+        private const int MaximumStreamCharacters = 7_936;
+        private readonly object _gate = new();
+        private readonly Process _process;
+        private readonly CancellationTokenSource _stop = new();
+        private readonly StreamReader _stdoutReader, _stderrReader;
+        private readonly StringBuilder _stdout = new(), _stderr = new();
+        private readonly Task _stdoutDrain, _stderrDrain;
+
+        internal ModelProcessDiagnostics(Process process)
+        {
+            _process = process;
+            _stdoutReader = process.StandardOutput; _stderrReader = process.StandardError;
+            _stdoutDrain = DrainAsync(_stdoutReader, _stdout);
+            _stderrDrain = DrainAsync(_stderrReader, _stderr);
+        }
+
+        private async Task DrainAsync(StreamReader reader, StringBuilder tail)
+        {
+            // Read chunks rather than ReadLine: a single oversized warning must
+            // not allocate an unbounded string or fill and block the child pipe.
+            var buffer = new char[4096];
+            try
+            {
+                while (true)
+                {
+                    var count = await reader.ReadAsync(buffer.AsMemory(), _stop.Token).ConfigureAwait(false);
+                    if (count == 0) return;
+                    lock (_gate)
+                    {
+                        tail.Append(buffer, 0, count);
+                        if (tail.Length > MaximumStreamCharacters) tail.Remove(0, tail.Length - MaximumStreamCharacters);
+                    }
+                }
+            }
+            catch (Exception error) when (error is IOException or OperationCanceledException or ObjectDisposedException) { }
+        }
+
+        internal async Task<string> CaptureAsync()
+        {
+            try
+            {
+                if (_process.HasExited)
+                {
+                    // Descendants can retain a redirected handle after parent
+                    // exit; never let diagnostic collection delay close forever.
+                    try { await Task.WhenAll(_stdoutDrain, _stderrDrain).WaitAsync(TimeSpan.FromSeconds(1)); }
+                    catch (TimeoutException) { }
+                }
+            }
+            catch (InvalidOperationException) { }
+            return Snapshot();
+        }
+
+        internal string Snapshot()
+        {
+            string exit;
+            try { exit = _process.HasExited ? _process.ExitCode.ToString(System.Globalization.CultureInfo.InvariantCulture) : "still running"; }
+            catch (InvalidOperationException) { exit = "unavailable"; }
+            lock (_gate) return $"F3D exit code: {exit}\nstdout:\n{_stdout}\nstderr:\n{_stderr}";
+        }
+
+        public void Dispose()
+        {
+            _stop.Cancel();
+            _stdoutReader.Dispose(); _stderrReader.Dispose();
+            _stop.Dispose();
+        }
     }
 
     internal async Task<JsonElement?> MpvCommandAsync(object[] command, CancellationToken token = default)
@@ -844,6 +957,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _session = null;
         _processCancellation.Dispose();
         PreviewTools.Kill(_process);
+        _modelDiagnostics?.Dispose();
+        _modelDiagnostics = null;
         _process?.Dispose();
         _process = null;
         _pipeName = null;
