@@ -87,6 +87,10 @@ internal static partial class Program
             try
             {
                 window.Show(); await MediaUiLoadAsync(host, audio, "audio", artifacts); host.UpdateLayout();
+                var fixtureOutput = await host.MpvCommandAsync(["get_property", "current-ao"]);
+                Check("isolated generated media fixtures use a null output without a physical audio device",
+                    fixtureOutput is { } outputReply && outputReply.TryGetProperty("data", out var audioOutput)
+                    && audioOutput.ValueKind == JsonValueKind.String && audioOutput.GetString() == "null");
                 var audioPid = host.OwnedProcessId;
                 Check("decoded WAV shows a named audio card and hides its unused native canvas", host.IsAudioOnly && !host.IsNativeViewportVisible
                     && host.AudioDisplayName == "Recorded voice note.wav" && host.AudioDetail.Contains("WAV audio", StringComparison.Ordinal));

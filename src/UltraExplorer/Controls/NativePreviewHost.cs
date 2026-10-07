@@ -169,6 +169,11 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                     "--input-default-bindings=no", "--input-builtin-bindings=no", "--input-vo-keyboard=no", "--input-cursor=no",
                     "--load-stats-overlay=no", "--load-console=no", "--load-commands=no", "--load-select=no", "--osd-level=0",
                     "--sub-auto=no", "--audio-file-auto=no", "--save-position-on-quit=no", "--write-filename-in-watch-later-config=no"];
+                // Generated native fixtures must decode and exercise IPC even
+                // on a runner without a physical playback device. Everyday
+                // previews retain mpv's default real audio output.
+                if (Environment.GetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW") == "1")
+                    arguments = arguments.Append("--ao=null");
             }
             var process = PreviewTools.Start(executable, arguments, _sessionDirectory);
             _process = process;
