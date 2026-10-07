@@ -1194,7 +1194,7 @@ public sealed partial class NestedTree : IChangeSink
         {
             var oldChild = previous.AllChildren[index];
             var child = NestedFolder.ChildOf(successor, oldChild.Name, oldChild.IsHidden,
-                oldChild.IsReparsePoint, oldChild.ModifiedTicks);
+                oldChild.IsReparsePoint, oldChild.ModifiedTicks, oldChild.IsArchive);
             children[index] = child;
             RememberRenameSuccessor(oldChild, child);
         }
@@ -1246,7 +1246,7 @@ public sealed partial class NestedTree : IChangeSink
                     // A child removed by an actual new listing must stay gone.
                     if (successor.IsLoaded && !successor.HasPartialListing) return null;
                     child = NestedFolder.ChildOf(successor, oldChild.Name, oldChild.IsHidden,
-                        oldChild.IsReparsePoint, oldChild.ModifiedTicks);
+                        oldChild.IsReparsePoint, oldChild.ModifiedTicks, oldChild.IsArchive);
                     successor.AllChildren = WithChildInOrder(successor.AllChildren, child);
                     successor.HasPartialListing = true;
                     ApplyVisibleChildren(successor);

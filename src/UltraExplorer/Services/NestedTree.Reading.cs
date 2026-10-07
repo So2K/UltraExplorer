@@ -1214,8 +1214,15 @@ public sealed partial class NestedTree
             var entry = listing.Folders[index];
             if (existing is not null && existing.Remove(entry.Name, out var kept))
             {
-                if (kept.IsReparsePoint == entry.IsReparsePoint && kept.IsHidden == entry.IsHidden)
+                if (kept.IsReparsePoint == entry.IsReparsePoint && kept.IsHidden == entry.IsHidden && kept.IsArchive == entry.IsArchive)
                 {
+                    // An archive written to holds something else now: read
+                    // again the next time it is drawn.
+                    if (entry.IsArchive && entry.ModifiedTicks != kept.ModifiedTicks)
+                    {
+                        kept.IsStale = true;
+                    }
+
                     children[index] = kept;
                     continue;
                 }
@@ -1226,7 +1233,7 @@ public sealed partial class NestedTree
                 replaced.Add(kept);
             }
 
-            children[index] = NestedFolder.ChildOf(folder, entry.Name, entry.IsHidden, entry.IsReparsePoint, entry.ModifiedTicks);
+            children[index] = NestedFolder.ChildOf(folder, entry.Name, entry.IsHidden, entry.IsReparsePoint, entry.ModifiedTicks, entry.IsArchive);
         }
 
         NestedFolder[] removed = existing is null ? [] : [.. existing.Values, .. replaced ?? []];
