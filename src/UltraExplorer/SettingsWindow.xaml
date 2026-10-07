@@ -637,6 +637,14 @@
                                       Header="UltraExplorer"
                                       Description="{Binding Version}" />
 
+                <controls:SettingCard Glyph="&#xE895;"
+                                      Header="Receive updates"
+                                      Description="Check GitHub once a day and download quietly while UltraExplorer is open. A small arrow appears when ready; installation waits for your click. Turning this off stops checks and downloads.">
+                    <CheckBox x:Name="ReceiveUpdatesChoice" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ReceiveUpdates, Mode=TwoWay}"
+                              AutomationProperties.Name="Receive updates" />
+                </controls:SettingCard>
+
                 <controls:SettingCard Glyph="&#xE838;"
                                       Header="Installed in"
                                       Description="{Binding InstallFolder}">

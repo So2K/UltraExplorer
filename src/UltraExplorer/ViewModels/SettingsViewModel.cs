@@ -7,6 +7,7 @@ using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Rendering.Gpu;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Updates;
 using UltraExplorer.Picker.Integration;
 
 namespace UltraExplorer.ViewModels;
@@ -58,6 +59,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private bool? _winEWanted;
     private bool _applyingWinE;
     private readonly DialogIntegrationController _dialogIntegration = DialogIntegrationController.Shared;
+    private readonly QuietUpdateService _quietUpdates;
+    private readonly System.Windows.Threading.Dispatcher _settingsDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
 
     /// <param name="main">The window's view model, whose settings these are.</param>
     /// <param name="canChooseLayout">False in a file dialog, which keeps the tree canvas whatever is chosen.</param>
@@ -69,9 +72,11 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         bool canChooseLayout,
         Func<string>? rendererNow,
         Func<string, string, string, bool> confirm,
-        Action<string>? openFolder = null)
+        Action<string>? openFolder = null,
+        QuietUpdateService? quietUpdates = null)
     {
         _main = main;
+        _quietUpdates = quietUpdates ?? QuietUpdateService.Shared;
         CanChooseLayout = canChooseLayout;
         _rendererNow = rendererNow;
         _confirm = confirm;
@@ -83,6 +88,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         RecoverDialogIntegrationCommand = new AsyncRelayCommand(() => DialogActionAsync(_dialogIntegration.RecoverAsync));
         ResetDialogExceptionsCommand = new AsyncRelayCommand(() => DialogActionAsync(_dialogIntegration.ResetExclusionsAsync));
         _dialogIntegration.Changed += OnDialogIntegrationChanged;
+        _quietUpdates.SnapshotChanged += OnQuietUpdatesChanged;
         _rendererStatus = _rendererNow?.Invoke() ?? string.Empty;
 
         _main.PropertyChanged += OnMainPropertyChanged;
@@ -92,6 +98,27 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     }
 
     private FolderOrders Orders => _main.Orders;
+
+    public bool ReceiveUpdates
+    {
+        get => _quietUpdates.Enabled;
+        set
+        {
+            if (_quietUpdates.Enabled == value) return;
+            _quietUpdates.Enabled = value;
+            OnPropertyChanged();
+        }
+    }
+
+    private void OnQuietUpdatesChanged(object? sender, EventArgs e)
+    {
+        if (_isDisposed || _settingsDispatcher.HasShutdownStarted) return;
+        if (_settingsDispatcher.CheckAccess()) OnPropertyChanged(nameof(ReceiveUpdates));
+        else _ = _settingsDispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () =>
+        {
+            if (!_isDisposed) OnPropertyChanged(nameof(ReceiveUpdates));
+        });
+    }
 
     public bool IsDialogReplacementEnabled
     {
@@ -741,6 +768,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
 
         _isDisposed = true;
         _dialogIntegration.Changed -= OnDialogIntegrationChanged;
+        _quietUpdates.SnapshotChanged -= OnQuietUpdatesChanged;
         _main.PropertyChanged -= OnMainPropertyChanged;
         _main.Tree.PropertyChanged -= OnTreePropertyChanged;
         Orders.Changed -= OnOrdersChanged;

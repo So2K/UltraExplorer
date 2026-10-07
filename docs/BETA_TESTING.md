@@ -1,4 +1,4 @@
-# Try the v1.3.0-beta.1 beta
+# Try the v1.3.0-beta.2 beta
 
 The useful feedback is a short workflow that behaves unexpectedly: which file
 type, what you did, and what happened. Use copies in a small disposable folder
@@ -7,7 +7,7 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
 ## Get started
 
 1. Download the installer or portable ZIP from the
-   [v1.3.0-beta.1 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.1).
+   [v1.3.0-beta.2 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.2).
    For the ZIP, extract the entire folder before running `UltraExplorer.exe`.
 2. Keep a few sample files together: two text files, an image, a PDF and,
    if relevant to your work, a media file, a model or a small ZIP containing
@@ -16,6 +16,26 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
    Windows folder/dialog integration and `Win+E` have their own preferences.
 
 Windows 11, x64 is the release target. No separate .NET installation is needed.
+
+## Quiet updates
+
+After starting, the normal explorer waits 30 seconds before checking; a saved
+timestamp limits checks to once per day. New downloads show a tiny ring near the
+top-left title buttons, then a blue arrow. Nothing opens automatically.
+
+1. Leave the arrow alone: the current version must keep working.
+2. Click it and choose **Later**: only the compact panel closes.
+3. In **Settings → About**, turn **Receive updates** off: the indicator and offer
+   disappear and downloads stop. Reopening must keep the choice.
+4. To apply a prepared update, open the arrow and explicitly press **Install
+   update**. Check that your settings, notes and color tags remain after restart.
+   A note conflict or refused close must leave its buffer available.
+
+Use a future release for an actual update check; do not alter version numbers or
+timestamps in your ordinary profile. The current version does not offer itself
+or an older version. For protected/read-only installation folders, update with
+the ordinary installer. The [update behavior](QUIET_UPDATES.md) describes limits
+and generated-fixture coverage.
 The portable build uses the same local settings profile as the installer;
 extracting another copy does not create an isolated profile.
 

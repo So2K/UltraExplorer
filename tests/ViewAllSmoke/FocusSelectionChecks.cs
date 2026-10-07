@@ -234,8 +234,17 @@ internal static partial class Program
         var flightBeforeFinalRead = FocusFlightOf(canvas);
         SetFocusFlightProgress(canvas, 2);
         disk.AddFile(docsPath, "aardvark.txt", 45);
-        var refreshAtLanding = tree.RefreshAsync(docs);
-        await WaitUntil(() => tree.HasWork, 3_000);
+        var pendingDriver = new CountingDriver();
+        tree.Driver.Active = pendingDriver;
+        Task refreshAtLanding;
+        try
+        {
+            refreshAtLanding = tree.RefreshAsync(docs);
+            await WaitUntil(() => tree.HasWork, 3_000);
+            Check("the same-frame landing fixture holds the completed read before manual intake",
+                tree.HasWork && !refreshAtLanding.IsCompleted);
+        }
+        finally { tree.Driver.Active = canvas; }
         canvas.RunFrameForTests(frameTime += TimeSpan.FromMilliseconds(16));
         var flightAfterFinalRead = FocusFlightOf(canvas);
         await refreshAtLanding;
@@ -640,7 +649,7 @@ internal static partial class Program
 
     private static NestedCanvas FocusCanvas(NestedTree tree)
     {
-        var canvas = new NestedCanvas { Tree = tree, FramesByHandForTests = true, DpiOverride = new DpiScale(1, 1) };
+        var canvas = new NestedCanvas { FramesByHandForTests = true, Tree = tree, DpiOverride = new DpiScale(1, 1) };
         canvas.Measure(new Size(1200, 800));
         canvas.Arrange(new Rect(0, 0, 1200, 800));
         canvas.UpdateLayout();
