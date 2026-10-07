@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.IO.Enumeration;
 using UltraExplorer.Models;
+using UltraExplorer.Services.Archives;
 
 namespace UltraExplorer.Services;
 
@@ -35,6 +36,12 @@ public static class NestedDirectoryReader
 
     public static NestedListing Read(string path, CancellationToken cancellationToken)
     {
+        // An archive, or a folder inside one, is read through 7-Zip.
+        if (ArchiveService.TryRead(path, cancellationToken) is { } inArchive)
+        {
+            return inArchive;
+        }
+
         var folders = t_folders ??= [];
         var listed = t_files ??= [];
         try
@@ -51,6 +58,7 @@ public static class NestedDirectoryReader
 
     private static NestedListing Read(string path, List<NestedEntry> folders, List<NestedFile> listed, CancellationToken cancellationToken)
     {
+        var archivesAsFolders = ArchiveService.BrowseArchives && ArchiveService.IsAvailable;
         var options = new EnumerationOptions
         {
             IgnoreInaccessible = false,
@@ -86,6 +94,12 @@ public static class NestedDirectoryReader
                         return true;
                     }
 
+                    // An archive is a folder on the canvas, not one of the files.
+                    if (archivesAsFolders && ArchiveFormats.IsBrowsable(entry.FileName))
+                    {
+                        return true;
+                    }
+
                     counts.Files++;
                     if ((entry.Attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0)
                     {
@@ -100,6 +114,12 @@ public static class NestedDirectoryReader
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var isHidden = (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0;
+                if (!isDirectory && archivesAsFolders && ArchiveFormats.IsBrowsable(name))
+                {
+                    folders.Add(new NestedEntry(name, isHidden, false, modifiedTicks, IsArchive: true));
+                    continue;
+                }
+
                 if (!isDirectory)
                 {
                     listed.Add(new NestedFile(name, isHidden, length, modifiedTicks));

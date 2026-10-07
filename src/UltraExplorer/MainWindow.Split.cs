@@ -248,7 +248,7 @@ public partial class MainWindow
         string[] gone;
         try
         {
-            gone = await Task.Run(() => items.Where(item => !Path.Exists(item.Path)).Select(item => item.Path).ToArray());
+            gone = await Task.Run(() => items.Where(item => !Path.Exists(item.Path) && !Services.Archives.ArchiveService.IsInsideArchive(item.Path)).Select(item => item.Path).ToArray());
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {

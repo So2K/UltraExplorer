@@ -8,6 +8,7 @@ using UltraExplorer.Controls;
 using UltraExplorer.Infrastructure;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Archives;
 using UltraExplorer.Services.Watch;
 
 namespace UltraExplorer.ViewModels;
@@ -33,7 +34,7 @@ public enum CanvasLayout
 /// command bar, search and status bar.  Everything that concerns the graph
 /// itself is delegated to <see cref="ViewAllViewModel"/>.
 /// </summary>
-public sealed class MainViewModel : ObservableObject, IDisposable
+public sealed partial class MainViewModel : ObservableObject, IDisposable
 {
     private readonly ShellIconService _iconService = new();
     private readonly NativeShellService _shellService = new();
@@ -1161,6 +1162,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return Task.FromResult(false);
         }
 
+        // Out of an archive is always a copy: the archive keeps what it has.
+        if (ArchiveService.AnyInsideArchive(paths))
+        {
+            return ExtractIntoAsync(paths, targetDirectory);
+        }
+
         return TransferAsync(paths, targetDirectory, move, move ? "Moving" : "Copying");
     }
 
@@ -1713,6 +1720,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        if (RefuseArchiveTarget(target))
+        {
+            return;
+        }
+
         var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder", false);
         if (name is null)
         {
@@ -1741,6 +1753,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         if (Tree.TargetDirectory is not { } target)
         {
             Toast.ShowError("Select a folder on the canvas first.");
+            return;
+        }
+
+        if (RefuseArchiveTarget(target))
+        {
             return;
         }
 
@@ -1787,6 +1804,17 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         var paths = Tree.SelectedPaths.ToArray();
         if (paths.Length == 0)
         {
+            return;
+        }
+
+        // Out of an archive, what goes on the clipboard is a copy taken out first.
+        if (ArchiveService.AnyInsideArchive(paths))
+        {
+            if (!cut || !RefuseInsideArchive(paths, "Cutting"))
+            {
+                await CopyFromArchiveAsync(paths);
+            }
+
             return;
         }
 
@@ -1877,6 +1905,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         await TransferAsync(payload.Paths, target, payload.Cut, payload.Cut ? "Moving" : "Copying");
+
+        // What was cut is gone from where it was: a second paste would only
+        // fail, so the clipboard lets go of it, as Explorer's does.
+        if (payload.Cut && payload.Paths.All(path => !File.Exists(path) && !Directory.Exists(path)))
+        {
+            try
+            {
+                Clipboard.Clear();
+            }
+            catch (ExternalException)
+            {
+            }
+        }
     }
 
     /// <summary>
@@ -1895,6 +1936,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task<bool> TransferAsync(IReadOnlyList<string> paths, string targetDirectory, bool move, string verb)
     {
+        if (RefuseArchiveTarget(targetDirectory))
+        {
+            return false;
+        }
+
         var given = paths.ToArray();
         var safePaths = await Task.Run(() => given
             .Where(ItemExists)
@@ -2028,6 +2074,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         var path = paths[0];
+        if (RefuseInsideArchive(paths, "Renaming"))
+        {
+            return;
+        }
+
         var currentName = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
         var isFolder = Tree.Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : Directory.Exists(path);
         var newName = PromptRequested?.Invoke("Rename", "Enter a new name", currentName, !isFolder);
@@ -2069,7 +2120,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task DuplicateSelectionAsync()
     {
         var paths = Tree.SelectedPaths;
-        if (paths.Count == 0)
+        if (paths.Count == 0 || RefuseInsideArchive(paths, "Duplicating"))
         {
             return;
         }
@@ -2134,7 +2185,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private async Task DeleteSelectionAsync(bool permanently)
     {
-        if (!ConfirmUnshownSelection())
+        if (RefuseInsideArchive(Tree.SelectedPaths, "Deleting") || !ConfirmUnshownSelection())
         {
             return;
         }
@@ -2242,6 +2293,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var files = Tree.Selection.Items.Where(item => !item.IsDirectory).Select(item => item.Path).ToArray();
             if (files.Length > 0)
             {
+                // Files inside an archive are taken out and opened through 7-Zip.
+                var inArchives = files.Where(ArchiveService.IsInsideArchive).ToArray();
+                foreach (var file in inArchives)
+                {
+                    _ = OpenFromArchiveAsync(file);
+                }
+
+                files = [.. files.Except(inArchives)];
+                if (files.Length == 0)
+                {
+                    return;
+                }
+
                 if (files.Length > OpenWithoutAsking
                     && ConfirmRequested?.Invoke("Open", $"Open all {files.Length:N0} selected files?", "Open") != true)
                 {

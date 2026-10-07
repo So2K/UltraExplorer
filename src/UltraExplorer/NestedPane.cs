@@ -7,6 +7,7 @@ using System.Windows.Threading;
 using UltraExplorer.Controls;
 using UltraExplorer.Models;
 using UltraExplorer.Services;
+using UltraExplorer.Services.Archives;
 using UltraExplorer.ViewModels;
 
 namespace UltraExplorer;
@@ -835,8 +836,9 @@ internal sealed class NestedPane
             // thread. Do not probe a network path synchronously a second time.
             // A folder the tree already has is one too; anything else is asked
             // about off the interface thread, where a share gone to sleep holds
-            // up this flight alone, not the window.
-            var folderPath = isDirectory || Tree.Find(path) is not null || await Task.Run(() => Directory.Exists(path))
+            // up this flight alone, not the window.  An archive, and a folder
+            // inside one, is a folder here.
+            var folderPath = isDirectory || Tree.Find(path) is not null || await Task.Run(() => ArchiveService.IsFolderLike(path))
                 ? path
                 : Path.GetDirectoryName(path) ?? path;
 
@@ -1209,6 +1211,25 @@ internal sealed class NestedPane
     /// </summary>
     private async void OnOpenRequested(NestedHit hit)
     {
+        // A file inside an archive: taken out to the temporary folder, opened from there.
+        if (hit.IsFile && hit.Folder.IsInArchive)
+        {
+            await _viewModel.OpenFromArchiveAsync(hit.Path);
+            return;
+        }
+
+        // An archive whose names are encrypted lists once it has its password.
+        if (!hit.IsFile && hit.Folder.IsInArchive && hit.Folder.LoadState == NestedLoadState.Failed
+            && hit.Folder.ErrorMessage.Contains("Password", StringComparison.OrdinalIgnoreCase))
+        {
+            if (ArchiveService.AskPassword(hit.Folder.FullPath))
+            {
+                await Tree.RefreshAsync(hit.Folder);
+            }
+
+            return;
+        }
+
         if (hit.IsFile)
         {
             if (_host.IsPickerMode)
@@ -1665,6 +1686,13 @@ internal sealed class NestedPane
                 return;
             }
 
+            if (onBackground && target.Folder.IsInArchive)
+            {
+                tree.Selection.ReplaceSingle(target.Folder.FullPath, true, 0, SelectionSource.Canvas);
+                ShowArchiveMenu([target.Folder.FullPath], isFolderArea: true);
+                return;
+            }
+
             if (onBackground)
             {
                 // The folder clicked in becomes the selection, as a click on the
@@ -1736,6 +1764,13 @@ internal sealed class NestedPane
             selection.Apply(new SelectionEdit { Focus = path, Source = SelectionSource.Canvas });
         }
 
+        // Inside an archive the Shell has no menu - nothing there is on disk.
+        if (selection.Paths.Any(ArchiveService.IsInsideArchive))
+        {
+            ShowArchiveMenu(selection.Paths, isFolderArea: false);
+            return;
+        }
+
         if (_host.ShowContextMenu(selection.Paths, Canvas, point, includeCanvasCommands: true, fallBack: false))
         {
             return;
@@ -1751,6 +1786,60 @@ internal sealed class NestedPane
         _host.ShowSelectionMenu(Canvas);
     }
 
+    /// <summary>
+    /// The menu inside an archive, where the Shell has none: open, copy and
+    /// extract - out of it, never into it.  For a folder's open space, the
+    /// folder (or the whole archive, at its top) is what it acts on.
+    /// </summary>
+    private void ShowArchiveMenu(IReadOnlyList<string> paths, bool isFolderArea)
+    {
+        var entries = new List<ShellMenuEntry>();
+        var single = paths.Count == 1 ? paths[0] : null;
+        var isArchiveItself = single is not null && ArchiveService.IsArchiveFile(single);
+        var isFile = single is not null && !isArchiveItself && !isFolderArea && !ArchiveService.IsFolderInArchive(single);
+        if (isFile)
+        {
+            entries.Add(new ShellMenuEntry("Open", () => _ = _viewModel.OpenFromArchiveAsync(single!)) { Glyph = "", Shortcut = "Enter" });
+            entries.Add(ShellMenuEntry.Separator);
+        }
+
+        if (isArchiveItself)
+        {
+            var stem = ArchiveService.StemOf(single!);
+            entries.Add(new ShellMenuEntry("Extract here", () => _ = _viewModel.ExtractArchivesAsync(paths, ownFolder: false)) { Glyph = "" });
+            entries.Add(new ShellMenuEntry($"Extract to \"{stem}\\\"", () => _ = _viewModel.ExtractArchivesAsync(paths, ownFolder: true)) { Glyph = "" });
+        }
+        else
+        {
+            var what = isFolderArea ? "this folder" : paths.Count == 1 ? "this" : $"{paths.Count} items";
+            entries.Add(new ShellMenuEntry($"Extract {what} next to the archive", () => _ = _viewModel.ExtractBesideArchiveAsync(paths)) { Glyph = "" });
+        }
+
+        entries.Add(new ShellMenuEntry("Extract to…", () => _ = _viewModel.ExtractToChosenFolderAsync(paths)) { Glyph = "" });
+        entries.Add(new ShellMenuEntry("Copy", () => _ = _viewModel.CopyFromArchiveAsync(paths)) { Glyph = "", Shortcut = "Ctrl+C" });
+        entries.Add(ShellMenuEntry.Separator);
+        entries.Add(new ShellMenuEntry("Show the archive in File Explorer", () =>
+        {
+            var archive = MainViewModel.ArchiveBeside(paths[0]) is { } folder ? OutermostArchive(paths[0], folder) : null;
+            if (archive is not null)
+            {
+                NativeShellService.ShowInExplorer(archive);
+            }
+        }) { Glyph = "" });
+
+        var menu = new ContextMenu { PlacementTarget = Canvas };
+        MainWindow.AddEntries(menu, entries);
+        menu.IsOpen = true;
+    }
+
+    /// <summary>The archive on disk directly inside <paramref name="folder"/> that <paramref name="path"/> goes through.</summary>
+    private static string? OutermostArchive(string path, string folder)
+    {
+        var rest = path.Length > folder.Length ? path[(folder.Length + 1)..] : string.Empty;
+        var slash = rest.IndexOf('\\');
+        return rest.Length == 0 ? null : Path.Combine(folder, slash < 0 ? rest : rest[..slash]);
+    }
+
     // ---- drag and drop ---------------------------------------------------------
 
     /// <summary>A folder or file picked up: the selection if it is part of one, otherwise just it.</summary>
@@ -1762,6 +1851,19 @@ internal sealed class NestedPane
         }
 
         var paths = DragPaths(path);
+
+        // Out of an archive, what is dragged is a copy taken out first: a
+        // drop anywhere - Explorer, the desktop, a program - gets real files.
+        if (paths.Any(ArchiveService.IsInsideArchive))
+        {
+            if (_viewModel.ExtractForDrag(paths) is not { } extracted)
+            {
+                return;
+            }
+
+            paths = extracted;
+        }
+
         _host.NestedDragPaths = paths;
         try
         {
@@ -1884,7 +1986,13 @@ internal sealed class NestedPane
             return null;
         }
 
+        // Nothing goes into an archive: it is read-only here.
         var target = hit.Folder;
+        if (target.IsInArchive)
+        {
+            return null;
+        }
+
         return _host.IsDropRefused(target.FullPath, () =>
             _dropCarried.GetValue(paths, DropCarried.Gather).Refuses(target.FullPath, fromThisWindow: _host.NestedDragPaths is not null) is { } refused
                 ? refused

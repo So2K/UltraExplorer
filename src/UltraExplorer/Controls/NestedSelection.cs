@@ -679,6 +679,14 @@ internal sealed class NestedSelection
             return true;
         }
 
+        // A file the window selects - a download shown in its folder - that
+        // the canvas draws as a folder: an archive.  Its cell is what is selected.
+        if (NestedTree.FindChild(parent, name.ToString()) is { IsArchive: true } archive)
+        {
+            SetFolder(archive, true);
+            return true;
+        }
+
         return false;
     }
 

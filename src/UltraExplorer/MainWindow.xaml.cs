@@ -118,6 +118,8 @@ public partial class MainWindow : Window
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
         _viewModel.PromptRequested += ShowInputDialog;
+        Services.Archives.ArchiveService.PasswordPrompt = _viewModel.AskArchivePassword;
+
         _viewModel.ConfirmRequested += ShowConfirmDialog;
         _viewModel.ContextMenuRequested += ShowContextMenu;
         _viewModel.Tree.FocusNodeRequested += FocusNode;
