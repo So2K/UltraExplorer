@@ -143,57 +143,79 @@ internal static partial class Program
                 {
                     var inputSource = HwndSource.FromHwnd(new WindowInteropHelper(preview).Handle)
                         ?? throw new InvalidOperationException("The real audio preview did not expose its HWND input source.");
-                    KeyEventArgs SpaceFrom(DependencyObject source, bool repeated = false)
+                    void KeyDiagnostic(string phase, KeyEventArgs? key = null, System.Text.Json.JsonElement? pause = null)
+                    {
+                        var closedFlag = typeof(QuickPreviewWindow).GetField("_closed", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(preview);
+                        Console.WriteLine($"Owner audio key diagnostic: phase={phase}; modifiers={Keyboard.Modifiers}; "
+                            + $"handled={key?.Handled}; repeat={key?.IsRepeat}; source={key?.Source?.GetType().Name}; originalSource={key?.OriginalSource?.GetType().Name}; "
+                            + $"previewVisible={preview.IsVisible}; closed={closedFlag}; returned={returned}; "
+                            + $"mediaLoaded={native.IsMediaLoaded}; controlsEnabled={native.PlaybackControls.IsEnabled}; pid={native.OwnedProcessId}; "
+                            + $"startedPid={native.LastStartedProcessId}; observer={native.IsMediaObserverRunning}; pause={pause?.GetRawText()}; "
+                            + $"error={native.LastError}; diagnostic={native.LastNativeDiagnostic}");
+                    }
+                    KeyEventArgs SpaceFrom(DependencyObject source, string phase, bool repeated = false)
                     {
                         var args = new KeyEventArgs(Keyboard.PrimaryDevice, inputSource, Environment.TickCount, Key.Space)
                         { RoutedEvent = Keyboard.PreviewKeyDownEvent, Source = source };
                         if (repeated)
                             (typeof(KeyEventArgs).GetMethod("SetRepeat", BindingFlags.Instance | BindingFlags.NonPublic)
                                 ?? throw new MissingMethodException("WPF KeyEventArgs.SetRepeat")).Invoke(args, [true]);
+                        KeyDiagnostic(phase + " before dispatch", args);
                         preview.RaiseEvent(args);
+                        KeyDiagnostic(phase + " after dispatch", args);
                         return args;
                     }
-                    async Task<bool> Paused()
+                    async Task<bool> Paused(string phase)
                     {
                         var response = await native.MpvCommandAsync(["get_property", "pause"]);
+                        KeyDiagnostic(phase, pause: response);
                         if (response is not { } reply || !reply.TryGetProperty("data", out var value)
                             || value.ValueKind is not (System.Text.Json.JsonValueKind.True or System.Text.Json.JsonValueKind.False))
-                            throw new IOException("The owned audio engine did not return an actual pause state.");
+                            throw new IOException($"The owned audio engine did not return an actual pause state at {phase}.");
                         return value.ValueKind == System.Text.Json.JsonValueKind.True;
                     }
                     await native.MpvCommandAsync(["set_property", "mute", true]);
                     var mute = await native.MpvCommandAsync(["get_property", "mute"]);
                     Check("audio shortcut fixtures mute the actual owned engine before any playback",
-                        mute is { } muted && muted.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.True && await Paused());
+                        mute is { } muted && muted.GetProperty("data").ValueKind == System.Text.Json.JsonValueKind.True && await Paused("initial before any key"));
                     var toolbar = new[] { "_open", "_openWith", "_delete" }
                         .Select(name => (Button)(typeof(QuickPreviewWindow).GetField(name, BindingFlags.Instance | BindingFlags.NonPublic)
                             ?? throw new MissingFieldException(name)).GetValue(preview)!).ToArray();
                     foreach (var button in toolbar)
                     {
-                        var key = SpaceFrom(button);
+                        var phase = "toolbar " + button.ToolTip;
+                        var pausedBefore = await Paused(phase + " before key");
+                        var key = SpaceFrom(button, phase);
+                        var pausedAfter = await Paused(phase + " after key");
                         Check($"Space on the audio toolbar {button.ToolTip} remains its button's own key",
-                            !key.Handled && returned == 0 && preview.IsVisible && await Paused());
+                            pausedBefore && pausedAfter && !key.Handled && returned == 0 && preview.IsVisible);
                     }
                     var playbackSources = new DependencyObject[] { native.TimelineControl, native.VolumeControl,
                         native.SpeedControl, (ComboBoxItem)native.SpeedControl.Items[0], native.PlayPauseControl, native.MuteControl };
                     foreach (var source in playbackSources)
                     {
-                        var key = SpaceFrom(source);
+                        var phase = "owned control " + source.GetType().Name;
+                        var pausedBefore = await Paused(phase + " before key");
+                        var key = SpaceFrom(source, phase);
+                        var pausedAfter = await Paused(phase + " after key");
                         Check($"Space on an owned {source.GetType().Name} playback control remains the control's key",
-                            native.OwnsPlaybackControl(source) && !key.Handled && returned == 0 && preview.IsVisible && await Paused());
+                            pausedBefore && pausedAfter && native.OwnsPlaybackControl(source) && !key.Handled && returned == 0 && preview.IsVisible);
                     }
                     var body = (Grid)(typeof(QuickPreviewWindow).GetField("_body", BindingFlags.Instance | BindingFlags.NonPublic)
                         ?? throw new MissingFieldException("_body")).GetValue(preview)!;
-                    var bodySpace = SpaceFrom(body);
+                    _ = await Paused("body before first key");
+                    var bodySpace = SpaceFrom(body, "body first Space");
                     var playing = false;
                     for (var attempt = 0; attempt < 40 && !playing; attempt++)
-                    { playing = !await Paused(); if (!playing) await Task.Delay(25); }
+                    { playing = !await Paused("body after first key " + attempt); if (!playing) await Task.Delay(25); }
                     Check("Space on the actual audio preview body toggles its owned player instead of closing",
                         bodySpace.Handled && playing && returned == 0 && preview.IsVisible && native.IsMediaLoaded);
-                    var repeatedSpace = SpaceFrom(body, repeated: true);
+                    _ = await Paused("body before repeated key");
+                    var repeatedSpace = SpaceFrom(body, "body repeated Space", repeated: true);
                     await Task.Delay(150);
+                    var repeatedPaused = await Paused("body after repeated key");
                     Check("holding Space consumes repeats without repeatedly toggling playback",
-                        repeatedSpace.IsRepeat && repeatedSpace.Handled && !await Paused() && returned == 0 && preview.IsVisible);
+                        repeatedSpace.IsRepeat && repeatedSpace.Handled && !repeatedPaused && returned == 0 && preview.IsVisible);
                     await native.StopPlaybackAsync();
                 }
                 // The same WM_CLOSE delivered by the window caption's X.
