@@ -1834,7 +1834,7 @@ public sealed partial class NestedCanvas
     {
         NestedFolderKind.Computer => "",
         NestedFolderKind.Drive => folder.FullPath.StartsWith(@"\\", StringComparison.Ordinal) ? "" : "",
-        _ => folder.IsReparsePoint ? "" : ""
+        _ => folder.IsReparsePoint ? "" : folder.IsArchive ? "" : ""
     };
 
     private static Color GlyphColour(NestedFolder folder) => folder.Kind switch

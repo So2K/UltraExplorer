@@ -73,6 +73,10 @@ internal static partial class Program
             await SplitViewWindowChecks(main, shell);
             await SplitBetweenPanesWindowChecks(main, shell);
             await SplitFollowWindowChecks(main, shell);
+            // The preview fixture creates a real cloaked HWND. Run it after
+            // the existing unshown-window keyboard checks so their global
+            // KeyboardDevice focus state starts exactly as before.
+            await HoverPreviewWindowChecks();
             shell.Dispose();
         }
         finally
@@ -331,7 +335,7 @@ internal static partial class Program
 
         var menu = main.BuildLayersMenu(main.CanvasLayersButton);
         Check("the layers button's menu is a switch for every layer, hidden items among them, then the minimap and Show all layers",
-            Headers(menu).SequenceEqual([.. switches, "Minimap", "Show all layers"])
+            Headers(menu).SequenceEqual(["Hover previews", .. switches, "Minimap", "Show all layers"])
             && switches.Where(name => name != "Hidden items").All(name => Item(menu, name) is { IsCheckable: true, IsChecked: true, StaysOpenOnClick: true })
             && Item(menu, "Hidden items")?.IsChecked == shell.Tree.ShowHiddenItems
             && Item(menu, "Minimap") is { IsEnabled: false }
@@ -363,7 +367,7 @@ internal static partial class Program
         var options = main.BuildCanvasOptionsMenu(main.SettingsButton);
         var layers = Item(options, "Layers");
         Check("Canvas options has the same switches under Layers, without the minimap",
-            layers is not null && Headers(layers).SequenceEqual([.. switches, "Show all layers"])
+            layers is not null && Headers(layers).SequenceEqual(["Hover previews", .. switches, "Show all layers"])
             && Item(layers, "Marks and notes")?.IsChecked == false && Item(options, "Hidden items") is null);
 
         Invoke(window.ShowAllLayersButton);
@@ -383,7 +387,8 @@ internal static partial class Program
         await SettingsSettle();
         var onTree = main.BuildLayersMenu(main.CanvasLayersButton);
         Check("on the tree canvas the menu says whose layers they are, and the minimap can be switched",
-            onTree.Items[0] is MenuItem { Header: "Shown on the nested canvas", IsEnabled: false } && Item(onTree, "Minimap")?.IsEnabled == true);
+            onTree.Items.OfType<MenuItem>().ElementAt(1) is { Header: "Shown on the nested canvas", IsEnabled: false }
+            && Item(onTree, "Hover previews") is { IsEnabled: true } && Item(onTree, "Minimap")?.IsEnabled == true);
         shell.Layout = CanvasLayout.Nested;
         await SettingsSettle();
 

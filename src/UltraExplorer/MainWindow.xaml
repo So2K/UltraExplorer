@@ -1382,6 +1382,9 @@
                         <TextBlock Text="Reading drives…" Margin="0,10,0,0" FontSize="11.5" Foreground="{StaticResource TextMutedBrush}" HorizontalAlignment="Center" />
                     </StackPanel>
                 </Border>
+
+                <!-- The shelf: slides out from the right while anything is dragged over the window. -->
+                <controls:DropShelf x:Name="Shelf" />
             </Grid>
         </Grid>
 

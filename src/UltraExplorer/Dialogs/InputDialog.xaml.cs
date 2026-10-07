@@ -7,6 +7,7 @@ public partial class InputDialog : Window
 {
     private bool _ownerOnly;
     private bool _accepted;
+    private readonly bool _password;
 
     internal bool ShowOwnerModal()
     {
@@ -27,21 +28,38 @@ public partial class InputDialog : Window
     /// a folder's name or a note, where what follows a dot is no extension:
     /// "Photos 2024.06" renamed by typing "Archive" is "Archive".
     /// </param>
-    public InputDialog(string title, string prompt, string initialValue, bool selectStem = true)
+    /// <param name="password">Shows masked input and keeps its value out of the ordinary text field.</param>
+    public InputDialog(string title, string prompt, string initialValue, bool selectStem = true, bool password = false)
     {
         InitializeComponent();
+        _password = password;
         TitleText.Text = title;
         PromptText.Text = prompt;
-        ValueTextBox.Text = initialValue;
+        if (password)
+        {
+            ValueTextBox.Visibility = Visibility.Collapsed;
+            ValuePasswordBox.Visibility = Visibility.Visible;
+            ValuePasswordBox.Password = initialValue;
+        }
+        else
+        {
+            ValueTextBox.Text = initialValue;
+        }
         Loaded += (_, _) =>
         {
+            if (_password)
+            {
+                ValuePasswordBox.Focus();
+                ValuePasswordBox.SelectAll();
+                return;
+            }
             ValueTextBox.Focus();
             var extensionIndex = selectStem ? initialValue.LastIndexOf('.') : -1;
             ValueTextBox.Select(0, extensionIndex > 0 ? extensionIndex : initialValue.Length);
         };
     }
 
-    public string Value => ValueTextBox.Text;
+    public string Value => _password ? ValuePasswordBox.Password : ValueTextBox.Text;
 
     private void Ok_Click(object sender, RoutedEventArgs e)
     {

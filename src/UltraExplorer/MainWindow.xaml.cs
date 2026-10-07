@@ -118,6 +118,14 @@ public partial class MainWindow : Window
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
         _viewModel.PromptRequested += ShowInputDialog;
+
+        // The shelf comes out for any drag over the window - one of its own or
+        // one from outside - and goes back once the drag is over.
+        Shelf.Initialize(new ShelfStore(), _viewModel);
+        Shelf.CompleteDrop = CompleteExternalDrop;
+        Shelf.Enabled = _viewModel.ShowDropShelf && !IsPickerMode;
+        AddHandler(DragDrop.PreviewDragEnterEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
+        AddHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
         _viewModel.ConfirmRequested += ShowConfirmDialog;
         _viewModel.ContextMenuRequested += ShowContextMenu;
         _viewModel.Tree.FocusNodeRequested += FocusNode;
@@ -136,6 +144,7 @@ public partial class MainWindow : Window
         Harness.Index = _viewModel.Tree.SpatialIndex;
         AttachNested();
         AttachSelection();
+        AttachHoverPreviews();
 
         StateChanged += (_, _) =>
         {
@@ -335,6 +344,18 @@ public partial class MainWindow : Window
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        if (!_allowClose && _quickPreview is { HasUnsavedChanges: true } preview)
+        {
+            e.Cancel = true;
+            if (_quickPreviewClosingOwner) return;
+            _quickPreviewClosingOwner = true;
+            try
+            {
+                if (await preview.ConfirmCloseAsync()) _ = Dispatcher.InvokeAsync(Close);
+            }
+            finally { _quickPreviewClosingOwner = false; }
+            return;
+        }
         // However the window goes away, the caller gets an answer.
         CompletePickerOnClose();
 
@@ -438,6 +459,23 @@ public partial class MainWindow : Window
         _closeRequested = true;
         try
         {
+            if (_quickPreview is { HasUnsavedChanges: true } preview)
+            {
+                var noteSave = preview.CommitForCloseAsync();
+                if (!noteSave.IsCompleted)
+                {
+                    var noteFrame = new DispatcherFrame();
+                    _ = noteSave.ContinueWith(_ => noteFrame.Continue = false, TaskScheduler.Default);
+                    using var noteTimeout = new Timer(_ => noteFrame.Continue = false, null, SessionEndSaveTimeout, Timeout.InfiniteTimeSpan);
+                    Dispatcher.PushFrame(noteFrame);
+                }
+                if (!noteSave.IsCompletedSuccessfully || !noteSave.Result)
+                {
+                    e.Cancel = true;
+                    _closeRequested = false;
+                    return;
+                }
+            }
             CaptureStateForSave();
             var saving = _viewModel.SaveNowAsync();
             if (!saving.IsCompleted)
@@ -460,7 +498,7 @@ public partial class MainWindow : Window
         finally
         {
             // The Closing that follows only tidies up.
-            _allowClose = true;
+            _allowClose = !e.Cancel;
         }
     }
 
@@ -514,7 +552,7 @@ public partial class MainWindow : Window
     private void ConfigureAutoPanning()
     {
         Editor.DisableAutoPanning = true;
-        Editor.IsMouseCaptureWithinChanged += (_, e) => Editor.DisableAutoPanning = e.NewValue is not true;
+        Editor.IsMouseCaptureWithinChanged += (_, e) => Editor.DisableAutoPanning = _isSpacePanning || e.NewValue is not true;
     }
 
     private void SetSpacePanArmed(bool armed)
@@ -546,6 +584,8 @@ public partial class MainWindow : Window
             _isSpacePanning = true;
             _panPointerAnchor = e.GetPosition(Editor);
             _panViewportAnchor = Editor.ViewportLocation;
+            Editor.BeginPanning();
+            Editor.DisableAutoPanning = true;
             Editor.Cursor = Cursors.SizeAll;
             Editor.CaptureMouse();
             e.Handled = true;
@@ -629,7 +669,7 @@ public partial class MainWindow : Window
 
         var moved = e.GetPosition(Editor) - _panPointerAnchor;
         Editor.ViewportLocation = _panViewportAnchor - moved / Math.Max(Editor.ViewportZoom, 0.001);
-        PushViewport();
+        // The viewport dependency-property callback updates the model once.
         e.Handled = true;
     }
 
@@ -652,7 +692,9 @@ public partial class MainWindow : Window
             return;
         }
 
+        Editor.EndPanning();
         Editor.ReleaseMouseCapture();
+        Editor.DisableAutoPanning = !Editor.IsMouseCaptureWithin;
         Editor.Cursor = _isSpaceHeld ? Cursors.Hand : null;
         e.Handled = true;
     }
@@ -660,7 +702,9 @@ public partial class MainWindow : Window
     /// <summary>A drag that loses capture - Alt+Tab, a dialog - must still end.</summary>
     private void Editor_LostMouseCapture(object sender, MouseEventArgs e)
     {
+        if (_isSpacePanning) Editor.EndPanning();
         _isSpacePanning = false;
+        Editor.DisableAutoPanning = !Editor.IsMouseCaptureWithin;
         EndOverviewDrag(committed: false);
     }
 
@@ -709,6 +753,8 @@ public partial class MainWindow : Window
 
     private void PushViewport()
     {
+        if (!IsNested) CancelSpacePreview();
+        if (_hoverPreview is not null) ClearHoverPreview();
         using var frame = PerfLog.Measure("viewport");
 
         using (PerfLog.Measure("viewport.model"))
@@ -2127,6 +2173,12 @@ public partial class MainWindow : Window
         // Whatever the key, it is for the pane the keyboard is in.
         FollowKeyboardToPane();
 
+        if (TryQuickPreviewKey(key, modifiers))
+        {
+            e.Handled = true;
+            return;
+        }
+
         // Ctrl+L and Alt+D are both "put the path in a line I can type in";
         // Windows has answered to either for twenty years.
         if ((modifiers == ModifierKeys.Control && key == Key.L)
@@ -2182,6 +2234,10 @@ public partial class MainWindow : Window
         }
 
         if (TryHandleFocusSelectionKey(key, modifiers, e.IsRepeat,
+                e.OriginalSource as DependencyObject, () => e.Handled = true))
+            return;
+
+        if (TryBeginSpacePreview(key, modifiers, e.IsRepeat,
                 e.OriginalSource as DependencyObject, () => e.Handled = true))
             return;
 
@@ -2279,11 +2335,6 @@ public partial class MainWindow : Window
             case (ModifierKeys.Control, Key.Subtract):
                 _viewModel.ZoomOutCommand.Execute(null);
                 break;
-            // Space is a button's own key too; the grab hand is for the canvas.
-            case (ModifierKeys.None, Key.Space) when onSelection:
-                SetSpacePanArmed(true);
-                break;
-
             // The Menu key is the other way Windows has always had to ask for
             // the menu of what has the keyboard.
             case (ModifierKeys.Shift, Key.F10) when onSelection:
@@ -2379,6 +2430,12 @@ public partial class MainWindow : Window
 
     private void Window_Deactivated(object? sender, EventArgs e)
     {
+        CancelSpacePreview(disarm: true);
+        if (_isSpacePanning)
+        {
+            Editor.EndPanning();
+            Editor.ReleaseMouseCapture();
+        }
         // Alt+Tab while space is held would otherwise leave the grab hand on.
         _isSpacePanning = false;
         SetSpacePanArmed(false);
@@ -2393,9 +2450,13 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Space)
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (key == Key.Space)
         {
-            SetSpacePanArmed(false);
+            var owned = _spacePreviewGesture.IsPressed;
+            var path = FinishSpacePreview(Keyboard.Modifiers, e.OriginalSource as DependencyObject);
+            if (owned) e.Handled = true;
+            if (path is not null) OpenQuickPreview(path);
         }
     }
 
@@ -2436,7 +2497,8 @@ public partial class MainWindow : Window
 
     private string? ShowInputDialog(string title, string prompt, string initialValue, bool selectStem)
     {
-        var dialog = new InputDialog(title, prompt, initialValue, selectStem) { Owner = this };
+        var dialog = new InputDialog(title, prompt, initialValue, selectStem,
+            password: title.Equals("Password", StringComparison.Ordinal)) { Owner = this };
         return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 

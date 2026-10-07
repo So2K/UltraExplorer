@@ -378,8 +378,42 @@
                               AutomationProperties.Name="Minimap" />
                 </controls:SettingCard>
 
+                <TextBlock Text="Optional features" Style="{StaticResource SectionHeading}" />
+
+                <controls:SettingCard Glyph="&#xE8B7;" Header="Browse archives as folders"
+                                      Description="Open ZIP, 7z, RAR and other archives on the nested canvas using 7-Zip. Turn off to open archives in their usual app.">
+                    <CheckBox x:Name="BrowseArchivesSwitch" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding BrowseArchives, Mode=TwoWay}" IsEnabled="{Binding CanChooseLayout}"
+                              AutomationProperties.Name="Browse archives as folders" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8B5;" Header="Drop shelf"
+                                      Description="Drag files to the right edge to keep them on a temporary board. Turn off to hide the shelf; saved cards stay available when you enable it again, for up to 7 days.">
+                    <CheckBox x:Name="DropShelfSwitch" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowDropShelf, Mode=TwoWay}" IsEnabled="{Binding CanChooseLayout}"
+                              AutomationProperties.Name="Drop shelf" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8C8;" Header="Copy path button"
+                                      Description="Show a small copy-path button on hovered files and folders on the nested canvas.">
+                    <CheckBox x:Name="CopyPathButtonSwitch" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowCopyPathButton, Mode=TwoWay}" IsEnabled="{Binding CanChooseLayout}"
+                              AutomationProperties.Name="Copy path button" />
+                </controls:SettingCard>
+
                 <!-- Layers: the switches of the layers menu in the canvas's corner. -->
                 <TextBlock Text="Layers" Style="{StaticResource SectionHeading}" />
+
+                <controls:SettingCard Glyph="&#xEB9F;"
+                                      Header="Hover previews"
+                                      Description="Rest the pointer on a file to see a thumbnail without opening it. Also works with selected files, in either canvas and the folder list.">
+                    <CheckBox x:Name="HoverPreviewsSwitch"
+                              Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding ShowHoverPreviews, Mode=TwoWay}"
+                              ToolTip="Show a content thumbnail when hovering a file"
+                              AutomationProperties.Name="Hover previews"
+                              AutomationProperties.HelpText="Show a content thumbnail when hovering a file" />
+                </controls:SettingCard>
 
                 <controls:SettingCard Glyph="&#xE8A5;"
                                       Header="Files"

@@ -678,6 +678,7 @@ public sealed partial class NestedCanvas
         using (var dc = _overlay.RenderOpen())
         {
             DrawHover(dc);
+            DrawCopyButton(dc);
             DrawHoverTip(dc);
             DrawMarquee(dc);
             DrawMarqueeCount(dc);
@@ -705,6 +706,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void DrawHoverTip(DrawingContext dc)
     {
+        if (SuppressFileHoverTip && _hover is { IsFile: true }) return;
         if (_hover is null && _press == PressKind.None && HotspotAt(_hoverPoint) is { Tip: { Length: > 0 } tip })
         {
             // One layout per line: a layout holds a single line (see Text),
@@ -783,6 +785,18 @@ public sealed partial class NestedCanvas
         if (sub is not null)
         {
             DrawTextAt(dc, sub.Value, new Point(box.X + 8, box.Y + 5 + title.Height));
+        }
+    }
+
+    private bool _suppressFileHoverTip;
+    internal bool SuppressFileHoverTip
+    {
+        get => _suppressFileHoverTip;
+        set
+        {
+            if (_suppressFileHoverTip == value) return;
+            _suppressFileHoverTip = value;
+            RenderOverlay();
         }
     }
 

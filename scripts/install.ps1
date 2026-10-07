@@ -27,6 +27,11 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'InstallPayload.ps1')
 $repository = Split-Path -Parent $PSScriptRoot
 $project = Join-Path $repository 'src\UltraExplorer\UltraExplorer.csproj'
+& (Join-Path $PSScriptRoot 'setup-archive-tools.ps1')
+if (!(Test-Path -LiteralPath (Join-Path $repository 'runtime/preview/f3d/bin/f3d.exe')) -or
+    !(Test-Path -LiteralPath (Join-Path $repository 'runtime/preview/mpv/mpv.exe'))) {
+    & (Join-Path $PSScriptRoot 'setup-preview-tools.ps1')
+}
 $programsRoot = [System.IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'Programs'))
 $destination = Join-Path $programsRoot 'UltraExplorer'
 $executable = Join-Path $destination 'UltraExplorer.exe'

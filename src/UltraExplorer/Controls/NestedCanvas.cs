@@ -332,6 +332,9 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
 
     private Flight? _flight;
 
+    /// <summary>When <see cref="_flight"/> began, as a <see cref="System.Diagnostics.Stopwatch"/> timestamp.</summary>
+    private long _flightStarted;
+
     private PressKind _press;
     private Point _pressPoint;
     private Point _panLast;
@@ -516,7 +519,18 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     }
 
     /// <summary>Space is held: a left drag pans whatever it starts on.</summary>
-    public bool IsSpacePanArmed { get; set; }
+    private bool _isSpacePanArmed;
+    public bool IsSpacePanArmed
+    {
+        get => _isSpacePanArmed;
+        set
+        {
+            if (_isSpacePanArmed == value) return;
+            _isSpacePanArmed = value;
+            if (!value && _press == PressKind.Left && _pressSpacePan)
+                EndPress();
+        }
+    }
 
     /// <summary>The folder being dropped onto, lit while a drag hovers over it.</summary>
     public NestedFolder? DropTarget

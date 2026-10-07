@@ -205,6 +205,18 @@ internal static partial class Program
         await Group(BatchCommandLineChecks);
         await Group(PublicationLifecycleChecks);
         await Group(RefreshIdentityConsumerChecks);
+        await Group(ArchiveChecks);
+        await Group(ArchiveToggleChecks);
+        await Group(ArchivePreviewChecks);
+        await Group(ArchiveLayoutChecks);
+        await Group(ArchiveZoneChecks);
+        await Group(Pr4WorkspaceFixChecks);
+        await Group(Pr4SearchFixChecks);
+        await Group(MaskedPasswordChecks);
+        await Group(OptionalFeatureChecks);
+        await Group(ShelfChecks);
+        await Group(Pr4ShelfSafetyChecks);
+        await Group(Pr4ShelfDropChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.
@@ -214,6 +226,20 @@ internal static partial class Program
         await Group(CrossClusterReviewChecks);
         await Group(TopReviewFixChecks);
         await Group(DriveGateChecks);
+        await Group(ThumbnailServiceChecks);
+        await Group(HoverPreviewChecks);
+        await Group(DocumentPreviewChecks);
+        await Group(UniversalThumbnailChecks);
+        await Group(PreviewToolsChecks);
+        await Group(QuickPreviewChecks);
+        await Group(PreviewSpaceGestureChecks);
+        await Group(SpacePreviewWindowChecks);
+        await Group(ImmediatePanChecks);
+        await Group(PreviewImageChecks);
+        await Group(LightTextPreviewChecks);
+        await Group(QuickPreviewActionRaceChecks);
+        await Group(HoverPreviewPreferenceChecks);
+        await Group(HoverIntegrationChecks);
     }
 
     /// <summary>
