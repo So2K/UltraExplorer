@@ -3,8 +3,8 @@
 Universal content providers and the compact full-view/editor are described in
 [UNIVERSAL_PREVIEWS.md](UNIVERSAL_PREVIEWS.md). PDF, text/document content, F3D
 models and mpv media now have providers independent of Windows' thumbnails;
-unknown readable files get content/hex information. The original scheduling,
-case/literal-path/cache/input rules below still apply.
+unknown readable files get content/hex information. The scheduling,
+case/literal-path/cache/input rules below apply to these providers.
 
 Hover a file for 220 ms to see a passive content thumbnail. Selection is
 independent: hovering one of several selected files previews that particular
@@ -13,8 +13,9 @@ canvas, tree canvas and folder list, including either pane of a split view.
 
 **Layers → Hover previews** and **Settings → Hover previews** control the same
 preference. It is enabled by default and remembered in `workspace.json` as
-`ShowHoverPreviews`. Existing workspaces retain the enabled default. The
-preference saves independently across windows and prepared file dialogs.
+`ShowHoverPreviews`. Saved choices are retained; profiles without this setting
+use the enabled default. The preference saves independently across windows
+and prepared file dialogs.
 
 The card uses the existing dark palette, preserves image proportions, shows
 the name and original image dimensions when available, and stays inside the
@@ -35,14 +36,17 @@ information tooltip.
   negative entries with a 5-second retry interval. Positive entries expire
   after 30 seconds. File length, write time and
   attributes are revalidated in the background, including cache hits.
-- WPF/WIC decodes common images, with all eight EXIF rotations/reflections.
-  Other formats use Windows' content thumbnail cache with
-  `WTS_REQUIRESURROGATE`; support depends on installed thumbnail providers.
+- WPF/WIC and Magick.NET decode images, including EXIF orientation. PDF,
+  document, F3D and mpv content uses the app's own providers. Remaining files
+  can use Windows' content thumbnail cache with `WTS_REQUIRESURROGATE`, then
+  bounded actual text or header information when no thumbnail is available.
+  Shell coverage depends on installed thumbnail providers.
   File type icons are never presented as content previews. Borrowed Shell
   bitmaps are detached before their owned handles are released.
 - Offline, recall-on-open, recall-on-data-access and leaf reparse files are
   skipped. Merely hovering does not hydrate cloud placeholders or follow a
-  leaf symlink. Missing, locked or corrupt files yield no preview.
+  leaf symlink. Missing and locked files yield no preview; corrupt or unsupported
+  readable content may use the information/header fallback.
 - Disposal cancels waiters without joining a blocked disk/native worker.
 
 Hover identities are case-exact, including Windows case-sensitive directories.
@@ -65,7 +69,7 @@ with `-p:IsPublishable=true --self-contained true` when the desktop runtime is
 not installed, then run separate processes for these groups:
 
 ```powershell
-$env:ULTRAEXPLORER_STATE_DIR = 'C:\temp\UltraExplorer-hover-test'
+$env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:TEMP ('UltraExplorer-hover-' + [guid]::NewGuid().ToString('N'))
 $env:ULTRAEXPLORER_TEST_WINDOW = '1'
 ViewAllSmoke.exe --only ThumbnailServiceChecks,HoverPreviewChecks
 ViewAllSmoke.exe --only HoverPreviewPreferenceChecks
@@ -73,11 +77,13 @@ ViewAllSmoke.exe --only HoverIntegrationChecks
 ViewAllSmoke.exe --only SettingsChecks
 ```
 
-The thumbnail checks read the requested three PNGs in
-`J:\Granny2Work\church\statueraw` without modifying them. Window checks use a
-cloaked, nonactivated real WPF window and owned fixtures, preserving the exact
-two-file selection while previewing its second item. They exercise same-path
-handoff between panes, captured-tree subscription cleanup, placement,
+The thumbnail checks use generated PNG/JPEG, orientation, malformed-content
+and locked-file fixtures. Set `ULTRAEXPLORER_PREVIEW_SAMPLE_FOLDER` to an optional
+folder containing sample PNGs for an additional read-only check; its files are
+not modified. Window checks use a cloaked, nonactivated real WPF window and
+owned fixtures, preserving the exact
+two-file selection while previewing its second item. They exercise same-file
+preview transitions between panes, captured-tree subscription cleanup, placement,
 immediate disable, and a routed mouse move from a generated list row.
 
 Set `HOVER_PREVIEW_SHOTS` to save rendered cards. `HOVER_REAL_PREVIEW` optionally
@@ -85,10 +91,6 @@ names a real file to render read-only. These screenshots use an injected hover
 target and are named `*-simulated-hover.png`; they are not evidence of physical
 pointer automation.
 
-Release build and focused checks are recorded in the feature's coordination
-handoff. Two old selection timing budgets also fail on unchanged base
-`6c0f738` on this machine; neither source nor thresholds were changed for this
-feature. The current deployment candidate is based on the qualified v1.2.1
-product and preserves its smooth F, Tags, selection, picker and file-operation
-fixes. Its new combined checks must pass before replacing the installed copy;
-historical isolated-feature totals are not a claim about this later candidate.
+These commands describe the focused verification method, not a completed
+result for every release. See [BUILD.md](../BUILD.md) for the harness and
+[beta testing guide](BETA_TESTING.md) for repeatable desktop workflows.
