@@ -9,6 +9,11 @@ saved preferences are retained. File dialogs keep all three features disabled.
   location and open it; copy/drag out to obtain real files. Context menus offer
   extraction. Writes into archives are refused. Turning it off returns archive
   files to their usual application and exits any archive folder currently in view.
+  Space or Quick Look on an entry opens an extracted copy as a read-only preview
+  with its archive origin displayed. Editing, autosave and Delete are disabled
+  there; Open/Open with deliberately open the temporary copy. Passive hover
+  never extracts archive contents. Switching to Tree view treats archives as
+  ordinary files; returning to Nested restores the saved ON preference.
 - **Drop shelf**: enable the board at the right edge, then drag files onto it.
   Drag a card to take its files out, Shift+drag to arrange cards, Ctrl+wheel to
   zoom, and pull the left edge to resize. The shelf normally keeps path links;
@@ -34,6 +39,10 @@ Review corrections preserve settings
 when the real UpdateAsync save path cannot read them, keep OLE sources alive
 through shelf copies, restrict cache deletion to owned copy directories, and
 protect archive output/caches and encrypted nested archive resolution.
+Extracted files also inherit the archive's Windows origin metadata
+(`Zone.Identifier`), including cached and nested extraction. A known origin
+which cannot be preserved fails extraction instead of reporting an unmarked
+output as ready to open.
 
 ## Verification
 
@@ -51,7 +60,32 @@ lifetime. This is a verification method, not a claim that the current build
 has passed every group. [BUILD.md](../BUILD.md) describes the harness;
 [BETA_TESTING.md](BETA_TESTING.md) covers repeatable desktop checks.
 
+### Qualified combined source
+
+The combined source includes the complete lightweight preview commit74dd485,
+with the Space/copy-path conflict resolved using one press-time Space snapshot.
+Self-contained Release builds have zero warnings/errors. Final verification:
+
+| Gate | Result |
+| --- | --- |
+| PR4 and adjacent workspace/camera/selection/read/split/layer/order regressions | 429/429 |
+| Preview, text save, image, Space/pan, selected-item focus and hover integration | 174/174 |
+| Settings | 308/308 |
+| Actual embedded F3D/mpv controls and lifecycle | 25/25 |
+| Tags | 35/35 |
+| Manifest-safe update/rollback | 47/47 |
+| Picker contracts and panes | 212/212 |
+| New critical integration gate | 22/22 root checks |
+
+The critical gate includes separate process wrappers: archive backend31/31,
+actual read-only archive window9/9, owner-close/system-end recovery17/17,
+layout10/10 and optional switch18/18; these child counts are not added again
+to the root total. Its origin-metadata checks are17/17 in-process. Source logs
+are retained under `artifacts/pr4-review/`, including original failures and
+the corrected fixtures. No full-suite all-green claim is made.
+
 ## Limits
+
 
 Automatic nested archive viewing has a 512 MiB extracted-size limit; explicit
 extraction is available for larger files. Archive lists use the ordinary canvas

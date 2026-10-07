@@ -135,6 +135,7 @@ pane, or use `Shift+F5` to copy and `Shift+F6` to move the selection there.
 | Visual landmarks | Colors, notes and pins; canvas beacons help locate marks outside the current view. |
 | Local name filter | Highlight names and wildcard matches in loaded branches without rearranging the map. |
 | Layers | Hide files, icons, details or marks to focus on the structure you need. |
+| Optional features | Independently enable archive folders, the drop shelf or hover copy-path buttons in Settings. All start off. See [how to try them](docs/OPTIONAL_FEATURES.md). |
 
 The map shows **directory structure**, not storage usage: sibling folder cells
 have equal sizes. It is useful for navigating a hierarchy, rather than judging
@@ -232,6 +233,8 @@ On Windows x64 with the [.NET 10 SDK](https://dotnet.microsoft.com/download):
 ```powershell
 git clone https://github.com/So2K/UltraExplorer.git
 cd UltraExplorer
+./scripts/setup-preview-tools.ps1
+./scripts/setup-archive-tools.ps1
 dotnet build UltraExplorer.sln -c Release
 dotnet run --project src/UltraExplorer/UltraExplorer.csproj -c Release
 ```

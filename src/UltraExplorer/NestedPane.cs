@@ -506,19 +506,46 @@ internal sealed class NestedPane
                 return folder is { IsComputer: false } ? folder.FullPath : null;
             }
 
-            var kept = selection.Items.Where(item => !IsVirtual(item.Path))
-                .Select(item => item.IsDirectory && Tree.Find(item.Path) is { IsArchive: true }
-                    ? item with { IsDirectory = false, Size = _viewModel.Tree.TryGetNode(item.Path, out var node) ? node.Entry.SizeBytes ?? 0 : 0 }
-                    : item).ToArray();
+            var fileIndexes = new Dictionary<NestedFolder, Dictionary<string, NestedFile>>();
+            SelectionItem PhysicalKind(SelectionItem item)
+            {
+                var path = Path.TrimEndingDirectorySeparator(item.Path);
+                var name = Path.GetFileName(path);
+                if (!item.IsDirectory || !ArchiveFormats.IsBrowsable(name)) return item;
+                var folder = Tree.Find(path);
+                if (folder is not null && !folder.IsArchive) return item;
+                if (Path.GetDirectoryName(path) is { } parentPath && Tree.Find(parentPath) is { } parent)
+                {
+                    if (!fileIndexes.TryGetValue(parent, out var files))
+                    {
+                        files = new Dictionary<string, NestedFile>(StringComparer.Ordinal);
+                        foreach (var listedFile in parent.AllFiles) files.TryAdd(listedFile.Name, listedFile);
+                        fileIndexes.Add(parent, files);
+                    }
+
+                    // An OFF refresh may already have removed the archive folder object.
+                    // Its cached file entry proves the physical kind without probing disk.
+                    if (files.TryGetValue(name, out var file)) return item with { IsDirectory = false, Size = file.Length };
+                }
+
+                return folder is { IsArchive: true }
+                    ? item with { IsDirectory = false, Size = _viewModel.Tree.TryGetNode(path, out var node) ? node.Entry.SizeBytes ?? 0 : 0 }
+                    : item;
+            }
+
+            var kept = selection.Items.Where(item => !IsVirtual(item.Path)).Select(PhysicalKind).ToArray();
             var focus = IsVirtual(selection.Focus)
                 ? kept.FirstOrDefault().Path ?? PhysicalParent(selection.Focus) ?? viewed?.FullPath ?? string.Empty
                 : selection.Focus;
             var anchor = IsVirtual(selection.Anchor) ? focus ?? string.Empty : selection.Anchor;
-            if (kept.Length != selection.Count || kept.Any(item => selection.TryGetItem(item.Path, out var old) && old.IsDirectory != item.IsDirectory)
+            var replacements = kept.Where(item => selection.TryGetItem(item.Path, out var old)
+                && (old.IsDirectory != item.IsDirectory || old.Size != item.Size)).Select(item => item.Path).ToArray();
+            if (kept.Length != selection.Count || replacements.Length > 0
                 || !string.Equals(focus, selection.Focus, StringComparison.OrdinalIgnoreCase)
                 || !string.Equals(anchor, selection.Anchor, StringComparison.OrdinalIgnoreCase))
             {
-                selection.Apply(new SelectionEdit { Clear = true, Added = kept,
+                // Explicit replacements bypass ItemSelection's path-only no-op optimization.
+                selection.Apply(new SelectionEdit { Clear = true, Removed = replacements, Added = kept,
                     // Null means "leave unchanged" to ItemSelection. Empty explicitly clears a ghost focus.
                     Focus = focus ?? string.Empty, Anchor = anchor ?? string.Empty,
                     Source = SelectionSource.Command, RecordsNavigation = false });

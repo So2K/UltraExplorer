@@ -47,6 +47,8 @@ internal static partial class Program
         var priorTime = priorState is null ? (DateTime?)null : File.GetLastWriteTimeUtc(workspace);
         var root = Path.Combine(AppPaths.StateDirectory, "archive-layout-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(root);
+        var directoryLikeArchive = Path.Combine(root, "ordinary.zip");
+        Directory.CreateDirectory(directoryLikeArchive);
         var zip = Path.Combine(root, "owned.zip");
         using (var archive = ZipFile.Open(zip, ZipArchiveMode.Create))
         using (var writer = new StreamWriter(archive.CreateEntry("folder/owned.txt").Open())) writer.Write("owned fixture");
@@ -90,7 +92,12 @@ internal static partial class Program
             Check("the physical tree treats the archive itself as an ordinary file", archiveNode is { IsDirectory: false });
             model.Tree.Selection.ReplaceSingle(zip, true, 0, SelectionSource.Canvas);
             pane.ApplyArchivePreference();
-            Check("an archive selected with an old folder kind becomes a file in tree mode", model.Tree.Selection.TryGetItem(zip, out var selected) && !selected.IsDirectory);
+            Check("an archive selected with an old folder kind becomes a file in tree mode", model.Tree.Selection.TryGetItem(zip, out var selected)
+                && !selected.IsDirectory && selected.Size == original.LongLength);
+            model.Tree.Selection.ReplaceSingle(directoryLikeArchive, true, 0, SelectionSource.Canvas);
+            pane.ApplyArchivePreference();
+            Check("a real directory named like an archive retains its folder kind", model.Tree.Selection.TryGetItem(directoryLikeArchive, out var realDirectory)
+                && realDirectory.IsDirectory && pane.Tree.Find(directoryLikeArchive) is { IsArchive: false });
 
             model.Layout = CanvasLayout.Nested;
             await SettingsSettle();
