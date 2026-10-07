@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
@@ -34,6 +35,31 @@ internal static partial class Program
         Check("actual video tracks override an audio file extension", !NativePreviewHost.HasOnlyAudio(realVideoTracks.RootElement, "renamed.wav"));
         Check("a recognized track list with no audio never claims an audio preview", !NativePreviewHost.HasOnlyAudio(subtitleTracks.RootElement, "empty.wav"));
         Check("the filename fallback handles literal uppercase audio and excludes movies", NativePreviewHost.HasOnlyAudio(null, "sound.WAV. ") && !NativePreviewHost.HasOnlyAudio(null, "movie.mp4"));
+        var readinessPath = Path.Combine(Path.GetTempPath(), "readiness-fixture.wav");
+        static JsonElement Success(object data) => JsonSerializer.SerializeToElement(new { data, error = "success" });
+        var selectedVideo = Success(new[] { new { type = "video", selected = true, albumart = false } });
+        var unselectedVideo = Success(new[] { new { type = "video", selected = false, albumart = false } });
+        var correctPath = Success(DocumentPreviewService.LiteralPath(readinessPath));
+        var decodedVideo = Success(new { w = 160, h = 96 });
+        var startPosition = Success(0);
+        Check("an empty or unselected track list never passes media readiness", !NativePreviewHost.MediaPropertiesReady(Success(Array.Empty<object>()), correctPath, decodedVideo, null, startPosition, readinessPath)
+            && !NativePreviewHost.MediaPropertiesReady(unselectedVideo, correctPath, decodedVideo, null, startPosition, readinessPath));
+        Check("file headers without decoded parameters or a real position never pass readiness", !NativePreviewHost.MediaPropertiesReady(selectedVideo, correctPath, null, null, startPosition, readinessPath)
+            && !NativePreviewHost.MediaPropertiesReady(selectedVideo, correctPath, decodedVideo, null, null, readinessPath));
+        Check("decoded media for a different path cannot satisfy the current file readiness", !NativePreviewHost.MediaPropertiesReady(selectedVideo, Success(Path.Combine(Path.GetTempPath(), "other.wav")), decodedVideo, null, startPosition, readinessPath));
+        Check("actual decoded selected video parameters pass readiness even with an audio extension", NativePreviewHost.MediaPropertiesReady(selectedVideo, correctPath, decodedVideo, null, startPosition, readinessPath));
+        using (var lineStream = new MemoryStream(Encoding.UTF8.GetBytes("first\nsecond\r\n" + new string('x', 256 * 1024 + 1) + "\n")))
+        using (var textReader = new StreamReader(lineStream, Encoding.UTF8))
+        {
+            var boundedLines = new NativePreviewHost.BoundedMediaLineReader(textReader);
+            var firstLine = await boundedLines.ReadAsync(CancellationToken.None);
+            var secondLine = await boundedLines.ReadAsync(CancellationToken.None);
+            Check("the persistent IPC reader preserves buffered lines and CRLF boundaries", firstLine == "first" && secondLine == "second");
+            var rejectedOversize = false;
+            try { await boundedLines.ReadAsync(CancellationToken.None); }
+            catch (IOException) { rejectedOversize = true; }
+            Check("an oversized native JSON line is rejected before parsing or log allocation", rejectedOversize);
+        }
         var mpv = PreviewTools.FindMpv();
         Check("the media UI fixtures use the actual bundled mpv engine", mpv is not null);
         if (mpv is null) return;
@@ -60,13 +86,15 @@ internal static partial class Program
             window.SourceInitialized += (_, _) => DialogNative.CloakOwn(new WindowInteropHelper(window).Handle, true);
             try
             {
-                window.Show(); await host.LoadAsync(audio); host.UpdateLayout();
+                window.Show(); await MediaUiLoadAsync(host, audio, "audio", artifacts); host.UpdateLayout();
                 var audioPid = host.OwnedProcessId;
                 Check("decoded WAV shows a named audio card and hides its unused native canvas", host.IsAudioOnly && !host.IsNativeViewportVisible
                     && host.AudioDisplayName == "Recorded voice note.wav" && host.AudioDetail.Contains("WAV audio", StringComparison.Ordinal));
                 Check("audio has no video-frame help header", !host.IsMediaHeaderVisible);
                 Check("audio starts paused with an accessible glyph Play action", AutomationProperties.GetName(host.PlayPauseControl) == "Play"
                     && host.PlayPauseControl.Content is TextBlock { Text.Length: 1 });
+                Check("successful media readiness keeps its actual decoded track snapshot and owned event observer", host.IsMediaObserverRunning
+                    && host.InitialMediaTracks is { } audioTracks && audioTracks.TryGetProperty("data", out var actualTracks) && actualTracks.GetArrayLength() > 0);
                 var sliderTrack = host.TimelineControl.Template.FindName("PART_Track", host.TimelineControl) as Track;
                 var volumeTrack = host.VolumeControl.Template.FindName("PART_Track", host.VolumeControl) as Track;
                 Check("both media sliders use custom tracks and round thumb templates", sliderTrack?.Thumb.Template is not null && volumeTrack?.Thumb.Template is not null
@@ -130,7 +158,7 @@ internal static partial class Program
                     await MediaUiEngineDiagnostic(host, "stop");
                 }
                 Check("Stop pauses and rewinds audio through its own IPC", MediaUiBool(stopPause) && MediaUiNumber(stopPosition) < 0.05 && stopUiName == "Play");
-                await host.LoadAsync(video); host.UpdateLayout();
+                await MediaUiLoadAsync(host, video, "video", artifacts); host.UpdateLayout();
                 var audioExited = audioPid is not null && await PreviewToolsWaitForExit(audioPid.Value);
                 if (host.IsAudioOnly || !host.IsNativeViewportVisible || host.IsMediaHeaderVisible || !audioExited)
                 {
@@ -154,13 +182,30 @@ internal static partial class Program
                 if (File.Exists(secondFrame)) MediaUiSaveVideoComposite(host, secondFrame, Path.Combine(artifacts, "media-video-interface.png"));
                 var polls = host.PlaybackPollCount; await Task.Delay(560);
                 Check("the restyled interface retains bounded four-per-second playback polling", host.IsPlaybackTimerRunning && host.PlaybackPollCount - polls is > 0 and <= 3);
+                var invalid = Path.Combine(directory, "invalid.wav");
+                await File.WriteAllTextAsync(invalid, "This is not an audio or video stream.");
+                var failureClock = Stopwatch.StartNew();
+                IOException? invalidFailure = null;
+                try { await host.LoadAsync(invalid); }
+                catch (IOException error) { invalidFailure = error; }
+                if (invalidFailure is not null)
+                    await File.WriteAllTextAsync(Path.Combine(artifacts, "media-invalid-engine.log"), host.LastNativeDiagnostic ?? "<missing native diagnostic>");
+                Check("a real undecodable file is rejected by native events without claiming a ready player", invalidFailure is not null && !host.IsMediaLoaded
+                    && failureClock.Elapsed < TimeSpan.FromSeconds(20) && !string.IsNullOrEmpty(host.LastNativeDiagnostic));
+                var failedPid = host.LastStartedProcessId;
+                var failedExited = failedPid is not null && await PreviewToolsWaitForExit(failedPid.Value);
+                await MediaUiWaitAsync(() => !host.IsMediaObserverRunning);
+                Check("a native load failure releases its own process and persistent event observer", failedExited && host.OwnedProcessId is null
+                    && !host.IsMediaObserverRunning && !host.IsPlaybackTimerRunning);
+                await MediaUiLoadAsync(host, video, "recovery", artifacts); host.UpdateLayout();
                 var videoPid = host.OwnedProcessId; window.Close();
                 // A bare test Window unloads its content on the next dispatcher
                 // pass. Wait for that real lifecycle notification before checking
                 // disposal; never call Dispose to make this assertion succeed.
                 await MediaUiWaitAsync(() => !host.IsPlaybackTimerRunning);
                 var ownedExited = videoPid is not null && await PreviewToolsWaitForExit(videoPid.Value);
-                Check("closing the player stops its poller and only its owned process", !host.IsPlaybackTimerRunning && ownedExited && host.OwnedProcessId is null);
+                await MediaUiWaitAsync(() => !host.IsMediaObserverRunning);
+                Check("closing the player stops its poller and only its owned process", !host.IsPlaybackTimerRunning && ownedExited && host.OwnedProcessId is null && !host.IsMediaObserverRunning);
             }
             finally { host.Dispose(); window.Close(); }
             var audioAfter = await File.ReadAllBytesAsync(audio);
@@ -200,6 +245,18 @@ internal static partial class Program
     {
         var clock = Stopwatch.StartNew();
         while (!condition() && clock.Elapsed < TimeSpan.FromSeconds(3)) await Task.Delay(30);
+    }
+
+    private static async Task MediaUiLoadAsync(NativePreviewHost host, string path, string stage, string artifacts)
+    {
+        try { await host.LoadAsync(path); }
+        catch
+        {
+            var native = host.LastNativeDiagnostic ?? "<missing native diagnostic>";
+            Console.WriteLine($"Media {stage} load failure native diagnostic: {native}");
+            await File.WriteAllTextAsync(Path.Combine(artifacts, $"media-{stage}-load-error.log"), native);
+            throw;
+        }
     }
 
     private static string MediaUiLayoutDiagnostic(NativePreviewHost host)

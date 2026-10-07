@@ -48,6 +48,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
     private CancellationTokenSource? _session;
     private CancellationTokenRegistration _processCancellation;
     private Process? _process;
+    private MediaSession? _mediaSession;
+    private Task? _mediaObserver;
     private string? _pipeName;
     private string? _sessionDirectory;
     private IntPtr _modelWindow;
@@ -62,6 +64,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
     internal string? LastError { get; private set; }
     internal string? LastNativeDiagnostic { get; private set; }
     internal int? OwnedProcessId => _process is { } process && !process.HasExited ? process.Id : null;
+    internal int? LastStartedProcessId { get; private set; }
+    internal bool IsMediaObserverRunning => _mediaObserver is { IsCompleted: false };
     internal IntPtr ViewportHandle => _surface.Window;
     internal IntPtr ModelWindowHandle => _modelWindow;
     internal bool IsPlaybackTimerRunning => _playbackTimer.IsEnabled;
@@ -117,6 +121,8 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         StopSession();
         var generation = ++_generation;
         LastError = null;
+        LastNativeDiagnostic = null;
+        LastStartedProcessId = null;
         IsAudioOnly = false;
         InitialMediaTracks = null;
         _surface.Visibility = Visibility.Visible;
@@ -138,6 +144,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _session = session;
         using var loading = CancellationTokenSource.CreateLinkedTokenSource(session.Token);
         loading.CancelAfter(TimeSpan.FromSeconds(20));
+        MediaSession? media = null;
         try
         {
             await _surface.Ready.WaitAsync(loading.Token);
@@ -161,18 +168,23 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                     "--idle=yes", "--force-window=yes", "--keep-open=yes", "--pause=yes", "--osc=no", "--hwdec=auto-safe",
                     "--input-default-bindings=no", "--input-builtin-bindings=no", "--input-vo-keyboard=no", "--input-cursor=no",
                     "--load-stats-overlay=no", "--load-console=no", "--load-commands=no", "--load-select=no", "--osd-level=0",
-                    "--sub-auto=no", "--audio-file-auto=no", "--save-position-on-quit=no", "--write-filename-in-watch-later-config=no",
-                    "--", DocumentPreviewService.LiteralPath(path)];
+                    "--sub-auto=no", "--audio-file-auto=no", "--save-position-on-quit=no", "--write-filename-in-watch-later-config=no"];
             }
             var process = PreviewTools.Start(executable, arguments, _sessionDirectory);
             _process = process;
+            LastStartedProcessId = process.Id;
             _processCancellation = session.Token.Register(() => PreviewTools.Kill(process));
             process.EnableRaisingEvents = true;
             process.Exited += (_, _) => Dispatcher.BeginInvoke(new Action(() =>
             {
-                if (!_disposed && generation == _generation)
+                if (!_disposed && generation == _generation && ReferenceEquals(_process, process) && ReferenceEquals(_session, session))
                 {
-                    _status.Text = "Preview closed";
+                    if (media is { } closedMedia && ReferenceEquals(closedMedia, _mediaSession))
+                    {
+                        closedMedia.Fail("The media engine closed its preview process.");
+                        LastError = closedMedia.Failure; CaptureMediaDiagnostic(closedMedia);
+                    }
+                    _status.Text = LastError ?? "Preview closed";
                     _header.Visibility = Visibility.Visible;
                     _mediaControls.IsEnabled = false;
                     _playbackTimer.Stop();
@@ -206,17 +218,31 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
             }
             else
             {
-                // A pipe being created proves only that mpv started. Wait until
-                // an actual file is loaded so corrupt codecs get a clear fallback.
+                // Connect before loadfile: the file-loaded/end-file events must
+                // belong to a persistent client, not a short-lived command pipe.
+                media = new MediaSession(); _mediaSession = media;
+                _mediaObserver = ObserveMediaAsync(_pipeName!, media, generation, session.Token);
+                await media.ObserverReady.Task.WaitAsync(loading.Token);
+                media.ThrowIfFailed();
+                var loaded = await MpvCommandAsync(["loadfile", DocumentPreviewService.LiteralPath(path), "replace"], loading.Token);
+                if (!PropertySucceeded(loaded)) throw new IOException("The media engine could not begin loading this file.");
+                await media.FileLoaded.Task.WaitAsync(loading.Token);
+                media.ThrowIfFailed();
+                JsonElement? tracks;
                 while (true)
                 {
                     loading.Token.ThrowIfCancellationRequested();
-                    if (process.HasExited) throw new IOException("mpv could not open this media file.");
-                    var response = await MpvCommandAsync(["get_property", "idle-active"], loading.Token);
-                    if (response is { } reply && reply.TryGetProperty("data", out var idle) && idle.ValueKind == JsonValueKind.False) break;
-                    await Task.Delay(80, loading.Token);
+                    media.ThrowIfFailed();
+                    if (process.HasExited) throw new IOException("The media engine closed before decoding this file.");
+                    tracks = await MpvCommandAsync(["get_property", "track-list"], loading.Token);
+                    var currentPath = await MpvCommandAsync(["get_property", "path"], loading.Token);
+                    var videoParams = await MpvCommandAsync(["get_property", "video-params"], loading.Token);
+                    var audioParams = await MpvCommandAsync(["get_property", "audio-params"], loading.Token);
+                    var time = await MpvCommandAsync(["get_property", "time-pos"], loading.Token);
+                    media.ThrowIfFailed();
+                    if (MediaPropertiesReady(tracks, currentPath, videoParams, audioParams, time, path)) break;
+                    await Task.Delay(40, loading.Token);
                 }
-                var tracks = await MpvCommandAsync(["get_property", "track-list"], loading.Token);
                 if (generation != _generation) throw new OperationCanceledException(session.Token);
                 InitialMediaTracks = tracks;
                 IsAudioOnly = HasOnlyAudio(tracks, path);
@@ -232,22 +258,26 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
                 _status.Text = "";
                 _mediaControls.Visibility = Visibility.Visible;
                 await RefreshPlaybackAsync(loading.Token);
+                media.ThrowIfFailed();
                 _playbackTimer.Start();
             }
         }
         catch (Exception ex)
         {
+            var mediaFailure = media?.Failure;
             var ownTimeout = ex is OperationCanceledException && !session.IsCancellationRequested;
             if (generation == _generation)
             {
-                LastError = ownTimeout
-                    ? "The preview engine took too long to load this file." : ex.Message;
+                LastError = mediaFailure ?? (ownTimeout
+                    ? "The preview engine took too long to load this file." : ex.Message);
+                if (media is not null) CaptureMediaDiagnostic(media);
                 _status.Text = LastError;
                 _header.Visibility = Visibility.Visible;
                 _mediaControls.Visibility = Visibility.Collapsed;
                 _audioCard.Visibility = Visibility.Collapsed;
                 StopSession();
             }
+            if (mediaFailure is not null && ex is not IOException) throw new IOException(mediaFailure, ex);
             if (ownTimeout) throw new TimeoutException("The preview engine took too long to load this file.", ex);
             throw;
         }
@@ -276,9 +306,10 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
             await pipe.WriteAsync(bytes, timeout.Token).ConfigureAwait(false);
             await pipe.FlushAsync(timeout.Token).ConfigureAwait(false);
             using var reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+            var lines = new BoundedMediaLineReader(reader);
             for (var index = 0; index < 64; index++)
             {
-                var line = await reader.ReadLineAsync(timeout.Token).ConfigureAwait(false);
+                var line = await lines.ReadAsync(timeout.Token).ConfigureAwait(false);
                 if (line is null) return null;
                 using var json = JsonDocument.Parse(line);
                 if (json.RootElement.TryGetProperty("request_id", out var id) && id.GetInt32() == 1)
@@ -288,6 +319,180 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         catch (OperationCanceledException) when (!token.IsCancellationRequested && !sessionToken.IsCancellationRequested && !_lifetime.IsCancellationRequested) { }
         catch (IOException) { }
         return null;
+    }
+
+    private async Task ObserveMediaAsync(string pipeName, MediaSession media, int generation, CancellationToken token)
+    {
+        try
+        {
+            using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+            await pipe.ConnectAsync(token).ConfigureAwait(false);
+            var request = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { command = new[] { "request_log_messages", "warn" }, request_id = 91 }) + "\n");
+            await pipe.WriteAsync(request, token).ConfigureAwait(false);
+            await pipe.FlushAsync(token).ConfigureAwait(false);
+            using var reader = new StreamReader(pipe, Encoding.UTF8, false, 4096, leaveOpen: true);
+            var lines = new BoundedMediaLineReader(reader);
+            while (true)
+            {
+                var line = await lines.ReadAsync(token).ConfigureAwait(false);
+                // Windows mpv closes IPC before sending a shutdown JSON event.
+                if (line is null) throw new IOException("The media engine closed its preview connection.");
+                using var document = JsonDocument.Parse(line);
+                var message = document.RootElement;
+                if (message.TryGetProperty("request_id", out var id) && id.TryGetInt32(out var requestId) && requestId == 91)
+                {
+                    if (MessageString(message, "error") != "success") throw new IOException("The media engine could not observe preview events.");
+                    media.ObserverReady.TrySetResult();
+                    continue;
+                }
+                switch (MessageString(message, "event"))
+                {
+                    case "log-message":
+                        media.AppendLog($"[{MessageString(message, "prefix")}] {MessageString(message, "level")}: {MessageString(message, "text")}");
+                        break;
+                    case "file-loaded":
+                        media.AppendLog("file-loaded\n");
+                        media.FileLoaded.TrySetResult();
+                        break;
+                    case "end-file":
+                        media.AppendLog(line + "\n");
+                        if (MessageString(message, "reason") == "error")
+                            throw new IOException("The media engine could not play this file: " + MessageString(message, "file_error"));
+                        // This means UNLOADED, including incomplete files which
+                        // can report eof. Ordinary keep-open EOF remains loaded.
+                        throw new IOException("The media file was unloaded before its preview could continue.");
+                    case "shutdown":
+                        throw new IOException("The media engine closed before previewing finished.");
+                }
+            }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested)
+        {
+            media.ObserverReady.TrySetCanceled(token); media.FileLoaded.TrySetCanceled(token);
+        }
+        catch (Exception ex) when (ex is IOException or JsonException or InvalidOperationException)
+        {
+            if (token.IsCancellationRequested) return;
+            media.Fail(ex.Message);
+            if (Dispatcher.HasShutdownStarted) return;
+            try
+            {
+                _ = Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (_disposed || generation != _generation || !ReferenceEquals(media, _mediaSession)) return;
+                    LastError = media.Failure; CaptureMediaDiagnostic(media);
+                    _status.Text = LastError;
+                    _header.Visibility = Visibility.Visible;
+                    _mediaControls.IsEnabled = false;
+                    StopSession();
+                }));
+            }
+            catch (InvalidOperationException) { }
+        }
+    }
+
+    private void CaptureMediaDiagnostic(MediaSession media)
+    {
+        LastNativeDiagnostic = media.LogSnapshot();
+        if (_sessionDirectory is not { } directory) return;
+        try { File.WriteAllText(Path.Combine(directory, "engine-error.log"), LastNativeDiagnostic, Encoding.UTF8); }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    internal static bool MediaPropertiesReady(JsonElement? tracksResponse, JsonElement? pathResponse, JsonElement? videoParamsResponse,
+        JsonElement? audioParamsResponse, JsonElement? positionResponse, string expectedPath)
+    {
+        if (!PropertyData(tracksResponse, out var tracks) || tracks.ValueKind != JsonValueKind.Array
+            || !PropertyData(pathResponse, out var path) || path.ValueKind != JsonValueKind.String
+            || !PropertyData(positionResponse, out var position) || position.ValueKind != JsonValueKind.Number
+            || !position.TryGetDouble(out var seconds) || !double.IsFinite(seconds) || seconds < 0) return false;
+        var currentPath = path.GetString();
+        if (string.IsNullOrEmpty(currentPath) || !Path.IsPathFullyQualified(currentPath)
+            || !string.Equals(DocumentPreviewService.LiteralPath(currentPath), DocumentPreviewService.LiteralPath(expectedPath), StringComparison.OrdinalIgnoreCase)) return false;
+        var selectedAudio = false; var selectedVideo = false;
+        foreach (var track in tracks.EnumerateArray())
+        {
+            if (track.ValueKind != JsonValueKind.Object || !track.TryGetProperty("selected", out var selected) || selected.ValueKind != JsonValueKind.True) continue;
+            var type = MessageString(track, "type");
+            selectedAudio |= type == "audio";
+            selectedVideo |= type == "video" && !(track.TryGetProperty("albumart", out var cover) && cover.ValueKind == JsonValueKind.True);
+        }
+        if (selectedVideo)
+            return PropertyData(videoParamsResponse, out var video) && video.ValueKind == JsonValueKind.Object
+                && PositiveNumber(video, "w") && PositiveNumber(video, "h");
+        return selectedAudio && PropertyData(audioParamsResponse, out var audio) && audio.ValueKind == JsonValueKind.Object && PositiveNumber(audio, "samplerate");
+    }
+
+    private static bool PositiveNumber(JsonElement value, string name) => value.TryGetProperty(name, out var number)
+        && number.ValueKind == JsonValueKind.Number && number.TryGetDouble(out var result) && double.IsFinite(result) && result > 0;
+    private static bool PropertySucceeded(JsonElement? response) => response is { } root && MessageString(root, "error") == "success";
+    private static bool PropertyData(JsonElement? response, out JsonElement data)
+    {
+        data = default;
+        return response is { } root && PropertySucceeded(response) && root.TryGetProperty("data", out data);
+    }
+    private static string MessageString(JsonElement message, string name) => message.TryGetProperty(name, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() ?? "" : "";
+
+    private sealed class MediaSession
+    {
+        // A UTF-16 log of at most 16K characters also stays below 64KiB
+        // when captured as UTF-8, including non-ASCII error messages.
+        private const int MaximumLogCharacters = 16 * 1024;
+        private readonly object _gate = new();
+        private readonly StringBuilder _log = new();
+        private string? _failure;
+        internal TaskCompletionSource ObserverReady { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal TaskCompletionSource FileLoaded { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        internal string? Failure => Volatile.Read(ref _failure);
+        internal void AppendLog(string line)
+        {
+            lock (_gate)
+            {
+                if (line.Length > MaximumLogCharacters) line = line[^MaximumLogCharacters..];
+                _log.Append(line);
+                if (_log.Length > MaximumLogCharacters) _log.Remove(0, _log.Length - MaximumLogCharacters);
+            }
+        }
+        internal void Fail(string reason)
+        {
+            if (Interlocked.CompareExchange(ref _failure, reason, null) is null) AppendLog(reason + "\n");
+            ObserverReady.TrySetResult(); FileLoaded.TrySetResult();
+        }
+        internal void ThrowIfFailed() { if (Failure is { } failure) throw new IOException(failure); }
+        internal string LogSnapshot() { lock (_gate) return _log.ToString(); }
+    }
+
+    internal sealed class BoundedMediaLineReader(StreamReader reader)
+    {
+        private const int MaximumCharacters = 256 * 1024;
+        private readonly char[] _buffer = new char[4096];
+        private int _offset, _count;
+        internal async Task<string?> ReadAsync(CancellationToken token)
+        {
+            StringBuilder? collected = null;
+            while (true)
+            {
+                if (_offset == _count)
+                {
+                    _count = await reader.ReadAsync(_buffer.AsMemory(), token).ConfigureAwait(false);
+                    _offset = 0;
+                    if (_count == 0) return collected?.ToString();
+                }
+                var newline = Array.IndexOf(_buffer, '\n', _offset, _count - _offset);
+                var length = (newline < 0 ? _count : newline) - _offset;
+                if (length + (collected?.Length ?? 0) > MaximumCharacters)
+                    throw new IOException("The media engine returned an oversized preview response.");
+                if (newline >= 0)
+                {
+                    var line = collected is null ? new string(_buffer, _offset, length) : collected.Append(_buffer, _offset, length).ToString();
+                    _offset = newline + 1;
+                    return line.TrimEnd('\r');
+                }
+                collected ??= new StringBuilder(Math.Min(MaximumCharacters, length + 4096));
+                collected.Append(_buffer, _offset, length); _offset = _count;
+            }
+        }
     }
 
     private void BuildAudioCard()
@@ -637,6 +842,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _process?.Dispose();
         _process = null;
         _pipeName = null;
+        _mediaSession = null;
         _modelWindow = IntPtr.Zero;
         _surface.Detach();
         if (_sessionDirectory is { } directory)
