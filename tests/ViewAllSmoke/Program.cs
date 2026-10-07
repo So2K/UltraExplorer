@@ -242,6 +242,8 @@ internal static partial class Program
         await Group(QuickPreviewActionRaceChecks);
         await Group(HoverPreviewPreferenceChecks);
         await Group(HoverIntegrationChecks);
+        await Group(QuietUpdateChecks);
+        await Group(QuietUpdateUiChecks);
     }
 
     /// <summary>

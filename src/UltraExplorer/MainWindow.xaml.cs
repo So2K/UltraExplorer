@@ -121,7 +121,7 @@ public partial class MainWindow : Window
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
         _viewModel.PromptRequested += ShowInputDialog;
-        Closed += (_, _) => { _quickPreview?.CompleteOwnerClose(); _sessionCloseTransaction?.Remove(this); };
+        Closed += (_, _) => { DisposeQuietUpdates(); _quickPreview?.CompleteOwnerClose(); _sessionCloseTransaction?.Remove(this); };
 
         // The shelf comes out for any drag over the window - one of its own or
         // one from outside - and goes back once the drag is over.
@@ -344,6 +344,8 @@ public partial class MainWindow : Window
 
         await RunSelectionDemoAsync();
         await RunMenuDemoAsync();
+        if (!_closeRequested && !IsTestWindow && !IsDiagnosticsRun && Application.Current is App app)
+            app.StartQuietUpdates(this);
     }
 
     private async void Window_Closing(object? sender, CancelEventArgs e)

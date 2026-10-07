@@ -8,12 +8,24 @@ using UltraExplorer.Picker;
 using UltraExplorer.Picker.Com;
 
 using UltraExplorer.Services;
+using UltraExplorer.Services.Updates;
 using UltraExplorer.Picker.Integration;
 
 namespace UltraExplorer;
 
 public partial class App : Application
 {
+    private QuietUpdateService? _quietUpdates;
+    private bool _quietUpdatesAllowed;
+
+    internal void StartQuietUpdates(MainWindow window)
+    {
+        if (!_quietUpdatesAllowed || window.IsPickerMode) return;
+        _quietUpdates ??= QuietUpdateService.Shared;
+        window.InitializeQuietUpdates(_quietUpdates);
+        _quietUpdates.Start();
+    }
+
     /// <summary>
     /// The taskbar identity of the everyday copy.  The Start menu shortcut
     /// that scripts/install.ps1 makes carries the same id, so a pinned button
@@ -184,6 +196,7 @@ public partial class App : Application
             ? new MainWindow(null, ExplorerLaunchRouter.FolderWorkspacePath(destination)) : new MainWindow();
         ShutdownMode = ShutdownMode.OnLastWindowClose;
         MainWindow = window;
+        _quietUpdatesAllowed = !isTestCopy;
         if (folderInvocation is not null) window.FolderDestinationId = folderInvocation.DestinationId;
         if (folderInvocation is not null) window.PrepareFolderInvocation(folderInvocation);
         ExplorerLaunchRouter.Attach(window);
@@ -292,6 +305,7 @@ public partial class App : Application
 
     protected override void OnExit(ExitEventArgs e)
     {
+        _quietUpdates?.Dispose();
         // The cards first - their textures read the atlases - then what the
         // atlases learned this run, for the next start.
         Rendering.Gpu.GpuBootstrap.Shutdown();

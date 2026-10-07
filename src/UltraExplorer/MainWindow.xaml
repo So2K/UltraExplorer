@@ -257,6 +257,61 @@
                         shell:WindowChrome.IsHitTestVisibleInChrome="True">
                     <TextBlock Text="&#xE710;" Style="{StaticResource IconText}" FontSize="11" />
                 </Button>
+                <!-- A downloaded update is offered only through this quiet indicator.
+                     The panel below opens solely when the user presses the arrow. -->
+                <Button x:Name="QuietUpdateButton"
+                        Width="24" Height="24" Padding="0" Margin="5,0,0,5"
+                        VerticalAlignment="Bottom"
+                        Style="{StaticResource ChromeButton}" Focusable="True"
+                        Visibility="Collapsed" IsEnabled="False"
+                        ToolTipService.ShowOnDisabled="True"
+                        Click="QuietUpdateButton_Click"
+                        shell:WindowChrome.IsHitTestVisibleInChrome="True">
+                    <Grid Width="14" Height="14">
+                        <Path x:Name="QuietUpdateRing" Visibility="Collapsed"
+                              Data="M 7,1 A 6,6 0 1 1 1,7"
+                              Stroke="{StaticResource TextDimBrush}" StrokeThickness="1.4"
+                              StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                              RenderTransformOrigin="0.5,0.5">
+                            <Path.RenderTransform><RotateTransform x:Name="QuietUpdateRingRotation" /></Path.RenderTransform>
+                        </Path>
+                        <TextBlock x:Name="QuietUpdateArrow" Text="&#xE896;"
+                                   Style="{StaticResource IconText}" FontSize="12"
+                                   Foreground="{StaticResource AccentBrush}" Visibility="Collapsed" />
+                    </Grid>
+                </Button>
+                <Popup x:Name="QuietUpdatePopover"
+                       PlacementTarget="{Binding ElementName=QuietUpdateButton}"
+                       Placement="Bottom" VerticalOffset="5" HorizontalOffset="-4"
+                       AllowsTransparency="True" StaysOpen="False" Focusable="False"
+                       Closed="QuietUpdatePopover_Closed">
+                    <Border Width="270" Padding="14" CornerRadius="6"
+                            Background="{StaticResource SurfaceRaisedBrush}"
+                            BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1"
+                            PreviewKeyDown="QuietUpdatePopover_PreviewKeyDown">
+                        <StackPanel>
+                            <TextBlock Text="Update ready" FontSize="13" FontWeight="SemiBold"
+                                       Foreground="{StaticResource TextBrush}" />
+                            <TextBlock x:Name="QuietUpdateVersionText" Margin="0,4,0,0" FontSize="12"
+                                       Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" />
+                            <TextBlock Text="Install and restart when you are ready."
+                                       Margin="0,6,0,0" FontSize="12" TextWrapping="Wrap"
+                                       Foreground="{StaticResource TextDimBrush}" />
+                            <TextBlock x:Name="QuietUpdateStatusText" Margin="0,8,0,0" FontSize="12"
+                                       TextWrapping="Wrap" Foreground="{StaticResource TextMutedBrush}"
+                                       Visibility="Collapsed" />
+                            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                <Button x:Name="QuietUpdateInstallButton" Style="{StaticResource AccentButton}"
+                                        Content="Install update" Padding="11,7"
+                                        Click="QuietUpdateInstallButton_Click"
+                                        AutomationProperties.Name="Install the downloaded update and restart" />
+                                <Button Style="{StaticResource FlatButton}" Content="Later" Margin="6,0,0,0"
+                                        Click="QuietUpdateDismissButton_Click"
+                                        AutomationProperties.Name="Keep using this version" />
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+                </Popup>
             </StackPanel>
 
             <StackPanel x:Name="CaptionButtons" Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Top" shell:WindowChrome.IsHitTestVisibleInChrome="True">
