@@ -130,6 +130,7 @@ internal static partial class Program
         await Group(WatchChecks);
         await Group(HubCoalesceChecks);
         await Group(LiveUpdateChecks);
+        await Group(Review1009CoreChecks);
         await Group(TreeLiveWatchChecks);
         await Group(CameraMotionChecks);
         await Group(NestedCameraChecks);

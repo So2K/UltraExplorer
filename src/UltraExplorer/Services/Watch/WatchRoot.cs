@@ -375,6 +375,48 @@ public sealed class WatchRoot
     }
 
     /// <summary>
+    /// The spelling <paramref name="spelling"/> as another letter's - a mapped
+    /// or <c>subst</c> letter's - alias of this root; null when the root has
+    /// none such.  Never the root's own spelling.
+    /// </summary>
+    internal WatchAlias? AliasOf(string spelling)
+    {
+        var aliases = _aliases;
+        for (var index = 1; index < aliases.Length; index++)
+        {
+            if (aliases[index].Spelling.Equals(spelling, StringComparison.OrdinalIgnoreCase))
+            {
+                return aliases[index];
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Takes a letter's spelling away again - the letter now stands for
+    /// something else - never the root's own.  The registry moves the paths
+    /// spelt with it first, while their place here can still be told.
+    /// </summary>
+    internal void RemoveAlias(string spelling)
+    {
+        lock (Gate)
+        {
+            var aliases = _aliases;
+            for (var index = 1; index < aliases.Length; index++)
+            {
+                if (aliases[index].Spelling.Equals(spelling, StringComparison.OrdinalIgnoreCase))
+                {
+                    WatchAlias[] kept = [.. aliases[..index], .. aliases[(index + 1)..]];
+                    _aliases = kept;
+                    _prefixes = [.. kept.Select(alias => alias.Spelling)];
+                    return;
+                }
+            }
+        }
+    }
+
+    /// <summary>
     /// Where <paramref name="path"/> - spelt under any of the root's spellings -
     /// is under the watched directory, without separators at either end: ""
     /// for the watched directory itself, null when no spelling leads to it.

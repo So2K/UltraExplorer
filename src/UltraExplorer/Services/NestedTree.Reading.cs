@@ -245,16 +245,17 @@ public sealed partial class NestedTree
     /// <summary>
     /// A drive or extra root's folder, made the first time <see cref="SetRoots"/>
     /// is given it, with the watch on its volume: every folder below it takes
-    /// that watch from its parent.
+    /// that watch from its parent; <paramref name="watch"/> when the caller
+    /// has already asked the hub for it.
     /// </summary>
-    private NestedFolder CreateRoot(NestedRoot root)
+    private NestedFolder CreateRoot(NestedRoot root, WatchRoot? watch = null)
     {
         // Added/reinserted drives may have changed their device or alias. A
         // pick keeps its old lane so its completion always frees the right one.
         lock (_gate) { _localLaneLetters = new string?[26]; _localSpecialLanes.Clear(); _rankedFrame = NotRanked; }
         return new(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText)
         {
-            Watch = WatchRootFor?.Invoke(root.FullPath)
+            Watch = watch ?? WatchRootFor?.Invoke(root.FullPath)
         };
     }
 
@@ -1113,6 +1114,9 @@ public sealed partial class NestedTree
         /// <summary>The read was cancelled: the tree is going away, or the reader gave up.</summary>
         public bool IsCancelled { get; init; }
         public int ArchivesGeneration { get; init; }
+
+        /// <summary>The hub registration the worker made for a first read, until it is applied or thrown away (<see cref="SettleFirstReadRegistration"/>).</summary>
+        public FirstReadRegistration? FirstRead { get; init; }
     }
 
     /// <summary>
@@ -1132,6 +1136,7 @@ public sealed partial class NestedTree
         NestedListing listing;
         NestedFolder[] children = basis;
         NestedFolder[] removed = [];
+        FirstReadRegistration? firstRead = null;
         try
         {
             // Picked just before the tree went away: nobody will look.
@@ -1145,9 +1150,13 @@ public sealed partial class NestedTree
             // inside the frame that first drew them doubled that frame, and
             // the ones that left the screen unread stayed registered for ever.
             // The tree counts it as its own once the read is applied.
-            if (pick.Kind == ReadKind.Load && _changes is { } hub)
+            // Kept with the result: a read whose result is thrown away - its
+            // pane closed, the load given up on - takes it off again when
+            // applied (SettleFirstReadRegistration), and a hub replaced or
+            // taken away meanwhile takes it off at once.
+            if (pick.Kind == ReadKind.Load)
             {
-                hub.Register(ChangeConsumer.Nested, path, folder);
+                firstRead = RegisterFirstRead(folder, path);
             }
 
             // Where changes are not watched as they happen, the directory's own
@@ -1181,7 +1190,8 @@ public sealed partial class NestedTree
             {
                 Ticket = pick.Ticket,
                 ArchivesGeneration = pick.ArchivesGeneration,
-                IsCancelled = true
+                IsCancelled = true,
+                FirstRead = firstRead
             };
         }
         catch (Exception ex)
@@ -1193,7 +1203,8 @@ public sealed partial class NestedTree
         {
             Ticket = pick.Ticket,
             ArchivesGeneration = pick.ArchivesGeneration,
-            DirectoryWriteTicks = directoryTicks
+            DirectoryWriteTicks = directoryTicks,
+            FirstRead = firstRead
         };
     }
 
@@ -1315,6 +1326,18 @@ public sealed partial class NestedTree
     /// did gets it queued now.
     /// </summary>
     private bool Apply(ReadResult read)
+    {
+        try
+        {
+            return ApplyRead(read);
+        }
+        finally
+        {
+            SettleFirstReadRegistration(read);
+        }
+    }
+
+    private bool ApplyRead(ReadResult read)
     {
         var folder = read.Folder;
         ExplicitRead? request;

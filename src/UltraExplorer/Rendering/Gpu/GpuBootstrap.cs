@@ -66,6 +66,13 @@ internal static class GpuBootstrap
     private static readonly Dictionary<Luid, GpuDeviceSet> Sets = [];
     private static readonly HashSet<Luid> Pending = [];
     private static readonly Dictionary<Luid, (long At, int Count)> Failures = [];
+
+    /// <summary>
+    /// The LUIDs no adapter had any more, for which the monitors were matched
+    /// to their cards again (<see cref="CreateAndPublish"/>): once each, so a
+    /// LUID that stays missing is only remembered as failed.  Under <see cref="Gate"/>.
+    /// </summary>
+    private static readonly HashSet<Luid> RematchedFor = [];
     private static readonly Dictionary<IntPtr, Luid> MonitorAdapters = [];
     private static readonly List<Action<GpuDeviceSet>> WarmUps = [];
     private static readonly Queue<long> Losses = new();
@@ -599,12 +606,28 @@ internal static class GpuBootstrap
         catch (Exception ex)
         {
             set?.Dispose();
+            bool rematch;
             lock (Gate)
             {
                 Pending.Remove(luid);
                 RecordFailure(luid, Clock.ElapsedTicks);
                 _lastFailure = ex.Message;
                 NoteLocked($"no device set for {GpuDeviceSet.FormatLuid(luid)}: {ex.Message}");
+
+                // A driver updated or reset gives the card a new LUID, and
+                // the monitors' map, made again only when the display
+                // settings change, would go on naming the old one: each try
+                // failed again, waiting up to five minutes between them, and
+                // the canvas stayed on the CPU.  The monitors are matched
+                // again once for it; the fresh map names the LUID the card
+                // has now.
+                rematch = ex is GpuUnavailableException { AdapterMissing: true } && RematchedFor.Add(luid);
+            }
+
+            if (rematch)
+            {
+                Note($"{GpuDeviceSet.FormatLuid(luid)} is gone; monitors will be matched again");
+                AddWork(MatchMonitorsAgain);
             }
 
             return null;

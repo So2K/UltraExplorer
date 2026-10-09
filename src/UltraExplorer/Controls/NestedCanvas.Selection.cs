@@ -172,6 +172,11 @@ public sealed partial class NestedCanvas
             Focus = active.Length > 0 ? active : null,
             Source = SelectionSource.Command
         });
+
+        // A selection made here starts its versions afresh, and may well
+        // have the one the window last handed in: Load would take it for an
+        // echo of that and keep what was selected before.
+        _selection.LoadedVersion = -1;
         _selection.Load(handed, _tree);
 
         // Not the window's version: the next one it hands in is always news.

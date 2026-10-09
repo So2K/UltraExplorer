@@ -206,6 +206,64 @@ internal sealed class ChangeRegistry
         }
     }
 
+    /// <summary>
+    /// A letter's spelling now stands for something else - re-<c>subst</c>ed,
+    /// or mapped to another share - than on <paramref name="losers"/>: every
+    /// path spelt with it and under one of them moves to <paramref name="to"/>,
+    /// the spelling is taken off them, and <paramref name="alias"/>, when
+    /// there is one, is given to <paramref name="to"/>.  Left, the old root
+    /// would go on claiming the letter's paths, and a folder registered
+    /// again with it would stay under the old root, heard by nobody.  A walk
+    /// over the registered paths, only when a letter changed what it stands
+    /// for.  Says what moved, for the roots' counts.
+    /// </summary>
+    public List<RootMove> MoveSpelling(string spelling, WatchRoot to, WatchAlias? alias, List<WatchRoot> losers)
+    {
+        var moves = new List<RootMove>();
+        var top = new WatchAlias(spelling, string.Empty).TopKey;
+        lock (_gate)
+        {
+            var moving = new List<Interest>();
+            var keys = new List<string>();
+            foreach (var (key, interest) in _paths)
+            {
+                if (interest.Root is { } from && losers.Contains(from)
+                    && (key.StartsWith(spelling, StringComparison.OrdinalIgnoreCase) || key.Equals(top, StringComparison.OrdinalIgnoreCase)))
+                {
+                    // Out of the old root's lookup while its spelling can
+                    // still tell where the path is under it.
+                    from.RemoveInterest(key);
+                    moving.Add(interest);
+                    keys.Add(key);
+                }
+            }
+
+            foreach (var loser in losers)
+            {
+                loser.RemoveAlias(spelling);
+            }
+
+            if (alias is not null)
+            {
+                to.AddAlias(alias);
+            }
+
+            for (var index = 0; index < keys.Count; index++)
+            {
+                var interest = moving[index];
+                if (!ReferenceEquals(interest.Root, to))
+                {
+                    moves.Add(new RootMove(interest.Root, to, Items(interest.Nested).Count, Items(interest.List).Count + Items(interest.Graph).Count));
+                }
+
+                interest.Root = to;
+                to.AddInterest(keys[index]);
+            }
+        }
+
+        return moves;
+    }
+
     /// <summary>Takes <paramref name="target"/>'s registration away; false when it had none.  Says which root the path was under.</summary>
     public bool Remove(ChangeConsumer consumer, string key, object target, out WatchRoot? root)
     {
