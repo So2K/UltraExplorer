@@ -222,6 +222,7 @@ internal static partial class Program
         await Group(ShelfChecks);
         await Group(Pr4ShelfSafetyChecks);
         await Group(Pr4ShelfDropChecks);
+        await Group(Review1009StateChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.

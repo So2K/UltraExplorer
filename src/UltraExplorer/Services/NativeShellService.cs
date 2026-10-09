@@ -394,6 +394,15 @@ public sealed class NativeShellService
         return false;
     }
 
+    /// <summary>
+    /// A number Windows changes at every change of the clipboard: the same
+    /// number later means the clipboard still holds what it held then.
+    /// </summary>
+    public static uint ClipboardSequence() => GetClipboardSequenceNumber();
+
+    [DllImport("user32.dll")]
+    private static extern uint GetClipboardSequenceNumber();
+
     public static ClipboardPayload? GetClipboardPayload()
     {
         for (var attempt = 0; attempt < 3; attempt++)
@@ -671,8 +680,119 @@ public sealed class NativeShellService
         return target;
     }
 
+    /// <summary>
+    /// Whether an item and a folder lie on the same volume, as Explorer
+    /// decides a plain drag between move and copy.  The drive letters alone
+    /// are wrong for a disk mounted into a folder of another (C:\Data on its
+    /// own disk) and for a subst drive (S: that is really a folder of C:), so
+    /// a local folder is asked for the volume it is on.  A drag asks this on
+    /// every move of the pointer: each folder's answer is kept, and a network
+    /// drive - which a dead share would stall - is left to its drive letter.
+    /// </summary>
     public static bool IsSameVolume(string source, string targetDirectory)
-        => string.Equals(Path.GetPathRoot(source), Path.GetPathRoot(targetDirectory), StringComparison.OrdinalIgnoreCase);
+    {
+        var sourceRoot = Path.GetPathRoot(source);
+        var targetRoot = Path.GetPathRoot(targetDirectory);
+        var byRoot = string.Equals(sourceRoot, targetRoot, StringComparison.OrdinalIgnoreCase);
+        var sourceFolder = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(source)) ?? source;
+        return VolumeOf(sourceFolder) is { } from && VolumeOf(targetDirectory) is { } to
+            ? string.Equals(from, to, StringComparison.OrdinalIgnoreCase)
+            : byRoot;
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> Volumes = new(StringComparer.OrdinalIgnoreCase);
+    private const string NoVolume = "";
+    private static long _volumesSince;
+
+    /// <summary>The volume GUID path of a local folder, or null when only its drive letter can tell.</summary>
+    internal static string? VolumeOf(string folder)
+    {
+        try
+        {
+            folder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+
+            // Kept for a drag's length, not for ever: a stick in the same
+            // letter later is another volume.
+            var now = Environment.TickCount64;
+            if (Volumes.Count > 4096 || now - Interlocked.Read(ref _volumesSince) > 30_000)
+            {
+                Volumes.Clear();
+                Interlocked.Exchange(ref _volumesSince, now);
+            }
+
+            if (Volumes.TryGetValue(folder, out var known))
+            {
+                return known.Length == 0 ? null : known;
+            }
+
+            var volume = AskVolume(folder, resolveSubst: true) ?? NoVolume;
+            Volumes[folder] = volume;
+            return volume.Length == 0 ? null : volume;
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
+    private static string? AskVolume(string folder, bool resolveSubst)
+    {
+        // A drive letter only: a share's name is its own volume, and asking
+        // a dead one would hold the drag for its network timeout.
+        if (folder.Length < 2 || folder[1] != ':' || !char.IsAsciiLetter(folder[0]))
+        {
+            return null;
+        }
+
+        var drive = folder[..2];
+        if (GetDriveType(drive + "\\") is not (DriveFixed or DriveRemovable or DriveRamDisk or DriveCdRom))
+        {
+            return null;
+        }
+
+        var buffer = new char[Math.Max(folder.Length + 2, 64)];
+        if (GetVolumePathName(folder, buffer, (uint)buffer.Length))
+        {
+            var mountPoint = new string(buffer, 0, Array.IndexOf(buffer, '\0') is var end and >= 0 ? end : buffer.Length);
+            var name = new char[64];
+            if (GetVolumeNameForVolumeMountPoint(mountPoint, name, (uint)name.Length))
+            {
+                return new string(name, 0, Array.IndexOf(name, '\0') is var nameEnd and >= 0 ? nameEnd : name.Length);
+            }
+        }
+
+        // A subst drive is no mount point: the folder it stands for is asked instead.
+        var device = new char[1024];
+        if (resolveSubst && QueryDosDevice(drive, device, (uint)device.Length) > 0)
+        {
+            var target = new string(device, 0, Array.IndexOf(device, '\0') is var deviceEnd and >= 0 ? deviceEnd : device.Length);
+            if (target.StartsWith(@"\??\", StringComparison.Ordinal) && target.Length > 6 && target[5] == ':')
+            {
+                return AskVolume(Path.TrimEndingDirectorySeparator(target[4..] + folder[2..]), resolveSubst: false);
+            }
+        }
+
+        return null;
+    }
+
+    private const uint DriveRemovable = 2;
+    private const uint DriveFixed = 3;
+    private const uint DriveCdRom = 5;
+    private const uint DriveRamDisk = 6;
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetDriveTypeW")]
+    private static extern uint GetDriveType(string rootPathName);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetVolumePathNameW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumePathName(string fileName, [Out] char[] volumePathName, uint bufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetVolumeNameForVolumeMountPointW", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetVolumeNameForVolumeMountPoint(string volumeMountPoint, [Out] char[] volumeName, uint bufferLength);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, EntryPoint = "QueryDosDeviceW", SetLastError = true)]
+    private static extern uint QueryDosDevice(string deviceName, [Out] char[] targetPath, uint max);
 
     /// <summary>
     /// Whether <paramref name="targetDirectory"/> is <paramref name="source"/>

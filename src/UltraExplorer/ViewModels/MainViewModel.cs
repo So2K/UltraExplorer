@@ -87,6 +87,14 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private bool _favoritesChanged;
 
     /// <summary>
+    /// Canvas settings changed while the workspace was still being read: the
+    /// window is usable then, and the file's value must not take such a click
+    /// back.  Their baseline is the file's, so the next save writes them.
+    /// </summary>
+    private byte _earlySettings;
+    private const byte EarlyMinimap = 1, EarlyLeftDrag = 2, EarlyLayers = 4;
+
+    /// <summary>
     /// The workspace as this window last read or wrote it: its own settings
     /// as they were then.  A save writes over the file only the settings
     /// that differ from these - the ones changed in this window since - and
@@ -453,6 +461,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _leftDrag, value))
             {
+                if (!_isStateLoaded) _earlySettings |= EarlyLeftDrag;
                 _ = SaveNowAsync();
             }
         }
@@ -497,6 +506,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             var normalized = NormalizePickerLayers(value & CanvasLayer.All);
             if (SetProperty(ref _layers, normalized))
             {
+                if (!_isStateLoaded) _earlySettings |= EarlyLayers;
                 _ = SaveNowAsync();
             }
             else if (normalized != value) OnPropertyChanged();
@@ -734,6 +744,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             if (SetProperty(ref _isMinimapVisible, value))
             {
+                if (!_isStateLoaded) _earlySettings |= EarlyMinimap;
                 OnPropertyChanged(nameof(IsMinimapShown));
             }
         }
@@ -796,7 +807,13 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         if (state is not null)
         {
             SidebarWidth = Math.Clamp(state.SidebarWidth <= 0 ? 240 : state.SidebarWidth, 190, 340);
-            IsMinimapVisible = state.IsMinimapVisible;
+            if ((_earlySettings & EarlyMinimap) == 0)
+            {
+                _isMinimapVisible = state.IsMinimapVisible;
+                OnPropertyChanged(nameof(IsMinimapVisible));
+                OnPropertyChanged(nameof(IsMinimapShown));
+            }
+
             Tree.FolderList.IsVisible = state.IsFolderListVisible;
             _savedLayout = string.IsNullOrWhiteSpace(state.CanvasLayout) ? nameof(CanvasLayout.Nested) : state.CanvasLayout;
             if (!_isPickerSession && Enum.TryParse<CanvasLayout>(_savedLayout, ignoreCase: true, out var layout) && layout != _layout)
@@ -811,13 +828,17 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
             _savedRenderer = state.CanvasRenderer;
             Rendering.Gpu.GpuBootstrap.SetSettingPreference(Renderer);
-            _leftDrag = WorkspaceState.ParseLeftDrag(state.NestedLeftDrag);
-            _leftDragHintShown = state.NestedLeftDragHintShown;
-            _layers = NormalizePickerLayers(CanvasLayers.Parse(state.CanvasLayersOff));
-            _showFavoriteLinks = state.ShowFavoriteLinks;
-            OnPropertyChanged(nameof(ShowFavoriteLinks));
             // Settings are usable while the workspace is still loading.
             // Keep a deliberate click made during that read.
+            if ((_earlySettings & EarlyLeftDrag) == 0) _leftDrag = WorkspaceState.ParseLeftDrag(state.NestedLeftDrag);
+            _leftDragHintShown = state.NestedLeftDragHintShown;
+            if ((_earlySettings & EarlyLayers) == 0) _layers = NormalizePickerLayers(CanvasLayers.Parse(state.CanvasLayersOff));
+            if (!_favoriteLinksChanged)
+            {
+                _showFavoriteLinks = state.ShowFavoriteLinks;
+                OnPropertyChanged(nameof(ShowFavoriteLinks));
+            }
+
             if (!_hoverPreviewsChanged)
             {
                 _showHoverPreviews = state.ShowHoverPreviews;
@@ -879,6 +900,15 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         // change, to be written by the next save.  Taken after the wait, it
         // counted as what the file already had and was never written.
         _savedWorkspace = CaptureWorkspace();
+
+        // A canvas setting clicked during the read is measured against the
+        // file's value, not its own: the next save writes it.
+        if (state is not null)
+        {
+            if ((_earlySettings & EarlyMinimap) != 0) _savedWorkspace.IsMinimapVisible = state.IsMinimapVisible;
+            if ((_earlySettings & EarlyLeftDrag) != 0) _savedWorkspace.NestedLeftDrag = state.NestedLeftDrag;
+            if ((_earlySettings & EarlyLayers) != 0) _savedWorkspace.CanvasLayersOff = state.CanvasLayersOff;
+        }
 
         // Which known folders, drives and WSL distributions are there is asked
         // off the UI thread, all at once, and none of it is waited for: a
@@ -957,7 +987,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         // An early Settings click could not save before the user's workspace
         // was loaded. Flush that preference now, with the same save gate,
         // without writing the canvas's newly initialized view.
-        if (_hoverPreviewsChanged)
+        if (_hoverPreviewsChanged || _favoriteLinksChanged)
         {
             await _stateSaving.WaitAsync();
             try { await SaveNavigationPreferencesCoreAsync(); }
@@ -1294,9 +1324,18 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                     return null;
                 }
 
+                // A workspace file missing or set aside: the everyday window
+                // owns every setting in it and writes them all, but a file
+                // dialog or a folder window still writes only what is its own
+                // - never its canvas's layers or view as the user's defaults.
                 if (current is null)
                 {
-                    return here;
+                    if (!_isPickerSession && !_isFolderWindow)
+                    {
+                        return here;
+                    }
+
+                    current = new WorkspaceState();
                 }
 
                 // Nothing of this window's to write - a window closed after
@@ -1645,17 +1684,21 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
     private void GoBack()
     {
-        if (_history.Back() is { } path)
+        var history = _history;
+        var from = history.Position;
+        if (history.Back() is { } path)
         {
-            _ = NavigateHistoryAsync(path);
+            _ = NavigateHistoryAsync(history, path, from);
         }
     }
 
     private void GoForward()
     {
-        if (_history.Forward() is { } path)
+        var history = _history;
+        var from = history.Position;
+        if (history.Forward() is { } path)
         {
-            _ = NavigateHistoryAsync(path);
+            _ = NavigateHistoryAsync(history, path, from);
         }
     }
 
@@ -1663,9 +1706,19 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     /// A step back or forward.  Only its own selection is kept out of the
     /// history: anything asked for while it reads its way there - a favourite
     /// clicked while a share wakes up - outranks it and is recorded as usual,
-    /// so the next step is taken from where the window really is.
+    /// so the next step is taken from where the window really is.  A place
+    /// no longer there - deleted, or on a drive since unplugged - is not gone
+    /// to, and the step is taken back (see <see cref="NavigationHistory.Undo"/>).
     /// </summary>
-    private Task NavigateHistoryAsync(string path) => Tree.RevealAsync(path, records: false);
+    private async Task NavigateHistoryAsync(NavigationHistory history, string path, int from)
+    {
+        var version = history.Version;
+        var outcome = await Tree.RevealAsync(path, records: false, exact: true);
+        if (outcome.Node is null || !outcome.IsExact && !outcome.Superseded)
+        {
+            history.Undo(from, version);
+        }
+    }
 
     private async Task GoUpAsync()
     {
@@ -1911,6 +1964,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        // Which clipboard this is, taken before it is read: a later one is
+        // not this cut's to clear.
+        var sequence = ClipboardSequence();
         var payload = NativeShellService.GetClipboardPayload();
         if (payload is null || payload.Paths.Length == 0)
         {
@@ -1919,18 +1975,43 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
 
         await TransferAsync(payload.Paths, target, payload.Cut, payload.Cut ? "Moving" : "Copying");
-
-        // What was cut is gone from where it was: a second paste would only
-        // fail, so the clipboard lets go of it, as Explorer's does.
-        if (payload.Cut && payload.Paths.All(path => !File.Exists(path) && !Directory.Exists(path)))
+        if (payload.Cut)
         {
-            try
-            {
-                Clipboard.Clear();
-            }
-            catch (ExternalException)
-            {
-            }
+            await ReleaseCutAsync(payload.Paths, sequence);
+        }
+    }
+
+    /// <summary>Which clipboard is current; a test puts its own here rather than use the user's.</summary>
+    internal static Func<uint> ClipboardSequence { get; set; } = NativeShellService.ClipboardSequence;
+
+    /// <summary>Empties the clipboard; a test puts its own here rather than empty the user's.</summary>
+    internal static Action ClearClipboard { get; set; } = Clipboard.Clear;
+
+    /// <summary>
+    /// What was cut is gone from where it was: a second paste would only
+    /// fail, so the clipboard lets go of it, as Explorer's does.  Whether it
+    /// is gone is asked off the UI thread (see <see cref="ItemExists"/>) - a
+    /// share that dropped during the move must not freeze the window here.
+    /// And only that cut is let go of: a move takes time, and text copied in
+    /// another program meanwhile is the user's, not this paste's to clear.
+    /// </summary>
+    internal static async Task<bool> ReleaseCutAsync(IReadOnlyList<string> paths, uint sequence)
+    {
+        var given = paths.ToArray();
+        var gone = await Task.Run(() => given.All(path => !ItemExists(path)));
+        if (!gone || ClipboardSequence() != sequence)
+        {
+            return false;
+        }
+
+        try
+        {
+            ClearClipboard();
+            return true;
+        }
+        catch (ExternalException)
+        {
+            return false;
         }
     }
 
