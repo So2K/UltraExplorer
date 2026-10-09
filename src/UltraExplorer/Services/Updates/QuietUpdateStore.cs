@@ -9,6 +9,9 @@ internal sealed class QuietUpdateStore
     internal sealed record Settings(bool Enabled = true);
     internal sealed record Attempt(DateTimeOffset LastAttemptUtc);
     internal sealed record Package(string Version, string Sha256, long Size);
+    /// <summary>Written once the normal main window of a version has started;
+    /// scripts/ApplyDownloadedUpdate.ps1 waits for it before deleting its backup.</summary>
+    internal sealed record Startup(string Version, int ProcessId, DateTimeOffset StartedUtc);
     private readonly string _directory;
     public QuietUpdateStore(string directory) => _directory = Path.GetFullPath(directory);
     public string DirectoryPath => _directory;
@@ -40,6 +43,8 @@ internal sealed class QuietUpdateStore
     public void SetEnabled(bool enabled) => Write("settings.json", new Settings(enabled));
     public void RecordAttempt(DateTimeOffset utc) => Write("attempt.json", new Attempt(utc));
     public void SetReady(Package ready) => Write("ready.json", ready);
+    public Startup? LastStartup => Read<Startup>("started.json");
+    public void RecordStartup(Startup startup) => Write("started.json", startup);
     public void ClearReady()
     {
         try { var path = Path.Combine(_directory, "ready.json"); AssertNoLinks(path); File.Delete(path); }

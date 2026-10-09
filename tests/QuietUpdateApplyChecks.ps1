@@ -122,6 +122,50 @@ try {
     Check-QuietApply 'failed startup rollback removes only newly installed resource' (-not (Test-Path -LiteralPath (Join-Path $install 'ru/current.dll')))
     Check-QuietApply 'failed startup rollback preserves workspace and notes' (([System.IO.File]::ReadAllText((Join-Path $install 'workspace.json')) -ceq '{"user":"keep"}') -and
         ([System.IO.File]::ReadAllText((Join-Path $install 'ru/my-notes.txt')) -ceq 'untouched notes'))
+    # M15: a new file held open by a just-started process must not stop the
+    # remaining old files from coming back; the error is reported at the end.
+    $lockedInstall = Join-Path $fixture 'locked-install'
+    $lockedBackup = Join-Path $fixture 'locked-backup'
+    $lockedStage = Join-Path $fixture 'locked-stage'
+    Write-QuietFixture $lockedInstall 'UltraExplorer.exe' 'locked old exe'
+    Write-QuietFixture $lockedInstall 'a-first.dll' 'old first'
+    Write-QuietFixture $lockedInstall 'z-last.dll' 'old last'
+    Write-QuietFixture $lockedInstall $UltraExplorerPackageManifest "UltraExplorer.exe`na-first.dll`nz-last.dll`n$UltraExplorerPackageManifest`n"
+    Write-QuietFixture $lockedStage 'UltraExplorer.exe' 'locked new exe'
+    Write-QuietFixture $lockedStage 'a-first.dll' 'new first'
+    Write-QuietFixture $lockedStage 'z-last.dll' 'new last'
+    New-UltraExplorerPayloadManifest $lockedStage
+    $lockedTransaction = Invoke-UltraExplorerPayloadUpdate $lockedStage $lockedInstall $lockedBackup
+    $lock = [System.IO.File]::Open((Join-Path $lockedInstall 'a-first.dll'), [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+    $undoError = $null
+    try { Undo-QuietPayloadUpdate $lockedTransaction } catch { $undoError = $_.Exception.Message } finally { $lock.Dispose() }
+    Check-QuietApply 'rollback reports a locked new file instead of stopping silently' ($undoError -match 'a-first\.dll' -and $undoError -match [regex]::Escape($lockedBackup))
+    Check-QuietApply 'rollback past a locked file still restores the old application' ([System.IO.File]::ReadAllText((Join-Path $lockedInstall 'UltraExplorer.exe')) -ceq 'locked old exe')
+    Check-QuietApply 'rollback past a locked file still restores later old files' ([System.IO.File]::ReadAllText((Join-Path $lockedInstall 'z-last.dll')) -ceq 'old last')
+    Check-QuietApply 'rollback keeps the old copy of the locked file in the backup' ([System.IO.File]::ReadAllText((Join-Path $lockedBackup 'a-first.dll')) -ceq 'old first')
+    # Health: only the restarted process's own startup report proves the new version.
+    $healthState = Join-Path $fixture 'health-profile'
+    [void][System.IO.Directory]::CreateDirectory($healthState)
+    function New-QuietRestartFixture([bool]$Exits, [int]$ExitCode) {
+        $process = [pscustomobject]@{ Id = 4242; ExitCode = $ExitCode; Exits = $Exits }
+        $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) return $this.Exits }
+        $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { }
+        $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+        return $process
+    }
+    Check-QuietApply 'a crash before the startup report is a failed update' ((Wait-QuietUpdateHealthy (New-QuietRestartFixture $true 3) $healthState '1.4.0' 1000) -ceq 'Failed')
+    Check-QuietApply 'a normal exit before the startup report is not rolled back' ((Wait-QuietUpdateHealthy (New-QuietRestartFixture $true 0) $healthState '1.4.0' 1000) -ceq 'Closed')
+    Check-QuietApply 'a silent running process stays unconfirmed, not healthy' ((Wait-QuietUpdateHealthy (New-QuietRestartFixture $false 0) $healthState '1.4.0' 600) -ceq 'Unconfirmed')
+    Write-QuietFixture $healthState 'updates\started.json' '{"Version":"1.4.0+abc","ProcessId":999,"StartedUtc":"2026-10-09T10:00:00Z"}'
+    Check-QuietApply 'another process startup report does not prove the new version' ((Wait-QuietUpdateHealthy (New-QuietRestartFixture $false 0) $healthState '1.4.0' 600) -ceq 'Unconfirmed')
+    Write-QuietFixture $healthState 'updates\started.json' '{"Version":"1.3.9","ProcessId":4242,"StartedUtc":"2026-10-09T10:00:00Z"}'
+    Check-QuietApply 'an older version startup report does not prove the new version' ((Wait-QuietUpdateHealthy (New-QuietRestartFixture $false 0) $healthState '1.4.0' 600) -ceq 'Unconfirmed')
+    Write-QuietFixture $healthState 'updates\started.json' '{"Version":"1.4.0+abc","ProcessId":4242,"StartedUtc":"2026-10-09T10:00:00Z"}'
+    Check-QuietApply 'the restarted process own report proves a healthy start' ((Wait-QuietUpdateHealthy (New-QuietRestartFixture $true 1) $healthState '1.4.0' 1000) -ceq 'Healthy')
+    # L14b: Installed apps is changed only for Setup's entry of exactly this folder.
+    Check-QuietApply 'Setup entry for the same folder matches with a trailing separator' (Test-QuietInstallLocation 'C:\Users\u\AppData\Local\Programs\UltraExplorer\' 'C:\Users\u\AppData\Local\Programs\UltraExplorer')
+    Check-QuietApply 'Setup entry for another folder never matches' (-not (Test-QuietInstallLocation 'C:\Program Files\UltraExplorer\' 'D:\Portable\UltraExplorer'))
+    Check-QuietApply 'a missing Setup location never matches' (-not (Test-QuietInstallLocation '' 'D:\Portable\UltraExplorer'))
     $profile = Join-Path $fixture 'profile'
     Write-QuietFixture $profile 'dialog-integration.json' '{"Enabled":true,"ExcludedApplications":["original.exe"],"Extra":"preserve"}'
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -217,21 +261,35 @@ try {
     $originalStart = ${function:Start-QuietUpdateApp}
     $originalClose = ${function:Close-QuietUpdateWindows}
     $originalCim = Get-Item Function:Get-CimInstance -ErrorAction SilentlyContinue
+    $originalUninstallVersion = ${function:Update-QuietUninstallVersion}
     $script:fixtureStarts = 0
+    $script:fixtureCrash = $false
+    $script:uninstallVersions = New-Object 'System.Collections.Generic.List[string]'
     try {
         function Get-CimInstance { param($ClassName, $Filter) return @() }
         function Get-QuietTargetCopies { param($Executable) return @() }
+        function Update-QuietUninstallVersion { param($Destination, $Version) $script:uninstallVersions.Add($Version); return $false }
+        # The isolated restart reports its start as QuietUpdateService does,
+        # or, with fixtureCrash, ends with an error before it could.
         function Start-QuietUpdateApp {
             param($Executable, $StateDirectory, $Role)
             $script:fixtureStarts++
-            $process = [pscustomobject]@{}
-            $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) return $false }
+            $crash = $script:fixtureCrash -and -not $Role
+            $process = [pscustomobject]@{ Id = 4242; ExitCode = $(if ($crash) { 1 } else { 0 }); Crash = $crash }
+            $process | Add-Member -MemberType ScriptMethod -Name WaitForExit -Value { param($milliseconds) return $this.Crash }
+            $process | Add-Member -MemberType ScriptMethod -Name Kill -Value { }
             $process | Add-Member -MemberType ScriptMethod -Name Dispose -Value { }
+            if (-not $Role -and -not $crash) {
+                Write-QuietFixture $StateDirectory 'updates\started.json' (@{ Version = $version; ProcessId = 4242; StartedUtc = '2026-10-09T10:00:00Z' } | ConvertTo-Json)
+            }
             return $process
         }
         Invoke-QuietDownloadedUpdate $requestPath
         $result = Get-Content -LiteralPath $request.ResultPath -Raw | ConvertFrom-Json
         Check-QuietApply 'complete explicit helper installs verified same-folder fixture' ($result.Status -ceq 'Installed' -and $result.Version -ceq $version)
+        Check-QuietApply 'a reported healthy start removes the old-file backup' ($null -eq $result.PSObject.Properties['BackupRetained'] -and
+            @(Get-ChildItem -LiteralPath $e2e -Directory -Filter 'UltraExplorer-update-backup-*').Count -eq 0)
+        Check-QuietApply 'a successful update asks Installed apps to show the new version' ($script:uninstallVersions.Count -eq 1 -and $script:uninstallVersions[0] -ceq $version)
         Check-QuietApply 'complete helper stages and owns the new package resource' ([System.IO.File]::ReadAllText((Join-Path $destination 'resource.dll')) -ceq 'owned new resource')
         Check-QuietApply 'complete helper preserves portable user note' ([System.IO.File]::ReadAllText((Join-Path $destination 'notes.txt')) -ceq 'portable note')
         Check-QuietApply 'complete helper restarts exactly once through isolated adapter' ($script:fixtureStarts -eq 1)
@@ -246,7 +304,29 @@ try {
         Check-QuietApply 'complete helper owner veto preserves installed bytes' ((Get-FileHash -LiteralPath (Join-Path $destination 'UltraExplorer.exe')).Hash -ceq $before)
         Check-QuietApply 'complete helper owner veto does not restart the still-open window' ($script:fixtureStarts -eq 1)
         Check-QuietApply 'complete helper owner veto creates no file backup' (@(Get-ChildItem -LiteralPath $e2e -Directory -Filter 'UltraExplorer-update-backup-*').Count -eq 0)
+        # M15: the new version crashes before reporting its start.
+        $crashPackage = New-QuietFixtureZip 'e2e-crash' @(
+            [pscustomobject]@{ Name = 'UltraExplorer.exe'; FilePath = $application },
+            [pscustomobject]@{ Name = 'resource.dll'; Text = 'crashing resource' },
+            [pscustomobject]@{ Name = $UltraExplorerPackageManifest; Text = "UltraExplorer.exe`nresource.dll`n$UltraExplorerPackageManifest`n" }
+        )
+        $request.ZipPath = $crashPackage.Path; $request.Sha256 = $crashPackage.Hash; $request.Size = $crashPackage.Size
+        [System.IO.File]::WriteAllText($requestPath, ($request | ConvertTo-Json))
+        $script:copyCalls = 0
+        function Get-QuietTargetCopies { param($Executable) $script:copyCalls++; if ($script:copyCalls -eq 1) { return @(New-QuietWindowFixture 120 $true $true) } return @() }
+        function Close-QuietUpdateWindows { param($Windows, $CloseProcesses) return [pscustomobject]@{ ClosedAny = $true; Error = $null } }
+        $script:fixtureCrash = $true
+        Remove-Item -LiteralPath (Join-Path $state 'updates\started.json')
+        $startsBefore = $script:fixtureStarts
+        Invoke-QuietDownloadedUpdate $requestPath
+        $result = Get-Content -LiteralPath $request.ResultPath -Raw | ConvertFrom-Json
+        Check-QuietApply 'a crash before the startup report fails the update' ($result.Status -ceq 'Failed' -and $result.Error -match 'could not start')
+        Check-QuietApply 'a crash before the startup report restores the previous files' ([System.IO.File]::ReadAllText((Join-Path $destination 'resource.dll')) -ceq 'owned new resource')
+        Check-QuietApply 'a crash rollback leaves no backup when every file came back' (@(Get-ChildItem -LiteralPath $e2e -Directory -Filter 'UltraExplorer-update-backup-*').Count -eq 0)
+        Check-QuietApply 'a crash rollback restarts the previous application once' ($script:fixtureStarts -eq $startsBefore + 2)
+        Check-QuietApply 'a failed update leaves Installed apps unchanged' ($script:uninstallVersions.Count -eq 1)
     } finally {
+        Set-Item Function:Update-QuietUninstallVersion $originalUninstallVersion
         Set-Item Function:Get-QuietTargetCopies $originalCopies
         Set-Item Function:Start-QuietUpdateApp $originalStart
         Set-Item Function:Close-QuietUpdateWindows $originalClose

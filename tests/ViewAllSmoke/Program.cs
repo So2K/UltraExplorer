@@ -247,6 +247,7 @@ internal static partial class Program
         await Group(HoverIntegrationChecks);
         await Group(QuietUpdateChecks);
         await Group(QuietUpdateUiChecks);
+        await Group(Review1009InstallChecks);
         await Group(PreviewOpenWithChecks);
         await Group(PreviewMediaUiChecks);
         await Group(PreviewOwnerActivationChecks);

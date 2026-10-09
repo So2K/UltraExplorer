@@ -30,6 +30,13 @@ installations migrate their Win+E intent to the new preference. The former
 Win+E/Home CLSID override is restored from its receipt while folder routes stay
 enabled. Fresh installations leave both preferences off.
 
+Opening folders is registered per user, so an all-users installation refuses it
+(see "All-users installations" in docs/SHELL_REGISTRATION.md). An upgrade with
+Setup, like `scripts/install.ps1` and the quiet updater, first runs
+`--dialog-recover` from the installed copy and stops its background roles, then
+restores the preference, the `UltraExplorer dialogs` sign-in start and the
+dialog/Win+E agents after the files are replaced, or after a cancelled install.
+
 Windows reserves Win-key combinations for the operating system; RegisterHotKey
 was rejected with error 1409 on the tested Windows build. The listener uses a
 dedicated message thread and a minimal WH_KEYBOARD_LL callback. Only the exact

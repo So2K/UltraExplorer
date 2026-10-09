@@ -60,6 +60,9 @@ VersionInfoDescription={#AppName} Setup
 
 ; Per-user by default, all users on request: {autopf} is
 ; %LOCALAPPDATA%\Programs for the first and Program Files for the second.
+; Opening folders in UltraExplorer is per user (HKCU), so an all-users copy
+; refuses it (ShellReplacementRegistration.IsPerMachineInstall), and the
+; uninstaller sweeps every loaded user hive for verbs an older version left.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=commandline dialog
 DefaultDirName={autopf}\{#AppName}
@@ -73,6 +76,8 @@ MinVersion=10.0.18362
 
 ; A running copy holds its exe; Restart Manager asks it to close (it saves
 ; its state as it always does) before the files are replaced or removed.
+; Live dialog integration is recovered first and restored after an upgrade
+; (PrepareToInstall/RestoreIntegration, the same steps as scripts/install.ps1).
 CloseApplications=yes
 RestartApplications=no
 
@@ -116,9 +121,25 @@ Filename: "{app}\{#AppExe}"; WorkingDir: "{app}"; Description: "{cm:LaunchProgra
 Filename: "{app}\{#AppExe}"; Parameters: "--dialog-recover"; Flags: runhidden waituntilterminated skipifdoesntexist; RunOnceId: "RestoreWindowsDialogs"
 
 [Code]
+const
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+  DialogRunName = 'UltraExplorer dialogs';
+  ShortcutRunName = 'UltraExplorer Win+E';
+
 var
   PreviousPackageFiles: TArrayOfString;
   CurrentPackageFiles: TArrayOfString;
+  { The dialog/folder integration paused for the upgrade, as scripts/install.ps1
+    does: recovered before the files change, preference and agents back after. }
+  IntegrationRecovered: Boolean;
+  IntegrationRestored: Boolean;
+  IntegrationEnabled: Boolean;
+  ShortcutEnabled: Boolean;
+  SavedSettingsPresent: Boolean;
+  SavedSettings: AnsiString;
+  HadDialogRunValue: Boolean;
+  OldDialogRunValue: String;
+  HadShortcutRunValue: Boolean;
 
 function PackageFileAttributes(const FileName: String): LongWord;
   external 'GetFileAttributesW@kernel32.dll stdcall';
@@ -187,6 +208,150 @@ begin
   end;
 end;
 
+function InstalledExecutable(): String;
+begin
+  Result := ExpandConstant('{app}\{#AppExe}');
+end;
+
+function IntegrationSettingsPath(): String;
+begin
+  Result := ExpandConstant('{localappdata}\{#AppName}\dialog-integration.json');
+end;
+
+{ A top-level JSON boolean, however the writer spaced it ("Enabled": true or
+  "Enabled":  true). False when the name is absent or not a boolean. }
+function JsonFlag(const Text, Name: String; var Value: Boolean): Boolean;
+var
+  At: Integer;
+  Rest: String;
+begin
+  Result := False;
+  At := Pos('"' + Name + '"', Text);
+  if At = 0 then Exit;
+  Rest := TrimLeft(Copy(Text, At + Length(Name) + 2, Length(Text)));
+  if Rest = '' then Exit;
+  if Rest[1] <> ':' then Exit;
+  Rest := TrimLeft(Copy(Rest, 2, Length(Rest)));
+  if Pos('true', Rest) = 1 then begin Value := True; Result := True; end
+  else if Pos('false', Rest) = 1 then begin Value := False; Result := True; end;
+end;
+
+function IsRoleCommand(const CommandLine: String): Boolean;
+var
+  Text: String;
+begin
+  Text := Lowercase(CommandLine);
+  Result := (Pos('--dialog-agent', Text) > 0) or (Pos('--dialog-guardian', Text) > 0) or
+    (Pos('--dialog-worker', Text) > 0) or (Pos('--dialog-proxy', Text) > 0) or
+    (Pos('--dialog-recover', Text) > 0) or (Pos('--shortcut-agent', Text) > 0);
+end;
+
+{ Background integration processes of the installed copy. With Stop, each one
+  still running is ended, as scripts/install.ps1 does after recovery. }
+function InstalledRoles(Stop: Boolean): Integer;
+var
+  Locator, Service, Items, Item: Variant;
+  I, ProcessId, Code: Integer;
+  Path, CommandLine: String;
+begin
+  Result := 0;
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('.', 'root\CIMV2');
+    Items := Service.ExecQuery('SELECT ProcessId, ExecutablePath, CommandLine FROM Win32_Process WHERE Name = ''{#AppExe}''');
+    for I := 0 to Items.Count - 1 do
+    begin
+      Item := Items.ItemIndex(I);
+      if VarIsNull(Item.ExecutablePath) or VarIsNull(Item.CommandLine) then Continue;
+      Path := Item.ExecutablePath;
+      CommandLine := Item.CommandLine;
+      if (CompareText(Path, InstalledExecutable()) <> 0) or not IsRoleCommand(CommandLine) then Continue;
+      Result := Result + 1;
+      if Stop then
+      begin
+        ProcessId := Item.ProcessId;
+        Log('Ending lingering installed background process ' + IntToStr(ProcessId));
+        Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /PID ' + IntToStr(ProcessId), '', SW_HIDE, ewWaitUntilTerminated, Code);
+      end;
+    end;
+  except
+    Log('Installed background processes could not be listed: ' + GetExceptionMessage);
+  end;
+end;
+
+{ Mirrors the finally block of scripts/install.ps1: the preference recovery
+  paused, the sign-in start and the agents come back. Runs once. }
+procedure RestoreIntegration(Installed: Boolean);
+var
+  Value: String;
+  Code: Integer;
+begin
+  if IntegrationRestored or not IntegrationRecovered then Exit;
+  IntegrationRestored := True;
+  { Nested tests throughout: nothing here relies on short-circuit evaluation. }
+  if SavedSettingsPresent then
+    if not SaveStringToFile(IntegrationSettingsPath(), SavedSettings, False) then
+      Log('The dialog integration preference could not be restored.');
+  if IntegrationEnabled then
+  begin
+    if Installed or not HadDialogRunValue then Value := '"' + InstalledExecutable() + '" --dialog-agent'
+    else Value := OldDialogRunValue;
+    if not RegWriteStringValue(HKCU, RunKey, DialogRunName, Value) then Log('The dialog sign-in start could not be restored.');
+    if FileExists(InstalledExecutable()) then
+      if not ExecAsOriginalUser(InstalledExecutable(), '--dialog-agent', ExpandConstant('{app}'), SW_HIDE, ewNoWait, Code) then
+        Log('The dialog agent could not be started: ' + SysErrorMessage(Code));
+  end;
+  { An older copy left by a failed upgrade does not know --shortcut-agent. }
+  if ShortcutEnabled and (Installed or HadShortcutRunValue) then
+    if FileExists(InstalledExecutable()) then
+      if not ExecAsOriginalUser(InstalledExecutable(), '--shortcut-agent', ExpandConstant('{app}'), SW_HIDE, ewNoWait, Code) then
+        Log('The Win+E agent could not be started: ' + SysErrorMessage(Code));
+end;
+
+{ An upgrade over a live integration: every dialog is handed back to Windows
+  and the installed agents stop before their files are replaced. }
+function RecoverIntegration(): String;
+var
+  Code, Waited: Integer;
+  Text: String;
+begin
+  Result := '';
+  IntegrationRecovered := False;
+  IntegrationRestored := False;
+  if not FileExists(InstalledExecutable()) then Exit;
+  SavedSettingsPresent := LoadStringFromFile(IntegrationSettingsPath(), SavedSettings);
+  IntegrationEnabled := False;
+  ShortcutEnabled := False;
+  if SavedSettingsPresent then
+  begin
+    Text := SavedSettings;
+    if not JsonFlag(Text, 'Enabled', IntegrationEnabled) then IntegrationEnabled := False;
+    if not JsonFlag(Text, 'WinEEnabled', ShortcutEnabled) then ShortcutEnabled := IntegrationEnabled;
+  end;
+  HadDialogRunValue := RegQueryStringValue(HKCU, RunKey, DialogRunName, OldDialogRunValue);
+  HadShortcutRunValue := RegValueExists(HKCU, RunKey, ShortcutRunName);
+  if not IntegrationEnabled and not ShortcutEnabled and (InstalledRoles(False) = 0) then Exit;
+
+  Log('Restoring Windows dialogs and stopping installed background integration.');
+  IntegrationRecovered := True;
+  if not ExecAsOriginalUser(InstalledExecutable(), '--dialog-recover', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) then
+    Code := -1;
+  if Code <> 0 then
+  begin
+    RestoreIntegration(False);
+    Result := 'UltraExplorer could not hand its Open/Save dialogs back to Windows (exit code ' + IntToStr(Code) + '). No application files were replaced.';
+    Exit;
+  end;
+  Waited := 0;
+  while (InstalledRoles(False) > 0) and (Waited < 15000) do
+  begin
+    Sleep(250);
+    Waited := Waited + 250;
+  end;
+  { Recovery has already restored originals; a lingering provider may end. }
+  InstalledRoles(True);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   Result := '';
@@ -198,6 +363,13 @@ begin
   end;
   SetArrayLength(PreviousPackageFiles, 0);
   LoadStringsFromFile(ExpandConstant('{app}\{#PackageManifest}'), PreviousPackageFiles);
+  Result := RecoverIntegration();
+end;
+
+{ A cancelled or failed installation still gets the paused integration back. }
+procedure DeinitializeSetup();
+begin
+  RestoreIntegration(False);
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -218,6 +390,7 @@ begin
     RemoveObsoletePackageFile('Vanara.PInvoke.Shared.dll');
     RemoveObsoletePackageFile('Vanara.PInvoke.Shell32.dll');
     RemoveObsoletePackageFile('Vanara.PInvoke.User32.dll');
+    RestoreIntegration(True);
   end;
 end;
 
@@ -244,6 +417,58 @@ begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'UltraExplorer dialogs');
 end;
 
+{ One folder verb (Folder, Directory or Drive; open or explore) whose command
+  starts this copy: the command, the empty DelegateExecute and the "open"
+  default written beside it go, then the keys this leaves empty - the same
+  release the app does for a registration whose receipt is gone. }
+procedure ReleaseFolderCommand(const RootKey: Integer; const ShellKey, Verb: String);
+var
+  VerbKey, CommandKey, Command, Value: String;
+begin
+  VerbKey := ShellKey + '\' + Verb;
+  CommandKey := VerbKey + '\command';
+  if not RegQueryStringValue(RootKey, CommandKey, '', Command) then Exit;
+  if Pos(Lowercase('"' + ExpandConstant('{app}\{#AppExe}') + '"'), Lowercase(Command)) <> 1 then Exit;
+  RegDeleteValue(RootKey, CommandKey, '');
+  if RegQueryStringValue(RootKey, CommandKey, 'DelegateExecute', Value) then
+    if Value = '' then RegDeleteValue(RootKey, CommandKey, 'DelegateExecute');
+  if RegQueryStringValue(RootKey, ShellKey, '', Value) then
+    if CompareText(Value, 'open') = 0 then RegDeleteValue(RootKey, ShellKey, '');
+  RegDeleteKeyIfEmpty(RootKey, CommandKey);
+  RegDeleteKeyIfEmpty(RootKey, VerbKey);
+  RegDeleteKeyIfEmpty(RootKey, ShellKey);
+  Log('Released folder command ' + CommandKey);
+end;
+
+procedure ReleaseFolderCommands(const RootKey: Integer; const Prefix: String);
+begin
+  ReleaseFolderCommand(RootKey, Prefix + 'Software\Classes\Folder\shell', 'open');
+  ReleaseFolderCommand(RootKey, Prefix + 'Software\Classes\Folder\shell', 'explore');
+  ReleaseFolderCommand(RootKey, Prefix + 'Software\Classes\Directory\shell', 'open');
+  ReleaseFolderCommand(RootKey, Prefix + 'Software\Classes\Directory\shell', 'explore');
+  ReleaseFolderCommand(RootKey, Prefix + 'Software\Classes\Drive\shell', 'open');
+  ReleaseFolderCommand(RootKey, Prefix + 'Software\Classes\Drive\shell', 'explore');
+end;
+
+{ Folder verbs live in each user's HKCU. --dialog-recover gives the
+  uninstalling user's back from its receipt; an all-users copy registered by an
+  earlier version may also have left them in other users' hives, which would
+  keep naming the deleted executable. Every loaded hive is swept for commands
+  that start exactly this copy (docs/SHELL_REGISTRATION.md). Hives of users
+  who are not signed in are not loaded and cannot be reached. }
+procedure ReleaseAllFolderCommands();
+var
+  Users: TArrayOfString;
+  I: Integer;
+begin
+  ReleaseFolderCommands(HKCU, '');
+  if not IsAdminInstallMode then Exit;
+  if RegGetSubkeyNames(HKU, '', Users) then
+    for I := 0 to GetArrayLength(Users) - 1 do
+      if (Pos('_Classes', Users[I]) = 0) and (CompareText(Users[I], '.DEFAULT') <> 0) then
+        ReleaseFolderCommands(HKU, Users[I] + '\');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
@@ -252,4 +477,7 @@ begin
     RemovePickerClass('{#SaveDialogClassKey}');
     RemoveDialogStart();
   end;
+  { After [UninstallRun]: recovery restores from its receipt first. }
+  if CurUninstallStep = usPostUninstall then
+    ReleaseAllFolderCommands();
 end;
