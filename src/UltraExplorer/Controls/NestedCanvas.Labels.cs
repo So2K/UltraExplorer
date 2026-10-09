@@ -229,18 +229,25 @@ public sealed partial class NestedCanvas
     /// Whether <paramref name="file"/>'s icon is still to come: none was
     /// found for its type yet (<paramref name="drawn"/> false), or it is a
     /// type each file has its own icon of, and the file is drawn with its
-    /// type's until its own is extracted.
+    /// type's until its own is extracted.  Asked of the atlas by the state of
+    /// the file's own icon, not by comparing slots: a program whose own icon
+    /// is its type's has the type's slot for good, and was counted as waiting
+    /// for ever - every icon that arrived anywhere drew the names again.  A
+    /// type the Shell had nothing for is not waiting either.
     /// </summary>
     private bool IconStillToCome(bool drawn, NestedFolder folder, in NestedFile file)
     {
-        if (!drawn)
+        if (_labelAtlases is not { } atlases)
         {
-            return true;
+            return !drawn;
         }
 
-        return _labelAtlases is { } atlases
-            && atlases.Icons.UsesPerFileIcon(file.Extension)
-            && atlases.Icons.SlotFor(folder.FullPath, file.Name, file.Extension) == atlases.Icons.SlotFor(file.Extension);
+        if (drawn && !atlases.Icons.UsesPerFileIcon(file.Extension))
+        {
+            return false;
+        }
+
+        return atlases.Icons.IconStillToCome(folder.FullPath, file.Name, file.Extension);
     }
 
     /// <summary>
@@ -262,7 +269,10 @@ public sealed partial class NestedCanvas
         // window - grew a shared atlas and let go of the views this frame's
         // names sample: a frame that only redraws the scene, for a folder
         // read, would present them with nothing bound.
-        if (_labelsOnGpu && _gpuLabels is { } labels && _gpuFrame is { } frame && labels.ViewsOutOfDate(frame))
+        // Or gave an icon slot these names sample to another picture: they
+        // would show another file's icon until drawn again.
+        if (_labelsOnGpu && _gpuLabels is { } labels && _gpuFrame is { } frame
+            && (labels.ViewsOutOfDate(frame) || labels.IconSlotsReusedSince(frame)))
         {
             _dirty |= Layers.Labels;
         }

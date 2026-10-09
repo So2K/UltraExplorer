@@ -207,6 +207,18 @@ internal sealed class IconAtlas : IDisposable
     private long _extractions;
     private IconAtlasTexture? _active;
 
+    /// <summary>
+    /// The slots the texture last made current can draw: all of them, or -
+    /// after it could not grow, the card short of memory rather than lost -
+    /// only the ones it holds.  A slot past them would be sampled as the
+    /// last slice it has, another file's icon, so none is handed out until
+    /// a texture holds them.  Under the gate.
+    /// </summary>
+    private int _drawableSlots = int.MaxValue;
+
+    /// <summary>Moves on whenever a slot is given to another picture than the one it held (<see cref="SlotsReused"/>).</summary>
+    private int _slotsReused;
+
     /// <summary>Who <see cref="ArrivalsPending"/> wakes, and how many of them: one per canvas drawing from the atlas.  Changed under the gate.</summary>
     private Action? _arrivalsPending;
     private int _listeners;
@@ -279,6 +291,16 @@ internal sealed class IconAtlas : IDisposable
 
     /// <summary>Whether finished icons are waiting; true after a <c>ProcessArrivals</c> that hit its limit.</summary>
     public bool HasPendingArrivals => !_arrivals.IsEmpty;
+
+    /// <summary>
+    /// Moves on whenever a slot is given a picture other than the one it
+    /// held - a file slot taken from the least recently drawn, or a slot let
+    /// go and taken again.  The texture is shared by every canvas on the
+    /// card, and names drawn before still sample the slot: a canvas whose
+    /// names were drawn at an older count draws them again, or it would show
+    /// another file's icon until something else had it draw them.
+    /// </summary>
+    public int SlotsReused => Volatile.Read(ref _slotsReused);
 
     /// <summary>Slots in use, both regions.</summary>
     public int SlotCount
@@ -367,7 +389,7 @@ internal sealed class IconAtlas : IDisposable
         var trimmed = Trim(extension);
         lock (_gate)
         {
-            return TypeSlot(trimmed);
+            return Drawable(TypeSlot(trimmed));
         }
     }
 
@@ -386,13 +408,13 @@ internal sealed class IconAtlas : IDisposable
             if (path is not null && _perFileIcons && IsPerFileType(trimmed))
             {
                 var slot = FileSlot(path, path);
-                if (slot >= 0)
+                if (slot >= 0 && slot < _drawableSlots)
                 {
                     return slot;
                 }
             }
 
-            return TypeSlot(trimmed);
+            return Drawable(TypeSlot(trimmed));
         }
     }
 
@@ -419,7 +441,7 @@ internal sealed class IconAtlas : IDisposable
         {
             lock (_gate)
             {
-                return TypeSlot(trimmed);
+                return Drawable(TypeSlot(trimmed));
             }
         }
 
@@ -438,13 +460,63 @@ internal sealed class IconAtlas : IDisposable
             if (_perFileIcons)
             {
                 var slot = FileSlot(path, null);
-                if (slot >= 0)
+                if (slot >= 0 && slot < _drawableSlots)
                 {
                     return slot;
                 }
             }
 
-            return TypeSlot(trimmed);
+            return Drawable(TypeSlot(trimmed));
+        }
+    }
+
+    /// <summary>
+    /// Whether the icon <paramref name="fileName"/> in <paramref name="folderPath"/>
+    /// is drawn with may still change for one being found: its type's icon is
+    /// still being asked for, or - for a type each file has its own icon of -
+    /// the file's own is, or was denied a slot and will be asked for again.
+    /// Not for a type the Shell had nothing for, nor for a program whose own
+    /// icon turned out to be its type's: nothing more is coming for those.
+    /// Asks for nothing; call it after <see cref="SlotFor(string, string, string)"/>.
+    /// </summary>
+    public bool IconStillToCome(string folderPath, string fileName, string extension)
+    {
+        var trimmed = Trim(extension);
+        if (trimmed.IsEmpty && Path.GetExtension(fileName.AsSpan()) is { Length: > 1 } named)
+        {
+            trimmed = named[1..];
+        }
+
+        var perFile = PerFileIcons && IsPerFileType(trimmed);
+        var separator = perFile && folderPath.Length > 0 && folderPath[^1] is not ('\\' or '/') ? 1 : 0;
+        var length = perFile ? folderPath.Length + separator + fileName.Length : 0;
+        Span<char> path = length <= 512 ? stackalloc char[length] : new char[length];
+        if (perFile)
+        {
+            folderPath.AsSpan().CopyTo(path);
+            if (separator == 1)
+            {
+                path[folderPath.Length] = '\\';
+            }
+
+            fileName.AsSpan().CopyTo(path[(folderPath.Length + separator)..]);
+        }
+
+        lock (_gate)
+        {
+            ref var type = ref CollectionsMarshal.GetValueRefOrNullRef(_typesBySpan, trimmed);
+            if (Unsafe.IsNullRef(ref type) || type.State == KeyState.Pending)
+            {
+                return true;
+            }
+
+            if (!perFile || !_perFileIcons)
+            {
+                return false;
+            }
+
+            ref var file = ref CollectionsMarshal.GetValueRefOrNullRef(_filesBySpan, path);
+            return Unsafe.IsNullRef(ref file) || file.State is KeyState.Pending or KeyState.Denied;
         }
     }
 
@@ -528,8 +600,11 @@ internal sealed class IconAtlas : IDisposable
         Volatile.Write(ref _signalled, 0);
         var taken = 0;
         var uploads = 0;
+        int reusedBefore;
+        bool othersListen;
         lock (_gate)
         {
+            reusedBefore = _slotsReused;
             _frame++;
             _frameTicks = Stopwatch.GetTimestamp();
             Activate(texture, context);
@@ -540,6 +615,24 @@ internal sealed class IconAtlas : IDisposable
                 {
                     uploads++;
                 }
+            }
+
+            othersListen = _listeners > 1;
+        }
+
+        if (othersListen && SlotsReused != reusedBefore)
+        {
+            // A slot another canvas's names may still sample holds another
+            // picture now: they are woken, as an arrival wakes them, and draw
+            // their names again for it (SlotsReused).  This canvas's own
+            // names are drawn after this, with the slots as they are now.
+            try
+            {
+                Volatile.Read(ref _arrivalsPending)?.Invoke();
+            }
+            catch (Exception)
+            {
+                // A subscriber's failure is not this frame's.
             }
         }
 
@@ -828,8 +921,11 @@ internal sealed class IconAtlas : IDisposable
             if (texture.Capacity < _nextSlot && !texture.Grow(context, CapacityFor(_nextSlot)))
             {
                 _active = null;
+                _drawableSlots = texture.Capacity;
                 return;
             }
+
+            _drawableSlots = int.MaxValue;
 
             for (var slot = 0; slot < _nextSlot; slot++)
             {
@@ -1092,10 +1188,16 @@ internal sealed class IconAtlas : IDisposable
             return -1;
         }
 
-        var slot = _freeSlots.Count > 0 ? _freeSlots.Pop() : _nextSlot < _slotData.Length ? _nextSlot++ : -1;
+        var reused = _freeSlots.Count > 0;
+        var slot = reused ? _freeSlots.Pop() : _nextSlot < _slotData.Length ? _nextSlot++ : -1;
         if (slot < 0)
         {
             return -1;
+        }
+
+        if (reused)
+        {
+            Volatile.Write(ref _slotsReused, _slotsReused + 1);
         }
 
         _slotRegion[slot] = region;
@@ -1139,6 +1241,7 @@ internal sealed class IconAtlas : IDisposable
             if (slot >= texture.Capacity && !texture.Grow(context, CapacityFor(slot + 1)))
             {
                 _active = null;
+                _drawableSlots = texture.Capacity;
                 return;
             }
 
@@ -1177,6 +1280,7 @@ internal sealed class IconAtlas : IDisposable
         _slotReferences[slot] = 0;
         Unlink(slot);
         _dirty = true;
+        Volatile.Write(ref _slotsReused, _slotsReused + 1);
     }
 
     private void Free(int slot)
@@ -1213,6 +1317,9 @@ internal sealed class IconAtlas : IDisposable
         _slotRegion[slot] = SlotRegion.Type;
         _slotFileKeys[slot] = null;
     }
+
+    /// <summary>A slot to hand out, or -1 when the texture it would be drawn from does not hold it (<see cref="_drawableSlots"/>).  Under the gate.</summary>
+    private int Drawable(int slot) => slot < _drawableSlots ? slot : -1;
 
     /// <summary>Marks a slot as drawn this frame and, for a file slot, the most recently drawn.</summary>
     private void Touch(int slot)

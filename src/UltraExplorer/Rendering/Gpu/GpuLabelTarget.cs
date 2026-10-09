@@ -82,6 +82,9 @@ internal sealed class GpuLabelTarget : LabelTarget
     private int _shapeBudget = int.MaxValue;
     private long _uploadTicks;
 
+    /// <summary>The icon atlas's <see cref="IconAtlas.SlotsReused"/> once this frame's arrivals were taken in: what its names were drawn for.</summary>
+    private int _iconSlotsReused;
+
     public GpuLabelTarget(FaceRegistry faces, TextShaper shaper, GlyphAtlas glyphs, IconAtlas? icons)
     {
         _faces = faces;
@@ -129,6 +132,7 @@ internal sealed class GpuLabelTarget : LabelTarget
         EnsureTextures(devices);
         var started = Stopwatch.GetTimestamp();
         _icons?.ProcessArrivals(_iconTexture, devices.Context);
+        _iconSlotsReused = _icons?.SlotsReused ?? 0;
         _uploadTicks = Stopwatch.GetTimestamp() - started;
 
         // Emptied as a new version of the lists, views let go: should the
@@ -159,12 +163,26 @@ internal sealed class GpuLabelTarget : LabelTarget
     {
         var frame = _frame ?? throw new InvalidOperationException("End without Begin.");
         var started = Stopwatch.GetTimestamp();
+        var glyphBacklog = false;
         if (_glyphTexture is { } glyphTexture && _devices is { } devices)
         {
             // A burst of new glyphs is copied in bounded steps; every glyph
-            // emitted this frame was placed before the first of them.
-            for (var round = 0; round < 8 && glyphTexture.Upload(devices.Context) == GlyphAtlasTexture.UploadBudget; round++)
+            // emitted this frame was placed before the first of them.  One
+            // past the steps' bound waits for the next frame, which is asked
+            // for: at rest nothing else would draw one, and the names whose
+            // glyphs were left behind would stay blank.
+            for (var round = 0; ; round++)
             {
+                if (glyphTexture.Upload(devices.Context) != GlyphAtlasTexture.UploadBudget)
+                {
+                    break;
+                }
+
+                if (round == 7)
+                {
+                    glyphBacklog = true;
+                    break;
+                }
             }
         }
 
@@ -173,8 +191,9 @@ internal sealed class GpuLabelTarget : LabelTarget
         frame.IconView = _iconTexture is { IsDisposed: false } icons ? icons.View : null;
         frame.GlyphView = _glyphTexture?.View;
         frame.LabelDevices = _devices;
+        frame.IconSlotsReused = _iconSlotsReused;
         frame.LabelsChanged();
-        WantsAnotherFrame = _icons is { HasPendingArrivals: true };
+        WantsAnotherFrame = glyphBacklog || _icons is { HasPendingArrivals: true };
         _frame = null;
         _sink = default;
     }
@@ -193,6 +212,15 @@ internal sealed class GpuLabelTarget : LabelTarget
         && ReferenceEquals(frame.LabelDevices, _devices)
         && (_glyphTexture is { } glyphs && frame.GlyphView is not null && !ReferenceEquals(frame.GlyphView, glyphs.View)
             || _iconTexture is { } icons && frame.IconView is not null && !ReferenceEquals(frame.IconView, icons.View));
+
+    /// <summary>
+    /// Whether <paramref name="frame"/>'s names were drawn with icon slots
+    /// that another canvas on the card has since given to other pictures
+    /// (<see cref="IconAtlas.SlotsReused"/>): drawn again, they take the
+    /// slots their files have now.
+    /// </summary>
+    public bool IconSlotsReusedSince(NestedGpuFrame frame) =>
+        _icons is { } icons && frame.IconView is not null && frame.IconSlotsReused != icons.SlotsReused;
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public override LabelText Text(string text, double size, Color ink, double maxWidth, LabelFace face, bool scaled)

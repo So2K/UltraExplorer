@@ -57,6 +57,9 @@ internal sealed class NestedGpuFrame : IDisposable
     /// </summary>
     public GpuDeviceSet? LabelDevices { get; set; }
 
+    /// <summary>The icon atlas's <see cref="IconAtlas.SlotsReused"/> the names were drawn for, set with <see cref="IconView"/>.</summary>
+    public int IconSlotsReused { get; set; }
+
     /// <summary>The colour the frame starts from: the bare canvas where no folder covers the view.</summary>
     public uint ClearColour { get; set; } = 0xFF111315;
 
