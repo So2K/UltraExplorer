@@ -127,7 +127,7 @@ internal sealed class DialogAgent : IDisposable
         // every tick, since that is how quickly a dialog should be noticed.
         if (++_ticks % 5 == 0)
         {
-            if (!DialogIntegrationStore.Read().Enabled) { Dispose(); _app.Shutdown(); return; }
+            if (!DialogIntegrationStore.ReadSteady().Enabled) { Dispose(); _app.Shutdown(); return; }
             foreach (var window in _seen.Keys.ToArray())
                 if (!DialogNative.IsWindow(window)) Forget(window);
             // The guardian restores a dialog whose replacement stopped; should
@@ -189,7 +189,7 @@ internal sealed class DialogAgent : IDisposable
 
     private void RetryUnclaimedRequest(nint window, uint process)
     {
-        if (_disposed || !DialogIntegrationStore.Read().Enabled || !DialogNative.IsWindow(window)
+        if (_disposed || !DialogIntegrationStore.ReadSteady().Enabled || !DialogNative.IsWindow(window)
             || DialogNative.ProcessId(window) != process || DialogNative.IsHidden(window)
             || DialogNative.GetProp(window, DialogNative.LeaseProperty) != 0) return;
         Forget(window);

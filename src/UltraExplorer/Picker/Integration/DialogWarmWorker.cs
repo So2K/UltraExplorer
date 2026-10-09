@@ -137,7 +137,7 @@ internal static class DialogWarmWorker
             await PrepareAsync(prepared);
             await writer.WriteLineAsync("READY");
             var served = 0;
-            while (DialogIntegrationStore.Read().Enabled)
+            while (DialogIntegrationStore.ReadSteady().Enabled)
             {
                 var command = await reader.ReadLineAsync();
                 if (command is null) break;
