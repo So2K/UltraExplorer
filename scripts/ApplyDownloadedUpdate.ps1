@@ -1,5 +1,7 @@
 # Started only by a person's confirmed Install click. This one-shot helper
-# never checks the network, registers startup tasks, elevates, or forces exit.
+# never checks the network, registers startup tasks, elevates, or forces the
+# running application to exit; only a new version that failed to start is
+# ended before its rollback (docs/QUIET_UPDATES.md).
 param([string]$RequestPath)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'InstallPayload.ps1')
@@ -128,18 +130,94 @@ function Assert-QuietUpdateExecutable([string]$Root, [string]$Version) {
 function Undo-QuietPayloadUpdate([object]$Update) {
     # Used only if the new application could not start. The original transaction
     # already rolls back failed copies; its backup is retained until restart.
-    foreach ($name in $Update.CopiedFiles) {
-        $path = Get-UltraExplorerPayloadPath $Update.DestinationRoot $name
-        if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+    # Every file is tried: one new file that stays locked must not keep the
+    # remaining old files from coming back. A file not restored stays in the
+    # backup, and the errors are reported together at the end.
+    $errors = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($name in @($Update.CopiedFiles)) {
+        try {
+            $path = Get-UltraExplorerPayloadPath $Update.DestinationRoot $name
+            if (Test-Path -LiteralPath $path -PathType Leaf) { Remove-Item -LiteralPath $path -Force }
+        } catch { [void]$errors.Add("${name}: $($_.Exception.Message)") }
     }
-    foreach ($name in $Update.BackupFiles) {
-        $saved = Get-UltraExplorerPayloadPath $Update.BackupRoot $name
-        $target = Get-UltraExplorerPayloadPath $Update.DestinationRoot $name
-        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $target))
-        [System.IO.File]::Move($saved, $target)
+    foreach ($name in @($Update.BackupFiles)) {
+        try {
+            $saved = Get-UltraExplorerPayloadPath $Update.BackupRoot $name
+            $target = Get-UltraExplorerPayloadPath $Update.DestinationRoot $name
+            [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $target))
+            # A new file that could not be removed is overwritten in place; the
+            # backup keeps the old bytes until that has succeeded.
+            if (Test-Path -LiteralPath $target -PathType Leaf) { [System.IO.File]::Copy($saved, $target, $true); [System.IO.File]::Delete($saved) }
+            else { [System.IO.File]::Move($saved, $target) }
+        } catch { [void]$errors.Add("${name}: $($_.Exception.Message)") }
     }
-    Remove-UltraExplorerPayloadEmptyDirectories $Update.DestinationRoot $Update.DestinationDirectories
-    Remove-UltraExplorerPayloadEmptyDirectories $Update.BackupRoot $Update.BackupDirectories
+    try { Remove-UltraExplorerPayloadEmptyDirectories $Update.DestinationRoot $Update.DestinationDirectories }
+    catch { [void]$errors.Add($_.Exception.Message) }
+    try { Remove-UltraExplorerPayloadEmptyDirectories $Update.BackupRoot $Update.BackupDirectories }
+    catch { [void]$errors.Add($_.Exception.Message) }
+    if ($errors.Count -gt 0) {
+        throw "$($errors.Count) file(s) could not be rolled back; the old files remain in $($Update.BackupRoot). $($errors -join ' ')"
+    }
+}
+
+# The failed new version may already run a window, dialog agent or helper from
+# the replaced files; they hold those files until every one has ended.
+function Stop-QuietTargetCopies([string]$Executable) {
+    $copies = @(Get-QuietTargetCopies $Executable)
+    try {
+        foreach ($copy in $copies) {
+            $process = $copy.Process
+            if ($process.HasExited) { continue }
+            if (-not $copy.IsRole) {
+                try { [void]$process.CloseMainWindow() } catch { }
+                if ($process.WaitForExit(10000)) { continue }
+            }
+            try { $process.Kill() } catch { }
+            [void]$process.WaitForExit(5000)
+        }
+    } finally { foreach ($copy in $copies) { $copy.Process.Dispose() } }
+}
+
+# QuietUpdateService records its version and process id once the main window
+# of a version has started. Only that proves the new version works; until it
+# does, the backup of the old files is kept.
+function Test-QuietStartupMarker([string]$StateDirectory, [string]$Version, [object]$ProcessId) {
+    try {
+        $path = Get-UltraExplorerPayloadPath $StateDirectory 'updates\started.json'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -gt 65536) { return $false }
+        $marker = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+        return $null -ne $ProcessId -and [string]$marker.ProcessId -ceq [string]$ProcessId -and
+            ([string]$marker.Version -split '\+', 2)[0] -ceq ($Version -split '\+', 2)[0]
+    } catch { return $false }
+}
+
+# Healthy: the new version reported its start. Failed: it ended with an error
+# first. Closed: it ended normally first (somebody closed it). Unconfirmed: it
+# still runs without a report when the wait ends.
+function Wait-QuietUpdateHealthy([object]$Process, [string]$StateDirectory, [string]$Version, [int]$TimeoutMilliseconds = 120000) {
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    while ($true) {
+        $exited = $Process.WaitForExit(250)
+        if (Test-QuietStartupMarker $StateDirectory $Version $Process.Id) { return 'Healthy' }
+        if ($exited) { if ($Process.ExitCode -eq 0) { return 'Closed' } else { return 'Failed' } }
+        if ([DateTime]::UtcNow -ge $deadline) { return 'Unconfirmed' }
+    }
+}
+
+function Test-QuietInstallLocation([string]$InstallLocation, [string]$Destination) {
+    if ([string]::IsNullOrWhiteSpace($InstallLocation) -or -not [System.IO.Path]::IsPathRooted($InstallLocation)) { return $false }
+    return [string]::Equals([System.IO.Path]::GetFullPath($InstallLocation).TrimEnd('\', '/'),
+        [System.IO.Path]::GetFullPath($Destination).TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+# Installed apps shows the version Setup recorded. Only Setup's own per-user
+# entry for exactly this folder is changed; a portable copy has none.
+function Update-QuietUninstallVersion([string]$Destination, [string]$Version) {
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F0B8E57-3C1D-4B7A-9E54-2D8A1C3F7B90}_is1'
+    $entry = Get-ItemProperty -LiteralPath $key -ErrorAction SilentlyContinue
+    if ($null -eq $entry -or -not (Test-QuietInstallLocation ([string]$entry.InstallLocation) $Destination)) { return $false }
+    Set-ItemProperty -LiteralPath $key -Name 'DisplayVersion' -Value (($Version -split '\+', 2)[0])
+    return $true
 }
 
 function Get-QuietTargetCopies([string]$Executable) {
@@ -371,17 +449,41 @@ public static class UltraExplorerQuietGracefulUpdate
         $installed = $true
         if ($recovered) { Use-QuietIntegrationPreference $stateDirectory $sid $preference; $recovered = $false }
         $restart = Start-QuietUpdateApp $executable $stateDirectory
-        try { if ($restart.WaitForExit(3000)) { throw 'The updated application could not start.' } }
+        try { $health = Wait-QuietUpdateHealthy $restart $stateDirectory $request.Version }
         finally { $restart.Dispose() }
+        if ($health -eq 'Failed') { throw 'The updated application could not start.' }
         $restartConfirmed = $true
-        # Cleanup failure retains recovery files; it does not undo a running app.
-        try { Complete-UltraExplorerPayloadUpdate $transaction } catch { Write-Warning $_.Exception.Message }
-        Write-QuietUpdateResult $operationRoot ([pscustomobject]@{ Status = 'Installed'; Version = $request.Version; CompletedUtc = [DateTime]::UtcNow.ToString('o') })
+        try { [void](Update-QuietUninstallVersion $destination $request.Version) }
+        catch { Write-Warning "Installed apps could not show the new version: $($_.Exception.Message)" }
+        $result = [pscustomobject]@{ Status = 'Installed'; Version = $request.Version; CompletedUtc = [DateTime]::UtcNow.ToString('o') }
+        if ($health -eq 'Healthy') {
+            # Cleanup failure retains recovery files; it does not undo a running app.
+            try { Complete-UltraExplorerPayloadUpdate $transaction } catch { Write-Warning $_.Exception.Message }
+        } else {
+            # Not proven either way: the running app is not undone, and the old
+            # files stay available for a manual rollback.
+            $result | Add-Member -NotePropertyName BackupRetained -NotePropertyValue $transaction.BackupRoot
+        }
+        Write-QuietUpdateResult $operationRoot $result
     } catch {
         $failure = $_.Exception.Message
         if ($installed -and $transaction -and -not $restartConfirmed) {
-            try { Undo-QuietPayloadUpdate $transaction; $installed = $false }
+            if ($preference -and ($preference.Enabled -or $preference.WinEEnabled)) {
+                # The failed version may have taken over dialogs; hand them back
+                # before its processes end. Its preference is restored below.
+                try {
+                    $recovered = $true
+                    $recovery = Start-QuietUpdateApp $executable $stateDirectory '--dialog-recover'
+                    try { if (-not $recovery.WaitForExit(15000)) { $recovery.Kill() } } finally { $recovery.Dispose() }
+                } catch { $failure += ' Integration recovery of the failed version did not finish. ' + $_.Exception.Message }
+            }
+            try { Stop-QuietTargetCopies $executable }
+            catch { $failure += ' The failed version could not be stopped. ' + $_.Exception.Message }
+            # Even a partial rollback restarts the old application below; any
+            # file it could not restore is named and kept in the backup.
+            try { Undo-QuietPayloadUpdate $transaction }
             catch { $failure += ' Rollback needs attention; the old files remain in the update backup. ' + $_.Exception.Message }
+            $installed = $false
         }
         if ($recovered -and $preference) {
             try { Use-QuietIntegrationPreference $stateDirectory $sid $preference; $recovered = $false }
