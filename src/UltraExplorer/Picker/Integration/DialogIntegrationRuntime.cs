@@ -38,14 +38,28 @@ internal static class DialogIntegrationRuntime
     /// Without a receipt, the registration lets go of the commands that are
     /// UltraExplorer's own (ShellRegistrationTransaction).
     /// </summary>
+    /// <remarks>Each step whatever became of the one before: settings that
+    /// cannot be written must not leave dialogs hidden, nor folders naming an
+    /// executable the uninstaller is about to delete. The first failure is
+    /// thrown once every step has run, so the exit code still tells; folder
+    /// defaults Windows refuses to give back are only logged, as before.</remarks>
     internal static void Recover()
     {
-        DialogIntegrationStore.Update(settings => settings with { WinEEnabled = false });
-        DialogGuardian.RestoreAll(true, "Windows dialogs restored. Replacement is paused.");
-        try { ReconcileFolderVerbs(false); }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
-            or System.Security.SecurityException or System.ComponentModel.Win32Exception)
-        { DialogIntegrationStore.Log("The Windows folder-opening defaults could not be restored", ex); }
+        Exception? first = null;
+        void Step(string failure, Action step, Func<Exception, bool>? onlyLogged = null)
+        {
+            try { step(); }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                DialogIntegrationStore.Log(failure, ex);
+                if (onlyLogged?.Invoke(ex) != true) first ??= ex;
+            }
+        }
+        Step("Win+E could not be given back to Windows", () => DialogIntegrationStore.Update(settings => settings with { WinEEnabled = false }));
+        Step("Windows dialogs could not all be restored", () => DialogGuardian.RestoreAll(true, "Windows dialogs restored. Replacement is paused."));
+        Step("The Windows folder-opening defaults could not be restored", () => ReconcileFolderVerbs(false),
+            ex => ex is IOException or UnauthorizedAccessException or System.Security.SecurityException or System.ComponentModel.Win32Exception);
+        if (first is not null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Throw(first);
     }
 
     /// <summary>How Windows' folder-opening defaults are put back or taken over; a test sees here what is asked.</summary>

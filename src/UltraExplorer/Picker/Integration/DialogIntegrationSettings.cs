@@ -36,6 +36,40 @@ internal static class DialogIntegrationStore
 
     public static DialogIntegrationSettings Read() => ReadCore(preserveOnReadFailure: false);
 
+    /// <summary>What this process last read whole; see <see cref="ReadSteady"/>.</summary>
+    private static volatile DialogIntegrationSettings? _lastRead;
+
+    /// <summary>
+    /// For what polls the setting and acts on "off" - the listener ending,
+    /// the watchdog putting every dialog back, a worker or a replacement
+    /// handing its dialog over. A file Windows will not open for a moment
+    /// (another process replacing it, a scanner holding it) is not the user
+    /// switching the mode off: it is read again a few times, and then the
+    /// last setting read whole stands. Only a setting actually read - or a
+    /// file that is not there, or a corrupt one - says off.
+    /// </summary>
+    public static DialogIntegrationSettings ReadSteady()
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                // Missing for a moment while another process puts it back?
+                // Asked again before that is believed.
+                if (attempt < 2 && !File.Exists(SettingsPath)) { Thread.Sleep(10); continue; }
+                return _lastRead = ReadCore(preserveOnReadFailure: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt >= 2) return _lastRead ?? Read();
+                Thread.Sleep(10);
+            }
+        }
+    }
+
+    /// <summary>The setting read last, as a test sets it; null forgets it.</summary>
+    internal static void RememberRead(DialogIntegrationSettings? settings) => _lastRead = settings;
+
     private static DialogIntegrationSettings ReadCore(bool preserveOnReadFailure)
     {
         try

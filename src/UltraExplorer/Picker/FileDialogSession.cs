@@ -519,8 +519,13 @@ public sealed class FileDialogSession : ObservableObject
             AllowsMultipleSelection ? paths : [paths[0]]);
     }
 
+    /// <remarks>A replaced dialog is handed its answer as text; what that text
+    /// cannot carry (<see cref="Integration.NativeDialogRules.HandBackProblem"/>)
+    /// is refused here, with the reason, rather than returned as something else.</remarks>
     public FileDialogVerdict Validate(IReadOnlyList<string> paths) =>
-        FileDialogValidator.Evaluate(Request, CurrentFilter, paths, _resolved);
+        Request.IsNativeProxy && Integration.NativeDialogRules.HandBackProblem(AllowsMultipleSelection ? paths : [.. paths.Take(1)]) is { } problem
+            ? new FileDialogVerdict(FileDialogVerdictKind.Reject, [], problem, "UltraExplorer")
+            : FileDialogValidator.Evaluate(Request, CurrentFilter, paths, _resolved);
 
     /// <summary>Records a yes so the same question is not asked again.</summary>
     public void Allow(FileDialogGate gate) => _resolved.Add(gate);

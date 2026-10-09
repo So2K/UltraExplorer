@@ -142,6 +142,7 @@ internal static partial class Program
         await Group(ShellMenuChecks);
         await Group(ReviewFixChecks);
         await Group(DialogRuntimeReviewChecks);
+        await Group(Review1009PickerChecks);
         await Group(ViewAllServiceChecks);
         await Group(TreeCoreReviewChecks);
         await Group(CanvasMiscReviewChecks);

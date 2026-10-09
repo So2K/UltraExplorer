@@ -58,6 +58,8 @@ internal sealed class NativeDialogProxy
     private bool _isPrepared, _hidden, _filterWatched, _pulseStarted;
     private nint _handle;
     private long _lastRefresh;
+    /// <summary>When the pulse first saw the picker answered (<see cref="Environment.TickCount64"/>), or 0.</summary>
+    private long _answeredAt;
     private int _generation;
     private double _frameMs = double.NaN, _readyMs = double.NaN, _readMs = double.NaN;
     private int _roots = -1;
@@ -130,7 +132,7 @@ internal sealed class NativeDialogProxy
         _serving = this;
         try
         {
-            if (!DialogIntegrationStore.Read().Enabled || !OriginalExists) return;
+            if (!DialogIntegrationStore.ReadSteady().Enabled || !OriginalExists) return;
             if (_recognised == 0 || Stopwatch.GetElapsedTime(_recognised) > TimeSpan.FromMinutes(1)) _recognised = Stopwatch.GetTimestamp();
             var glance = FastDialogRead.Read(_original, PreparedPicker.Names);
             _nameEdit = glance.NameEdit;
@@ -194,6 +196,9 @@ internal sealed class NativeDialogProxy
             {
                 var shown = !double.IsNaN(_frameMs);
                 await ConfirmEarlyAsync(request);
+                // Cancelled while it was being rebound: the cancel goes to the
+                // dialog, rather than waiting on a rebind for a closed picker.
+                if (_window.PickerResult.IsCompleted && !_fallback) { await HandBackEarlyAsync(await _window.PickerResult); return; }
                 // Bound early but not shown yet (its folder was slow to draw):
                 // bound to the full contract first, then a last short wait for
                 // the finished picture, then the folder as it is - as a newly
@@ -224,6 +229,10 @@ internal sealed class NativeDialogProxy
             if (_fallback) return;
             if (_lease is null) { await HandBackEarlyAsync(result); return; }
             if (!DialogLease.BelongsToWindow(_lease.Record)) return;
+            // The picker refuses these itself; one that got past it (its disk
+            // did not answer in time) stays with Windows, never handed back as
+            // another name or another folder's files.
+            if (result.Accepted && NativeDialogRules.HandBackProblem(result.Paths) is { } problem) throw new NotSupportedException(problem);
             await _pending.WaitAsync(TimeSpan.FromSeconds(8));
             if (_fallback || !DialogLease.BelongsToWindow(_lease.Record)) return;
             if (result.Accepted)
@@ -252,12 +261,17 @@ internal sealed class NativeDialogProxy
         catch (Exception ex)
         {
             _fallback = true;
-            if (ex is TimeoutException) CanReuseWorker = false;
+            // While the watchdog still holds the lease nothing is in doubt: a
+            // problem in the picker (a message that could not be posted, a
+            // rebind, a window) sends this one dialog back and retires this
+            // worker; the mode, its sign-in start and folder defaults stay.
+            var stillProtected = _lease is { IsProtected: true };
+            if (ex is TimeoutException || stillProtected) CanReuseWorker = false;
             _lease?.Restore(true);
             DialogIntegrationStore.Log(_handedBack
                 ? $"{Application}: native follow-up ended; its original dialog is available"
                 : $"{Application}: returned to its Windows dialog after a problem", ex);
-            if (_lease is not null && !_handedBack)
+            if (_lease is not null && !_handedBack && !stillProtected)
                 try { DialogIntegrationStore.Update(settings => settings with { Enabled = false,
                     LastRecovery = "Dialog replacement encountered a problem. Windows dialogs are restored; you can turn it on again in Settings." }); }
                 catch (IOException) { }
@@ -314,7 +328,7 @@ internal sealed class NativeDialogProxy
         // The original stays on screen, and keeps the keyboard, until the
         // picker comes over it (Uncloak): a folder slow to draw would leave
         // the user with no dialog at all for as long as the full read takes.
-        if (!_lease.IsProtected || !DialogIntegrationStore.Read().Enabled || !OriginalExists
+        if (!_lease.IsProtected || !DialogIntegrationStore.ReadSteady().Enabled || !OriginalExists
             || !DialogLease.BelongsToWindow(_lease.Record) || !InFront())
         { ReturnToWindows(); return; }
         Stage("early-leased");
@@ -553,7 +567,7 @@ internal sealed class NativeDialogProxy
             var fresh = new FileDialogSession(request);
             _session = fresh;
             _controls!.SetOptions(_snapshot.ApplicationPath, _snapshot.Mode, _options);
-            await _window!.RebindAsync(fresh);
+            await RebindUnlessClosedAsync(_window!.RebindAsync(fresh));
             return;
         }
         if (!NativeDialogRules.SameContract(early.Request, request))
@@ -566,11 +580,23 @@ internal sealed class NativeDialogProxy
             if (!Models.ViewAllPath.Equals(early.CurrentFolder, carried.CurrentFolder)) carried.CurrentFolder = early.CurrentFolder;
             if (early.HasInteracted) carried.MarkInteraction();
             _session = carried;
-            await _window!.RebindAsync(carried, sameDialog: true);
+            await RebindUnlessClosedAsync(_window!.RebindAsync(carried, sameDialog: true));
             return;
         }
         if (!early.HasInteracted && !string.Equals(early.FileNameText, request.FileName, StringComparison.Ordinal))
             early.FileNameText = request.FileName;
+    }
+
+    /// <summary>
+    /// A rebind, or the picker's own answer if that comes first: a Cancel or
+    /// a close while the picker is rebound is never left waiting on it, with
+    /// the original hidden and its application blocked. The result asked for
+    /// after the rebind has begun: a new dialog's rebind replaces it.
+    /// </summary>
+    private async Task RebindUnlessClosedAsync(Task rebind)
+    {
+        await Task.WhenAny(rebind, _window!.PickerResult);
+        if (rebind.IsCompleted) await rebind;
     }
 
     /// <summary>
@@ -587,7 +613,7 @@ internal sealed class NativeDialogProxy
         _lastRefresh = Environment.TickCount64;
         StartPulse();
         if (_window.PickerResult.IsCompleted || _fallback) return;
-        if (!_lease.IsProtected || !DialogIntegrationStore.Read().Enabled || !DialogLease.BelongsToWindow(_lease.Record)
+        if (!_lease.IsProtected || !DialogIntegrationStore.ReadSteady().Enabled || !DialogLease.BelongsToWindow(_lease.Record)
             || !InFront() || !DialogNative.Hide(_original)) { ReturnToWindows(); return; }
         _hidden = true;
         WatchFileTypes();
@@ -696,10 +722,13 @@ internal sealed class NativeDialogProxy
     /// <summary>
     /// The dialog (or something of its own, a tooltip or a list it dropped)
     /// is still what the user is working with. A test copy's fixture never is
-    /// the foreground, by design, and is not asked.
+    /// the foreground, by design, and is not asked. The picker's own windows
+    /// count as the picker: a message it shows, a name it asks for, are
+    /// windows of this process, and the user has not left for them.
     /// </summary>
     private bool InFront() => IsFixture || DialogNative.IsForegroundDialog(_original)
-        || (_handle != 0 && DialogNative.GetForegroundWindow() == _handle);
+        || (_handle != 0 && DialogNative.GetForegroundWindow() is var front && front != 0
+            && (front == _handle || DialogNative.ProcessId(front) == (uint)Environment.ProcessId));
 
     private async void OnPresented(object? sender, EventArgs e)
     {
@@ -709,7 +738,7 @@ internal sealed class NativeDialogProxy
         // The frame just rendered reaches the screen before the original goes.
         DialogNative.WaitForComposition();
         _frameMs = Since;
-        if (!_lease.IsProtected || !DialogIntegrationStore.Read().Enabled || !DialogLease.BelongsToWindow(_lease.Record)
+        if (!_lease.IsProtected || !DialogIntegrationStore.ReadSteady().Enabled || !DialogLease.BelongsToWindow(_lease.Record)
             || !InFront() || !DialogNative.Hide(_original)) { ReturnToWindows(); return; }
         _hidden = true;
         _readyMs = Since;
@@ -770,7 +799,7 @@ internal sealed class NativeDialogProxy
             // The provisional window covers an untouched original. Even
             // while its provider is busy, emergency off or the caller closing
             // must dismiss that overlay without awaiting the full contract.
-            if (!OriginalExists || !DialogIntegrationStore.Read().Enabled || !InFront()) ReturnToWindows();
+            if (!OriginalExists || !DialogIntegrationStore.ReadSteady().Enabled || !InFront()) ReturnToWindows();
             else if (_window is not null && !double.IsNaN(_frameMs) && !DialogNative.IsAbove(_handle, _original))
             {
                 // The original came up over the picker (the application
@@ -781,9 +810,22 @@ internal sealed class NativeDialogProxy
             }
             return;
         }
+        // The picker answered but nothing took the answer up (a stage still
+        // waiting on something of its own): the original back on screen, not
+        // left hidden behind a picker that is gone.
+        if (_window is not null && _window.PickerResult.IsCompleted && !_handedBack)
+        {
+            if (_answeredAt == 0) _answeredAt = Environment.TickCount64;
+            else if (Environment.TickCount64 - _answeredAt > 1500)
+            {
+                DialogIntegrationStore.Log($"{Application}: its picker closed and nothing was handed back; returned to its Windows dialog.");
+                ReturnToWindows();
+                return;
+            }
+        }
         _lease.Pulse();
         var protectedNow = _lease.IsProtected;
-        var enabled = DialogIntegrationStore.Read().Enabled;
+        var enabled = DialogIntegrationStore.ReadSteady().Enabled;
         if (!protectedNow && !File.Exists(_lease.RecoveryPath) && enabled)
         {
             // The watchdog is gone: nothing would put the original back if
@@ -883,8 +925,7 @@ internal sealed class NativeDialogProxy
             {
                 await Task.Run(() => DialogIntegrationStore.Update(settings => settings with
                 {
-                    ExcludedApplications = settings.ExcludedApplications.Append(application)
-                        .Distinct(StringComparer.OrdinalIgnoreCase).Take(128).ToArray()
+                    ExcludedApplications = NativeDialogRules.WithExclusion(settings.ExcludedApplications, application)
                 }));
             }
             catch (Exception ex) { DialogIntegrationStore.Log("The application exception could not be saved", ex); }
