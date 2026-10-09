@@ -50,6 +50,25 @@ An invalid or wrong-root receipt causes an error before any registry mutation.
 The per-user mutex prevents two UltraExplorer windows racing with each other;
 other applications can still edit registry values concurrently.
 
+## All-users installations
+
+Folder verbs live in each user's own HKCU, but Setup's uninstaller runs as one
+user. With an all-users installation (Program Files, or any folder an all-users
+Setup recorded in its HKLM uninstall entry), every other user who had enabled
+the mode would keep folder commands naming the deleted executable, so no folder
+would open for them. Decision (review 2026-10-09, H3):
+
+- `ShellReplacementRegistration.IsPerMachineInstall` refuses ON for such a copy.
+  `Reconcile(true)` takes back a registration an earlier version made and throws,
+  so the settings owner keeps the combined switch off and reports why. Install
+  for the current user (Setup's default) to open folders in UltraExplorer.
+- The uninstaller additionally sweeps, after `--dialog-recover`, HKCU and, in
+  all-users mode, every loaded `HKU\<SID>` hive for `Folder`, `Directory` and
+  `Drive` `open`/`explore` commands that start exactly `{app}\UltraExplorer.exe`.
+  It removes them like a receipt-less release (command, empty `DelegateExecute`,
+  the `open` default, then empty keys). Hives of users who are not signed in are
+  not loaded and cannot be reached; that is why ON is refused in the first place.
+
 Test window, isolated state, fixture-only process, benchmark, and snapshot copies
 cannot invoke the production registry facade. The engine accepts an injected
 `RegistryKey`, allowing its real native registry implementation to be tested
