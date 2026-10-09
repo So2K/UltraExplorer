@@ -101,7 +101,25 @@ internal sealed class EverythingClient
 
     private static readonly Lazy<EverythingClient> Instance = new(() => new EverythingClient());
 
-    private readonly ConcurrentDictionary<uint, TaskCompletionSource<byte[]>> _pending = new();
+    private readonly ConcurrentDictionary<uint, PendingReply> _pending = new();
+
+    /// <summary>
+    /// A query waiting for its reply: from the process of the Everything
+    /// window it was sent to, and no other.  Run as administrator the reply
+    /// window must take WM_COPYDATA from below (see <see cref="Pump"/>), so
+    /// any program of the user's could send it a list of its own; a reply is
+    /// taken only from that process, under an id no other program saw, and a
+    /// stream of wrong guesses ends the query rather than waiting for one to hit.
+    /// </summary>
+    private sealed class PendingReply(uint everythingProcess, TaskCompletionSource<byte[]> answer)
+    {
+        public uint EverythingProcess { get; } = everythingProcess;
+        public TaskCompletionSource<byte[]> Answer { get; } = answer;
+        public int Refused;
+    }
+
+    /// <summary>How many replies that are not this query's end it, as a guess at its id.</summary>
+    private const int MostRefused = 16;
 
     /// <summary>
     /// One query out at a time: Everything answers only the latest query of
@@ -112,7 +130,6 @@ internal sealed class EverythingClient
     private readonly Lock _gate = new();
     private Thread? _thread;
     private nint _window;
-    private int _nextReply = 0x55450000;
     private int _startAttempted;
 
     private EverythingClient()
@@ -232,9 +249,11 @@ internal sealed class EverythingClient
         }
 
         await _oneAtATime.WaitAsync(cancellationToken).ConfigureAwait(false);
-        var id = unchecked((uint)Interlocked.Increment(ref _nextReply));
+        // Unpredictable: the id is all that tells Everything's reply from another program's.
+        var id = BinaryPrimitives.ReadUInt32LittleEndian(System.Security.Cryptography.RandomNumberGenerator.GetBytes(4));
+        _ = GetWindowThreadProcessId(everything, out var everythingProcess);
         var answer = new TaskCompletionSource<byte[]>(TaskCreationOptions.RunContinuationsAsynchronously);
-        _pending[id] = answer;
+        _pending[id] = new PendingReply(everythingProcess, answer);
         try
         {
             // Off the caller's thread: sending waits for Everything to take
@@ -547,18 +566,35 @@ internal sealed class EverythingClient
         {
             var copy = (CopyDataStruct*)lParam;
             var id = unchecked((uint)copy->Data);
-            if (Instance.IsValueCreated && Instance.Value._pending.TryGetValue(id, out var answer))
+            if (!Instance.IsValueCreated)
             {
-                // The data is Everything's only for as long as this message
-                // lasts: copied out now, read later.
-                var bytes = copy->Pointer == 0 || copy->Size == 0
-                    ? []
-                    : new ReadOnlySpan<byte>((void*)copy->Pointer, (int)copy->Size).ToArray();
-                answer.TrySetResult(bytes);
-                return 1;
+                return 0;
             }
 
-            return 0;
+            // WM_COPYDATA names its sender's window in wParam: a reply counts
+            // only from the process of the Everything window that was asked.
+            var sender = wParam == 0 || GetWindowThreadProcessId(wParam, out var process) == 0 ? 0u : process;
+            var pending = Instance.Value._pending;
+            if (!pending.TryGetValue(id, out var reply) || reply.EverythingProcess == 0 || sender != reply.EverythingProcess)
+            {
+                foreach (var waiting in pending.Values)
+                {
+                    if (Interlocked.Increment(ref waiting.Refused) >= MostRefused)
+                    {
+                        waiting.Answer.TrySetException(new TimeoutException("Too many replies that were not this query's."));
+                    }
+                }
+
+                return 0;
+            }
+
+            // The data is Everything's only for as long as this message
+            // lasts: copied out now, read later.
+            var bytes = copy->Pointer == 0 || copy->Size == 0
+                ? []
+                : new ReadOnlySpan<byte>((void*)copy->Pointer, (int)copy->Size).ToArray();
+            reply.Answer.TrySetResult(bytes);
+            return 1;
         }
 
         if (message == WmClose)
@@ -693,6 +729,9 @@ internal sealed class EverythingClient
 
     [DllImport("user32.dll")]
     private static extern void PostQuitMessage(int exitCode);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(nint window, out uint processId);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
     private static extern nint GetModuleHandleW(string? moduleName);
