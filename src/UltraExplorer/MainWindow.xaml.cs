@@ -350,6 +350,10 @@ public partial class MainWindow : Window
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        // A rename the list asked for a moment ago would open its dialog
+        // over a window on its way out, or on one already torn down.
+        _folderListRenameTimer.Stop();
+        _folderListRenameRow = null;
         if (_allowClose)
         {
             // However the window goes away, the caller gets an answer.
@@ -506,6 +510,7 @@ public partial class MainWindow : Window
             // The Closing that follows only tidies up.
             _allowClose = !e.Cancel;
             if (e.Cancel) transaction.Cancel();
+            else _folderListRenameTimer.Stop();
         }
     }
 
@@ -546,6 +551,17 @@ public partial class MainWindow : Window
         internal void Cancel()
         {
             _args.Cancel = true;
+            Abandon();
+        }
+
+        /// <summary>
+        /// The session did not end after all: WM_ENDSESSION came with FALSE
+        /// because another program or the user refused it after every
+        /// window here had agreed.  The args are spent by then, so only the
+        /// windows go back to working as before.
+        /// </summary>
+        internal void Abandon()
+        {
             _watch.Stop();
             foreach (var (owner, preview) in _owners.ToArray())
             {
@@ -564,6 +580,14 @@ public partial class MainWindow : Window
             if (_watch.Dispatcher.HasShutdownStarted) _watch.Stop();
         }
     }
+
+    /// <summary>
+    /// WM_ENDSESSION with FALSE: the shutdown <see cref="OnSessionEnding"/>
+    /// agreed to was cancelled elsewhere.  Without this the windows stayed
+    /// closing for good - no previews, drive rescans, drops or Explorer
+    /// handoffs, and the next close skipped its save.
+    /// </summary>
+    private void OnSessionEndCancelled() => _sessionCloseTransaction?.Abandon();
 
     private static bool WaitForSessionEndSave(Task saving, long started)
     {
@@ -1181,6 +1205,7 @@ public partial class MainWindow : Window
         _folderListRenameTimer.Stop();
         var clicked = _folderListRenameRow;
         _folderListRenameRow = null;
+        if (_closeRequested || _allowClose) return;
         if (FolderListItems.SelectedItems.Count == 1
             && FolderListItems.SelectedItem is FolderListItem row
             && clicked is not null

@@ -9,6 +9,7 @@ namespace UltraExplorer;
 public partial class MainWindow
 {
     private const int WmDeviceChange = 0x0219;
+    private const int WmEndSession = 0x0016;
     private const int WmMouseHorizontalWheel = 0x020E;
 
     /// <summary>
@@ -73,6 +74,11 @@ public partial class MainWindow
                 OnDeviceChangeMessage(wParam, lParam, ref handled, ref result);
                 return result;
             }
+
+            // FALSE: a shutdown the windows had agreed to was cancelled.
+            case WmEndSession when wParam == IntPtr.Zero:
+                OnSessionEndCancelled();
+                return IntPtr.Zero;
 
             case WmMouseHorizontalWheel:
                 OnHorizontalWheelMessage(wParam, lParam, ref handled);
