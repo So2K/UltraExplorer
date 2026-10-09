@@ -45,9 +45,13 @@ internal sealed class ArchiveZoneHelper
     /// <summary>Copy the stream byte for byte; a more restrictive existing mark stays intact.</summary>
     internal void Apply(string output)
     {
-        ArchiveService.EnsureSafeOutput(output);
+        ArchiveService.EnsureSafeOutput(output, output);
         if ((File.GetAttributes(output) & FileAttributes.Directory) != 0)
             throw new IOException("Origin metadata must be applied to an extracted file.");
+        // FAT32, exFAT and some SMB shares have no named streams at all: the
+        // mark cannot exist there, as Windows' own copy drops it.  NTFS and
+        // any volume that cannot be asked stay fail-closed.
+        if (!SupportsNamedStreams(output)) return;
         var existing = Capture(output);
         if (existing is not null && Zone(existing._bytes) is { } prior
             && Zone(_bytes) is { } source && prior > source) return;
@@ -61,6 +65,28 @@ internal sealed class ArchiveZoneHelper
     }
 
     internal static void Propagate(string archive, string output) => Capture(archive)?.Apply(output);
+
+    /// <summary>Test seam: the volume answer for a path, instead of asking Windows.</summary>
+    internal static Func<string, bool?>? NamedStreamsOverride { get; set; }
+    private const uint FileNamedStreams = 0x00040000;
+
+    /// <summary>Whether the volume holding a path keeps named streams; true when it cannot be told.</summary>
+    internal static bool SupportsNamedStreams(string path)
+    {
+        if (NamedStreamsOverride?.Invoke(path) is { } forced) return forced;
+        var volume = new char[1024];
+        if (!GetVolumePathNameW(Path.GetFullPath(path), volume, (uint)volume.Length)) return true;
+        // Not cached: a drive letter can come back as another volume.
+        var root = new string(volume, 0, Array.IndexOf(volume, '\0'));
+        return !GetVolumeInformationW(root, null, 0, out _, out _, out var flags, null, 0) || (flags & FileNamedStreams) != 0;
+    }
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetVolumePathNameW(string fileName, [System.Runtime.InteropServices.Out] char[] volumePathName, uint bufferLength);
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetVolumeInformationW(string rootPathName, char[]? volumeName, uint volumeNameSize,
+        out uint serialNumber, out uint maximumComponentLength, out uint fileSystemFlags, char[]? fileSystemName, uint fileSystemNameSize);
 
     private static int? Zone(byte[] bytes)
     {

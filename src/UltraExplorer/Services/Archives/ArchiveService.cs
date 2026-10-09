@@ -247,7 +247,7 @@ public static class ArchiveService
         lock (ExtractionLocks.GetOrAdd(folder, static _ => new object()))
         {
             cancellation.ThrowIfCancellationRequested();
-            EnsureSafeOutput(copy);
+            EnsureSafeOutput(copy, folder);
             if (File.Exists(copy) && new FileInfo(copy).Length == item.Size)
             {
                 ArchiveZoneHelper.Propagate(outer.Path, copy);
@@ -257,7 +257,7 @@ public static class ArchiveService
             var staging = Path.Combine(folder, Guid.NewGuid().ToString("N") + ".partial");
             try
             {
-                ExtractItems(outer, [(item, staging)], cancellation, null, allowPrompt, passwordPrompt);
+                ExtractItems(outer, [(item, staging)], folder, cancellation, null, allowPrompt, passwordPrompt);
                 File.Move(staging, copy, overwrite: true);
             }
             finally
@@ -415,8 +415,10 @@ public static class ArchiveService
     /// <summary>
     /// A file inside an archive, taken out to be opened.  A program - an
     /// .exe, a script, an installer - comes out with everything in its
-    /// folder, the way it would run unpacked.  Taken out again only when the
-    /// archive has changed.
+    /// folder, the way it would run unpacked, up to 512 MiB of it.  Opened
+    /// again, the same copy is given while it is as it was taken out; one
+    /// the user has edited is never overwritten nor passed off as the
+    /// archive's - the file comes out afresh into a folder of its own.
     /// </summary>
     public static async Task<string> ExtractForOpenAsync(string path, IProgress<ArchiveProgress>? progress, CancellationToken cancellation, Func<string, string?>? passwordPrompt = null)
     {
@@ -434,43 +436,58 @@ public static class ArchiveService
             lock (ExtractionLocks.GetOrAdd(root, static _ => new object()))
             {
                 cancellation.ThrowIfCancellationRequested();
-                EnsureSafeOutput(target);
-                if (File.Exists(target) && new FileInfo(target).Length == item.Size)
+                EnsureSafeOutput(target, root);
+                if (OpenedCopies.TryGetValue(target, out var earlier) && IsUntouched(earlier))
                 {
-                    ArchiveZoneHelper.Propagate(location.Index.Path, target);
-                    return target;
+                    ArchiveZoneHelper.Propagate(location.Index.Path, earlier.Path);
+                    RecordOpened(target, earlier.Path);
+                    return earlier.Path;
                 }
 
-                var staging = root + ".partial-" + Guid.NewGuid().ToString("N");
                 var slash = location.Inner.LastIndexOf('\\');
                 var parent = slash < 0 ? string.Empty : location.Inner[..slash];
-                var work = new List<(ArchiveItem, string)>();
+                var wanted = new List<(ArchiveItem Item, string Inner)>();
                 if (NativeShellService.IsExecutable(path) || IsInstaller(path))
                 {
-                    foreach (var (inner, below) in location.Index.Below(parent))
-                        work.Add((below, Path.Combine(staging, inner)));
-                }
-                else
-                {
-                    work.Add((item, Path.Combine(staging, location.Inner)));
+                    wanted.AddRange(location.Index.Below(parent).Select(entry => (entry.Item, entry.Inner)));
+                    if (wanted.Sum(entry => entry.Item.Size) > MaximumAutomaticNestedBytes)
+                    {
+                        // A setup.exe at the top of a huge archive: just the program.
+                        wanted.Clear();
+                    }
                 }
 
+                if (wanted.Count == 0)
+                {
+                    wanted.Add((item, location.Inner));
+                }
+
+                // Anything already in the way - an edited copy, an earlier
+                // program's folder - and this one gets a folder of its own.
+                var into = wanted.Any(entry => File.Exists(Path.Combine(root, entry.Inner))
+                    || !entry.Item.IsDirectory && entry.Item.Index != uint.MaxValue && Directory.Exists(Path.Combine(root, entry.Inner)))
+                    ? root + "-" + Guid.NewGuid().ToString("N")[..8]
+                    : root;
+                var staging = into + ".partial-" + Guid.NewGuid().ToString("N");
+                var work = wanted.Select(entry => (entry.Item, Path.Combine(staging, entry.Inner))).ToList();
                 try
                 {
-                    ExtractItems(location.Index, work, cancellation, progress, passwordPrompt: prompt);
+                    ExtractItems(location.Index, work, staging, cancellation, progress, passwordPrompt: prompt);
                     foreach (var (_, staged) in work)
                     {
-                        var output = Path.Combine(root, Path.GetRelativePath(staging, staged));
-                        EnsureSafeOutput(output);
+                        var relative = Path.GetRelativePath(staging, staged);
+                        var output = Path.Combine(into, relative);
+                        EnsureSafeOutput(output, into);
                         if (Directory.Exists(staged)) Directory.CreateDirectory(output);
                         else
                         {
                             Directory.CreateDirectory(Path.GetDirectoryName(output)!);
-                            File.Move(staged, output, overwrite: true);
+                            File.Move(staged, output, overwrite: false);
+                            RecordOpened(Path.Combine(root, relative), output);
                         }
                     }
 
-                    return target;
+                    return Path.Combine(into, location.Inner);
                 }
                 finally
                 {
@@ -478,6 +495,21 @@ public static class ArchiveService
                 }
             }
         }, cancellation);
+    }
+
+    /// <summary>Each file taken out to be opened, by where it would be first put: where it is, and its size and date then.</summary>
+    private static readonly ConcurrentDictionary<string, (string Path, long Length, long WriteTicks)> OpenedCopies = new(StringComparer.OrdinalIgnoreCase);
+
+    private static void RecordOpened(string canonical, string actual)
+    {
+        var info = new FileInfo(actual);
+        OpenedCopies[canonical] = (actual, info.Length, info.LastWriteTimeUtc.Ticks);
+    }
+
+    private static bool IsUntouched((string Path, long Length, long WriteTicks) copy)
+    {
+        var info = new FileInfo(copy.Path);
+        return info.Exists && info.Length == copy.Length && info.LastWriteTimeUtc.Ticks == copy.WriteTicks;
     }
 
     private static bool IsInstaller(string path) =>
@@ -488,51 +520,62 @@ public static class ArchiveService
     /// Items inside archives copied into a folder on disk, each under its own
     /// name - made unique when the folder has one already - with everything
     /// below it.  The items can come from different archives.  Returns what
-    /// was made, one path per item.
+    /// was made, one path per item.  Everything is taken out into a hidden
+    /// folder beside first and moved into place only once complete, so a
+    /// cancelled or failed copy leaves nothing half made behind.
     /// </summary>
     public static Task<IReadOnlyList<string>> ExtractToAsync(IReadOnlyList<string> paths, string destination, IProgress<ArchiveProgress>? progress, CancellationToken cancellation, Func<string, string?>? passwordPrompt = null)
     {
         var prompt = CapturePrompt(passwordPrompt);
         return Task.Run<IReadOnlyList<string>>(() =>
         {
-            var made = new List<string>();
-            var groups = new Dictionary<ArchiveIndex, List<(ArchiveItem, string)>>(ReferenceEqualityComparer.Instance);
-            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var path in paths)
+            EnsureSafeOutput(destination, destination);
+            Directory.CreateDirectory(destination);
+            var staging = MakeStaging(destination);
+            try
             {
-                if (!TryLocate(path, out var location, cancellation, acceptedOperation: true, passwordPrompt: prompt))
+                var tops = new List<(string Staged, string Name)>();
+                var groups = new Dictionary<ArchiveIndex, List<(ArchiveItem, string)>>(ReferenceEqualityComparer.Instance);
+                foreach (var path in paths)
                 {
-                    throw new FileNotFoundException("Not inside an archive.", path);
+                    if (!TryLocate(path, out var location, cancellation, acceptedOperation: true, passwordPrompt: prompt))
+                    {
+                        throw new FileNotFoundException("Not inside an archive.", path);
+                    }
+
+                    var name = location.Inner.Length == 0 ? StemOf(location.ArchivePath) : Path.GetFileName(location.Inner);
+                    var top = Path.Combine(staging, tops.Count.ToString(System.Globalization.CultureInfo.InvariantCulture), name);
+                    tops.Add((top, name));
+                    if (!groups.TryGetValue(location.Index, out var work))
+                    {
+                        groups[location.Index] = work = [];
+                    }
+
+                    var cut = location.Inner.Length == 0 ? 0 : location.Inner.Length + 1;
+                    foreach (var (inner, item) in location.Index.Below(location.Inner))
+                    {
+                        var rest = inner.Length > cut ? inner[cut..] : string.Empty;
+                        work.Add((item, rest.Length == 0 && location.Inner.Length > 0 ? top : Path.Combine(top, rest)));
+                    }
+
+                    if (location.Inner.Length == 0)
+                    {
+                        Directory.CreateDirectory(top);
+                    }
                 }
 
-                var name = location.Inner.Length == 0 ? StemOf(location.ArchivePath) : Path.GetFileName(location.Inner);
-                var top = UniquePath(destination, name, taken);
-                made.Add(top);
-                if (!groups.TryGetValue(location.Index, out var work))
+                var total = new ProgressSum(progress, groups.Values.Sum(work => work.Sum(entry => entry.Item1.Size)));
+                foreach (var (index, work) in groups)
                 {
-                    groups[location.Index] = work = [];
+                    ExtractItems(index, work, staging, cancellation, total, passwordPrompt: prompt);
                 }
 
-                var cut = location.Inner.Length == 0 ? 0 : location.Inner.Length + 1;
-                foreach (var (inner, item) in location.Index.Below(location.Inner))
-                {
-                    var rest = inner.Length > cut ? inner[cut..] : string.Empty;
-                    work.Add((item, rest.Length == 0 && location.Inner.Length > 0 ? top : Path.Combine(top, rest)));
-                }
-
-                if (location.Inner.Length == 0)
-                {
-                    Directory.CreateDirectory(top);
-                }
+                return tops.Select(top => Publish(top.Staged, destination, top.Name)).ToList();
             }
-
-            var total = new ProgressSum(progress, groups.Values.Sum(work => work.Sum(entry => entry.Item1.Size)));
-            foreach (var (index, work) in groups)
+            finally
             {
-                ExtractItems(index, work, cancellation, total, passwordPrompt: prompt);
+                DiscardStaging(staging);
             }
-
-            return made;
         }, cancellation);
     }
 
@@ -559,30 +602,40 @@ public static class ArchiveService
                 : throw new InvalidOperationException("No folder to unpack into.");
             var top = index.List(string.Empty);
             var single = top.Folders.Count + top.Files.Count == 1 && top.FileCount == top.Files.Count;
-            var work = new List<(ArchiveItem, string)>();
-            string result;
-            if (single && !alwaysOwnFolder)
+            EnsureSafeOutput(destination, destination);
+            var staging = MakeStaging(destination);
+            try
             {
-                var name = top.Folders.Count == 1 ? top.Folders[0].Name : top.Files[0].Name;
-                result = UniquePath(destination, name, null);
-                var cut = name.Length + 1;
-                foreach (var (inner, item) in index.Below(name))
+                var work = new List<(ArchiveItem, string)>();
+                string name, staged;
+                if (single && !alwaysOwnFolder)
                 {
-                    work.Add((item, inner.Length > cut ? Path.Combine(result, inner[cut..]) : result));
+                    name = top.Folders.Count == 1 ? top.Folders[0].Name : top.Files[0].Name;
+                    staged = Path.Combine(staging, name);
+                    var cut = name.Length + 1;
+                    foreach (var (inner, item) in index.Below(name))
+                    {
+                        work.Add((item, inner.Length > cut ? Path.Combine(staged, inner[cut..]) : staged));
+                    }
                 }
-            }
-            else
-            {
-                result = UniquePath(destination, StemOf(archivePath), null);
-                Directory.CreateDirectory(result);
-                foreach (var (inner, item) in index.Below(string.Empty))
+                else
                 {
-                    work.Add((item, Path.Combine(result, inner)));
+                    name = StemOf(archivePath);
+                    staged = Path.Combine(staging, name);
+                    Directory.CreateDirectory(staged);
+                    foreach (var (inner, item) in index.Below(string.Empty))
+                    {
+                        work.Add((item, Path.Combine(staged, inner)));
+                    }
                 }
-            }
 
-            ExtractItems(index, work, cancellation, new ProgressSum(progress, work.Sum(entry => entry.Item1.Size)), passwordPrompt: prompt);
-            return result;
+                ExtractItems(index, work, staging, cancellation, new ProgressSum(progress, work.Sum(entry => entry.Item1.Size)), passwordPrompt: prompt);
+                return Publish(staged, destination, name);
+            }
+            finally
+            {
+                DiscardStaging(staging);
+            }
         }, cancellation);
     }
 
@@ -603,7 +656,7 @@ public static class ArchiveService
     /// and its share of the bytes - the biggest files dealt out first, so the
     /// threads finish together.
     /// </summary>
-    private static void ExtractItems(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> work, CancellationToken cancellation, IProgress<ArchiveProgress>? progress, bool allowPrompt = true, Func<string, string?>? passwordPrompt = null)
+    private static void ExtractItems(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> work, string root, CancellationToken cancellation, IProgress<ArchiveProgress>? progress, bool allowPrompt = true, Func<string, string?>? passwordPrompt = null)
     {
         var files = new List<(ArchiveItem Item, string Output)>(work.Count);
         var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -611,7 +664,7 @@ public static class ArchiveService
         foreach (var (item, output) in work)
         {
             cancellation.ThrowIfCancellationRequested();
-            EnsureSafeOutput(output);
+            EnsureSafeOutput(output, root);
             if (!outputNames.Add(output))
                 throw new InvalidDataException("Archive entries have conflicting output names. Extract them individually to preserve both files.");
             if (item.IsDirectory || item.Index == uint.MaxValue)
@@ -643,7 +696,7 @@ public static class ArchiveService
         var threads = index.IsSolid ? 1 : Math.Min(Math.Min(Environment.ProcessorCount, 8), Math.Max(1, (int)Math.Min(files.Count / 4, bytes / (8L << 20))));
         if (threads <= 1)
         {
-            RunExtract(index, files, cancellation, sum, allowPrompt, passwordPrompt);
+            RunExtract(index, files, root, cancellation, sum, allowPrompt, passwordPrompt);
             return;
         }
 
@@ -662,7 +715,7 @@ public static class ArchiveService
         {
             try
             {
-                RunExtract(index, share, stop.Token, sum, allowPrompt, passwordPrompt);
+                RunExtract(index, share, root, stop.Token, sum, allowPrompt, passwordPrompt);
             }
             catch (Exception ex)
             {
@@ -679,7 +732,7 @@ public static class ArchiveService
     }
 
     /// <summary>One handle on the archive, one call to 7-Zip for every file of a share - in the archive's own order, which is the fast one.</summary>
-    private static void RunExtract(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> files, CancellationToken cancellation, ProgressSum progress, bool allowPrompt, Func<string, string?>? passwordPrompt)
+    private static void RunExtract(ArchiveIndex index, IReadOnlyList<(ArchiveItem Item, string Output)> files, string root, CancellationToken cancellation, ProgressSum progress, bool allowPrompt, Func<string, string?>? passwordPrompt)
     {
         for (var attempt = 0; ; attempt++)
         {
@@ -692,12 +745,12 @@ public static class ArchiveService
                 if (!targets.TryAdd(item.Index, (output, item.ModifiedTicks, item.Size)))
                 {
                     // Parent+child or duplicate selections can request the same archive entry at multiple destinations.
-                    RunExtract(index, [(item, output)], cancellation, progress, allowPrompt, passwordPrompt);
+                    RunExtract(index, [(item, output)], root, cancellation, progress, allowPrompt, passwordPrompt);
                 }
             }
 
             var indices = targets.Keys.Order().ToArray();
-            var callback = new ExtractCallback(targets, () => PasswordFor(archiveFile, allowPrompt, passwordPrompt), progress, cancellation, zone);
+            var callback = new ExtractCallback(targets, () => PasswordFor(archiveFile, allowPrompt, passwordPrompt), progress, cancellation, zone, root);
             int result;
             try
             {
@@ -781,24 +834,66 @@ public static class ArchiveService
         return name;
     }
 
-    /// <summary><paramref name="name"/> in <paramref name="folder"/>, or "name (2)" and on when that is taken - on disk or by an earlier item of the same copy.</summary>
-    private static string UniquePath(string folder, string name, HashSet<string>? taken)
+    /// <summary>
+    /// A finished item moved from staging into <paramref name="folder"/> as
+    /// <paramref name="name"/>, or "name (2)" and on when that is taken.  The
+    /// rename itself claims the name - it fails rather than replace - so two
+    /// extractions at once never end up in the same one.
+    /// </summary>
+    private static string Publish(string staged, string folder, string name)
     {
-        var path = Path.Combine(folder, name);
         var stem = Path.GetFileNameWithoutExtension(name);
         var extension = Path.GetExtension(name);
-        for (var number = 2; File.Exists(path) || Directory.Exists(path) || taken is not null && taken.Contains(path); number++)
+        for (var number = 1; ; number++)
         {
-            path = Path.Combine(folder, $"{stem} ({number}){extension}");
-        }
+            var path = Path.Combine(folder, number == 1 ? name : $"{stem} ({number}){extension}");
+            if (File.Exists(path) || Directory.Exists(path))
+            {
+                continue;
+            }
 
-        taken?.Add(path);
-        return path;
+            try
+            {
+                if (Directory.Exists(staged)) Directory.Move(staged, path);
+                else File.Move(staged, path, overwrite: false);
+                return path;
+            }
+            catch (IOException) when (File.Exists(path) || Directory.Exists(path))
+            {
+                // Taken between the look and the move: the next number.
+            }
+        }
     }
 
-    /// <summary>Never follow a pre-existing file, junction or symbolic-link output to another location.</summary>
-    internal static void EnsureSafeOutput(string output)
+    /// <summary>A hidden folder in <paramref name="destination"/> for an extraction to fill before anything is moved into view.</summary>
+    private static string MakeStaging(string destination)
     {
+        var staging = Directory.CreateDirectory(Path.Combine(destination, ".ultraexplorer-" + Guid.NewGuid().ToString("N")[..12] + ".partial"));
+        staging.Attributes |= FileAttributes.Hidden;
+        return staging.FullName;
+    }
+
+    private static void DiscardStaging(string staging)
+    {
+        try
+        {
+            if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Never follow a pre-existing file, junction or symbolic-link output to
+    /// another location - from the output up to <paramref name="root"/>, the
+    /// folder the extraction was pointed at, itself included.  What is above
+    /// it is the user's (D:\Work linked to E:\Work, a TEMP behind a junction)
+    /// and followed as any program would.
+    /// </summary>
+    internal static void EnsureSafeOutput(string output, string root)
+    {
+        var stop = Path.GetFullPath(root).TrimEnd('\\');
         for (var current = Path.GetFullPath(output); !string.IsNullOrEmpty(current); current = Path.GetDirectoryName(current))
         {
             try
@@ -816,6 +911,11 @@ public static class ArchiveService
             }
             catch (FileNotFoundException) { }
             catch (DirectoryNotFoundException) { }
+
+            if (current.TrimEnd('\\').Equals(stop, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
         }
     }
 
@@ -892,7 +992,8 @@ internal sealed class ExtractCallback(
     Func<string?> password,
     ArchiveService.ProgressSum progress,
     CancellationToken cancellation,
-    ArchiveZoneHelper? zone = null) : IArchiveExtractCallback, ICryptoGetTextPassword
+    ArchiveZoneHelper? zone = null,
+    string? root = null) : IArchiveExtractCallback, ICryptoGetTextPassword
 {
     private FileStream? _current;
     private (string Output, long Ticks, long Size) _target;
@@ -908,6 +1009,9 @@ internal sealed class ExtractCallback(
     public bool PasswordRefused { get; private set; }
 
     public int SetTotal(ulong total) => HResult.Ok;
+
+    /// <summary>The folder the extraction owns from, for the link check; without one, the file's own folder.</summary>
+    private string RootOf(string output) => root ?? Path.GetDirectoryName(output) ?? output;
 
     public unsafe int SetCompleted(IntPtr completeValue)
     {
@@ -935,7 +1039,7 @@ internal sealed class ExtractCallback(
         try
         {
             if (cancellation.IsCancellationRequested) return HResult.Abort;
-            ArchiveService.EnsureSafeOutput(target.Output);
+            ArchiveService.EnsureSafeOutput(target.Output, RootOf(target.Output));
             var stream = new FileStream(target.Output, FileMode.Create, FileAccess.Write, FileShare.Read, 1 << 20, FileOptions.SequentialScan);
             _current = stream;
             _target = target;
@@ -1047,9 +1151,9 @@ internal sealed class ExtractCallback(
         {
             try
             {
-                ArchiveService.EnsureSafeOutput(_target.Output);
-                // Callback targets are fresh UniquePath outputs or private
-                // staging files. Only these failed outputs may be removed.
+                ArchiveService.EnsureSafeOutput(_target.Output, RootOf(_target.Output));
+                // Callback targets are fresh files in private staging
+                // folders. Only these failed outputs may be removed.
                 var attributes = File.GetAttributes(_target.Output);
                 if ((attributes & FileAttributes.ReadOnly) != 0)
                     File.SetAttributes(_target.Output, attributes & ~FileAttributes.ReadOnly);
