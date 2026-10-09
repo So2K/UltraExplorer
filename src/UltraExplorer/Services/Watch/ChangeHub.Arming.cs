@@ -123,9 +123,16 @@ public sealed partial class ChangeHub
         var started = Stopwatch.GetTimestamp();
         DirectoryChangeWatcher? watcher = null;
         var error = ArmFailureForTests?.Invoke(root) ?? 0;
+
+        // Records of its own for every watch opened: an arm found stale below
+        // has its watch running - and parsing on its own thread - until it is
+        // stopped, and with the root's one records shared with its current
+        // watch, the two wrote the same scratch buffers and half-seen rename
+        // at once.  Counted on the root's, as before.
+        var records = new RootRecords(this, root, root.Records);
         if (error == 0)
         {
-            error = DirectoryChangeWatcher.Open(root.WatchedPath, BufferFor(root), allowDetails: !root.IsNetwork, root.Records!, out watcher);
+            error = DirectoryChangeWatcher.Open(root.WatchedPath, BufferFor(root), allowDetails: !root.IsNetwork, records, out watcher);
             if (error == 0)
             {
                 OpenedForTests?.Invoke(watcher!);

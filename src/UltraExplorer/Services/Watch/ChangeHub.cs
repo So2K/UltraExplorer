@@ -601,6 +601,7 @@ public sealed partial class ChangeHub : IDisposable
         }
 
         WatchRoot root;
+        List<ChangeRegistry.RootMove>? moves = null;
         lock (_rootsGate)
         {
             if (_letters[index] is { IsDropped: false } raced)
@@ -608,17 +609,18 @@ public sealed partial class ChangeHub : IDisposable
                 return raced;
             }
 
+            WatchAlias? alias = null;
             if (target is not null && inner is not null)
             {
                 root = target;
-                root.AddAlias(new WatchAlias(spelling, inner));
+                alias = new WatchAlias(spelling, inner);
             }
             else if (found.DriveType == WatchNative.DriveRemote)
             {
                 if (found.Share is { } share && share.StartsWith(@"\\", StringComparison.Ordinal))
                 {
                     root = _rootLookup.TryGetValue(share, out var known2) ? known2 : AddRootLocked(share, WatchKind.Network, isNetwork: true);
-                    root.AddAlias(new WatchAlias(spelling, string.Empty));
+                    alias = new WatchAlias(spelling, string.Empty);
                 }
                 else
                 {
@@ -634,7 +636,38 @@ public sealed partial class ChangeHub : IDisposable
                 root = ReuseOrAddLocked(spelling, WatchKind.Local, isNetwork: false);
             }
 
+            // The letter was another root's spelling before - subst'ed or
+            // mapped elsewhere, and the volumes looked at again since - or
+            // this root's for another folder: the spelling, and the paths
+            // registered with it, leave the root it no longer stands for.
+            List<WatchRoot>? losers = null;
+            foreach (var other in _rootList)
+            {
+                if (other.AliasOf(spelling) is { } old
+                    && (!ReferenceEquals(other, root) || alias is null || !old.Inner.Equals(alias.Inner, StringComparison.OrdinalIgnoreCase)))
+                {
+                    (losers ??= []).Add(other);
+                }
+            }
+
+            if (losers is not null)
+            {
+                moves = Registry.MoveSpelling(spelling, root, alias, losers);
+            }
+            else if (alias is not null)
+            {
+                root.AddAlias(alias);
+            }
+
             _letters[index] = root;
+        }
+
+        if (moves is not null)
+        {
+            foreach (var moved in moves)
+            {
+                MoveInterest(moved);
+            }
         }
 
         // Before it arms, so that the bump arming makes reaches what it takes in.
