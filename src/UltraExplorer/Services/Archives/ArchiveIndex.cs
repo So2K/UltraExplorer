@@ -159,6 +159,7 @@ internal sealed class ArchiveIndex
         var items = new Dictionary<string, ArchiveItem>((int)Math.Min(count, 1_000_000), StringComparer.Ordinal);
         var folders = new Dictionary<string, Folder>(StringComparer.Ordinal) { [string.Empty] = new Folder() };
         var fallbackName = System.IO.Path.GetFileNameWithoutExtension(path);
+        var innerOfRaw = new Dictionary<string, string>(StringComparer.Ordinal);
         for (uint index = 0; index < count; index++)
         {
             if ((index & 1023) == 0)
@@ -171,7 +172,8 @@ internal sealed class ArchiveIndex
                 continue;
             }
 
-            var inner = Clean(Property.String(archive, index, PropId.Path));
+            var raw = Property.String(archive, index, PropId.Path).Replace('/', '\\');
+            var inner = Clean(raw);
             if (inner.Length == 0)
             {
                 // A gzip, an xz: one stream with no name of its own.
@@ -192,6 +194,18 @@ internal sealed class ArchiveIndex
                 Property.FileTimeTicks(archive, index, PropId.MTime),
                 (attributes & (FileAttributes.Hidden | FileAttributes.System)) != 0 && (int)attributes != -1);
 
+            if (innerOfRaw.TryGetValue(raw, out var same))
+            {
+                inner = same;
+            }
+            else if (!isDirectory && items.ContainsKey(inner))
+            {
+                // Two different names made one by cleaning - "report." and
+                // "report", "a:b.txt" and "a_b.txt": both kept, the later one
+                // numbered, rather than one silently lost.
+                inner = Numbered(items, inner);
+            }
+
             if (items.TryGetValue(inner, out var earlier))
             {
                 // The same name twice - a tar appended to, a folder listed
@@ -207,6 +221,7 @@ internal sealed class ArchiveIndex
                 continue;
             }
 
+            innerOfRaw[raw] = inner;
             items[inner] = item;
             AddToParent(folders, items, inner, item);
             if (isDirectory)
@@ -236,6 +251,24 @@ internal sealed class ArchiveIndex
         }
 
         folder.Children.Add((slash < 0 ? inner : inner[(slash + 1)..], item));
+    }
+
+    /// <summary>"name (2).ext", "name (3).ext" and on: the first no other entry has.</summary>
+    private static string Numbered(Dictionary<string, ArchiveItem> items, string inner)
+    {
+        var slash = inner.LastIndexOf('\\');
+        var folder = slash < 0 ? string.Empty : inner[..(slash + 1)];
+        var name = slash < 0 ? inner : inner[(slash + 1)..];
+        var stem = System.IO.Path.GetFileNameWithoutExtension(name);
+        var extension = System.IO.Path.GetExtension(name);
+        for (var number = 2; ; number++)
+        {
+            var candidate = $"{folder}{stem} ({number}){extension}";
+            if (!items.ContainsKey(candidate))
+            {
+                return candidate;
+            }
+        }
     }
 
     private static void ReplaceChild(Dictionary<string, Folder> folders, string inner, ArchiveItem item)
@@ -288,10 +321,30 @@ internal sealed class ArchiveIndex
                 }
             }
 
+            if (IsReservedDevice(name))
+            {
+                // CON, NUL, COM1.txt and the like open a device, not a file: renamed as 7-Zip does.
+                name = "_" + name;
+            }
+
             kept.Add(name);
         }
 
         return string.Join('\\', kept);
+    }
+
+    private static bool IsReservedDevice(string name)
+    {
+        var dot = name.IndexOf('.');
+        var stem = (dot < 0 ? name : name[..dot]).TrimEnd(' ');
+        return stem.Length switch
+        {
+            3 => stem.Equals("CON", StringComparison.OrdinalIgnoreCase) || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
+                || stem.Equals("AUX", StringComparison.OrdinalIgnoreCase) || stem.Equals("NUL", StringComparison.OrdinalIgnoreCase),
+            4 => stem[3] is >= '1' and <= '9'
+                && (stem.StartsWith("COM", StringComparison.OrdinalIgnoreCase) || stem.StartsWith("LPT", StringComparison.OrdinalIgnoreCase)),
+            _ => false
+        };
     }
 }
 
