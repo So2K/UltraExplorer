@@ -407,6 +407,14 @@ public partial class MainWindow : Window
                 try { await transfer; }
                 catch (Exception) { /* The drop handler reports the transfer error; still save the window. */ }
             }
+            // "Extract here" and the like write on a pool thread the process
+            // does not wait for; closing mid-way would cut a file short.
+            if (_viewModel.ArchiveWritesPending)
+            {
+                _viewModel.Toast.ShowBusy("Closing once the extraction in progress has finished…");
+                try { await _viewModel.ArchiveWritesAsync(); }
+                catch (Exception) { /* The extraction reports its own error. */ }
+            }
             try
             {
                 CaptureStateForSave();

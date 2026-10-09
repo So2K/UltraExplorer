@@ -13,6 +13,24 @@ namespace UltraExplorer.ViewModels;
 /// </summary>
 public sealed partial class MainViewModel
 {
+    private readonly List<Task> _archiveWrites = [];
+
+    /// <summary>
+    /// Extractions into folders on disk still writing. They run on a pool
+    /// thread, which the process does not wait for: closing the last window
+    /// mid-way would leave a file cut short, so Close waits for these.
+    /// </summary>
+    internal Task ArchiveWritesAsync() => Task.WhenAll(_archiveWrites.ToArray());
+
+    internal bool ArchiveWritesPending => _archiveWrites.Count > 0;
+
+    private async Task<T> TrackArchiveWrite<T>(Task<T> work)
+    {
+        _archiveWrites.Add(work);
+        try { return await work; }
+        finally { _archiveWrites.Remove(work); }
+    }
+
     /// <summary>
     /// True - and says why - when any of the paths is inside an archive, for
     /// what cannot be done there: rename, delete, cut, make something new.
@@ -72,7 +90,7 @@ public sealed partial class MainViewModel
         try
         {
             var watch = Stopwatch.StartNew();
-            var made = await ArchiveService.ExtractToAsync(paths, targetDirectory, ArchiveProgressFor("Extracting"), CancellationToken.None, AskArchivePassword);
+            var made = await TrackArchiveWrite(ArchiveService.ExtractToAsync(paths, targetDirectory, ArchiveProgressFor("Extracting"), CancellationToken.None, AskArchivePassword));
             if (_isDisposed) return true;
             await Tree.RefreshPathAsync(targetDirectory);
             var name = Path.GetFileName(targetDirectory.TrimEnd(Path.DirectorySeparatorChar));
@@ -100,8 +118,8 @@ public sealed partial class MainViewModel
         {
             try
             {
-                made.Add(await ArchiveService.ExtractArchiveAsync(
-                    archive, destination, ownFolder, ArchiveProgressFor($"Extracting {Path.GetFileName(archive)}"), CancellationToken.None, AskArchivePassword));
+                made.Add(await TrackArchiveWrite(ArchiveService.ExtractArchiveAsync(
+                    archive, destination, ownFolder, ArchiveProgressFor($"Extracting {Path.GetFileName(archive)}"), CancellationToken.None, AskArchivePassword)));
             }
             catch (Exception ex) when (IsArchiveFailure(ex))
             {
