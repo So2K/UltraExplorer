@@ -679,7 +679,11 @@ public sealed class FolderMarkService
             catch (AbandonedMutexException) { entered = true; }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException) { }
 
-            var marks = ReadForMerge();
+            if (ReadForMerge() is not { } marks)
+            {
+                return false;
+            }
+
             foreach (var (key, halves) in changes)
             {
                 Apply(marks, key, halves);
@@ -701,34 +705,47 @@ public sealed class FolderMarkService
     /// <summary>
     /// The marks the file holds now, for this copy's changes to go over.  A
     /// file that is not there holds none.  One that cannot be understood is
-    /// set aside, as at the start (see <see cref="LoadAsync"/>), and one that
-    /// cannot be read leaves what this copy has: its own marks, which is all
-    /// a save ever wrote before.
+    /// set aside, as at the start (see <see cref="LoadAsync"/>), and leaves
+    /// this copy's own marks to write.  One that cannot be read - held a
+    /// moment by a virus scanner or a backup - is tried again briefly, and
+    /// then null: this copy's marks may be older than the file's, and
+    /// written over it they would erase marks another copy saved.  The save
+    /// is left to the next one instead.
     /// </summary>
-    private Dictionary<string, FolderMark> ReadForMerge()
+    private Dictionary<string, FolderMark>? ReadForMerge()
     {
-        try
+        for (var attempt = 0; ; attempt++)
         {
-            if (!File.Exists(StatePath))
+            try
             {
-                return new Dictionary<string, FolderMark>(StringComparer.OrdinalIgnoreCase);
-            }
+                if (!File.Exists(StatePath))
+                {
+                    return new Dictionary<string, FolderMark>(StringComparer.OrdinalIgnoreCase);
+                }
 
-            using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 16 * 1024);
-            if (JsonSerializer.Deserialize<Dictionary<string, FolderMark>>(stream, JsonOptions) is { } stored)
+                using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 16 * 1024);
+                return JsonSerializer.Deserialize<Dictionary<string, FolderMark>>(stream, JsonOptions) is { } stored
+                    ? Complete(stored)
+                    : OwnMarks();
+            }
+            catch (JsonException)
             {
-                return Complete(stored);
+                StateFiles.Quarantine(StatePath);
+                return OwnMarks();
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                if (attempt >= 3)
+                {
+                    return null;
+                }
+
+                Thread.Sleep(50 * (attempt + 1));
             }
         }
-        catch (JsonException)
-        {
-            StateFiles.Quarantine(StatePath);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
-        {
-        }
 
-        return _marks.Where(pair => !pair.Value.IsEmpty).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, FolderMark> OwnMarks() =>
+            _marks.Where(pair => !pair.Value.IsEmpty).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase);
     }
 
     private bool Write(Dictionary<string, FolderMark> marks)
