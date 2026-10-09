@@ -1221,7 +1221,19 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             return false;
         }
 
-        return paths.All(path => NativeShellService.IsSameVolume(path, targetDirectory));
+        // Asked on every new folder a drag comes to, for every item dragged:
+        // items of one folder share its volume, so each folder is asked once
+        // and fifty thousand items of one folder cost one question.
+        var asked = string.Empty;
+        foreach (var path in paths)
+        {
+            var folder = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(path.AsSpan()));
+            if (asked.Length > 0 && folder.Equals(asked, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!NativeShellService.IsSameVolume(path, targetDirectory)) return false;
+            asked = folder.ToString();
+        }
+
+        return true;
     }
 
     internal async Task RefreshPickerNavigationPreferencesAsync()
