@@ -34,9 +34,27 @@ public sealed class ShelfStore
         NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowNamedFloatingPointLiterals
     };
 
+    /// <summary>Every shelf open in this process, for one window's save to reach the others' cards.</summary>
+    private static readonly List<WeakReference<ShelfStore>> Open = [];
+
     private readonly object _gate = new();
     private readonly NativeShellService _shell = new();
+
+    /// <summary>The file's turn among every window and copy of the app: the same name for the same shelf.</summary>
+    private readonly string _turnName;
+
     private List<ShelfEntry> _entries = [];
+
+    /// <summary>
+    /// This window's changes not yet written.  Each window has a shelf of its
+    /// own over the same file, so a save never writes back the list as this
+    /// window read it - that would drop what another window put on the shelf
+    /// since, or bring back what it took off.  The file is read again in its
+    /// turn and these changes are replayed over it.  A save that could not
+    /// read or write the file keeps them for the next.
+    /// </summary>
+    private readonly List<Action<List<ShelfEntry>>> _pending = [];
+    private double? _pendingWidth;
 
     public ShelfStore() : this(System.IO.Path.Combine(AppPaths.StateDirectory, "Shelf")) { }
 
@@ -44,7 +62,14 @@ public sealed class ShelfStore
     internal ShelfStore(string root)
     {
         Root = System.IO.Path.GetFullPath(root);
-        Load();
+        _turnName = @"Local\UltraExplorer.Shelf." + Convert.ToHexString(
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(Root.ToUpperInvariant())));
+        Sync(write: false);
+        lock (Open)
+        {
+            Open.RemoveAll(reference => !reference.TryGetTarget(out _));
+            Open.Add(new WeakReference<ShelfStore>(this));
+        }
     }
 
     /// <summary>The shelf's own folder: its list, and the copies it keeps.</summary>
@@ -132,10 +157,10 @@ public sealed class ShelfStore
                     entry = entry with { Path = copy, IsCopy = true };
                 }
 
-                lock (_gate)
+                Change(list =>
                 {
-                    _entries.Add(entry);
-                }
+                    if (!list.Any(other => string.Equals(other.Path, entry.Path, StringComparison.OrdinalIgnoreCase))) list.Add(entry);
+                });
 
                 placed.Add(entry.Path);
                 added++;
@@ -157,32 +182,31 @@ public sealed class ShelfStore
         }
     }
 
-    private void Replace(ShelfEntry old, ShelfEntry now)
+    /// <summary>Applies a change to this window's list now, and to the file's at the next save.</summary>
+    private void Change(Action<List<ShelfEntry>> change)
     {
         lock (_gate)
         {
-            var at = _entries.IndexOf(old);
-            if (at >= 0)
-            {
-                _entries[at] = now;
-            }
+            change(_entries);
+            _pending.Add(change);
         }
     }
 
     /// <summary>Cards moved on the board: their places kept.</summary>
     public void SetPositions(IEnumerable<(string Path, double X, double Y)> places)
     {
-        lock (_gate)
+        var moved = places.ToList();
+        Change(list =>
         {
-            foreach (var (path, x, y) in places)
+            foreach (var (path, x, y) in moved)
             {
-                var at = _entries.FindIndex(entry => string.Equals(entry.Path, path, StringComparison.OrdinalIgnoreCase));
+                var at = list.FindIndex(entry => string.Equals(entry.Path, path, StringComparison.OrdinalIgnoreCase));
                 if (at >= 0)
                 {
-                    _entries[at] = _entries[at] with { X = x, Y = y };
+                    list[at] = list[at] with { X = x, Y = y };
                 }
             }
-        }
+        });
 
         Save();
     }
@@ -190,7 +214,12 @@ public sealed class ShelfStore
     /// <summary>The shelf pulled wider or narrower.</summary>
     public void SetWidth(double width)
     {
-        Width = double.IsFinite(width) ? Math.Clamp(width, 300, 4000) : 520;
+        lock (_gate)
+        {
+            Width = double.IsFinite(width) ? Math.Clamp(width, 300, 4000) : 520;
+            _pendingWidth = Width;
+        }
+
         Save();
     }
 
@@ -202,7 +231,7 @@ public sealed class ShelfStore
         lock (_gate)
         {
             removed = _entries.Where(entry => wanted.Contains(entry.Path)).ToList();
-            _entries = _entries.Except(removed).ToList();
+            if (removed.Count > 0) Change(list => list.RemoveAll(entry => wanted.Contains(entry.Path)));
         }
 
         if (removed.Count == 0)
@@ -220,8 +249,8 @@ public sealed class ShelfStore
         List<ShelfEntry> all;
         lock (_gate)
         {
-            all = _entries;
-            _entries = [];
+            all = [.. _entries];
+            Change(list => list.Clear());
         }
 
         DeleteCopies(all);
@@ -244,11 +273,12 @@ public sealed class ShelfStore
         var gone = snapshot.Where(entry => now - entry.AddedUtc > KeepFor || DefinitelyMissing(entry.Path)).ToList();
         if (gone.Count == 0) return false;
         var candidates = gone.ToDictionary(entry => entry.Path, StringComparer.OrdinalIgnoreCase);
+        bool Expired(ShelfEntry entry) => candidates.TryGetValue(entry.Path, out var candidate)
+            && entry.AddedUtc == candidate.AddedUtc && entry.IsCopy == candidate.IsCopy;
         lock (_gate)
         {
-            gone = _entries.Where(entry => candidates.TryGetValue(entry.Path, out var candidate)
-                && entry.AddedUtc == candidate.AddedUtc && entry.IsCopy == candidate.IsCopy).ToList();
-            _entries = _entries.Except(gone).ToList();
+            gone = _entries.Where(Expired).ToList();
+            if (gone.Count > 0) Change(list => list.RemoveAll(Expired));
         }
         if (gone.Count == 0) return false;
 
@@ -284,47 +314,170 @@ public sealed class ShelfStore
         public List<ShelfEntry> Entries { get; set; } = [];
     }
 
-    private void Load()
+    /// <summary>
+    /// Reads the file in its turn and lays this window's pending changes over
+    /// it; with <paramref name="write"/>, writes the result back.  True when
+    /// it was written.  A file that cannot be read now is never written over:
+    /// the list as this window has it could be empty or old.
+    /// </summary>
+    private bool Sync(bool write)
     {
-        try
+        var dropped = new List<ShelfEntry>();
+        var foreign = false;
+        lock (_gate)
         {
-            if (File.Exists(ListPath))
+            Mutex? turn = null;
+            var entered = false;
+            try
             {
-                var text = File.ReadAllText(ListPath);
-                if (text.TrimStart().StartsWith('['))
+                // A copy that hangs in its turn is not waited for long; the
+                // read, merge and write still go over the file as it is now.
+                try
                 {
-                    _entries = JsonSerializer.Deserialize<List<ShelfEntry>>(text, JsonOptions) ?? [];
+                    turn = new Mutex(false, _turnName);
+                    entered = turn.WaitOne(TimeSpan.FromSeconds(3));
                 }
-                else if (JsonSerializer.Deserialize<Saved>(text, JsonOptions) is { } saved)
+                catch (AbandonedMutexException) { entered = true; }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or WaitHandleCannotBeOpenedException) { }
+
+                if (!TryRead(out var stored, out var width))
                 {
-                    _entries = saved.Entries ?? [];
-                    Width = double.IsFinite(saved.Width) ? Math.Clamp(saved.Width, 300, 4000) : 520;
+                    return false;
                 }
+
+                var merged = new List<ShelfEntry>(stored);
+                foreach (var change in _pending)
+                {
+                    change(merged);
+                }
+
+                width = _pendingWidth ?? width;
+                if (write)
+                {
+                    if (!Write(merged, width))
+                    {
+                        return false;
+                    }
+
+                    _pending.Clear();
+                    _pendingWidth = null;
+
+                    // What this window's changes took off - a card another
+                    // window put there too - goes with its copy.
+                    dropped = stored.Where(entry => entry.IsCopy
+                        && !merged.Any(kept => string.Equals(kept.Path, entry.Path, StringComparison.OrdinalIgnoreCase))).ToList();
+                }
+
+                Width = width;
+                foreign = !merged.SequenceEqual(_entries);
+                _entries = merged;
+            }
+            finally
+            {
+                if (entered)
+                {
+                    turn!.ReleaseMutex();
+                }
+
+                turn?.Dispose();
             }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+
+        DeleteCopies(dropped);
+        if (foreign)
         {
-            _entries = [];
+            // Another window's or copy's changes: the cards follow.
+            Changed?.Invoke();
         }
 
-        _entries = _entries.Where(entry => entry is not null && !string.IsNullOrWhiteSpace(entry.Path))
-            .DistinctBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase).ToList();
+        return write;
     }
 
-    private void Save()
+    private bool TryRead(out List<ShelfEntry> entries, out double width)
     {
-        lock (_gate)
+        entries = [];
+        width = Width;
+        for (var attempt = 0; ; attempt++)
         {
             try
             {
-                Directory.CreateDirectory(Root);
-                var temporary = ListPath + ".tmp";
-                File.WriteAllText(temporary, JsonSerializer.Serialize(new Saved { Width = Width, Entries = [.. _entries] }, JsonOptions));
-                File.Move(temporary, ListPath, overwrite: true);
+                if (File.Exists(ListPath))
+                {
+                    var text = File.ReadAllText(ListPath);
+                    if (text.TrimStart().StartsWith('['))
+                    {
+                        entries = JsonSerializer.Deserialize<List<ShelfEntry>>(text, JsonOptions) ?? [];
+                    }
+                    else if (JsonSerializer.Deserialize<Saved>(text, JsonOptions) is { } saved)
+                    {
+                        entries = saved.Entries ?? [];
+                        width = double.IsFinite(saved.Width) ? Math.Clamp(saved.Width, 300, 4000) : 520;
+                    }
+                }
+
+                break;
+            }
+            catch (JsonException)
+            {
+                // Not to be understood: set aside, and the shelf starts over.
+                StateFiles.Quarantine(ListPath);
+                entries = [];
+                break;
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
+                // Held a moment by a scanner or a backup: tried again briefly.
+                if (attempt >= 2)
+                {
+                    return false;
+                }
+
+                Thread.Sleep(40 * (attempt + 1));
             }
+        }
+
+        entries = entries.Where(entry => entry is not null && !string.IsNullOrWhiteSpace(entry.Path))
+            .DistinctBy(entry => entry.Path, StringComparer.OrdinalIgnoreCase).ToList();
+        return true;
+    }
+
+    private bool Write(List<ShelfEntry> entries, double width)
+    {
+        var temporary = System.IO.Path.Combine(Root, $".shelf.{Guid.NewGuid():N}.tmp");
+        try
+        {
+            Directory.CreateDirectory(Root);
+            File.WriteAllText(temporary, JsonSerializer.Serialize(new Saved { Width = width, Entries = entries }, JsonOptions));
+            File.Move(temporary, ListPath, overwrite: true);
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            try { File.Delete(temporary); } catch (Exception cleanup) when (cleanup is IOException or UnauthorizedAccessException) { }
+            return false;
+        }
+    }
+
+    /// <summary>Writes this window's changes; the other windows' shelves take them up.</summary>
+    private void Save()
+    {
+        if (!Sync(write: true))
+        {
+            return;
+        }
+
+        List<ShelfStore> others;
+        lock (Open)
+        {
+            others = Open.Select(reference => reference.TryGetTarget(out var store) ? store : null)
+                .OfType<ShelfStore>()
+                .Where(store => store != this && string.Equals(store.Root, Root, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+        }
+
+        foreach (var other in others)
+        {
+            other.Sync(write: false);
         }
     }
 
