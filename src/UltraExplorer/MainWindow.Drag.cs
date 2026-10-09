@@ -216,7 +216,11 @@ public partial class MainWindow
                 // A node dragged within the window: the keyboard has been this
                 // window's all along, so what it says is held is what is held.
                 var move = MainViewModel.ShouldMove(paths, target.FullPath, Keyboard.Modifiers);
-                await _viewModel.DropIntoPathAsync(paths, target.FullPath, move);
+                // Tracked like an outside drop, so closing the window waits
+                // for an extraction out of an archive to finish writing.
+                var transfer = _viewModel.DropIntoPathWithResultAsync(paths, target.FullPath, move);
+                TrackExternalDrop(transfer);
+                await transfer;
                 return;
             }
 
