@@ -308,26 +308,50 @@ try {
     $payloadUpdate = Invoke-UltraExplorerPayloadUpdate -StagingRoot $staging -DestinationRoot $destination -BackupRoot $backup
     $installed = $true
 } finally {
-    if ($recovered -and $null -ne $preference) {
-        Use-IntegrationPreference $preference
+    # Each restore step runs even when an earlier one fails: one exception
+    # must not leave the sign-in start, the agents or the backup behind.
+    $restoreErrors = New-Object 'System.Collections.Generic.List[string]'
+    function Invoke-RestoreStep([string]$step, [scriptblock]$action) {
+        try { & $action } catch {
+            [void]$restoreErrors.Add("${step}: $($_.Exception.Message)")
+            Write-Warning "Update cleanup step failed ($step): $($_.Exception.Message)"
+        }
     }
-    if ($null -ne $preference -and $preference.Enabled -and ($installed -or $recovered)) {
-        New-Item -Path $runKey -Force | Out-Null
-        $value = if ($installed -or $null -eq $oldRunValue) { '"' + $executable + '" --dialog-agent' } else { $oldRunValue }
-        if ($null -ne $value) { New-ItemProperty -LiteralPath $runKey -Name $runName -Value $value -PropertyType String -Force | Out-Null }
+    Invoke-RestoreStep 'dialog preference' {
+        if ($recovered -and $null -ne $preference) { Use-IntegrationPreference $preference }
     }
-    if ($null -ne $preference -and $preference.Enabled -and ($installed -or $recovered) -and (Test-Path -LiteralPath $executable) -and (Test-CanStart $executable)) {
-        $resident = Start-InstalledRole '--dialog-agent'
-        $resident.Dispose()
+    Invoke-RestoreStep 'dialog sign-in start' {
+        if ($null -ne $preference -and $preference.Enabled -and ($installed -or $recovered)) {
+            New-Item -Path $runKey -Force | Out-Null
+            $value = if ($installed -or $null -eq $oldRunValue) { '"' + $executable + '" --dialog-agent' } else { $oldRunValue }
+            if ($null -ne $value) { New-ItemProperty -LiteralPath $runKey -Name $runName -Value $value -PropertyType String -Force | Out-Null }
+        }
+    }
+    Invoke-RestoreStep 'dialog agent' {
+        if ($null -ne $preference -and $preference.Enabled -and ($installed -or $recovered) -and (Test-Path -LiteralPath $executable) -and (Test-CanStart $executable)) {
+            $resident = Start-InstalledRole '--dialog-agent'
+            $resident.Dispose()
+        }
     }
     # A failed first upgrade still has the older executable, which does not
     # recognise --shortcut-agent and would open an ordinary window instead.
-    if ($null -ne $preference -and $preference.WinEEnabled -and ($installed -or ($recovered -and $null -ne $oldShortcutRunValue)) -and (Test-Path -LiteralPath $executable) -and (Test-CanStart $executable)) {
-        $shortcut = Start-InstalledRole '--shortcut-agent'
-        $shortcut.Dispose()
+    Invoke-RestoreStep 'Win+E agent' {
+        if ($null -ne $preference -and $preference.WinEEnabled -and ($installed -or ($recovered -and $null -ne $oldShortcutRunValue)) -and (Test-Path -LiteralPath $executable) -and (Test-CanStart $executable)) {
+            $shortcut = Start-InstalledRole '--shortcut-agent'
+            $shortcut.Dispose()
+        }
     }
-    if (Test-Path -LiteralPath $staging) { Assert-UpdatePath $staging $temporaryRoot; Remove-Item -LiteralPath $staging -Recurse -Force }
-    if ($installed -and $null -ne $payloadUpdate) { Complete-UltraExplorerPayloadUpdate $payloadUpdate }
+    Invoke-RestoreStep 'staging cleanup' {
+        if (Test-Path -LiteralPath $staging) { Assert-UpdatePath $staging $temporaryRoot; Remove-Item -LiteralPath $staging -Recurse -Force }
+    }
+    Invoke-RestoreStep 'update backup cleanup' {
+        if ($installed -and $null -ne $payloadUpdate) { Complete-UltraExplorerPayloadUpdate $payloadUpdate }
+    }
+}
+# Reached only when the update itself succeeded; a failed update reports its
+# own error above, after the same warnings.
+if ($restoreErrors.Count -gt 0) {
+    throw "The update was installed, but $($restoreErrors.Count) cleanup step(s) failed: $($restoreErrors -join '; ')"
 }
 
 # The app sets this taskbar id on itself (App.AppUserModelId); a shortcut that
