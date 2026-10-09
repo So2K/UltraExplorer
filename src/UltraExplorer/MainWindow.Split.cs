@@ -703,6 +703,7 @@ public partial class MainWindow
         // meanwhile, or held down, is let go, or everything would be copied
         // twice, or moved twice.
         var from = ActivePane;
+        var to = InactivePane;
         if (!_paneSendsAsking.Add(from))
         {
             return;
@@ -723,6 +724,16 @@ public partial class MainWindow
                     return;
                 }
 
+                // A slow share answered after the window began closing, the
+                // split was closed, or the other pane went elsewhere: the
+                // items would have gone into a folder no longer on screen.
+                if (_closeRequested || to is null || !_panes.Contains(to) || !IsNested
+                    || !(to.SortFolder() is { } shown && ViewAllPath.Equals(shown, folder)))
+                {
+                    _viewModel.Toast.ShowError($"Nothing {(move ? "moved" : "copied")}: the other pane no longer shows {name}.");
+                    return;
+                }
+
                 going = PathsGoingTo(paths, folder);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
@@ -737,7 +748,13 @@ public partial class MainWindow
                 return;
             }
 
-            await _viewModel.DropIntoPathAsync(going, folder, move);
+            // Close waits for it as for a drop: an extraction out of an
+            // archive runs off this thread, and a window gone meanwhile
+            // left the file it was writing cut short, and a move's marks
+            // never carried over.
+            var transfer = _viewModel.DropIntoPathWithResultAsync(going, folder, move);
+            TrackExternalDrop(transfer);
+            await transfer;
         }
         finally
         {
