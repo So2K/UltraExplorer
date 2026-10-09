@@ -54,6 +54,10 @@ internal sealed class QuickPreviewWindow : Window
     private NativePreviewHost? _native;
     private PreviewTextEditSession? _editor;
     private DocumentPreviewData? _document;
+    /// <summary>The length and write time of the text file as it was last read or saved here (see <see cref="RefreshTextAfterActivationAsync"/>).</summary>
+    private (long Length, long Ticks)? _documentStamp;
+    /// <summary>One shell thumbnail reader for every file that has no other preview, let go with the window.</summary>
+    private FileThumbnailService? _thumbnails;
     private string _path = "";
     private string? _originPath;
     private int _page, _pageCount, _generation;
@@ -138,7 +142,7 @@ internal sealed class QuickPreviewWindow : Window
             _ = RefreshTextAfterActivationAsync();
         };
         Closing += OnClosing;
-        Closed += (_, _) => { _closed = true; EndImagePan(); CloseOpenMenu(); _load.Cancel(); _load.Dispose(); _native?.Dispose(); };
+        Closed += (_, _) => { _closed = true; EndImagePan(); CloseOpenMenu(); _load.Cancel(); _load.Dispose(); _native?.Dispose(); _thumbnails?.Dispose(); _thumbnails = null; };
         ResetTools();
     }
 
@@ -177,11 +181,48 @@ internal sealed class QuickPreviewWindow : Window
         OpenFile(_files[index], readOnly: _forceReadOnly, originPath: origin);
         await Loading;
     }
-    internal Task RefreshTextAfterActivationAsync()
+    /// <summary>
+    /// Coming back to Quick Look: a clean text whose file was changed
+    /// meanwhile - by an external editor - is read again, keeping the caret
+    /// and the scroll.  One left as it was keeps the editor as it is: read
+    /// again on every activation, it lost the scroll, the caret and the find,
+    /// and the click or keys that activated the window with them.
+    /// </summary>
+    internal async Task RefreshTextAfterActivationAsync()
     {
-        if (!_closed && !_ownerCloseFrozen && !_dirty && !_saving && _document is not null)
-        { OpenFile(_path, readOnly: _forceReadOnly, originPath: _originPath); return Loading; }
-        return Task.CompletedTask;
+        if (!CanRefreshText()) return;
+        var path = _path; var generation = _generation; var known = _documentStamp;
+        var now = await Task.Run(() => ReadStamp(path));
+        if (!CanRefreshText() || generation != _generation || !string.Equals(path, _path, StringComparison.Ordinal)) return;
+        if (now is not null && now == known) return;
+        var caret = _text.CaretOffset; var top = _text.VerticalOffset; var left = _text.HorizontalOffset;
+        OpenFile(_path, readOnly: _forceReadOnly, originPath: _originPath);
+        var request = _openRequest;
+        await Loading;
+        if (_closed || request != _openRequest || _document is null) return;
+        _text.CaretOffset = Math.Min(caret, _text.Document.TextLength);
+        _text.UpdateLayout();
+        _text.ScrollToVerticalOffset(top); _text.ScrollToHorizontalOffset(left);
+    }
+    private bool CanRefreshText() => !_closed && !_ownerCloseFrozen && !_dirty && !_saving && _document is not null;
+    private static (long Length, long Ticks)? ReadStamp(string path)
+    {
+        try { return new FileInfo(DocumentPreviewService.LiteralPath(path)) is { Exists: true } file ? (file.Length, file.LastWriteTimeUtc.Ticks) : null; }
+        catch (Exception e) when (e is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { return null; }
+    }
+    /// <summary>
+    /// A drive is about to be removed: a video or model from it shown in
+    /// mpv or F3D is closed, since the player's handle on the file would
+    /// refuse the removal.  True when one was.
+    /// </summary>
+    internal bool ReleaseMediaOnVolume(string volumeRoot)
+    {
+        if (_closed || _native is not { } native || string.IsNullOrEmpty(_path)) return false;
+        var root = Path.GetPathRoot(_path)?.TrimEnd('\\', '/');
+        if (string.IsNullOrEmpty(root) || !string.Equals(root, volumeRoot.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase)) return false;
+        _generation++; _native = null; _body.Children.Remove(native); native.Dispose();
+        Status("Preview closed: the drive is being removed");
+        return true;
     }
     internal bool HasUnsavedChanges => _dirty || _saving;
     internal Task Loading { get; private set; } = Task.CompletedTask;
@@ -206,7 +247,7 @@ internal sealed class QuickPreviewWindow : Window
         UpdateFileNavigation();
         _load.Cancel(); _load.Dispose(); _load = new CancellationTokenSource();
         EndImagePan(); CloseOpenMenu();
-        _generation++; _native?.Dispose(); _native = null; _editor = null; _document = null;
+        _generation++; _native?.Dispose(); _native = null; _editor = null; _document = null; _documentStamp = null;
         _dirty = false; _renderingPdf = false; _page = 0; _pageCount = 0; _fit = true; _zoom = 1;
         _image.Source = null; _text.Text = ""; _text.IsReadOnly = true; ResetTools();
         var syntax = HighlightingManager.Instance.GetDefinitionByExtension(Path.GetExtension(path));
@@ -230,8 +271,13 @@ internal sealed class QuickPreviewWindow : Window
         try
         {
             // Do not hydrate cloud placeholders simply to view their content.
-            var readable = await Task.Run(() => new FileInfo(DocumentPreviewService.LiteralPath(path)) is { Exists: true } f
-                && new ThumbnailFileStamp(f.Length, f.LastWriteTimeUtc.Ticks, (uint)f.Attributes).CanReadContent, token);
+            (long Length, long Ticks)? stamp = null;
+            var readable = await Task.Run(() =>
+            {
+                if (new FileInfo(DocumentPreviewService.LiteralPath(path)) is not { Exists: true } f) return false;
+                stamp = (f.Length, f.LastWriteTimeUtc.Ticks);
+                return new ThumbnailFileStamp(f.Length, f.LastWriteTimeUtc.Ticks, (uint)f.Attributes).CanReadContent;
+            }, token);
             if (!Current(generation)) return;
             if (!readable) throw new IOException("This file is unavailable locally. Download it first, then reopen the preview.");
             if (Path.GetExtension(path.TrimEnd(' ', '.')).Equals(".pdf", StringComparison.OrdinalIgnoreCase))
@@ -260,13 +306,16 @@ internal sealed class QuickPreviewWindow : Window
             if (!Current(generation)) return;
             if (document is not null)
             {
-                _document = document; _text.Text = document.Text; _body.Children.Add(_text);
+                _document = document; _documentStamp = stamp; _text.Text = document.Text; _body.Children.Add(_text);
                 Status(document.Detail);
                 if (!_forceReadOnly && document.CanEdit && !document.Truncated && !document.IsBinary)
                     await PrepareTextEditorAsync(path, document, generation, token);
                 return;
             }
-            using var thumbnails = new FileThumbnailService();
+            // Shared, like the hover preview's: one made for each file and let
+            // go after a timeout left its shell thread blocked behind a hung
+            // thumbnail handler, a thread more for every such file.
+            var thumbnails = _thumbnails ??= new FileThumbnailService();
             var thumbnail = await thumbnails.GetAsync(path, token).WaitAsync(TimeSpan.FromSeconds(8), token);
             if (!Current(generation)) return;
             if (thumbnail is null) throw new IOException("No preview is available. Use Open in app to view this file.");
@@ -404,6 +453,8 @@ internal sealed class QuickPreviewWindow : Window
             var text = _text.Text;
             var editor = _editor!;
             await Task.Run(() => editor.SaveAsync(text, _load.Token), _load.Token);
+            var path = _path;
+            if (ReferenceEquals(editor, _editor)) _documentStamp = await Task.Run(() => ReadStamp(path));
             _dirty = _text.Text != editor.Text;
             _discard.Visibility = Visibility.Collapsed;
             Status("Saved · " + Path.GetFileName(_path));

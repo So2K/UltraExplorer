@@ -726,13 +726,17 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _volume.Margin = new Thickness(6, 0, 0, 0); Grid.SetColumn(_volume, 5); buttons.Children.Add(_volume);
         _volume.ValueChanged += (_, _) => { if (!_syncingControls) RunPlaybackAction(() => SetVolumeAsync(_volume.Value)); };
         _timeline.ValueChanged += (_, _) => { if (!_syncingControls) QueueSeek(_timeline.Value); };
+        // A scrub can outlive the player: Alt+Right or Delete mid-drag disposes
+        // it, and the drag still ends here - on a lifetime already disposed.
         _timeline.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) =>
         {
+            if (_disposed || _pipeName is null) return;
             _scrubbing = true; _resumeAfterScrub = !_paused;
             RunPlaybackAction(async () => { await MpvCommandAsync(["set_property", "pause", true]); });
         }));
         _timeline.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) =>
         {
+            if (_disposed || _pipeName is null) { _scrubbing = false; return; }
             var resume = _resumeAfterScrub; var target = _timeline.Value;
             var token = _session?.Token ?? _lifetime.Token;
             _scrubbing = false; ClearPendingSeek();
@@ -981,6 +985,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         ++_generation;
         _lifetime.Cancel();
         StopSession();
+        _scrubbing = _resumeAfterScrub = false;
         _surface.Dispose();
         _lifetime.Dispose();
     }

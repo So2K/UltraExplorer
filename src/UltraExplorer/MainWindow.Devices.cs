@@ -78,9 +78,17 @@ public partial class MainWindow
     /// </summary>
     partial void OnDeviceChangeMessage(IntPtr wParam, IntPtr lParam, ref bool handled, ref IntPtr result)
     {
-        if (_volumeNotifications?.OnDeviceChange((int)wParam.ToInt64(), lParam) == DeviceChange.VolumesChanged)
+        WatchRoot? root = null;
+        var change = _volumeNotifications?.OnDeviceChange((int)wParam.ToInt64(), lParam, out root) ?? DeviceChange.None;
+        if (change == DeviceChange.VolumesChanged)
         {
             ScheduleDriveRescan();
+        }
+        else if (change == DeviceChange.WatchSuspended && root is not null)
+        {
+            // The watch was not all that held the drive: a video or model in
+            // Quick Look is open in mpv or F3D, which vetoed the removal too.
+            _quickPreview?.ReleaseMediaOnVolume(root.Key);
         }
     }
 
@@ -480,9 +488,21 @@ internal sealed class VolumeNotifications : IDisposable
     /// wParam, <paramref name="data"/> its lParam - a DEV_BROADCAST_HDR, or
     /// nothing.  Says what it meant; the watches it concerns are dealt with here.
     /// </summary>
-    public DeviceChange OnDeviceChange(int kind, IntPtr data)
+    public DeviceChange OnDeviceChange(int kind, IntPtr data) => OnDeviceChange(kind, data, out _);
+
+    /// <param name="root">The watch the message was about, when it was about one.</param>
+    public DeviceChange OnDeviceChange(int kind, IntPtr data, out WatchRoot? root)
     {
+        root = null;
         if (data == IntPtr.Zero || _disposed)
+        {
+            return DeviceChange.None;
+        }
+
+        // Any program can send this message with any lParam: what it points
+        // at is read only once it is memory of this process, and no further
+        // than the size it claims - a bogus pointer was an access violation.
+        if (!IsReadable(data, Marshal.SizeOf<BroadcastHeader>()))
         {
             return DeviceChange.None;
         }
@@ -493,13 +513,13 @@ internal sealed class VolumeNotifications : IDisposable
             return kind is DbtDeviceArrival or DbtDeviceRemoveComplete ? DeviceChange.VolumesChanged : DeviceChange.None;
         }
 
-        if (header.DeviceType != DbtDevTypeHandle)
+        if (header.DeviceType != DbtDevTypeHandle || header.Size < HandleEventOffset || !IsReadable(data, header.Size))
         {
             return DeviceChange.None;
         }
 
-        var handle = Marshal.PtrToStructure<BroadcastHandle>(data);
-        if (!_byNotification.TryGetValue(handle.Notification, out var root))
+        var notification = Marshal.ReadIntPtr(data, NotificationOffset);
+        if (!_byNotification.TryGetValue(notification, out root))
         {
             return DeviceChange.None;
         }
@@ -526,7 +546,9 @@ internal sealed class VolumeNotifications : IDisposable
                 return DeviceChange.WatchDropped;
 
             case DbtCustomEvent:
-                return OnVolumeEvent(root, handle.EventGuid);
+                return header.Size >= HandleNameOffset
+                    ? OnVolumeEvent(root, Marshal.PtrToStructure<Guid>(data + HandleEventOffset))
+                    : DeviceChange.None;
         }
 
         return DeviceChange.None;
@@ -677,6 +699,54 @@ internal sealed class VolumeNotifications : IDisposable
             UnregisterDeviceNotification(registration.Notification);
         }
     }
+
+    private static readonly int NotificationOffset = Marshal.OffsetOf<BroadcastHandle>(nameof(BroadcastHandle.Notification)).ToInt32();
+    private static readonly int HandleEventOffset = Marshal.OffsetOf<BroadcastHandle>(nameof(BroadcastHandle.EventGuid)).ToInt32();
+    private static readonly int HandleNameOffset = Marshal.OffsetOf<BroadcastHandle>(nameof(BroadcastHandle.NameOffset)).ToInt32();
+
+    /// <summary>Whether <paramref name="size"/> bytes from <paramref name="address"/> are committed, readable memory of this process.</summary>
+    private static bool IsReadable(IntPtr address, int size)
+    {
+        if (size <= 0 || size > 64 * 1024) return false;
+        var start = (ulong)address.ToInt64();
+        var end = start + (ulong)size;
+        while (start < end)
+        {
+            if (VirtualQuery((IntPtr)(long)start, out var region, (nuint)Marshal.SizeOf<MemoryRegion>()) == 0
+                || region.State != MemCommit
+                || (region.Protect & (PageNoAccess | PageGuard)) != 0
+                || (region.Protect & ReadableProtections) == 0)
+            {
+                return false;
+            }
+
+            start = (ulong)region.BaseAddress.ToInt64() + region.RegionSize;
+        }
+
+        return true;
+    }
+
+    private const uint MemCommit = 0x1000;
+    private const uint PageNoAccess = 0x01;
+    private const uint PageGuard = 0x100;
+    private const uint ReadableProtections = 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80;
+
+    /// <summary>MEMORY_BASIC_INFORMATION.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MemoryRegion
+    {
+        public IntPtr BaseAddress;
+        public IntPtr AllocationBase;
+        public uint AllocationProtect;
+        public ushort PartitionId;
+        public ulong RegionSize;
+        public uint State;
+        public uint Protect;
+        public uint Type;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern nuint VirtualQuery(IntPtr address, out MemoryRegion buffer, nuint length);
 
     /// <summary>A notification, and the watch handle it was registered on.</summary>
     private readonly record struct Registration(IntPtr Notification, SafeHandle Handle);
