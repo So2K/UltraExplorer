@@ -85,7 +85,8 @@ public sealed partial class NestedTree : IChangeSink
     /// made from now on take its watch from the hub
     /// (<see cref="WatchRootFor"/>), so it belongs before the first
     /// <see cref="SetRoots"/>: a root made before it has no watch, and only
-    /// its path decides which lane its reads go in.  Folders already read
+    /// its path decides which lane its reads go in, until the roots are set
+    /// again and it is made anew with one.  Folders already read
     /// are registered at once; a hub replaced has them all taken off it.
     /// </summary>
     public ChangeHub? Changes
@@ -98,17 +99,34 @@ public sealed partial class NestedTree : IChangeSink
                 return;
             }
 
-            if (_changes is { } previous)
+            lock (_firstReads)
             {
-                foreach (var folder in _registered)
+                if (_changes is { } previous)
                 {
-                    previous.Unregister(ChangeConsumer.Nested, folder.FullPath, folder);
+                    foreach (var folder in _registered)
+                    {
+                        previous.Unregister(ChangeConsumer.Nested, folder.FullPath, folder);
+                    }
+
+                    _registered.Clear();
+
+                    // First reads still under way registered their folders
+                    // from the worker; their results may never be applied -
+                    // a closed pane's tree is not drained again - so they are
+                    // taken off here too, or the hub would hold the closed
+                    // pane's whole tree, through each folder's parents, and
+                    // keep polling it.
+                    foreach (var firstRead in _firstReads)
+                    {
+                        firstRead.Hub.Unregister(ChangeConsumer.Nested, firstRead.Path, firstRead.Folder);
+                    }
+
+                    _firstReads.Clear();
                 }
 
-                _registered.Clear();
+                _changes = value;
             }
 
-            _changes = value;
             WatchRootFor = value is null ? null : value.RootFor;
             if (value is not null)
             {
@@ -974,6 +992,98 @@ public sealed partial class NestedTree : IChangeSink
         else
         {
             slice();
+        }
+    }
+
+    /// <summary>
+    /// What a worker registered with the hub for a folder's first read, from
+    /// before its listing was taken until the read is applied or thrown away.
+    /// </summary>
+    private sealed record FirstReadRegistration(NestedFolder Folder, ChangeHub Hub, string Path);
+
+    /// <summary>
+    /// The first reads under way that registered their folder from the worker
+    /// and are not applied yet; also the lock that keeps a worker's
+    /// registration and <see cref="Changes"/> being replaced in one order.
+    /// Only reads in flight are in it - a handful.
+    /// </summary>
+    private readonly List<FirstReadRegistration> _firstReads = [];
+
+    /// <summary>
+    /// On a worker: registers a folder about to be read for the first time
+    /// with the hub, if there is one, and remembers it as the read's until
+    /// the result is applied (<see cref="SettleFirstReadRegistration"/>).
+    /// </summary>
+    private FirstReadRegistration? RegisterFirstRead(NestedFolder folder, string path)
+    {
+        lock (_firstReads)
+        {
+            if (_changes is not { } hub)
+            {
+                return null;
+            }
+
+            hub.Register(ChangeConsumer.Nested, path, folder);
+            var firstRead = new FirstReadRegistration(folder, hub, path);
+            _firstReads.Add(firstRead);
+            return firstRead;
+        }
+    }
+
+    /// <summary>
+    /// A read's result was applied or thrown away: the registration its
+    /// worker made is the tree's own now if the folder was registered
+    /// (<see cref="_registered"/>) under the same hub and path; otherwise -
+    /// the read cancelled, given up on, its folder cut off, the hub replaced
+    /// - it is taken off the hub, unless another read of the folder still
+    /// under way holds the same one.  Left, nothing would ever take it off.
+    /// </summary>
+    private void SettleFirstReadRegistration(ReadResult read)
+    {
+        if (read.FirstRead is not { } firstRead)
+        {
+            return;
+        }
+
+        lock (_firstReads)
+        {
+            // Not there: the hub was replaced and took it off already.
+            if (!_firstReads.Remove(firstRead))
+            {
+                return;
+            }
+
+            var folder = firstRead.Folder;
+            if (ReferenceEquals(firstRead.Hub, _changes)
+                && _registered.Contains(folder)
+                && string.Equals(firstRead.Path, folder.FullPath, StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            foreach (var other in _firstReads)
+            {
+                if (ReferenceEquals(other.Folder, folder)
+                    && ReferenceEquals(other.Hub, firstRead.Hub)
+                    && string.Equals(other.Path, firstRead.Path, StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+            }
+
+            firstRead.Hub.Unregister(ChangeConsumer.Nested, firstRead.Path, folder);
+        }
+    }
+
+    /// <summary>First reads under way whose worker registration is not settled yet, for tests.</summary>
+    internal int FirstReadRegistrationsInFlight
+    {
+        get
+        {
+            lock (_firstReads)
+            {
+                return _firstReads.Count;
+            }
         }
     }
 

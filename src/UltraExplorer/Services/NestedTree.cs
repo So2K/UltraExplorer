@@ -291,9 +291,17 @@ public sealed partial class NestedTree : IDisposable
         {
             // A drive unplugged and plugged back in before this ran has a new
             // watch: the old cell, still on the dropped one, would never hear
-            // of a change on it again, so it is made afresh.
+            // of a change on it again, so it is made afresh.  So is one made
+            // while nothing watched the disk - a picker built while hidden -
+            // now that a hub has a watch for it: the watch is fixed when a
+            // folder is made and taken by every folder below from its parent,
+            // and kept, the root would never hear of a change, refresh after
+            // an overflow, be polled where the volume refuses a watch, or
+            // arm a share's.
+            WatchRoot? watch = null;
             if (existing.Remove(root.FullPath, out var kept) && kept.Name == root.Name && kept.Kind == root.Kind
-                && kept.Watch is not { IsDropped: true })
+                && kept.Watch is not { IsDropped: true }
+                && (kept.Watch is not null || (watch = WatchRootFor?.Invoke(root.FullPath)) is null))
             {
                 kept.SecondaryText = root.SecondaryText;
                 children.Add(kept);
@@ -305,7 +313,7 @@ public sealed partial class NestedTree : IDisposable
                 Forget(kept);
             }
 
-            children.Add(CreateRoot(root));
+            children.Add(CreateRoot(root, watch));
             _knownCount++;
         }
 
