@@ -14,6 +14,12 @@ public sealed class NavigationHistory
     private readonly List<string> _places = [];
     private int _index = -1;
 
+    /// <summary>Changes at every step and every place recorded: the same number later means nothing moved since.</summary>
+    public int Version { get; private set; }
+
+    /// <summary>Which of the places it is at.</summary>
+    public int Position => _index;
+
     /// <summary>How many places are kept.</summary>
     public int Count => _places.Count;
 
@@ -48,6 +54,7 @@ public sealed class NavigationHistory
         }
 
         _index = _places.Count - 1;
+        Version++;
     }
 
     /// <summary>Forgets every place: a prepared picker bound to a new dialog starts its Back and Forward afresh.</summary>
@@ -55,13 +62,37 @@ public sealed class NavigationHistory
     {
         _places.Clear();
         _index = -1;
+        Version++;
     }
 
     /// <summary>One step back: the place to go to, or null at the first.</summary>
-    public string? Back() => CanGoBack ? _places[--_index] : null;
+    public string? Back() => CanGoBack ? Step(-1) : null;
 
     /// <summary>One step forward: the place to go to, or null at the last.</summary>
-    public string? Forward() => CanGoForward ? _places[++_index] : null;
+    public string? Forward() => CanGoForward ? Step(1) : null;
+
+    private string Step(int by)
+    {
+        _index += by;
+        Version++;
+        return _places[_index];
+    }
+
+    /// <summary>
+    /// Takes back a step that did not get there - its folder deleted, its
+    /// drive unplugged: the pane is still at <paramref name="position"/>, and
+    /// so is its history.  Left one step off, the next place gone to would cut
+    /// away every place ahead of it.  Nothing is taken back once anything else
+    /// moved the history since the step (<paramref name="version"/>).
+    /// </summary>
+    public void Undo(int position, int version)
+    {
+        if (Version == version && position >= 0 && position < _places.Count)
+        {
+            _index = position;
+            Version++;
+        }
+    }
 
     /// <summary>Where this pane has already been, newest first and each place once.</summary>
     public IReadOnlyList<string> Recent()
