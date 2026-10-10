@@ -121,12 +121,20 @@ internal static class FastDialogRead
     /// <summary>Check boxes, radio choices, lists, plain text fields and labels.</summary>
     private static bool Mirrorable(nint control, int depth)
     {
+        if (depth > 8) return false;
         var style = DialogNative.Style(control);
         switch (ClassOf(control))
         {
             case "Button":
                 return (style & 0xF) is 2 or 3 or 4 or 5 or 6 or 9;
             case "Static":
+            case "#32770" when (style & 0x40000000) != 0:
+                var count = 0;
+                for (var child = DialogNative.GetWindow(control, 5); child != 0; child = DialogNative.GetWindow(child, 2))
+                {
+                    if (++count > 128) return false;
+                    if (DialogNative.HasVisibleControlStyle(child) && !Mirrorable(child, depth + 1)) return false;
+                }
                 return true;
             case "ComboBox":
                 return (style & 0x30) == 0 || (style & 0x200) != 0; // owner-drawn only with CBS_HASSTRINGS

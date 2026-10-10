@@ -86,7 +86,15 @@
         </DataTemplate>
         <DataTemplate x:Key="NativeText">
             <StackPanel Margin="0,4,22,4" MinWidth="180" MaxWidth="320">
-                <TextBlock Text="{Binding Label}" Foreground="{StaticResource TextMutedBrush}" FontSize="11.5" Margin="0,0,0,4" TextWrapping="Wrap" />
+                <TextBlock Text="{Binding Label}" Foreground="{StaticResource TextMutedBrush}" FontSize="11.5" Margin="0,0,0,4" TextWrapping="Wrap">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding Label}" Value=""><Setter Property="Visibility" Value="Collapsed" /></DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
                 <TextBox Text="{Binding Text, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" IsEnabled="{Binding IsEnabled}"
                          Height="30" Padding="8,3" VerticalContentAlignment="Center"
                          AutomationProperties.AutomationId="{Binding AutomationId}" AutomationProperties.Name="{Binding Label}" />
@@ -94,6 +102,12 @@
         </DataTemplate>
         <DataTemplate x:Key="NativeLabel">
             <TextBlock Text="{Binding Label}" FontSize="12" Foreground="{StaticResource TextMutedBrush}" Margin="0,5,22,5" TextWrapping="Wrap" MaxWidth="420" />
+        </DataTemplate>
+        <DataTemplate x:Key="NativeButton">
+            <Button Content="{Binding Label}" Command="{Binding ActionCommand}" IsEnabled="{Binding IsEnabled}"
+                    Style="{StaticResource DialogButton}" FontSize="12" Margin="0,4,22,4"
+                    ToolTip="Continue in the application's Windows dialog to open this setting. Your options are kept."
+                    AutomationProperties.AutomationId="{Binding AutomationId}" AutomationProperties.Name="{Binding Label}" />
         </DataTemplate>
         <local:NativeOptionTemplateSelector x:Key="NativeTemplates" />
     </UserControl.Resources>
@@ -105,6 +119,9 @@
                 <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" MaxHeight="160">
                     <ItemsControl x:Name="OptionsList" ItemTemplateSelector="{StaticResource NativeTemplates}" Focusable="False"
                                   AutomationProperties.Name="Options of the application">
+                        <ItemsControl.ItemContainerStyle>
+                            <Style TargetType="ContentPresenter"><Setter Property="VerticalAlignment" Value="Center" /></Style>
+                        </ItemsControl.ItemContainerStyle>
                         <ItemsControl.ItemsPanel><ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
                     </ItemsControl>
                 </ScrollViewer>

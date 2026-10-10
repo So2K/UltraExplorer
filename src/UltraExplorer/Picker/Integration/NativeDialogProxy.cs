@@ -878,7 +878,8 @@ internal sealed class NativeDialogProxy
         for (var i = 0; i < snapshots.Length; i++)
         {
             var snapshot = snapshots[i];
-            if (i < _options.Count && _options[i].Key == snapshot.Key) _options[i].Synchronize(snapshot);
+            if (i < _options.Count && _options[i].Key == snapshot.Key && _options[i].Kind == snapshot.Kind)
+                _options[i].Synchronize(snapshot);
             else
             {
                 if (i < _options.Count) _options.RemoveAt(i);
@@ -891,7 +892,7 @@ internal sealed class NativeDialogProxy
     private void OnOptionChanged(NativeOptionSnapshot option)
     {
         _generation++;
-        _pending = ApplyOptionAsync(option);
+        _pending = option.Kind == NativeOptionKind.Button ? OpenNativeOptionAsync(option) : ApplyOptionAsync(option);
     }
     private void OnFilterChanged()
     {
@@ -912,8 +913,48 @@ internal sealed class NativeDialogProxy
 
     private async Task ApplyOptionAsync(NativeOptionSnapshot option)
     {
-        try { await _thread.Run(() => { if (!_fallback) _automation!.SetOption(option); }).WaitAsync(TimeSpan.FromSeconds(8)); }
+        var generation = _generation;
+        try
+        {
+            var options = await _thread.Run(() =>
+            {
+                if (_fallback) return Array.Empty<NativeOptionSnapshot>();
+                _automation!.SetOption(option);
+                return _automation.ReadOptions();
+            }).WaitAsync(TimeSpan.FromSeconds(8));
+            if (!_finishing && !_fallback && generation == _generation) SynchronizeOptions(options);
+        }
         catch (Exception ex) { if (ex is TimeoutException) CanReuseWorker = false; DialogIntegrationStore.Log($"{Application}: an option could not be passed on", ex); ReturnToWindows(); }
+    }
+
+    private async Task OpenNativeOptionAsync(NativeOptionSnapshot option)
+    {
+        try
+        {
+            var name = _session?.FileNameText;
+            if (!string.IsNullOrWhiteSpace(name) && _snapshot?.Mode == FileDialogMode.Save
+                && _session?.CurrentFolder is { Length: > 0 } folder)
+                name = Path.GetFullPath(name, folder);
+            var button = await _thread.Run(() =>
+            {
+                if (_fallback) return nint.Zero;
+                var action = _automation!.GetOptionButton(option);
+                if (!string.IsNullOrWhiteSpace(name)) _automation.SetName(name);
+                return action;
+            }).WaitAsync(TimeSpan.FromSeconds(8));
+            if (button == 0 || _fallback || !OriginalExists) return;
+            // Complex settings belong to the application's own modal UI.
+            // Restore its parent first, preserving all previously applied
+            // options and the typed save name, then let it handle the action.
+            ReturnToWindows();
+            DialogNative.PostOptionButton(_original, button);
+        }
+        catch (Exception ex)
+        {
+            if (ex is TimeoutException) CanReuseWorker = false;
+            DialogIntegrationStore.Log($"{Application}: its settings button needs the Windows dialog", ex);
+            ReturnToWindows();
+        }
     }
 
     private async void UseWindows(bool exclude)

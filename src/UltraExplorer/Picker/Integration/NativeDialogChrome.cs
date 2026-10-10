@@ -22,7 +22,52 @@ internal sealed class NativeDialogChrome
     {
         var chrome = new NativeDialogChrome(automation);
         chrome.ReadChildren(root, 0);
+        chrome.ReadNativeOptionPanels(automation, root.Properties.NativeWindowHandle.ValueOrDefault);
         return chrome;
+    }
+
+    // Some applications embed their own Win32 dialog beside the common
+    // dialog's app module. The UIA control view can omit that whole panel,
+    // exposing only the spacer label used to reserve its area (REAPER).
+    // FloatNotifySink is the common dialog's host for these custom controls;
+    // never discover panels by walking the shell view or navigation rows.
+    private void ReadNativeOptionPanels(UIA3Automation automation, nint root)
+    {
+        if (root == 0) return;
+        var panels = new List<nint>();
+        var seen = new HashSet<nint>();
+        var tooManyPanels = false;
+        DialogNative.EnumChildWindows(root, (child, _) =>
+        {
+            if (DialogNative.ClassName(child) != "FloatNotifySink" || !HasVisibleAncestry(child, root)) return true;
+            var visited = 0;
+            for (var panel = DialogNative.GetWindow(child, 5); panel != 0; panel = DialogNative.GetWindow(panel, 2))
+            {
+                if (++visited > 128) { tooManyPanels = true; return false; }
+                if (DialogNative.ClassName(panel) != "#32770" || (DialogNative.Style(panel) & 0x40000000) == 0
+                    || !DialogNative.HasVisibleControlStyle(panel) || !seen.Add(panel)) continue;
+                panels.Add(panel);
+                if (panels.Count > 32) { tooManyPanels = true; return false; }
+            }
+            return true;
+        }, 0);
+        if (tooManyPanels)
+            throw new NotSupportedException("The dialog has too many additional application panels.");
+        using var cached = _cache.Activate();
+        foreach (var panel in panels) OptionContainers.Add(automation.FromHandle(panel));
+    }
+
+    internal static bool HasVisibleAncestry(nint child, nint root)
+    {
+        for (var depth = 0; child != 0 && depth <= MaximumDepth; depth++)
+        {
+            if (child == root) return true;
+            // IsWindowVisible changes when the protected original is hidden;
+            // its children's own styles remain the application's contract.
+            if (!DialogNative.HasVisibleControlStyle(child)) return false;
+            child = DialogNative.GetAncestor(child, 1);
+        }
+        return false;
     }
 
     private void ReadChildren(AutomationElement parent, int depth)

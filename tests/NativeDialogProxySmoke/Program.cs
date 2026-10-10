@@ -27,7 +27,8 @@ internal static class Program
     private static int Main(string[] args)
     {
         if (args.Contains("--native-dialog-fixture"))
-            return DialogProducers.Handles(args) ? DialogProducers.Run(args) : ViewAllSmoke.NativeDialogFixture.Run(args);
+            return ReaperSaveOptionsFixture.Handles(args) ? ReaperSaveOptionsFixture.Run(args)
+                : DialogProducers.Handles(args) ? DialogProducers.Run(args) : ViewAllSmoke.NativeDialogFixture.Run(args);
         if (args.Length < 2) { Console.WriteLine("NativeDialogProxySmoke <UltraExplorer.exe> <output-folder> [case[,case...]]"); return 2; }
         // Window and monitor rectangles in physical pixels, both the same way.
         SetProcessDpiAwarenessContext(-4);
@@ -201,6 +202,13 @@ internal static class Program
                 : resultPath + ".fixture.log", "fixture");
             Console.WriteLine($"  native dialog {original:X} {TestScreen.Describe(original)}");
             Check("the native dialog opens on a secondary monitor", TestScreen.OnSecondary(original));
+            if (spec is { NativePanel: true })
+                Wait(() =>
+                {
+                    if (File.Exists(resultPath + ".panel-error"))
+                        throw new InvalidOperationException(File.ReadAllText(resultPath + ".panel-error"));
+                    return File.Exists(resultPath + ".panel-ready");
+                }, 5000, "the fixture's native REAPER options panel");
             using var earlyVisibility = pendingCaptureCase ? new EarlyVisibilityWatch(original, (uint)fixture.Id,
                 Path.Combine(state, "dialog-integration", "sessions")) : null;
             if (agent is null)
@@ -1128,7 +1136,8 @@ internal static class Program
     /// times out waiting for its proxy, and the run prints integration.log.)
     /// </summary>
     private sealed record ProducerCase(string? Typed, string[] Expected, int? TypeIndex = null, bool Overwrite = false,
-        string? ProposedName = null, string[]? Files = null, bool StaysNative = false, bool Looked = false);
+        string? ProposedName = null, string[]? Files = null, bool StaysNative = false, bool Looked = false,
+        bool NativePanel = false, bool NativeAction = false);
 
     private const string TwoFiles = "\"{root}\\sample.txt\" \"{root}\\second.txt\"";
 
@@ -1155,6 +1164,14 @@ internal static class Program
         // own controls (a program's template: a preview, options of its own) the
         // picker cannot mirror: looked at, and left with Windows.
         ["win32-hook"] = new(null, [], StaysNative: true, Looked: true),
+        // REAPER's modern dialog hosts an independent Win32 child #32770
+        // beside the blank Static in FloatNotifySink, outside the usual
+        // AppControlsModuleInner subtree. Its native BN_CLICKED handlers
+        // enable dependents and the application's OnFileOk reads the HWNDs.
+        ["reaper-save-options"] = new(@"{root}\saved-result", ["saved-result.rpp"], TypeIndex: 1,
+            ProposedName: "export", NativePanel: true),
+        ["reaper-save-format"] = new(@"{root}\saved-result", ["saved-result.rpp"], TypeIndex: 1,
+            ProposedName: "export", NativePanel: true, NativeAction: true),
         // IFileDialog edge cases.
         ["open-types24"] = new(@"{root}\frame.ppm", ["frame.ppm"], TypeIndex: 17, Files: ["frame.ppm"]),
         ["open-psdlabel"] = new(@"{root}\layers.psd", ["layers.psd"], TypeIndex: 2, Files: ["layers.psd"]),
@@ -1187,8 +1204,11 @@ internal static class Program
         }
         if (spec.Typed is { } typed)
             thread.Run(() => NameEdit(window).AsTextBox().Text = typed.Replace("{root}", root, StringComparison.Ordinal)).GetAwaiter().GetResult();
+        if (spec.NativePanel) ExerciseReaperOptions(spec.NativeAction, spec.Typed?.Replace("{root}", root, StringComparison.Ordinal),
+            fixture, original, thread, window);
         Thread.Sleep(200);
-        thread.Run(() => Required(window.FindFirstDescendant("PickerAcceptButton")).AsButton().Invoke()).GetAwaiter().GetResult();
+        if (spec.NativeAction) DialogNative.Click(original, 1);
+        else thread.Run(() => Required(window.FindFirstDescendant("PickerAcceptButton")).AsButton().Invoke()).GetAwaiter().GetResult();
         if (spec.Overwrite) AnswerOverwriteWarning(original, fixture, thread, automation);
         Wait(() => File.Exists(resultPath), 10000, "the native result");
         using var result = JsonDocument.Parse(ReadResult(resultPath));
@@ -1206,12 +1226,97 @@ internal static class Program
             Check($"the program's file type {type} comes back as it chose it", got == type);
             if (got != type) Console.WriteLine($"        the program got file type {got}");
         }
+        if (spec.NativePanel)
+        {
+            Check("the application's native child panel was created", data.GetProperty("panelReady").GetBoolean()
+                && data.GetProperty("Error").ValueKind == JsonValueKind.Null);
+            var options = data.GetProperty("onAccept");
+            Check("project subdirectory reaches the application's OnFileOk", options.GetProperty("create").GetBoolean());
+            Check("media copy and conversion reach the application's OnFileOk", options.GetProperty("copy").GetBoolean()
+                && options.GetProperty("convert").GetBoolean());
+            Check("media trimming and its edited tail reach the application's OnFileOk", options.GetProperty("trim").GetBoolean()
+                && options.GetProperty("tail").GetString() == "750");
+            Check("the chosen copy mode excludes move and copy-rather", !options.GetProperty("move").GetBoolean()
+                && !options.GetProperty("copyRather").GetBoolean());
+            Check("the application's native command handlers received every change", options.GetProperty("commandCount").GetInt32() >= 10);
+            if (spec.NativeAction)
+                Check("Format invokes the application's native handler once", options.GetProperty("FormatClicks").GetInt32() == 1);
+        }
         var log = ReadLog(Path.Combine(state, "dialog-integration", "integration.log"));
-        Check("it was served through the picker, never left with Windows",
+        Check(spec.NativeAction ? "the picker serves options before the explicit native Format handoff"
+                : "it was served through the picker, never left with Windows",
             log.Contains("dialog shown through UltraExplorer", StringComparison.Ordinal) && !log.Contains("stays with Windows", StringComparison.Ordinal));
         using (var settings = JsonDocument.Parse(File.ReadAllText(Path.Combine(state, "dialog-integration.json"))))
             Check("a completed native handoff leaves replacement enabled", settings.RootElement.GetProperty("Enabled").GetBoolean());
         File.Copy(resultPath, Path.Combine(root, "verified-result.json"));
+    }
+
+    private static void ExerciseReaperOptions(bool format, string? typedName, Process fixture, nint original,
+        AutomationThread thread, AutomationElement window)
+    {
+        AutomationElement Control(string label, ControlType type) => Required(Required(window.FindFirstDescendant("NativeDialogOptions"))
+            .FindFirstDescendant(cf => cf.ByName(label).And(cf.ByControlType(type))));
+        void SetCheck(string label, bool value) => thread.Run(() => Control(label, ControlType.CheckBox).AsCheckBox().IsChecked = value)
+            .GetAwaiter().GetResult();
+        bool Enabled(string label, ControlType type) => thread.Run(() => Control(label, type).IsEnabled).GetAwaiter().GetResult();
+        string[] labels = [ReaperSaveOptionsFixture.CreateLabel, ReaperSaveOptionsFixture.CopyLabel, ReaperSaveOptionsFixture.ConvertLabel,
+            ReaperSaveOptionsFixture.TrimLabel, ReaperSaveOptionsFixture.MoveLabel, ReaperSaveOptionsFixture.CopyRatherLabel];
+        Check("all six native REAPER options have visible labels in the picker", thread.Run(() => labels.All(label =>
+        {
+            var control = Control(label, ControlType.CheckBox);
+            return !control.IsOffscreen && !string.IsNullOrWhiteSpace(control.Name) && control.BoundingRectangle.Height > 0;
+        })).GetAwaiter().GetResult());
+        Check("conversion and trimming initially remain disabled", !Enabled(ReaperSaveOptionsFixture.ConvertLabel, ControlType.CheckBox)
+            && !Enabled(ReaperSaveOptionsFixture.TrimLabel, ControlType.CheckBox));
+        SetCheck(ReaperSaveOptionsFixture.CreateLabel, true);
+        SetCheck(ReaperSaveOptionsFixture.MoveLabel, true);
+        Wait(() => Enabled(ReaperSaveOptionsFixture.CopyRatherLabel, ControlType.CheckBox), 5000, "Move enabling its native dependent");
+        Check("Move enables Copy rather through the native handler", true);
+        SetCheck(ReaperSaveOptionsFixture.CopyRatherLabel, true);
+        SetCheck(ReaperSaveOptionsFixture.CopyRatherLabel, false);
+        SetCheck(ReaperSaveOptionsFixture.MoveLabel, false);
+        SetCheck(ReaperSaveOptionsFixture.CopyLabel, true);
+        Wait(() => Enabled(ReaperSaveOptionsFixture.ConvertLabel, ControlType.CheckBox)
+            && Enabled(ReaperSaveOptionsFixture.TrimLabel, ControlType.CheckBox), 5000, "Copy enabling its native dependents");
+        Check("Copy enables conversion and trimming through the native handler", true);
+        SetCheck(ReaperSaveOptionsFixture.ConvertLabel, true);
+        SetCheck(ReaperSaveOptionsFixture.TrimLabel, true);
+        thread.Run(() => Required(Required(window.FindFirstDescendant("NativeDialogOptions"))
+            .FindFirstDescendant(cf => cf.ByControlType(ControlType.Edit))).AsTextBox().Text = "750").GetAwaiter().GetResult();
+        SetCheck(ReaperSaveOptionsFixture.CopyLabel, false);
+        Wait(() => !Enabled(ReaperSaveOptionsFixture.ConvertLabel, ControlType.CheckBox)
+            && !Enabled(ReaperSaveOptionsFixture.TrimLabel, ControlType.CheckBox), 5000, "Copy disabling its native dependents again");
+        Check("clearing Copy disables its native dependent options", true);
+        SetCheck(ReaperSaveOptionsFixture.CopyLabel, true);
+        Wait(() => Enabled(ReaperSaveOptionsFixture.ConvertLabel, ControlType.CheckBox)
+            && Enabled(ReaperSaveOptionsFixture.TrimLabel, ControlType.CheckBox), 5000, "restoring Copy and its native dependents");
+        if (!format) return;
+        Wait(() => Enabled("Format...", ControlType.Button), 5000, "the application's Format button");
+        Check("Format remains visible and actionable in the picker", thread.Run(() => !Control("Format...", ControlType.Button).IsOffscreen)
+            .GetAwaiter().GetResult());
+        thread.Run(() => Control("Format...", ControlType.Button).AsButton().Invoke()).GetAwaiter().GetResult();
+        nint prompt = 0;
+        Wait(() =>
+        {
+            DialogNative.EnumWindows((candidate, _) =>
+            {
+                if (candidate != original && DialogNative.ProcessId(candidate) == fixture.Id && DialogNative.IsWindowVisible(candidate)
+                    && DialogNative.Title(candidate) == ReaperSaveOptionsFixture.FormatTitle) prompt = candidate;
+                return true;
+            }, 0);
+            return prompt != 0;
+        }, 5000, "the application's native format dialog");
+        Check("Format opens the application's own dialog on the secondary monitor", TestScreen.OnSecondary(prompt));
+        Check("Format restores the original Save dialog before its native action", !DialogNative.IsHidden(original)
+            && !DialogNative.IsCloaked(original) && DialogNative.IsWindowVisible(original));
+        Check("Format keeps the outstanding Save request unaccepted", !fixture.HasExited && DialogNative.IsWindow(original));
+        var nativeName = DialogNative.ReadEdit(DialogNative.FindChild(original, 1001, "Edit"));
+        Check("Format preserves the intended Save name in the original dialog", typedName is not null
+            && (string.Equals(nativeName, typedName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(nativeName, typedName + ".rpp", StringComparison.OrdinalIgnoreCase)));
+        DialogNative.Click(prompt, 2);
+        Wait(() => !DialogNative.IsWindow(prompt), 5000, "closing the native format dialog");
+        Wait(() => DialogNative.IsWindowEnabled(original), 5000, "the original Save dialog after Format");
     }
 
     /// <summary>

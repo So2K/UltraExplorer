@@ -50,7 +50,8 @@ public sealed class NativeOptionTemplateSelector : DataTemplateSelector
         var key = option.Kind switch
         {
             NativeOptionKind.CheckBox => "NativeCheck", NativeOptionKind.RadioButton => "NativeRadio",
-            NativeOptionKind.ComboBox => "NativeCombo", NativeOptionKind.TextBox => "NativeText", _ => "NativeLabel"
+            NativeOptionKind.ComboBox => "NativeCombo", NativeOptionKind.TextBox => "NativeText",
+            NativeOptionKind.Button => "NativeButton", _ => "NativeLabel"
         };
         return element.FindResource(key) as DataTemplate;
     }

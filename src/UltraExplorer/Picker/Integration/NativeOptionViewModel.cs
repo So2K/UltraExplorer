@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using UltraExplorer.Infrastructure;
+using System.Windows.Input;
 
 namespace UltraExplorer.Picker.Integration;
 
@@ -9,7 +10,13 @@ internal sealed class NativeOptionViewModel : ObservableObject
     private readonly Action<NativeOptionSnapshot> _changed;
     private bool _quiet;
     public NativeOptionViewModel(NativeOptionSnapshot snapshot, Action<NativeOptionSnapshot> changed)
-    { _snapshot = snapshot; _changed = changed; Synchronize(snapshot); }
+    {
+        _snapshot = snapshot;
+        _changed = changed;
+        ActionCommand = new RelayCommand(() => _changed(_snapshot), () => IsEnabled);
+        Synchronize(snapshot);
+    }
+    public ICommand ActionCommand { get; }
     public string Key => _snapshot.Key;
     public NativeOptionKind Kind => _snapshot.Kind;
     public string Label => _snapshot.Label;
@@ -41,6 +48,7 @@ internal sealed class NativeOptionViewModel : ObservableObject
         if (!Choices.SequenceEqual(items)) { Choices.Clear(); foreach (var item in items) Choices.Add(item); }
         _snapshot = snapshot;
         foreach (var name in new[] { nameof(Label), nameof(IsEnabled), nameof(IsThreeState), nameof(Checked), nameof(Text), nameof(SelectedIndex) }) OnPropertyChanged(name);
+        ((RelayCommand)ActionCommand).RaiseCanExecuteChanged();
         _quiet = false;
     }
 }

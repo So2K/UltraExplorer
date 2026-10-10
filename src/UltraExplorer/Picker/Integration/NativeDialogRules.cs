@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 
 namespace UltraExplorer.Picker.Integration;
 
-internal enum NativeOptionKind { CheckBox, RadioButton, ComboBox, TextBox, Label }
+internal enum NativeOptionKind { CheckBox, RadioButton, ComboBox, TextBox, Label, Button }
 
 internal sealed record NativeOptionSnapshot(string Key, NativeOptionKind Kind, string Label, bool Enabled,
     bool? Checked = null, string Text = "", string[]? Choices = null, int SelectedIndex = -1);
