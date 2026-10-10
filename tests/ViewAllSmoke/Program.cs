@@ -202,6 +202,7 @@ internal static partial class Program
         await Group(LongPathShellOperationChecks);
         await Group(ExplorerIntegrationFollowupChecks);
         await Group(FileCommandReview2Checks);
+        await Group(CreateItemChecks);
         await Group(NestedVisibilityRenameIntegrationChecks);
         await Group(FocusSelectionChecks);
         await Group(BatchCommandLineChecks);

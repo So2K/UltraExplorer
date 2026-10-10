@@ -630,7 +630,7 @@
                             <TextBlock Text="&#xE70D;" Style="{StaticResource IconText}" FontSize="8" Margin="7,2,0,0" />
                         </StackPanel>
                     </Button>
-                    <Button x:Name="NewFolderButton" Style="{StaticResource CommandBarButton}" Command="{Binding NewFolderCommand}" ToolTip="New folder (Ctrl+Shift+N)" AutomationProperties.Name="New folder">
+                    <Button x:Name="NewFolderButton" Style="{StaticResource CommandBarButton}" Command="{Binding NewFolderCommand}" ToolTip="New folder (Ctrl+N)" AutomationProperties.Name="New folder">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock Text="&#xE8F4;" Style="{StaticResource IconText}" FontSize="13" Margin="0,0,7,0" />
                             <TextBlock Text="New folder" VerticalAlignment="Center" FontSize="12" />

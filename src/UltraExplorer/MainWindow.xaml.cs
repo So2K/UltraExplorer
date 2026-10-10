@@ -121,6 +121,7 @@ public partial class MainWindow : Window
         _viewModel.FitAllRequested += FitAll;
         _viewModel.ZoomRequested += ApplyZoom;
         _viewModel.PromptRequested += ShowInputDialog;
+        _viewModel.CreationPromptRequested += ShowCreationInputDialog;
         Closed += (_, _) => { DisposeQuietUpdates(); _quickPreview?.CompleteOwnerClose(); _sessionCloseTransaction?.Remove(this); };
 
         // The shelf comes out for any drag over the window - one of its own or
@@ -1167,7 +1168,7 @@ public partial class MainWindow : Window
 
         // No Shell menu for this folder: the app's own is better than nothing.
         var menu = new ContextMenu { PlacementTarget = FolderListPanel };
-        AddCommandItem(menu, "New folder", "\uE8F4", _viewModel.NewFolderCommand, "Ctrl+Shift+N");
+        AddCommandItem(menu, "New folder", "\uE8F4", _viewModel.NewFolderCommand, "Ctrl+N");
         AddCommandItem(menu, "New text file", "\uE8A5", _viewModel.NewTextFileCommand);
         AddCommandItem(menu, "Paste", "\uE77F", _viewModel.PasteCommand, "Ctrl+V");
         menu.IsOpen = true;
@@ -1617,7 +1618,7 @@ public partial class MainWindow : Window
         }
 
         menu.Items.Add(new Separator());
-        AddCommandItem(menu, "Duplicate", "\uE8C8", _viewModel.DuplicateCommand, "Ctrl+Shift+D");
+        AddCommandItem(menu, "Duplicate", "\uE8C8", _viewModel.DuplicateCommand, "Ctrl+D");
         AddCommandItem(menu, "Delete", "\uE74D", _viewModel.DeleteCommand, "Del");
         AddCommandItem(menu, "Delete permanently", "\uE74D", _viewModel.PermanentDeleteCommand, "Shift+Del");
         menu.Items.Add(new Separator());
@@ -1723,7 +1724,7 @@ public partial class MainWindow : Window
         AddCommandItem(menu, "Copy as path", "\uE71B", _viewModel.CopyPathCommand, "Ctrl+Shift+C");
         menu.Items.Add(new Separator());
         AddCommandItem(menu, "Rename", "\uE8AC", _viewModel.RenameCommand, "F2");
-        AddCommandItem(menu, "Duplicate", "\uE8C8", _viewModel.DuplicateCommand, "Ctrl+Shift+D");
+        AddCommandItem(menu, "Duplicate", "\uE8C8", _viewModel.DuplicateCommand, "Ctrl+D");
         AddCommandItem(menu, "Delete", "\uE74D", _viewModel.DeleteCommand, "Del");
         AddCommandItem(menu, "Delete permanently", "\uE74D", _viewModel.PermanentDeleteCommand, "Shift+Del");
         menu.Items.Add(new Separator());
@@ -2372,6 +2373,12 @@ public partial class MainWindow : Window
         var onSelection = IsSelectionSurfaceFocused()
             && (!FolderListItems.IsKeyboardFocusWithin || _viewModel.Tree.FolderList.HasCurrentRows);
 
+        if (TryHandleCreationKey(key, modifiers, onSelection, e.IsRepeat))
+        {
+            e.Handled = true;
+            return;
+        }
+
         // Shift+F5 and Shift+F6: what is selected, to the other pane.
         if (onSelection && TryHandlePaneTransferKey(key, modifiers))
         {
@@ -2403,12 +2410,6 @@ public partial class MainWindow : Window
                 break;
             case (ModifierKeys.Control | ModifierKeys.Shift, Key.C) when onSelection:
                 _viewModel.CopyPathCommand.Execute(null);
-                break;
-            case (ModifierKeys.Control | ModifierKeys.Shift, Key.N):
-                _viewModel.NewFolderCommand.Execute(null);
-                break;
-            case (ModifierKeys.Control | ModifierKeys.Shift, Key.D) when onSelection:
-                _viewModel.DuplicateCommand.Execute(null);
                 break;
             case (ModifierKeys.Alt, Key.Left):
                 _viewModel.BackCommand.Execute(null);
@@ -2494,6 +2495,26 @@ public partial class MainWindow : Window
         }
 
         e.Handled = true;
+    }
+
+    /// <summary>Creation shortcuts from the pane showing the selection; held keys are consumed once.</summary>
+    internal bool TryHandleCreationKey(Key key, ModifierKeys modifiers, bool onSelection, bool isRepeat = false)
+    {
+        if (!onSelection || (modifiers != ModifierKeys.Control
+            && modifiers != (ModifierKeys.Control | ModifierKeys.Shift)))
+        {
+            return false;
+        }
+
+        var command = key switch
+        {
+            Key.N => _viewModel.NewFolderCommand,
+            Key.D => _viewModel.DuplicateCommand,
+            _ => null
+        };
+        if (command is null) return false;
+        if (!isRepeat) command.Execute(null);
+        return true;
     }
 
     /// <summary>
@@ -2609,6 +2630,13 @@ public partial class MainWindow : Window
     {
         var dialog = new InputDialog(title, prompt, initialValue, selectStem,
             password: title.Equals("Password", StringComparison.Ordinal)) { Owner = this };
+        return dialog.ShowOwnerModal() ? dialog.Value : null;
+    }
+
+    private string? ShowCreationInputDialog(CreateItemPrompt request)
+    {
+        var dialog = new InputDialog(request.Title, request.Prompt, request.InitialValue, request.SelectStem,
+            creation: request) { Owner = this };
         return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 

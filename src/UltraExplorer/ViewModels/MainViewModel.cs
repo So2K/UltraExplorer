@@ -309,6 +309,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     /// a dot in "Photos 2024.06" is no extension.
     /// </summary>
     public event Func<string, string, string, bool, string?>? PromptRequested;
+    /// <summary>Names a new item while showing its captured destination folder.</summary>
+    public event Func<CreateItemPrompt, string?>? CreationPromptRequested;
     /// <summary>
     /// Asks the user before something is done: the title, the message and the
     /// confirming button's label.  "Delete" is drawn as a danger; anything
@@ -1791,9 +1793,11 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         await Tree.RevealPathAsync(item.Path);
     }
 
-    private async Task CreateFolderAsync()
+    private Task CreateFolderAsync() => CreateFolderInAsync(Tree.TargetDirectory);
+
+    internal async Task CreateFolderInAsync(string? target)
     {
-        if (Tree.TargetDirectory is not { } target)
+        if (target is null)
         {
             Toast.ShowError("Select a folder on the canvas first.");
             return;
@@ -1804,7 +1808,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var name = PromptRequested?.Invoke("New folder", "Folder name", "New folder", false);
+        var request = new CreateItemPrompt(target, IsFolder: true);
+        var name = CreationPromptRequested is { } ask ? ask(request)
+            : PromptRequested?.Invoke("New folder", "Folder name", "New folder", false);
         if (name is null)
         {
             return;
@@ -1840,7 +1846,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        var name = PromptRequested?.Invoke("New text file", "File name", "New note.txt", true);
+        var request = new CreateItemPrompt(target, IsFolder: false);
+        var name = CreationPromptRequested is { } ask ? ask(request)
+            : PromptRequested?.Invoke("New text file", "File name", "New note.txt", true);
         if (name is null)
         {
             return;
@@ -2188,7 +2196,21 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
         var currentName = Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar));
         var isFolder = Tree.Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : Directory.Exists(path);
-        var newName = PromptRequested?.Invoke("Rename", "Enter a new name", currentName, !isFolder);
+        await RenameItemAsync(path, isFolder, currentName, newlyCreated: false);
+    }
+
+    internal Task NameNewItemAsync(string path)
+    {
+        var isFolder = Tree.Selection.TryGetItem(path, out var selected) ? selected.IsDirectory : Directory.Exists(path);
+        return RenameItemAsync(path, isFolder, Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar)), newlyCreated: true);
+    }
+
+    private async Task RenameItemAsync(string path, bool isFolder, string currentName, bool newlyCreated)
+    {
+        var request = newlyCreated && Path.GetDirectoryName(path) is { } parentDirectory
+            ? new CreateItemPrompt(parentDirectory, isFolder, currentName) : null;
+        var newName = request is not null && CreationPromptRequested is { } ask ? ask(request)
+            : PromptRequested?.Invoke("Rename", "Enter a new name", currentName, !isFolder);
         if (string.IsNullOrWhiteSpace(newName) || string.Equals(newName, currentName, StringComparison.Ordinal))
         {
             return;
@@ -2213,10 +2235,13 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             if (!string.IsNullOrEmpty(parent))
             {
                 await Tree.RefreshPathAsync(parent);
-                await Tree.RevealPathAsync(renamed, focus: false);
+                // The template is already selected and NoteOwnRename follows
+                // its new name. A fresh reveal after a slow rename could act
+                // on a different pane the user has since switched to.
+                if (!newlyCreated) await Tree.RevealPathAsync(renamed, focus: false);
             }
 
-            ShowDone($"Renamed to {Path.GetFileName(renamed)}");
+            ShowDone($"{(newlyCreated ? "Created" : "Renamed to")} {Path.GetFileName(renamed)}");
         }
         catch (Exception ex)
         {
