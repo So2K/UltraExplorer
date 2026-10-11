@@ -46,7 +46,8 @@ These checks do not imply every application-specific dialog is supported.
 
 Focused creation/dialog/review checks pass **205/205**, with the isolated
 creation child reporting **38/38**. The final focused native cases pass
-**204/204**. Setup identity fixtures pass **30/30** in both PowerShell 5 and 7;
+**215/215**, including slow early name rereads; typing in the original dialog
+remains protected (**11/11**). Setup identity fixtures pass **30/30** in both PowerShell 5 and 7;
 they use disposable profiles and do not exercise an actual UAC account switch.
 
 The broad desktop run reported **5197/5201**: the retained graph reference,

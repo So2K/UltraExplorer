@@ -503,6 +503,9 @@ internal sealed class NativeDialogProxy
         {
             currentName = null;
         }
+        if (_snapshot is null && IsFixture
+            && Environment.GetEnvironmentVariable("ULTRAEXPLORER_DIALOG_TEST_EARLY_RECHECK_UNREAD") == "1")
+            currentName = null;
         if (_fallback || _window?.PickerResult.IsCompleted == true || !OriginalExists || !InFront()
             || (_lease is not null && (!_lease.IsProtected || !DialogLease.BelongsToWindow(_lease.Record)))) return false;
         // Navigation can leave the same filename in a different directory.
@@ -514,6 +517,16 @@ internal sealed class NativeDialogProxy
             && !Models.ViewAllPath.Equals(liveFolder, boundFolder);
         var addressChanged = !string.Equals(live.Address, _addressWhenRead, StringComparison.Ordinal);
         var folderChanged = nameEditChanged || folderPathChanged || addressChanged;
+        if (_snapshot is null && currentName is null && !folderChanged)
+        {
+            // Full capture can keep the caller's thread busy during this
+            // early recheck. Its original stays visible; verify the name
+            // again after the bounded full read before showing the picker.
+            _path = "prepared";
+            Stage("name-recheck-deferred");
+            DialogIntegrationStore.Log($"{Application}: the original's early file name could not be reread in time; waiting for the full read.");
+            return false;
+        }
         if (folderChanged || currentName is null || _nameWhenRead is null || !string.Equals(currentName, _nameWhenRead, StringComparison.Ordinal))
         {
             DialogIntegrationStore.Log($"{Application}: the original name or folder changed or could not be verified before handoff; it stays with Windows."

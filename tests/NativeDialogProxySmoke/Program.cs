@@ -49,7 +49,7 @@ internal static class Program
         { Console.WriteLine("Refusing to run: there is no secondary monitor, and test windows may not open on the primary one."); return 3; }
 
         var cases = args.Length > 2 ? args[2].Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            : ["open", "open-fresh", "open-unread-name-fresh", "open-large", "open-profile", "multi", "save", "save-fresh", "save-repeat", "save-sequence", "save-recycle", "save-downloads", "save-custom", "save-hidden-options", "save-extension", "open-nofilter", "save-nofilter", "folder", "cancel", "fallback", "exclude", "unsupported", "crash", "guard-crash", "stall", "overwrite", "early-cancel", "early-fallback", "early-off", "read-timeout", "idle-worker",
+            : ["open", "open-fresh", "open-unread-name-fresh", "open-recheck-unread-fresh", "open-large", "open-profile", "multi", "save", "save-fresh", "save-repeat", "save-sequence", "save-recycle", "save-downloads", "save-custom", "save-hidden-options", "save-extension", "open-nofilter", "save-nofilter", "folder", "cancel", "fallback", "exclude", "unsupported", "crash", "guard-crash", "stall", "overwrite", "early-cancel", "early-fallback", "early-off", "read-timeout", "idle-worker",
                 "early-worker-loss", "early-guard-loss", .. Producers.Keys];
         if (cases.Any(mode => Producers.GetValueOrDefault(mode)?.NativeAction == true))
             CheckNativeActionNames(Path.Combine(output, "action-name-checks"));
@@ -130,9 +130,10 @@ internal static class Program
         if (noFilter) mode = mode[..^"-nofilter".Length];
         var fresh = mode.EndsWith("-fresh", StringComparison.Ordinal);
         var earlyNameUnread = mode == "open-unread-name-fresh";
+        var earlyRecheckUnread = mode == "open-recheck-unread-fresh";
         var idleWorker = mode == "idle-worker";
         var flow = spec is not null ? (spec.StaysNative ? "stays-native" : "producer")
-            : earlyNameUnread ? "open" : fresh ? mode[..^"-fresh".Length] : mode == "open-profile" ? "cancel" : mode == "save-recycle" ? "save-repeat" : mode;
+            : earlyNameUnread || earlyRecheckUnread ? "open" : fresh ? mode[..^"-fresh".Length] : mode == "open-profile" ? "cancel" : mode == "save-recycle" ? "save-repeat" : mode;
         var pendingCaptureCase = flow is "early-cancel" or "early-fallback" or "early-off" or "early-worker-loss" or "early-guard-loss" or "read-timeout";
         var fixtureMode = mode == "open-profile" ? mode
             : flow is "save-custom" or "save-hidden-options" or "save-repeat" or "save-sequence" or "save-extension" or "save-downloads" or "save" or "folder" or "multi" or "unsupported" ? flow
@@ -173,6 +174,7 @@ internal static class Program
             if (pendingCaptureCase)
                 environment["ULTRAEXPLORER_DIALOG_TEST_CAPTURE_DELAY_MS"] = flow == "read-timeout" ? "10000" : "1200";
             if (earlyNameUnread) environment["ULTRAEXPLORER_DIALOG_TEST_EARLY_NAME_UNREAD"] = "1";
+            if (earlyRecheckUnread) environment["ULTRAEXPLORER_DIALOG_TEST_EARLY_RECHECK_UNREAD"] = "1";
             if (showSignal is not null)
             {
                 // The worker first, ready and settled; the dialog after.
@@ -425,15 +427,19 @@ internal static class Program
                 Check("the changed file type reaches the native caller", data.GetProperty("typeIndex").GetInt32() == 2);
                 Check("the newly visible checkbox value reaches native OnFileOk", !data.GetProperty("onAccept").GetProperty("layers").GetBoolean());
             }
-            if (earlyNameUnread)
+            if (earlyNameUnread || earlyRecheckUnread)
             {
                 var integrationLog = Path.Combine(state, "dialog-integration", "integration.log");
                 Wait(() => ReadLog(integrationLog).Contains("timing path=prepared ", StringComparison.Ordinal), 5000,
                     "the unread early name being served after the full read");
                 var log = ReadLog(integrationLog);
-                Check("the fresh fixture exercises an unread early file name",
-                    log.Contains("The fixture's early file name is unreadable; waiting for the full read.", StringComparison.Ordinal));
-                Check("an unread early name defers replacement to the complete native contract",
+                Check(earlyRecheckUnread ? "the fresh fixture exercises an unread early name recheck"
+                    : "the fresh fixture exercises an unread early file name",
+                    log.Contains(earlyRecheckUnread
+                        ? "the original's early file name could not be reread in time; waiting for the full read."
+                        : "The fixture's early file name is unreadable; waiting for the full read.", StringComparison.Ordinal));
+                Check(earlyRecheckUnread ? "an unread early recheck defers replacement until the full contract and a fresh name verification"
+                    : "an unread early name defers replacement to the complete native contract",
                     log.Contains("timing path=prepared ", StringComparison.Ordinal)
                         && !log.Contains("path=prepared-early", StringComparison.Ordinal)
                         && !log.Contains("original name or folder changed or could not be verified", StringComparison.Ordinal));
