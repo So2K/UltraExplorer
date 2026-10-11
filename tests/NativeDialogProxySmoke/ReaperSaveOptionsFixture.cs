@@ -30,7 +30,8 @@ internal static class ReaperSaveOptionsFixture
     internal static bool Handles(string[] args)
     {
         var index = Array.IndexOf(args, "--native-dialog-fixture");
-        return index >= 0 && index + 3 < args.Length && args[index + 3] is "reaper-save-options" or "reaper-save-format";
+        return index >= 0 && index + 3 < args.Length && args[index + 3] is "reaper-save-options" or "reaper-save-format"
+            or "reaper-save-format-quoted" or "reaper-open-format-relative";
     }
 
     internal static int Run(string[] args)
@@ -43,10 +44,14 @@ internal static class ReaperSaveOptionsFixture
         try
         {
             using var guard = new FixtureWindowGuard(output + ".fixture.log", keepDialogsInside: true);
-            instance = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("C0B4E2F3-BA21-4773-8DBA-335EC946EB8B"), true)!)!;
+            var open = mode.StartsWith("reaper-open", StringComparison.Ordinal);
+            instance = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid(open
+                ? "DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7" : "C0B4E2F3-BA21-4773-8DBA-335EC946EB8B"), true)!)!;
             var dialog = (IFileDialog)instance;
             dialog.GetOptions(out var flags);
             dialog.SetOptions(flags | (uint)(FileDialogOptions.ForceFileSystem | FileDialogOptions.PathMustExist));
+            if (open) dialog.SetOptions(flags | (uint)(FileDialogOptions.ForceFileSystem | FileDialogOptions.PathMustExist
+                | FileDialogOptions.FileMustExist));
             dialog.SetTitle("UltraExplorer integration fixture " + mode);
             dialog.SetFileTypes(1, [new ComDlgFilterSpec { Name = "REAPER Project files (*.RPP)", Spec = "*.RPP" }]);
             dialog.SetFileTypeIndex(1);
@@ -59,7 +64,7 @@ internal static class ReaperSaveOptionsFixture
             // Reserve native layout space, then replace this text with the
             // empty Static sibling that the real REAPER dialog also contains.
             ((INativeFileDialogCustomize)instance).AddText(6100, Anchor);
-            using var panel = new OptionsPanel(instance, mode == "reaper-save-format", output);
+            using var panel = new OptionsPanel(instance, mode != "reaper-save-options", output);
             var events = new SaveEvents(panel);
             dialog.Advise(events, out var cookie);
             File.WriteAllText(output + ".ready", Environment.ProcessId.ToString(CultureInfo.InvariantCulture));

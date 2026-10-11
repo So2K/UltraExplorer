@@ -374,7 +374,14 @@ internal sealed class NativeDialogProxy
         try { details = await read.WaitAsync(TimeSpan.FromMilliseconds(220)); }
         catch (Exception ex) when (ex is not OutOfMemoryException) { return null; }
         Stage("details");
-        if (details is null || (glance.Mode != FileDialogMode.PickFolder && details.Filters is not { Length: > 0 })) return null;
+        if (details is not null && IsFixture
+            && Environment.GetEnvironmentVariable("ULTRAEXPLORER_DIALOG_TEST_EARLY_NAME_UNREAD") == "1")
+        {
+            details = details with { FileName = null };
+            DialogIntegrationStore.Log("The fixture's early file name is unreadable; waiting for the full read.");
+        }
+        if (details is null || details.FileName is null
+            || (glance.Mode != FileDialogMode.PickFolder && details.Filters is not { Length: > 0 })) return null;
         _nameWhenRead = details.FileName;
         return (application, details);
     }
@@ -502,13 +509,17 @@ internal sealed class NativeDialogProxy
         // Read the live address without filesystem I/O; do not let a stale
         // early glance move the user back to the folder they have left.
         var live = FastDialogRead.Read(_original, PreparedPicker.Names);
-        var folderChanged = live.NameEdit != _nameEdit
-            || live.Folder is { } liveFolder && _folderWhenRead is { } boundFolder
-                && !Models.ViewAllPath.Equals(liveFolder, boundFolder)
-            || !string.Equals(live.Address, _addressWhenRead, StringComparison.Ordinal);
+        var nameEditChanged = live.NameEdit != _nameEdit;
+        var folderPathChanged = live.Folder is { } liveFolder && _folderWhenRead is { } boundFolder
+            && !Models.ViewAllPath.Equals(liveFolder, boundFolder);
+        var addressChanged = !string.Equals(live.Address, _addressWhenRead, StringComparison.Ordinal);
+        var folderChanged = nameEditChanged || folderPathChanged || addressChanged;
         if (folderChanged || currentName is null || _nameWhenRead is null || !string.Equals(currentName, _nameWhenRead, StringComparison.Ordinal))
         {
-            DialogIntegrationStore.Log($"{Application}: the original name or folder changed or could not be verified before handoff; it stays with Windows.");
+            DialogIntegrationStore.Log($"{Application}: the original name or folder changed or could not be verified before handoff; it stays with Windows."
+                + $" boundNameMissing={_nameWhenRead is null}, currentNameMissing={currentName is null},"
+                + $" nameChanged={!string.Equals(currentName, _nameWhenRead, StringComparison.Ordinal)}, nameEditChanged={nameEditChanged},"
+                + $" folderChanged={folderPathChanged}, addressChanged={addressChanged}.");
             ReturnToWindows();
             return false;
         }
@@ -931,10 +942,7 @@ internal sealed class NativeDialogProxy
     {
         try
         {
-            var name = _session?.FileNameText;
-            if (!string.IsNullOrWhiteSpace(name) && _snapshot?.Mode == FileDialogMode.Save
-                && _session?.CurrentFolder is { Length: > 0 } folder)
-                name = Path.GetFullPath(name, folder);
+            var name = _session is { } session ? OptionActionName(session, _window?.PickerSelection ?? []) : null;
             var button = await _thread.Run(() =>
             {
                 if (_fallback) return nint.Zero;
@@ -955,6 +963,19 @@ internal sealed class NativeDialogProxy
             DialogIntegrationStore.Log($"{Application}: its settings button needs the Windows dialog", ex);
             ReturnToWindows();
         }
+    }
+
+    // Resolving the current answer does not accept it, validate on disk or
+    // remember a folder. Selection labels are only basenames; Prepare keeps
+    // their absolute PendingSelection paths and applies the same typed-name
+    // rules as OK, including quotes and names relative to the visible folder.
+    internal static string? OptionActionName(FileDialogSession session, IReadOnlyList<string> selection)
+    {
+        var prepared = session.Prepare(selection, readDisk: false);
+        if (prepared.Kind != FileDialogActionKind.Accept) return session.FileNameText;
+        if (NativeDialogRules.HandBackProblem(prepared.Paths) is { } problem)
+            throw new NotSupportedException(problem);
+        return NativeDialogRules.TypedResult(new(true, prepared.Paths, session.FileTypeIndex));
     }
 
     private async void UseWindows(bool exclude)

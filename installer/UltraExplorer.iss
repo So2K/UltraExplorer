@@ -105,6 +105,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; First in a solid archive so PrepareToInstall can read it cheaply. The second
 ; entry installs it as well, alongside ALL runtime, native and locale files.
 Source: "{#PublishDir}\{#PackageManifest}"; Flags: dontcopy
+Source: "SetupIntegration.ps1"; Flags: dontcopy
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
@@ -133,13 +134,8 @@ var
     does: recovered before the files change, preference and agents back after. }
   IntegrationRecovered: Boolean;
   IntegrationRestored: Boolean;
-  IntegrationEnabled: Boolean;
-  ShortcutEnabled: Boolean;
-  SavedSettingsPresent: Boolean;
-  SavedSettings: AnsiString;
-  HadDialogRunValue: Boolean;
-  OldDialogRunValue: String;
-  HadShortcutRunValue: Boolean;
+  IntegrationScript: String;
+  IntegrationOperation: String;
 
 function PackageFileAttributes(const FileName: String): LongWord;
   external 'GetFileAttributesW@kernel32.dll stdcall';
@@ -213,29 +209,6 @@ begin
   Result := ExpandConstant('{app}\{#AppExe}');
 end;
 
-function IntegrationSettingsPath(): String;
-begin
-  Result := ExpandConstant('{localappdata}\{#AppName}\dialog-integration.json');
-end;
-
-{ A top-level JSON boolean, however the writer spaced it ("Enabled": true or
-  "Enabled":  true). False when the name is absent or not a boolean. }
-function JsonFlag(const Text, Name: String; var Value: Boolean): Boolean;
-var
-  At: Integer;
-  Rest: String;
-begin
-  Result := False;
-  At := Pos('"' + Name + '"', Text);
-  if At = 0 then Exit;
-  Rest := TrimLeft(Copy(Text, At + Length(Name) + 2, Length(Text)));
-  if Rest = '' then Exit;
-  if Rest[1] <> ':' then Exit;
-  Rest := TrimLeft(Copy(Rest, 2, Length(Rest)));
-  if Pos('true', Rest) = 1 then begin Value := True; Result := True; end
-  else if Pos('false', Rest) = 1 then begin Value := False; Result := True; end;
-end;
-
 function IsRoleCommand(const CommandLine: String): Boolean;
 var
   Text: String;
@@ -246,12 +219,11 @@ begin
     (Pos('--dialog-recover', Text) > 0) or (Pos('--shortcut-agent', Text) > 0);
 end;
 
-{ Background integration processes of the installed copy. With Stop, each one
-  still running is ended, as scripts/install.ps1 does after recovery. }
-function InstalledRoles(Stop: Boolean): Integer;
+{ Read-only count: another user's integration must be closed by that user. }
+function InstalledRoles(): Integer;
 var
   Locator, Service, Items, Item: Variant;
-  I, ProcessId, Code: Integer;
+  I: Integer;
   Path, CommandLine: String;
 begin
   Result := 0;
@@ -267,94 +239,122 @@ begin
       CommandLine := Item.CommandLine;
       if (CompareText(Path, InstalledExecutable()) <> 0) or not IsRoleCommand(CommandLine) then Continue;
       Result := Result + 1;
-      if Stop then
-      begin
-        ProcessId := Item.ProcessId;
-        Log('Ending lingering installed background process ' + IntToStr(ProcessId));
-        Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /PID ' + IntToStr(ProcessId), '', SW_HIDE, ewWaitUntilTerminated, Code);
-      end;
     end;
   except
     Log('Installed background processes could not be listed: ' + GetExceptionMessage);
   end;
 end;
 
-{ Mirrors the finally block of scripts/install.ps1: the preference recovery
-  paused, the sign-in start and the agents come back. Runs once. }
+type
+  TIntegrationGuid = record
+    D1: LongWord;
+    D2, D3: Word;
+    D4: array[0..7] of Byte;
+  end;
+
+function IntegrationCreateGuid(var Value: TIntegrationGuid): Integer;
+  external 'CoCreateGuid@ole32.dll stdcall';
+function IntegrationBase64(const Binary: String; BinaryBytes, Flags: LongWord;
+  Buffer: String; var BufferChars: LongWord): Boolean;
+  external 'CryptBinaryToStringW@crypt32.dll stdcall';
+
+function IntegrationHex(Value: LongWord; Width: Integer): String;
+var
+  I: Integer;
+begin
+  Result := '';
+  for I := 1 to Width do
+  begin
+    Result := Copy('0123456789abcdef', (Value mod 16) + 1, 1) + Result;
+    Value := Value div 16;
+  end;
+end;
+
+function NewIntegrationOperation(): String;
+var
+  Value: TIntegrationGuid;
+  I: Integer;
+begin
+  if IntegrationCreateGuid(Value) <> 0 then RaiseException('A Setup integration operation could not be created.');
+  Result := IntegrationHex(Value.D1, 8) + IntegrationHex(Value.D2, 4) + IntegrationHex(Value.D3, 4);
+  for I := 0 to 7 do Result := Result + IntegrationHex(Value.D4[I], 2);
+  Result := Lowercase(Result);
+end;
+
+function IntegrationLiteral(Value: String): String;
+begin
+  StringChangeEx(Value, '''', '''''', True);
+  Result := '''' + Value + '''';
+end;
+
+{ Both halves run under the original user's credentials, including profile,
+  HKCU, mutex and role ownership. EncodedCommand avoids giving that user access
+  to an elevated Setup's temporary directory or trusting their record as admin. }
+function RunIntegration(const Action: String; Installed: Boolean; var Code: Integer): Boolean;
+var
+  Script, Encoded, Arguments: String;
+  Chars: LongWord;
+begin
+  Script := '& {' + IntegrationScript + '}' + ' -Action ' + IntegrationLiteral(Action) +
+    ' -Executable ' + IntegrationLiteral(InstalledExecutable()) +
+    ' -OperationId ' + IntegrationLiteral(IntegrationOperation);
+  if Installed then Script := Script + ' -Installed $true';
+  Chars := ((Length(Script) * 2 + 2) div 3) * 4 + 1;
+  Encoded := StringOfChar(#0, Chars);
+  if not IntegrationBase64(Script, Length(Script) * 2, $40000001, Encoded, Chars) then
+    RaiseException('Setup integration command could not be encoded.');
+  SetLength(Encoded, Chars);
+  Arguments := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ' + Encoded;
+  if Length(Arguments) + Length(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe')) + 3 >= 32767 then
+    RaiseException('Setup integration command exceeds the Windows command-line limit.');
+  Result := ExecAsOriginalUser(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Arguments, ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
 procedure RestoreIntegration(Installed: Boolean);
 var
-  Value: String;
   Code: Integer;
 begin
   if IntegrationRestored or not IntegrationRecovered then Exit;
-  IntegrationRestored := True;
-  { Nested tests throughout: nothing here relies on short-circuit evaluation. }
-  if SavedSettingsPresent then
-    if not SaveStringToFile(IntegrationSettingsPath(), SavedSettings, False) then
-      Log('The dialog integration preference could not be restored.');
-  if IntegrationEnabled then
-  begin
-    if Installed or not HadDialogRunValue then Value := '"' + InstalledExecutable() + '" --dialog-agent'
-    else Value := OldDialogRunValue;
-    if not RegWriteStringValue(HKCU, RunKey, DialogRunName, Value) then Log('The dialog sign-in start could not be restored.');
-    if FileExists(InstalledExecutable()) then
-      if not ExecAsOriginalUser(InstalledExecutable(), '--dialog-agent', ExpandConstant('{app}'), SW_HIDE, ewNoWait, Code) then
-        Log('The dialog agent could not be started: ' + SysErrorMessage(Code));
-  end;
-  { An older copy left by a failed upgrade does not know --shortcut-agent. }
-  if ShortcutEnabled and (Installed or HadShortcutRunValue) then
-    if FileExists(InstalledExecutable()) then
-      if not ExecAsOriginalUser(InstalledExecutable(), '--shortcut-agent', ExpandConstant('{app}'), SW_HIDE, ewNoWait, Code) then
-        Log('The Win+E agent could not be started: ' + SysErrorMessage(Code));
+  if not RunIntegration('Restore', Installed, Code) then Code := -1;
+  if Code = 0 then IntegrationRestored := True
+  else Log('The original user integration could not be restored (exit code ' + IntToStr(Code) + '). Its recovery record was retained.');
 end;
 
-{ An upgrade over a live integration: every dialog is handed back to Windows
-  and the installed agents stop before their files are replaced. }
 function RecoverIntegration(): String;
 var
-  Code, Waited: Integer;
-  Text: String;
+  Code: Integer;
 begin
   Result := '';
   IntegrationRecovered := False;
   IntegrationRestored := False;
   if not FileExists(InstalledExecutable()) then Exit;
-  SavedSettingsPresent := LoadStringFromFile(IntegrationSettingsPath(), SavedSettings);
-  IntegrationEnabled := False;
-  ShortcutEnabled := False;
-  if SavedSettingsPresent then
-  begin
-    Text := SavedSettings;
-    if not JsonFlag(Text, 'Enabled', IntegrationEnabled) then IntegrationEnabled := False;
-    if not JsonFlag(Text, 'WinEEnabled', ShortcutEnabled) then ShortcutEnabled := IntegrationEnabled;
-  end;
-  HadDialogRunValue := RegQueryStringValue(HKCU, RunKey, DialogRunName, OldDialogRunValue);
-  HadShortcutRunValue := RegValueExists(HKCU, RunKey, ShortcutRunName);
-  if not IntegrationEnabled and not ShortcutEnabled and (InstalledRoles(False) = 0) then Exit;
-
-  Log('Restoring Windows dialogs and stopping installed background integration.');
+  if IntegrationOperation = '' then IntegrationOperation := NewIntegrationOperation();
   IntegrationRecovered := True;
-  if not ExecAsOriginalUser(InstalledExecutable(), '--dialog-recover', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) then
-    Code := -1;
+  if not RunIntegration('Snapshot', False, Code) then Code := -1;
   if Code <> 0 then
   begin
     RestoreIntegration(False);
-    Result := 'UltraExplorer could not hand its Open/Save dialogs back to Windows (exit code ' + IntToStr(Code) + '). No application files were replaced.';
+    Result := 'UltraExplorer could not hand the original user''s Open/Save dialogs back to Windows (exit code ' + IntToStr(Code) + '). No application files were replaced.';
     Exit;
   end;
-  Waited := 0;
-  while (InstalledRoles(False) > 0) and (Waited < 15000) do
+  { Another signed-in user's agents cannot be stopped using this user's
+    snapshot. Refuse replacement while such a copy still holds its files. }
+  if InstalledRoles() > 0 then
   begin
-    Sleep(250);
-    Waited := Waited + 250;
+    RestoreIntegration(False);
+    Result := 'Another signed-in user still has UltraExplorer background integration running. Close that copy before updating; no application files were replaced.';
   end;
-  { Recovery has already restored originals; a lingering provider may end. }
-  InstalledRoles(True);
 end;
-
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ScriptBytes: AnsiString;
 begin
   Result := '';
+  ExtractTemporaryFile('SetupIntegration.ps1');
+  if not LoadStringFromFile(ExpandConstant('{tmp}\SetupIntegration.ps1'), ScriptBytes) then
+  begin Result := 'The Setup integration helper could not be read.'; Exit; end;
+  IntegrationScript := ScriptBytes;
   ExtractTemporaryFile('{#PackageManifest}');
   if not LoadStringsFromFile(ExpandConstant('{tmp}\{#PackageManifest}'), CurrentPackageFiles) then
   begin

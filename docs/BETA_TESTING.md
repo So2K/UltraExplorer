@@ -1,4 +1,4 @@
-# Try the v1.3.0-beta.3 beta
+# Try the v1.3.0-beta.4 beta
 
 The useful feedback is a short workflow that behaves unexpectedly: which file
 type, what you did, and what happened. Use copies in a small disposable folder
@@ -7,7 +7,7 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
 ## Get started
 
 1. Download the installer or portable ZIP from the
-   [v1.3.0-beta.3 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.3).
+   [v1.3.0-beta.4 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.4).
    For the ZIP, extract the entire folder before running `UltraExplorer.exe`.
 2. Keep a few sample files together: two text files, an image, a PDF and,
    if relevant to your work, a media file, a model or a small ZIP containing
@@ -43,6 +43,9 @@ extracting another copy does not create an isolated profile.
 
 | Try | Expected result |
 | --- | --- |
+| Select a disposable folder and press `Ctrl+N`. Check the destination, then cancel or create a folder. | The dialog shows the full selected destination and rejects invalid names. Cancel creates nothing. `Ctrl+Shift+N` remains available; typing in an editor keeps its normal behavior. |
+| Select a copied file and press `Ctrl+D`, then hold the shortcut briefly. | One copy appears beside the original with the same contents and extension and a nonconflicting name. Key repeat does not make extra copies. `Ctrl+Shift+D` remains available. |
+| In a disposable REAPER project, open Save Project with dialog replacement enabled. Change the target folder, then choose **Format**. | The project options appear. Format opens REAPER's native settings with the chosen filename, destination and options retained; that Save dialog stays native. Cancel without saving if you only want to inspect it. |
 | Select one image, move the pointer over another file, then tap `Space` briefly. | Quick Look shows the selected image. The file menu's **Quick Look** also opens its target. `Ctrl+Space` previews the hovered file, or the selection when nothing is hovered. |
 | Close the preview. Hold `Space` and move the pointer; repeat with `Space+drag`. | The map follows the pointer immediately. Releasing Space stops the movement and does not open a preview. |
 | Rest the pointer over an image, then scroll or move away. | A passive preview appears without changing selection and disappears with the gesture. Turn **Hover previews** off and repeat: no content card appears. |

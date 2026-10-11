@@ -107,7 +107,16 @@ internal static partial class Program
         Check("M16: Setup restores the preference and agents after installing and on cancel",
             Regex.IsMatch(setup, @"ssPostInstall[\s\S]*?RestoreIntegration\(True\);")
             && Regex.IsMatch(setup, @"procedure DeinitializeSetup\(\);\s*begin\s*RestoreIntegration\(False\);")
-            && setup.Contains("'--dialog-agent'", StringComparison.Ordinal) && setup.Contains("'--shortcut-agent'", StringComparison.Ordinal));
+            && setup.Contains("RunIntegration('Restore', Installed, Code)", StringComparison.Ordinal));
+        var setupHelper = File.ReadAllText(Path.Combine(root, "installer", "SetupIntegration.ps1"));
+        Check("M16: both halves execute with the original user's identity and a bounded command line",
+            setup.Contains("ExecAsOriginalUser(ExpandConstant('{sys}\\WindowsPowerShell\\v1.0\\powershell.exe')", StringComparison.Ordinal)
+            && setup.Contains("-EncodedCommand", StringComparison.Ordinal) && setup.Contains(">= 32767", StringComparison.Ordinal)
+            && !setup.Contains("IntegrationSettingsPath()", StringComparison.Ordinal));
+        Check("M16: original-user helper selects its own SID and profile and preserves the current document",
+            setupHelper.Contains("[Security.Principal.WindowsIdentity]::GetCurrent().User.Value", StringComparison.Ordinal)
+            && setupHelper.Contains("[Environment]::GetFolderPath('LocalApplicationData')", StringComparison.Ordinal)
+            && setupHelper.Contains("Merge-SetupIntegrationSnapshot (Read-SetupIntegrationJson $settingsPath)", StringComparison.Ordinal));
         Check("H3: the uninstaller sweeps every loaded user hive for this copy's folder verbs",
             Regex.IsMatch(setup, @"usPostUninstall[\s\S]*?ReleaseAllFolderCommands\(\);")
             && setup.Contains("RegGetSubkeyNames(HKU, '', Users)", StringComparison.Ordinal));
