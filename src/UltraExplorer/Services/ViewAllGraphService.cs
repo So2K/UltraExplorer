@@ -1497,11 +1497,14 @@ public sealed class ViewAllGraphService : IDisposable
         }
         finally
         {
-            if (--pending.Refreshes == 0
-                && _pendingRefreshes.TryGetValue(node.FullPath, out var current)
-                && ReferenceEquals(current, pending))
+            if (--pending.Refreshes == 0)
             {
-                _pendingRefreshes.Remove(node.FullPath);
+                if (_pendingRefreshes.TryGetValue(node.FullPath, out var current)
+                    && ReferenceEquals(current, pending))
+                {
+                    _pendingRefreshes.Remove(node.FullPath);
+                }
+                pending.Completion.TrySetResult();
             }
         }
     }
@@ -1509,6 +1512,8 @@ public sealed class ViewAllGraphService : IDisposable
     /// <summary>The refreshes of one folder in flight, the sub-folders they are to open again and how far Load more had read each, and what they are to ask for by name again (see <see cref="_pendingRefreshes"/>).</summary>
     private sealed class PendingRefresh
     {
+        public TaskCompletionSource Completion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public HashSet<string> Expanded { get; } = new(StringComparer.OrdinalIgnoreCase);
 
         public Dictionary<string, int> ChildLoadLimits { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -1522,6 +1527,30 @@ public sealed class ViewAllGraphService : IDisposable
 
         /// <summary>How far Load more had read the folder itself, for a refresh of a folder above it that starts meanwhile.</summary>
         public int OwnLimit { get; set; }
+    }
+
+    /// <summary>The refreshes already rebuilding a strict ancestor of this
+    /// path. A folder's own refresh retains its node and is not a barrier.
+    /// Completion includes re-expansion and named children,
+    /// so a caller does not mistake the temporary empty branch for a deletion.
+    /// The returned task never cancels those shared refreshes.</summary>
+    internal Task? RefreshCompletionFor(string normalizedPath)
+    {
+        if (_pendingRefreshes.Count == 0) return null;
+        List<Task>? waits = null;
+        foreach (var ancestor in ViewAllPath.AncestorChain(normalizedPath))
+        {
+            if (string.Equals(ancestor, normalizedPath, StringComparison.OrdinalIgnoreCase)) continue;
+            if (_pendingRefreshes.TryGetValue(ancestor, out var refresh))
+                (waits ??= []).Add(refresh.Completion.Task);
+        }
+
+        return waits switch
+        {
+            null => null,
+            [var single] => single,
+            _ => Task.WhenAll(waits)
+        };
     }
 
     /// <summary>
@@ -2713,6 +2742,9 @@ public sealed class ViewAllGraphService : IDisposable
 
     private void ClearGraph()
     {
+        foreach (var refresh in _pendingRefreshes.Values) refresh.Completion.TrySetCanceled();
+        _pendingRefreshes.Clear();
+
         // Cancelled but not disposed, as in CancelLoad: each load disposes its own.
         foreach (var cancellation in _loads.Values)
         {

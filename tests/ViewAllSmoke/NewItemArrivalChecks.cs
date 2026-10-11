@@ -27,6 +27,7 @@ internal static partial class Program
             await ArrivalDeferredVisibilityChecksAsync();
             await ArrivalTinyTileChecksAsync();
             await ArrivalActualWatchChecksAsync();
+            await ArrivalLifecycleEdgeChecksAsync();
         });
         return Task.CompletedTask;
     }

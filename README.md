@@ -13,7 +13,7 @@ See the structure, fly into a folder, and keep your bearings.
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [Download for Windows](https://github.com/So2K/UltraExplorer/releases/latest) ·
-[Try v1.3.0 beta](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.4) ·
+[Try v1.3.0 beta](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.5) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -24,12 +24,19 @@ See the structure, fly into a folder, and keep your bearings.
 
 </div>
 
-**v1.3.0-beta.4 is available for testing:** quiet update checks with user-initiated
-installation, Space Quick Look, quick text notes, compact media/3D previews and
-optional archive, shelf and copy-path tools.
+**v1.3.0-beta.5 is available for testing:** new-item feedback joins clearer
+creation dialogs, keyboard shortcuts and REAPER Save options. Quiet update
+checks with user-initiated installation, Space Quick Look, quick text notes,
+compact media/3D previews and optional archive, shelf and copy-path tools remain included.
 See the [beta testing guide](docs/BETA_TESTING.md) for short sample workflows
 and reporting steps. Archive browsing, the shelf and copy-path button start
 off; enable each in Settings when you want to test it.
+
+In folders already read, newly added files and folders pulse yellow twice
+when they become visible on the nested canvas. Offscreen, hidden, filtered or
+too-small entries wait. Existing contents do not flash on first opening, and
+the feedback keeps your selection and camera unchanged.
+[Beta.5 release notes and validation limits](docs/RELEASE_NOTES_v1.3.0-beta.5.md).
 
 You remember roughly where something lives: a project inside a client folder,
 an export beside its source, a reference tucked several levels down. UltraExplorer

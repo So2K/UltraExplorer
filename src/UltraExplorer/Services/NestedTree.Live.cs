@@ -928,6 +928,7 @@ public sealed partial class NestedTree : IChangeSink
     /// </summary>
     partial void OnForgotten(NestedFolder folder)
     {
+        FolderForgotten?.Invoke(folder);
         _renames.Remove(folder);
         ForgetGone(folder);
         if (_goneByParent.Remove(folder, out var gone))

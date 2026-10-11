@@ -22,7 +22,7 @@ public sealed partial class NestedCanvas
     private int _pendingArrivalCount;
     private bool _arrivalsVisible;
     private TimeSpan? _arrivalStepTime;
-    private long _arrivalPruneVersion = -1;
+    private bool _arrivalParentsForgotten;
 
     internal readonly record struct ArrivalHighlight(string Path, Rect Bounds, double Opacity);
     internal IReadOnlyList<ArrivalHighlight> LastArrivalHighlights => _lastArrivalHighlights;
@@ -31,14 +31,15 @@ public sealed partial class NestedCanvas
 
     private sealed class ArrivalPulse(NestedFolder parent, string name, bool directory)
     {
-        public readonly NestedFolder Parent = parent;
+        public NestedFolder Parent = parent;
         public string Name = name;
-        public readonly bool IsDirectory = directory;
+        public bool IsDirectory = directory;
         public double Elapsed;
         public bool Visible;
         public bool Started;
         public string? Path;
         public string? ParentPath;
+        public List<string>? RenameSources;
     }
 
     private void OnItemsAdded(IReadOnlyList<NestedArrival> arrivals)
@@ -73,6 +74,9 @@ public sealed partial class NestedCanvas
                 _activeArrivals.Remove(replaced);
                 _pendingArrivalCount--;
             }
+            pulse.RenameSources ??= [];
+            if (pulse.RenameSources.Count < UltraExplorer.Services.Watch.ChangeHub.MaximumRenames
+                && !pulse.RenameSources.Contains(pulse.Name)) pulse.RenameSources.Add(pulse.Name);
             pulse.Name = rename.NewName;
             pulse.Path = null;
             group.Add(pulse.Name, pulse);
@@ -97,6 +101,86 @@ public sealed partial class NestedCanvas
         return false;
     }
 
+    private void OnFolderLoadedForArrivals(NestedFolder parent) => ReconcileArrivalGroup(parent);
+
+    private void ReconcileArrivalGroup(NestedFolder parent)
+    {
+        if (!parent.IsLoaded || parent.HasPartialListing || parent.IsTruncated
+            || !_arrivalGroups.TryGetValue(parent, out var group)) return;
+        List<string>? removed = null;
+        foreach (var (name, pulse) in group)
+        {
+            if (NestedTree.TryArrivalKind(parent, name, out var directory))
+            {
+                pulse.IsDirectory = directory;
+                pulse.RenameSources?.Clear();
+            }
+            else if (!HasArrivalRenameSource(parent, pulse))
+                (removed ??= []).Add(name);
+        }
+        if (removed is null) return;
+        foreach (var name in removed)
+        {
+            _activeArrivals.Remove(group[name]);
+            group.Remove(name);
+            _pendingArrivalCount--;
+        }
+        if (group.Count == 0) _arrivalGroups.Remove(parent);
+        RequestFrame(Layers.Overlay);
+    }
+
+    private static bool HasArrivalRenameSource(NestedFolder parent, ArrivalPulse pulse)
+    {
+        if (pulse.RenameSources is null) return false;
+        foreach (var source in pulse.RenameSources)
+            if (NestedTree.TryArrivalKind(parent, source, out _)) return true;
+        return false;
+    }
+
+    private void OnFolderForgottenForArrivals(NestedFolder parent)
+    {
+        if (_pendingArrivalCount == 0) return;
+        // Forget happens before rename carry-over has made its successors.
+        // Reconcile once the apply has finished, together with the picture.
+        _arrivalParentsForgotten = true;
+        RequestFrame(Layers.Overlay);
+    }
+
+    private void ReconcileForgottenArrivalParents()
+    {
+        if (!_arrivalParentsForgotten || _tree is null) return;
+        _arrivalParentsForgotten = false;
+        _detachedArrivalGroups.Clear();
+        foreach (var parent in _arrivalGroups.Keys)
+            if (NestedTree.IsDetached(parent)) _detachedArrivalGroups.Add(parent);
+        // Following a successor may materialize an existing named path and
+        // raise FolderLoaded. Keep that out of the dictionary enumeration.
+        foreach (var previous in _detachedArrivalGroups)
+        {
+            if (_tree.RenameSuccessor(previous) is { } successor) MoveArrivalGroup(previous, successor);
+            else RemoveArrivalGroup(previous);
+        }
+        _detachedArrivalGroups.Clear();
+    }
+
+    private void MoveArrivalGroup(NestedFolder previous, NestedFolder successor)
+    {
+        if (!_arrivalGroups.Remove(previous, out var group)) return;
+        if (!_arrivalGroups.TryGetValue(successor, out var target))
+            _arrivalGroups.Add(successor, target = group);
+        foreach (var (name, pulse) in group)
+        {
+            pulse.Parent = successor;
+            pulse.Path = null;
+            pulse.ParentPath = null;
+            if (ReferenceEquals(target, group)) continue;
+            if (target.TryAdd(name, pulse)) continue;
+            _activeArrivals.Remove(pulse);
+            _pendingArrivalCount--;
+        }
+        ReconcileArrivalGroup(successor);
+    }
+
     private void RemoveArrivalGroup(NestedFolder parent)
     {
         if (!_arrivalGroups.Remove(parent, out var group)) return;
@@ -114,7 +198,7 @@ public sealed partial class NestedCanvas
         _pendingArrivalCount = 0;
         _arrivalsVisible = false;
         _arrivalStepTime = null;
-        _arrivalPruneVersion = -1;
+        _arrivalParentsForgotten = false;
     }
 
     private void PauseArrivalPulses()
@@ -156,15 +240,7 @@ public sealed partial class NestedCanvas
         _activeArrivals.Clear();
         _arrivalsVisible = false;
         if (_pendingArrivalCount == 0 || _tree is null || (!IsVisible && !FramesByHandForTests)) return;
-
-        if (_arrivalPruneVersion != _tree.Version)
-        {
-            _arrivalPruneVersion = _tree.Version;
-            _detachedArrivalGroups.Clear();
-            foreach (var parent in _arrivalGroups.Keys)
-                if (NestedTree.IsDetached(parent)) _detachedArrivalGroups.Add(parent);
-            foreach (var parent in _detachedArrivalGroups) RemoveArrivalGroup(parent);
-        }
+        ReconcileForgottenArrivalParents();
 
         var visible = 0;
         // These lists are the current scene's actual, individually drawn

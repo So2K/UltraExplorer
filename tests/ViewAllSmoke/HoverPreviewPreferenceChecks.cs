@@ -16,6 +16,15 @@ internal static partial class Program
 {
     private static Task HoverPreviewPreferenceChecks()
     {
+        // A full run already created WPF's singleton Application for another
+        // STA group. Keep the real theme and every preference/window assertion
+        // on this group's own application dispatcher, as other UI groups do.
+        if (_only is not [var alone] || !alone.Equals(nameof(HoverPreviewPreferenceChecks), StringComparison.OrdinalIgnoreCase))
+        {
+            RunGroupInOwnProcess(nameof(HoverPreviewPreferenceChecks));
+            return Task.CompletedTask;
+        }
+
         RunOnSta("hover preview preferences", HoverPreviewPreferenceOnStaAsync);
         return Task.CompletedTask;
     }

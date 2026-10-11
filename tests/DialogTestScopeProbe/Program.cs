@@ -8,6 +8,37 @@ static Process Start(string mode)
     start.ArgumentList.Add(mode); return Process.Start(start)!;
 }
 if (args.FirstOrDefault() == "--leaf") { Console.WriteLine(Environment.ProcessId); Thread.Sleep(30000); return 0; }
+if (args.FirstOrDefault() == "--state-scope")
+{
+    using var owned = Process.GetCurrentProcess();
+    var real = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UltraExplorer");
+    var state = args[1] switch
+    {
+        "real" => real,
+        "quoted-real" => "\"" + real + "\"",
+        "expanded-real" => @"%LOCALAPPDATA%\UltraExplorer",
+        "real-child" => Path.Combine(real, "owned-probe"),
+        _ => Path.Combine(Path.GetTempPath(), "UltraExplorerScopeProbe", Guid.NewGuid().ToString("N"))
+    };
+    Environment.SetEnvironmentVariable("ULTRAEXPLORER_STATE_DIR", state);
+    Environment.SetEnvironmentVariable("ULTRAEXPLORER_DIALOG_TEST_ALLOW_CHILD_PROCESS", "1");
+    Environment.SetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW", "1");
+    Environment.SetEnvironmentVariable("ULTRAEXPLORER_DIALOG_TEST_PARENT_STARTED", owned.StartTime.ToUniversalTime().ToFileTimeUtc().ToString());
+    Console.WriteLine(new DialogFixtureProcessScope((uint)owned.Id).AllowsChildren);
+    return 0;
+}
+static async Task<bool> StateAllows(string state)
+{
+    var start = new ProcessStartInfo(Path.ChangeExtension(typeof(DialogFixtureProcessScope).Assembly.Location, ".exe"))
+    { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true };
+    start.ArgumentList.Add("--state-scope");
+    start.ArgumentList.Add(state);
+    using var process = Process.Start(start)!;
+    var text = await process.StandardOutput.ReadToEndAsync();
+    await process.WaitForExitAsync();
+    if (process.ExitCode != 0 || !bool.TryParse(text.Trim(), out var allows)) throw new InvalidOperationException("The isolated state probe did not complete.");
+    return allows;
+}
 if (args.FirstOrDefault() == "--middle")
 {
     using var leaf = Start("--leaf"); Console.WriteLine(await leaf.StandardOutput.ReadLineAsync());
@@ -33,9 +64,14 @@ try
     var wrongStart = new DialogFixtureProcessScope(pid);
     Check("wrong parent creation identity excludes children", !wrongStart.AllowsChildren && !wrongStart.Allows((uint)child.Id));
     Environment.SetEnvironmentVariable("ULTRAEXPLORER_DIALOG_TEST_PARENT_STARTED", parent.StartTime.ToUniversalTime().ToFileTimeUtc().ToString());
-    Environment.SetEnvironmentVariable("ULTRAEXPLORER_STATE_DIR", Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "UltraExplorer"));
-    Check("real user state cannot enable child qualification", !new DialogFixtureProcessScope(pid).AllowsChildren);
-    Environment.SetEnvironmentVariable("ULTRAEXPLORER_STATE_DIR", Path.Combine(Path.GetTempPath(), "UltraExplorerScopeProbe", "state"));
+    // AppPaths resolves once per process, just as it does in production.
+    // Each startup spelling therefore needs a fresh process, not a later
+    // environment edit that would leave the actual state folder unchanged.
+    Check("fresh isolated state enables owned child qualification", await StateAllows("isolated"));
+    Check("real user state cannot enable child qualification", !await StateAllows("real"));
+    Check("quoted real user state cannot enable child qualification", !await StateAllows("quoted-real"));
+    Check("expanded real user state cannot enable child qualification", !await StateAllows("expanded-real"));
+    Check("a child of real user state cannot enable child qualification", !await StateAllows("real-child"));
     Environment.SetEnvironmentVariable("ULTRAEXPLORER_TEST_WINDOW", "0");
     Check("ordinary window mode cannot broaden fixture PID scope", !new DialogFixtureProcessScope(pid).AllowsChildren);
     child.Kill(); child.WaitForExit();

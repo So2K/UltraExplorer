@@ -457,6 +457,8 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
                 _tree.Changed -= OnTreeChanged;
                 _tree.FolderLoaded -= OnFolderLoadedForFilter;
                 _tree.FolderLoaded -= OnFolderLoadedForGpu;
+                _tree.FolderLoaded -= OnFolderLoadedForArrivals;
+                _tree.FolderForgotten -= OnFolderForgottenForArrivals;
                 _tree.SortChanged -= OnTreeSortChanged;
                 _tree.ItemsAdded -= OnItemsAdded;
                 _tree.ItemsRenamed -= OnItemsRenamed;
@@ -495,6 +497,8 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
                 _tree.Changed += OnTreeChanged;
                 _tree.FolderLoaded += OnFolderLoadedForFilter;
                 _tree.FolderLoaded += OnFolderLoadedForGpu;
+                _tree.FolderLoaded += OnFolderLoadedForArrivals;
+                _tree.FolderForgotten += OnFolderForgottenForArrivals;
                 _tree.SortChanged += OnTreeSortChanged;
                 _tree.ItemsAdded += OnItemsAdded;
                 _tree.ItemsRenamed += OnItemsRenamed;
