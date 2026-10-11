@@ -58,15 +58,25 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <TextBlock x:Name="TitleText" FontSize="17" FontWeight="SemiBold" />
-            <TextBlock x:Name="PromptText" Grid.Row="1" Margin="0,7,0,14" Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" />
-            <TextBox x:Name="ValueTextBox" Grid.Row="2" MinHeight="38" />
-            <PasswordBox x:Name="ValuePasswordBox" Grid.Row="2" MinHeight="38"
+            <StackPanel x:Name="DestinationPanel" Grid.Row="1" Margin="0,14,0,7" Visibility="Collapsed">
+                <TextBlock Text="In folder" Margin="0,0,0,6" Foreground="{StaticResource TextMutedBrush}" />
+                <TextBox x:Name="DestinationTextBox" IsReadOnly="True" Height="Auto" MinHeight="38" MaxHeight="82"
+                         TextWrapping="Wrap" VerticalScrollBarVisibility="Auto"
+                         Foreground="{StaticResource TextMutedBrush}" AutomationProperties.Name="Destination folder" />
+            </StackPanel>
+            <TextBlock x:Name="PromptText" Grid.Row="2" Margin="0,7,0,14" Foreground="{StaticResource TextMutedBrush}" TextWrapping="Wrap" />
+            <TextBox x:Name="ValueTextBox" Grid.Row="3" MinHeight="38" />
+            <PasswordBox x:Name="ValuePasswordBox" Grid.Row="3" MinHeight="38"
                          Visibility="Collapsed" PasswordChar="●" AutomationProperties.Name="Password" />
-            <StackPanel Grid.Row="3" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
+            <TextBlock x:Name="NameErrorText" Grid.Row="4" Margin="0,8,0,0" Visibility="Collapsed"
+                       Foreground="{StaticResource DangerBrush}" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+            <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,18,0,0">
                 <Button Style="{StaticResource FlatButton}" Content="Cancel" MinWidth="82" Margin="0,0,8,0" Click="Cancel_Click" />
-                <Button Style="{StaticResource AccentButton}" Content="OK" MinWidth="82" IsDefault="True" Click="Ok_Click" />
+                <Button x:Name="ConfirmButton" Style="{StaticResource AccentButton}" Content="OK" MinWidth="82" IsDefault="True" Click="Ok_Click" />
             </StackPanel>
         </Grid>
     </Border>

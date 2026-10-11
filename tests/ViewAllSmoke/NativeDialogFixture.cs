@@ -129,7 +129,14 @@ internal static class NativeDialogFixture
                 custom.SetSelectedControlItem(504, 1);
                 if (mode == "save-hidden-options") custom.SetControlState(501, 1); // enabled, not visible
             }
-            if (mode == "unsupported") custom.AddPushButton(505, "Advanced export options");
+            // Plain action buttons now return to the application's own
+            // settings UI. An application menu remains outside the mirrored
+            // control contract and must preserve the original dialog.
+            if (mode == "unsupported")
+            {
+                custom.AddMenu(505, "Advanced export options");
+                custom.AddControlItem(505, 1, "Advanced profile");
+            }
             var events = new FixtureEvents(custom, mode == "save-hidden-options");
             dialog.Advise(events, out var cookie);
             using var optionProbe = mode.Contains("custom", StringComparison.Ordinal) ? new FixtureOptionProbe(dialog, custom, output) : null;

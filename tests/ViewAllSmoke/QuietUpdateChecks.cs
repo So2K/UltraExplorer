@@ -54,7 +54,9 @@ internal static partial class Program
         service.Start(); service.Start();
         await firstDelay.Task.WaitAsync(TimeSpan.FromSeconds(5));
         Check("normal startup schedules exactly one 30-second first delay", durations.Count == 1 && durations[0] == TimeSpan.FromSeconds(30));
-        Check("startup sends no request and creates no download/install work", handler.Requests.Count == 0 && !Directory.Exists(fixture.Path) && service.State == QuietUpdateState.Idle);
+        // The only startup write is the health marker the confirmed-update helper waits for.
+        Check("startup sends no request and creates no download/install work", handler.Requests.Count == 0 && service.State == QuietUpdateState.Idle
+            && Directory.GetFiles(fixture.Path).Select(System.IO.Path.GetFileName).SequenceEqual(["started.json"]));
         clock.Advance(TimeSpan.FromSeconds(30)); releaseDelay.SetResult();
         await QuietWait(() => handler.Requests.Count == 1);
         Check("first network request is made only after the initial delay", handler.Requests.Count == 1);
@@ -355,7 +357,7 @@ internal static partial class Program
         var linkCache = System.IO.Path.Combine(linkedFixture.Path, "hard-link-cache");
         Directory.CreateDirectory(linkCache);
         var partial = new QuietUpdateStore(linkCache).PackagePath(QuietHash(payloadForLinks), partial: true);
-        Check("the owned fixture creates a real NTFS hard link", QuietCreateHardLink(partial, sentinelPath, IntPtr.Zero));
+        Check("the owned fixture creates a real NTFS hard link", QuietCreateHardLink(QuietLongPath(partial), QuietLongPath(sentinelPath), IntPtr.Zero));
         if (File.Exists(partial))
         {
             var handler = QuietReleaseHandler(payloadForLinks, "v1.3.1");
@@ -383,6 +385,9 @@ internal static partial class Program
     [DllImport("kernel32.dll", EntryPoint = "CreateHardLinkW", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool QuietCreateHardLink(string newName, string existingName, IntPtr securityAttributes);
+    // CreateHardLinkW is limited to MAX_PATH without the extended prefix; a long
+    // TEMP (CI agents, nested worktrees) would otherwise fail the fixture itself.
+    private static string QuietLongPath(string path) => @"\\?\" + System.IO.Path.GetFullPath(path);
 
     private static QuietHandler QuietReleaseHandler(byte[] payload, string tag, string? sumsHash = null, string? redirectTo = null, bool corruptDownload = false)
     {

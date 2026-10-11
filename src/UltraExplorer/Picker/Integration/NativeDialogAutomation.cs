@@ -213,10 +213,10 @@ internal sealed class NativeDialogAutomation : IDisposable
     {
         if (depth > 8 || result.Count > 64) throw new NotSupportedException("The additional controls are too complex to mirror.");
         using var cached = _optionCache!.Activate();
-        foreach (var child in knownChildren ?? parent.FindAllChildren())
+        foreach (var child in OptionChildren(parent, knownChildren))
         {
             var hwnd = child.Properties.NativeWindowHandle.ValueOrDefault;
-            if (hwnd != 0 && !DialogNative.HasVisibleControlStyle(hwnd)) continue;
+            if (hwnd != 0 && !NativeDialogChrome.HasVisibleAncestry(hwnd, _handle)) continue;
             var key = hwnd != 0 ? "hwnd_" + hwnd.ToString("X")
                 : string.Join("_", child.Properties.RuntimeId.ValueOrDefault ?? []) + "-" + child.Properties.AutomationId.ValueOrDefault;
             if (!_readKeys.Add(key)) continue;
@@ -233,27 +233,33 @@ internal sealed class NativeDialogAutomation : IDisposable
             else if (nativeCombo is not null) kind = ControlType.ComboBox;
             else if (nativeEdit is not null) kind = ControlType.Edit;
             else if (hwnd != 0 && DialogNative.ClassName(hwnd) == "Static") kind = ControlType.Text;
-            if (kind is ControlType.Pane or ControlType.Group or ControlType.Tree or ControlType.Custom)
+            else if (hwnd != 0 && DialogNative.ClassName(hwnd) == "Button" && (DialogNative.Style(hwnd) & 0xf) is 0 or 1)
+                kind = ControlType.Button;
+            var nativeContainer = hwnd != 0 && DialogNative.ClassName(hwnd) is ("Static" or "#32770")
+                && DialogNative.GetWindow(hwnd, 5) != 0;
+            if (kind is ControlType.Pane or ControlType.Group or ControlType.Tree or ControlType.Custom || nativeContainer)
             {
                 if (kind == ControlType.Custom && (child.Patterns.Invoke.IsSupported || child.Patterns.Value.IsSupported
                     || child.Patterns.Toggle.IsSupported))
                     throw new NotSupportedException("An interactive custom option needs its original dialog.");
-                var children = child.FindAllChildren();
+                var children = OptionChildren(child);
                 if (children.Length == 0 && (hwnd != 0 || !string.IsNullOrEmpty(child.Name)))
                     throw new NotSupportedException("An additional application control needs its original dialog.");
                 ReadChildren(child, result, depth + 1, children);
                 continue;
             }
             var enabled = child.IsEnabled;
+            var label = child.Name ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(label) && hwnd != 0) label = DialogNative.Title(hwnd);
             NativeOptionSnapshot option;
             if (kind == ControlType.CheckBox && (nativeCheck is not null || child.Patterns.Toggle.IsSupported))
             {
                 var state = nativeCheck is { } checkState ? (ToggleState)checkState.State : child.Patterns.Toggle.Pattern.ToggleState.Value;
-                option = new(key, NativeOptionKind.CheckBox, child.Name ?? DialogNative.Title(hwnd), enabled,
+                option = new(key, NativeOptionKind.CheckBox, label, enabled,
                     state == ToggleState.Indeterminate ? null : state == ToggleState.On);
             }
             else if (kind == ControlType.RadioButton && (nativeCheck is not null || child.Patterns.SelectionItem.IsSupported))
-                option = new(key, NativeOptionKind.RadioButton, child.Name ?? string.Empty, enabled,
+                option = new(key, NativeOptionKind.RadioButton, label, enabled,
                     nativeCheck is { } radioState ? radioState.State == 1 : child.Patterns.SelectionItem.Pattern.IsSelected.Value,
                     Text: string.Join("_", parent.Properties.RuntimeId.ValueOrDefault ?? []));
             else if (kind == ControlType.ComboBox && (child.Patterns.Selection.IsSupported
@@ -274,15 +280,21 @@ internal sealed class NativeDialogAutomation : IDisposable
                     selectedIndex = Array.FindIndex(items, item => item.Patterns.SelectionItem.Pattern.IsSelected.Value);
                 }
                 if (labels.Length is 0 or > 100) throw new NotSupportedException("An additional list cannot be read.");
-                option = new(key, NativeOptionKind.ComboBox, native is null ? child.Name ?? string.Empty : "", enabled, Choices: labels,
+                option = new(key, NativeOptionKind.ComboBox, native is null ? label : "", enabled, Choices: labels,
                     SelectedIndex: selectedIndex);
             }
             else if (kind == ControlType.Edit && (nativeEdit is not null || child.Patterns.Value.IsSupported))
-                option = new(key, NativeOptionKind.TextBox, child.Name ?? string.Empty, enabled && (nativeEdit is not null
+                option = new(key, NativeOptionKind.TextBox, label, enabled && (nativeEdit is not null
                     || !child.Patterns.Value.Pattern.IsReadOnly.Value),
                     Text: nativeEdit ?? child.Patterns.Value.Pattern.Value.Value);
             else if (kind == ControlType.Text)
-                option = new(key, NativeOptionKind.Label, child.Name ?? string.Empty, false);
+            {
+                if (string.IsNullOrWhiteSpace(label)) continue;
+                option = new(key, NativeOptionKind.Label, label, false);
+            }
+            else if (kind == ControlType.Button && hwnd != 0 && DialogNative.ClassName(hwnd) == "Button"
+                && (DialogNative.Style(hwnd) & 0xf) is 0 or 1)
+                option = new(key, NativeOptionKind.Button, label, enabled);
             else if (kind == ControlType.Separator) continue;
             else throw new NotSupportedException($"The dialog has an additional {kind} control ({child.Properties.ClassName.ValueOrDefault}, {child.Properties.AutomationId.ValueOrDefault}) which needs its original window.");
             if (option.Kind is NativeOptionKind.ComboBox or NativeOptionKind.TextBox
@@ -296,6 +308,32 @@ internal sealed class NativeDialogAutomation : IDisposable
             if (result.Count > 64)
                 throw new NotSupportedException("The additional controls are too complex to mirror.");
         }
+    }
+
+    // UIA's control view may omit a child dialog or flatten its descendants.
+    // Within application options only, include the actual child HWNDs too;
+    // the read-key set merges both views without mirroring a control twice.
+    private AutomationElement[] OptionChildren(AutomationElement parent, AutomationElement[]? knownChildren = null)
+    {
+        var children = (knownChildren ?? parent.FindAllChildren()).ToList();
+        var handles = children.Select(child => child.Properties.NativeWindowHandle.ValueOrDefault).ToHashSet();
+        var hwnd = parent.Properties.NativeWindowHandle.ValueOrDefault;
+        // Provider-only group nodes sometimes share the surrounding DirectUI
+        // host's HWND. Its siblings include the file view and navigation;
+        // only actual native option panels/label hosts own child HWNDs here.
+        if (hwnd == 0 || hwnd == _handle
+            || DialogNative.ClassName(hwnd) is not ("#32770" or "Static" or "RadioButtonList")) return [.. children];
+        var visited = 0;
+        for (var child = DialogNative.GetWindow(hwnd, 5); child != 0; child = DialogNative.GetWindow(child, 2))
+        {
+            if (++visited > 128)
+                throw new NotSupportedException("The additional control hierarchy is too large to mirror safely.");
+            if (!DialogNative.HasVisibleControlStyle(child) || !handles.Add(child)) continue;
+            if (children.Count >= 128)
+                throw new NotSupportedException("The additional control hierarchy is too large to mirror safely.");
+            children.Add(_automation.FromHandle(child));
+        }
+        return [.. children];
     }
 
     private void RequireOwnedMutation()
@@ -318,7 +356,7 @@ internal sealed class NativeDialogAutomation : IDisposable
         if (!_options.TryGetValue(value.Key, out var control) || !control.IsEnabled)
             throw new InvalidOperationException("The application's option changed. Use its Windows dialog.");
         var hwnd = control.Properties.NativeWindowHandle.ValueOrDefault;
-        if (hwnd != 0 && (!DialogNative.HasVisibleControlStyle(hwnd) || !DialogNative.IsWindowEnabled(hwnd)))
+        if (hwnd != 0 && (!NativeDialogChrome.HasVisibleAncestry(hwnd, _handle) || !DialogNative.IsWindowEnabled(hwnd)))
             throw new InvalidOperationException("The application hid or disabled this option. Use its Windows dialog.");
         switch (value.Kind)
         {
@@ -354,6 +392,22 @@ internal sealed class NativeDialogAutomation : IDisposable
                 else control.Patterns.Value.Pattern.SetValue(value.Text);
                 break;
         }
+    }
+
+    // Complex options can open application-owned modal windows. The proxy
+    // first returns the original dialog to the screen, then posts the click;
+    // never invoke such a button while its native parent is hidden.
+    public nint GetOptionButton(NativeOptionSnapshot value)
+    {
+        RequireOwnedMutation();
+        if (value.Kind != NativeOptionKind.Button || !_options.TryGetValue(value.Key, out var control))
+            throw new InvalidOperationException("The application's options button changed. Use its Windows dialog.");
+        var hwnd = control.Properties.NativeWindowHandle.ValueOrDefault;
+        if (hwnd == 0 || DialogNative.ClassName(hwnd) != "Button" || (DialogNative.Style(hwnd) & 0xf) is not (0 or 1)
+            || !NativeDialogChrome.HasVisibleAncestry(hwnd, _handle) || !DialogNative.IsWindowEnabled(hwnd)
+            || !control.IsEnabled || DialogNative.ProcessId(hwnd) != DialogNative.ProcessId(_handle))
+            throw new InvalidOperationException("The application's options button is unavailable. Use its Windows dialog.");
+        return hwnd;
     }
 
     public NativeOptionSnapshot[] SetFilter(int oneBasedIndex)

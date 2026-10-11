@@ -142,7 +142,7 @@ internal sealed class GpuDeviceSet : IDisposable
             using var factory = DXGI.CreateDXGIFactory2<IDXGIFactory4>(false);
             if (factory.EnumAdapterByLuid(adapterLuid, out adapter).Failure || adapter is null)
             {
-                throw new GpuUnavailableException($"No graphics adapter has LUID {FormatLuid(adapterLuid)}.");
+                throw new GpuUnavailableException($"No graphics adapter has LUID {FormatLuid(adapterLuid)}.") { AdapterMissing = true };
             }
         }
         catch (SharpGenException ex)
@@ -528,4 +528,7 @@ internal sealed class GpuUnavailableException : Exception
         : base(message, innerException)
     {
     }
+
+    /// <summary>No adapter has the LUID asked for: it changed - a driver updated or reset - since it was looked up.</summary>
+    public bool AdapterMissing { get; init; }
 }

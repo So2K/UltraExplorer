@@ -22,13 +22,19 @@ namespace UltraExplorer.Services.Watch;
 /// spelt with a short 8.3 name (PROGRA~1), which Windows sometimes reports
 /// changes under, is looked up again under its long name.</para>
 ///
-/// <para>One buffer of records at a time - a root has one watcher, and a
-/// watcher parses one buffer at a time - so the scratch buffers and the
-/// half-seen rename need no lock.  Nothing here allocates on a miss, but
-/// for a folder spelt with a short name: its long name, once per buffer.</para>
+/// <para>One buffer of records at a time - every watch opened has records
+/// of its own (an arm overtaken by another still runs its watch until it is
+/// stopped), and a watcher parses one buffer at a time - so the scratch
+/// buffers and the half-seen rename need no lock.  A watch's records count
+/// into the root's own records, which tests feed
+/// and read.  Nothing here allocates on a miss, but for a folder spelt with
+/// a short name: its long name, once per buffer.</para>
 /// </summary>
-internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChangeRecordSink
+internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root, RootRecords? countInto = null) : IChangeRecordSink
 {
+    /// <summary>Where the counts below are kept: the root's records, for a watch's; these, for the root's own.</summary>
+    private RootRecords Counts => countInto ?? this;
+
     private char[] _path = new char[512];
     private char[] _longPath = new char[512];
     private char[] _oldParent = new char[256];
@@ -54,7 +60,7 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
 
     public void Record(in ChangeRecord record)
     {
-        Records++;
+        Counts.Records++;
         var name = record.Name;
         var slash = name.LastIndexOf('\\');
         var parent = slash < 0 ? ReadOnlySpan<char>.Empty : name[..slash];
@@ -141,7 +147,7 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
 
         if (hit)
         {
-            Hits++;
+            Counts.Hits++;
         }
     }
 
@@ -204,7 +210,7 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
             return false;
         }
 
-        LongNameHits++;
+        Counts.LongNameHits++;
         return true;
     }
 
@@ -217,7 +223,7 @@ internal sealed unsafe class RootRecords(ChangeHub hub, WatchRoot root) : IChang
         }
 
         _path[length] = '\0';
-        LongNameLookups++;
+        Counts.LongNameLookups++;
         uint found;
         fixed (char* shortPath = _path)
         fixed (char* longPath = _longPath)

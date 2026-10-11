@@ -42,13 +42,57 @@ internal static class ShellReplacementRegistration
             var executable = DialogSelfProcess.ExecutablePath;
             if (enabled && !File.Exists(executable))
                 throw new FileNotFoundException("UltraExplorer's executable is unavailable.", executable);
+            // An all-users copy never registers: a registration an earlier
+            // version made is taken back on this start instead.
+            var refused = enabled && IsPerMachineInstall(executable);
             using var root = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, RegistryView.Registry64);
             // Every start of every role reconciles. Only a change is announced:
             // the broadcast makes the desktop and every Explorer window redraw.
-            if (ShellRegistrationTransaction.Reconcile(root, JournalPath, executable, enabled, includeHome: false))
+            if (ShellRegistrationTransaction.Reconcile(root, JournalPath, executable, enabled && !refused, includeHome: false))
                 SHChangeNotify(0x08000000, 0, 0, 0); // SHCNE_ASSOCCHANGED, SHCNF_IDLIST.
+            if (refused)
+                throw new IOException("Opening folders in UltraExplorer is set up per user, so it is not available for an all-users installation: "
+                    + "uninstalling could not take the other users' folder commands back. Install UltraExplorer for the current user to use it.");
         }
         finally { if (entered) mutex.ReleaseMutex(); }
+    }
+
+    /// <summary>Setup's uninstall entry (AppId in installer/UltraExplorer.iss).</summary>
+    internal const string SetupUninstallKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\{6F0B8E57-3C1D-4B7A-9E54-2D8A1C3F7B90}_is1";
+
+    /// <summary>
+    /// Whether this executable belongs to an all-users installation: Program
+    /// Files, or the folder an all-users Setup recorded in HKLM. Folder verbs
+    /// live in each user's own HKCU while the uninstaller runs as one user, so
+    /// every other user's folders would keep naming the deleted executable
+    /// (docs/SHELL_REGISTRATION.md). Such a copy never registers them.
+    /// </summary>
+    internal static bool IsPerMachineInstall(string executable) => IsPerMachineLocation(executable,
+        [Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86),
+            Environment.GetEnvironmentVariable("ProgramW6432")],
+        MachineInstallLocation());
+
+    internal static bool IsPerMachineLocation(string executable, IEnumerable<string?> machineRoots, string? machineInstallLocation)
+    {
+        if (Normalize(Path.GetDirectoryName(executable)) is not { } directory) return false;
+        if (Normalize(machineInstallLocation) is { } installed && directory.Equals(installed, StringComparison.OrdinalIgnoreCase)) return true;
+        return machineRoots.Select(Normalize).Any(root => root is not null
+            && directory.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase));
+
+        static string? Normalize(string? path) => string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path.Trim())
+            ? null : Path.GetFullPath(path.Trim()).TrimEnd(Path.DirectorySeparatorChar);
+    }
+
+    private static string? MachineInstallLocation()
+    {
+        try
+        {
+            using var machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, RegistryView.Registry64);
+            using var entry = machine.OpenSubKey(SetupUninstallKey, writable: false);
+            return entry?.GetValue("InstallLocation") as string;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException) { return null; }
     }
 
     [DllImport("shell32.dll")]

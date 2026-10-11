@@ -429,6 +429,9 @@ public partial class MainWindow
                 _ = _viewModel.Tree.RevealPathAsync(opened);
                 return;
             // New ▸ Shortcut starts Windows' own wizard, which names what it makes.
+            case ShellMenuPick.Shell when choice.IsNew && menu.NewTarget is { } folderTarget && string.Equals(choice.Verb, "NewFolder", StringComparison.OrdinalIgnoreCase):
+                _ = _viewModel.CreateFolderInAsync(folderTarget);
+                return;
             case ShellMenuPick.Shell when choice.IsNew && menu.NewTarget is { } folder && !string.Equals(choice.Verb, "NewLink", StringComparison.OrdinalIgnoreCase):
                 var before = FolderEntries(folder);
                 menu.Invoke(choice, x, y);
@@ -510,9 +513,8 @@ public partial class MainWindow
     }
 
     /// <summary>
-    /// Explorer puts a new folder or file straight into renaming; so does the
-    /// app: what the New made is read into the canvas, becomes the selection,
-    /// and the app's rename opens on it - or <paramref name="rename"/>, for tests.
+    /// A file made from a Windows template gets its own naming prompt with the
+    /// destination shown. The injected callback remains available for tests.
     /// </summary>
     internal async Task<string?> FollowNewItemAsync(string folder, IReadOnlySet<string> before, Action? rename = null)
     {
@@ -521,9 +523,14 @@ public partial class MainWindow
             return null;
         }
 
+        var holder = _viewModel.Tree.SelectionHolder;
+        var version = _viewModel.Tree.Selection.Version;
         await _viewModel.Tree.RefreshPathAsync(folder);
+        if (!ReferenceEquals(holder, _viewModel.Tree.SelectionHolder)
+            || version != _viewModel.Tree.Selection.Version) return made;
         _viewModel.Tree.Selection.ReplaceSingle(made, Directory.Exists(made), 0, SelectionSource.Command);
-        (rename ?? (() => _viewModel.RenameCommand.Execute(null)))();
+        if (rename is not null) rename();
+        else await _viewModel.NameNewItemAsync(made);
         return made;
     }
 
@@ -672,7 +679,7 @@ public partial class MainWindow
         var entries = new List<ShellMenuEntry>();
         if (!forShell)
         {
-            entries.Add(new ShellMenuEntry(where is null ? "New folder" : $"New folder in {where}") { Command = _viewModel.NewFolderCommand, Glyph = "\uE8F4", Shortcut = "Ctrl+Shift+N" });
+            entries.Add(new ShellMenuEntry(where is null ? "New folder" : $"New folder in {where}") { Command = _viewModel.NewFolderCommand, Glyph = "\uE8F4", Shortcut = "Ctrl+N" });
             entries.Add(new ShellMenuEntry(where is null ? "New text file" : $"New text file in {where}") { Command = _viewModel.NewTextFileCommand, Glyph = "\uE8A5" });
             entries.Add(new ShellMenuEntry(where is null ? "Paste" : $"Paste into {where}") { Command = _viewModel.PasteCommand, Glyph = "\uE77F", Shortcut = "Ctrl+V" });
             entries.Add(ShellMenuEntry.Separator);

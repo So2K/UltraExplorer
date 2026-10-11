@@ -32,6 +32,8 @@ public sealed class QuietUpdateService : IDisposable
     private bool _disposed;
     private bool? _unpersistedPreference;
 
+    private static readonly TimeSpan AttemptClockSkew = TimeSpan.FromMinutes(5);
+
     public QuietUpdateService(string? cacheDirectory = null)
         : this(cacheDirectory ?? Path.Combine(AppPaths.StateDirectory, "updates"),
             typeof(QuietUpdateService).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "", null, TimeProvider.System) { }
@@ -79,7 +81,10 @@ public sealed class QuietUpdateService : IDisposable
     {
         try
         {
-            // Start is called only after the normal main window is visible.
+            // Start is called only after the normal main window is visible:
+            // the confirmed-update helper keeps its rollback backup until the
+            // restarted version reports that here (docs/QUIET_UPDATES.md).
+            RecordStartup();
             // Even re-enabling the setting cannot bypass this first delay.
             await _delay(TimeSpan.FromSeconds(30), _lifetime.Token).ConfigureAwait(false);
             StartSettingsWatcher();
@@ -92,6 +97,13 @@ public sealed class QuietUpdateService : IDisposable
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException) { Publish(QuietUpdateState.Failed); }
+    }
+
+    private void RecordStartup()
+    {
+        if (_installed is null) return;
+        try { _store.RecordStartup(new QuietUpdateStore.Startup(_installed.Value, Environment.ProcessId, _time.GetUtcNow())); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     private void StartSettingsWatcher()
@@ -153,7 +165,10 @@ public sealed class QuietUpdateService : IDisposable
         {
             await LoadReadyAsync(operation.Token).ConfigureAwait(false);
             var now = _time.GetUtcNow();
-            if (now - _store.LastAttemptUtc < TimeSpan.FromDays(1)) return;
+            var last = _store.LastAttemptUtc;
+            // A timestamp ahead of the clock (the clock was set back, a profile
+            // copied from another machine) must not stop checks until that date.
+            if (last <= now + AttemptClockSkew && now - last < TimeSpan.FromDays(1)) return;
             // Persist the attempt before HTTP, also on failure/cancellation.
             // A second process/restart/toggle therefore cannot spam GitHub.
             _store.RecordAttempt(now);
@@ -200,7 +215,15 @@ public sealed class QuietUpdateService : IDisposable
     private async Task LoadReadyAsync(CancellationToken token)
     {
         var package = _store.Ready;
-        if (package is null || !ValidPackage(package)) return;
+        if (package is null) return;
+        if (!ValidPackage(package))
+        {
+            // The offered version is now installed (or older): its package
+            // (~150 MB) and offer are spent, not kept until the next release.
+            if (UpdateVersion.Parse(package.Version) is { } version && _installed is not null && version.CompareTo(_installed) <= 0)
+            { _verified = null; _store.ClearReady(); _store.PrunePackages(""); }
+            return;
+        }
         var path = _store.PackagePath(package.Sha256);
         if (_verified == package && File.Exists(path) && File.GetLastWriteTimeUtc(path) == _verifiedWriteTime)
         { if (State != QuietUpdateState.Installing) PublishReady(package, path); return; }

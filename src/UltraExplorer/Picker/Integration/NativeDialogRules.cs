@@ -3,7 +3,7 @@ using System.Text.RegularExpressions;
 
 namespace UltraExplorer.Picker.Integration;
 
-internal enum NativeOptionKind { CheckBox, RadioButton, ComboBox, TextBox, Label }
+internal enum NativeOptionKind { CheckBox, RadioButton, ComboBox, TextBox, Label, Button }
 
 internal sealed record NativeOptionSnapshot(string Key, NativeOptionKind Kind, string Label, bool Enabled,
     bool? Checked = null, string Text = "", string[]? Choices = null, int SelectedIndex = -1);
@@ -210,6 +210,40 @@ internal static partial class NativeDialogRules
                 throw new ArgumentException("The selected path cannot be delivered to Windows.");
         return result.Paths.Count == 1 ? result.Paths[0] : string.Join(" ", result.Paths.Select(path => '"' + path + '"'));
     }
+
+    /// <summary>
+    /// Why these paths cannot be typed into the application's own dialog as
+    /// they are, or null when they can. The dialog gets them as text in its
+    /// name box, and reads that text its own way:
+    /// <list type="bullet">
+    /// <item>several files are returned from one folder only - a program
+    /// still asking with <c>GetOpenFileName</c> is handed one folder and the
+    /// names in it, so files from another folder would come back as files of
+    /// the first; such a program looks the same as any other from outside;</item>
+    /// <item>a name with <c>%NAME%</c> in it has the variable put in by
+    /// Windows - "%OS%.txt" would come back as "Windows_NT.txt".</item>
+    /// </list>
+    /// </summary>
+    public static string? HandBackProblem(IReadOnlyList<string> paths)
+    {
+        foreach (var path in paths)
+            if (path.Contains('%') && !string.Equals(Environment.ExpandEnvironmentVariables(path), path, StringComparison.Ordinal))
+                return $"{Path.GetFileName(path.TrimEnd(Path.DirectorySeparatorChar))} cannot be handed to this application's dialog as it is named:"
+                    + " Windows would read the part between % signs as a variable and return another name."
+                    + " Rename it, or use the Windows dialog this time.";
+        if (paths.Count > 1 && paths.Select(path => Path.GetDirectoryName(path.TrimEnd(Path.DirectorySeparatorChar)) ?? path)
+                .Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any())
+            return "This application can only be given several files from one folder. Choose the files in one folder.";
+        return null;
+    }
+
+    /// <summary>
+    /// The applications whose dialogs stay with Windows, with one more: the
+    /// newest 128, so that the one just added is always among them.
+    /// </summary>
+    public static string[] WithExclusion(IEnumerable<string> excluded, string application) =>
+        excluded.Where(path => !string.Equals(path, application, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase).Append(application).TakeLast(128).ToArray();
 
     /// <summary>What the calling program is called in the replacement's footer:
     /// its own description ("Notepad") when it has a short one, otherwise its

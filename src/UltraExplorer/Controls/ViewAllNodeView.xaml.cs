@@ -19,6 +19,11 @@ public partial class ViewAllNodeView : UserControl
     public ViewAllNodeView()
     {
         InitializeComponent();
+
+        // The handle holds the mouse from the press: a release anywhere
+        // else, or the capture taken away, lets go of the drag - left armed,
+        // a later drag across the handle carried off this node's files.
+        DragHandle.LostMouseCapture += (_, _) => _dragArmed = false;
     }
 
     private ViewAllNodeViewModel? Node => DataContext as ViewAllNodeViewModel;
@@ -85,7 +90,6 @@ public partial class ViewAllNodeView : UserControl
         // Handled so the canvas never starts a layout drag from the handle.
         e.Handled = true;
         _dragOrigin = e.GetPosition(this);
-        _dragArmed = true;
 
         if (!node.IsSelected && !Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
         {
@@ -95,15 +99,34 @@ public partial class ViewAllNodeView : UserControl
         {
             shell.Tree.Activate(node);
         }
+
+        _dragArmed = DragHandle.CaptureMouse();
     }
 
-    private void DragHandle_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
-        => _dragArmed = false;
+    private void DragHandle_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e) => Disarm();
+
+    private void Disarm()
+    {
+        _dragArmed = false;
+        if (DragHandle.IsMouseCaptured)
+        {
+            DragHandle.ReleaseMouseCapture();
+        }
+    }
+
+    /// <summary>Whether a press on the handle is waiting to become a drag, for checks.</summary>
+    internal bool IsDragArmedForChecks => _dragArmed;
 
     private void DragHandle_PreviewMouseMove(object sender, MouseEventArgs e)
     {
-        if (!_dragArmed || e.LeftButton != MouseButtonState.Pressed || Node is not { } node || Shell is not { } shell)
+        if (!_dragArmed)
         {
+            return;
+        }
+
+        if (e.LeftButton != MouseButtonState.Pressed || Node is not { } node || Shell is not { } shell)
+        {
+            Disarm();
             return;
         }
 
@@ -114,7 +137,7 @@ public partial class ViewAllNodeView : UserControl
             return;
         }
 
-        _dragArmed = false;
+        Disarm();
         var paths = shell.Tree.SelectedNodes.Count > 1 && node.IsSelected
             ? shell.Tree.SelectedNodes.Select(selected => selected.FullPath).ToArray()
             : [node.FullPath];

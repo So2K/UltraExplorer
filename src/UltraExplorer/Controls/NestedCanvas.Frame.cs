@@ -667,9 +667,13 @@ public sealed partial class NestedCanvas
             // moment it stops - drawing every name crisp costs WPF's render thread
             // a frame or two - but once it has been still for a third of a second,
             // when a frame that takes longer shows as nothing at all, and the
-            // user is not in the middle of the next move.
-            var settled = !moving && _lastMotion != 0
-                && System.Diagnostics.Stopwatch.GetElapsedTime(_lastMotion).TotalMilliseconds >= SettleMilliseconds;
+            // user is not in the middle of the next move.  A camera that has
+            // never moved is settled: a flight that ended without a step
+            // (StartFlight does not count as motion) drew its frames for
+            // motion all the same, and with nothing to time the settling
+            // from, they were never drawn crisp and the loop ran every vsync.
+            var settled = !moving && (_lastMotion == 0
+                || System.Diagnostics.Stopwatch.GetElapsedTime(_lastMotion).TotalMilliseconds >= SettleMilliseconds);
             if (settled && (_lodDegraded || _textAnimated))
             {
                 _dirty |= Layers.All;

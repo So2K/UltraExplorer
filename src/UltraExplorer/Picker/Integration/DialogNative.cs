@@ -317,6 +317,20 @@ internal static class DialogNative
             throw new Win32Exception(Marshal.GetLastWin32Error(), "The original dialog could not receive the action.");
     }
 
+    /// <summary>Posts an application option action after its native dialog is restored to the screen.</summary>
+    internal static void PostOptionButton(nint original, nint button)
+    {
+        if (!IsWindow(original) || IsHidden(original) || !IsWindowEnabled(original)
+            || !IsChild(original, button) || ProcessId(original) != ProcessId(button)
+            || ClassName(button) != "Button" || (Style(button) & 0xf) is not (0 or 1)
+            || !IsWindowVisible(button) || !IsWindowEnabled(button))
+            throw new InvalidOperationException("The application's settings button is no longer available.");
+        // BM_CLICK runs the application's own handler on its thread. Posting
+        // permits that handler to open a modal without blocking our worker.
+        if (!PostMessage(button, 0xF5, 0, 0))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "The application's settings button could not receive the action.");
+    }
+
     /// <summary>
     /// The message the application raised over its dialog (a file-exists or
     /// sharing warning, its own validation) brought to the front. Only a
@@ -497,6 +511,7 @@ internal static class DialogNative
     [DllImport("user32.dll")] private static extern bool SetWindowPos(nint window, nint after, int x, int y, int width, int height, uint flags);
     [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
     [DllImport("user32.dll", SetLastError = true)] private static extern bool PostMessage(nint window, uint message, nint wparam, nint lparam);
+    [DllImport("user32.dll")] private static extern bool IsChild(nint parent, nint child);
     [DllImport("user32.dll", EntryPoint = "SetPropW", ExactSpelling = true, CharSet = CharSet.Unicode, SetLastError = true)] internal static extern bool SetProp(nint window, string name, nint value);
     [DllImport("user32.dll", EntryPoint = "GetPropW", ExactSpelling = true, CharSet = CharSet.Unicode)] internal static extern nint GetProp(nint window, string name);
     [DllImport("user32.dll", EntryPoint = "RemovePropW", ExactSpelling = true, CharSet = CharSet.Unicode)] internal static extern nint RemoveProp(nint window, string name);

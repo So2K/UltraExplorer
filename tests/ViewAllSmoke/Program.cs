@@ -130,6 +130,7 @@ internal static partial class Program
         await Group(WatchChecks);
         await Group(HubCoalesceChecks);
         await Group(LiveUpdateChecks);
+        await Group(Review1009CoreChecks);
         await Group(TreeLiveWatchChecks);
         await Group(CameraMotionChecks);
         await Group(NestedCameraChecks);
@@ -142,6 +143,7 @@ internal static partial class Program
         await Group(ShellMenuChecks);
         await Group(ReviewFixChecks);
         await Group(DialogRuntimeReviewChecks);
+        await Group(Review1009PickerChecks);
         await Group(ViewAllServiceChecks);
         await Group(TreeCoreReviewChecks);
         await Group(CanvasMiscReviewChecks);
@@ -200,6 +202,7 @@ internal static partial class Program
         await Group(LongPathShellOperationChecks);
         await Group(ExplorerIntegrationFollowupChecks);
         await Group(FileCommandReview2Checks);
+        await Group(CreateItemChecks);
         await Group(NestedVisibilityRenameIntegrationChecks);
         await Group(FocusSelectionChecks);
         await Group(BatchCommandLineChecks);
@@ -210,8 +213,10 @@ internal static partial class Program
         await Group(ArchivePreviewChecks);
         await Group(ArchiveQuickLookWindowChecks);
         await Group(OwnerClosePreviewChecks);
+        await Group(Review1009UiChecks);
         await Group(ArchiveLayoutChecks);
         await Group(ArchiveZoneChecks);
+        await Group(Review1009ArchiveChecks);
         await Group(Pr4WorkspaceFixChecks);
         await Group(Pr4SearchFixChecks);
         await Group(MaskedPasswordChecks);
@@ -219,6 +224,7 @@ internal static partial class Program
         await Group(ShelfChecks);
         await Group(Pr4ShelfSafetyChecks);
         await Group(Pr4ShelfDropChecks);
+        await Group(Review1009StateChecks);
 
         // Last: the Settings window needs the app's theme, which means the
         // app itself, and a process can only ever have the one.
@@ -244,6 +250,7 @@ internal static partial class Program
         await Group(HoverIntegrationChecks);
         await Group(QuietUpdateChecks);
         await Group(QuietUpdateUiChecks);
+        await Group(Review1009InstallChecks);
         await Group(PreviewOpenWithChecks);
         await Group(PreviewMediaUiChecks);
         await Group(PreviewOwnerActivationChecks);

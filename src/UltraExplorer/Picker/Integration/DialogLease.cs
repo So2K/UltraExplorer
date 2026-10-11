@@ -90,6 +90,7 @@ internal sealed class DialogLease : IDisposable
         {
             DialogGuardian.EnsureRunning();
             var clock = Stopwatch.StartNew();
+            var lastEnsure = 0L;
             while (clock.Elapsed < TimeSpan.FromSeconds(4))
             {
                 lease.Pulse();
@@ -98,6 +99,14 @@ internal sealed class DialogLease : IDisposable
                     lease.GuardianProcess = guardian.Process;
                     lease.GuardianStartedTicks = guardian.StartedTicks;
                     return lease;
+                }
+                // A guardian that has just decided to end (the mode read off,
+                // nothing left to guard) still holds its mutex, so the first
+                // EnsureRunning started nobody; once it has gone, a new one is.
+                if (clock.ElapsedMilliseconds - lastEnsure >= 300)
+                {
+                    lastEnsure = clock.ElapsedMilliseconds;
+                    if (lastEnsure > 0) DialogGuardian.EnsureRunning();
                 }
                 // The guardian is woken by the lease itself and answers within
                 // a few milliseconds; a guardian only starting takes longer.
@@ -289,7 +298,7 @@ internal static class DialogGuardian
         {
             // Pausing what is already off changes nothing, and writes nothing:
             // an uninstall's --dialog-recover leaves no trace of a mode never used.
-            if (disable && DialogIntegrationStore.Read().Enabled)
+            if (disable && DialogIntegrationStore.ReadSteady().Enabled)
                 DialogIntegrationStore.Update(settings => settings with { Enabled = false, LastRecovery = reason });
         }
     }
@@ -402,7 +411,9 @@ internal static class DialogGuardian
                 var now = Environment.TickCount64;
                 if (now - turn > 1000) foreach (var protection in active.Values) protection.LastBeat = Math.Min(protection.LastBeat + now - turn - 1000, now);
                 turn = now;
-                var enabled = DialogIntegrationStore.Read().Enabled;
+                // A settings file busy for a moment is not the mode switched
+                // off: that would put every dialog back and end this watchdog.
+                var enabled = DialogIntegrationStore.ReadSteady().Enabled;
                 if (!enabled && active.Count == 0) break;
                 foreach (var path in LeasePaths())
                 {

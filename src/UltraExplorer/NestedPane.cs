@@ -206,6 +206,9 @@ internal sealed class NestedPane
     /// <summary>The flight asked for last, which a flight asked for before it and still reading its way there stands down for (see <see cref="FlyToAsync"/>).</summary>
     private int _flightTicket;
 
+    /// <summary>Moves of the camera by the user's hand: a flight still reading when one came lets the camera be (see <see cref="FlyToAsync"/>).</summary>
+    private long _userCameraMoves;
+
     /// <summary>The second pane's camera to start from: where it was last time, or where the first pane is (see <see cref="StartAt"/>).</summary>
     private NestedCameraState? _startCamera;
 
@@ -773,6 +776,7 @@ internal sealed class NestedPane
     private void OnUserCameraMoved()
     {
         _movedByHand = true;
+        _userCameraMoves++;
         if (!_host.IsPickerMode)
         {
             return;
@@ -907,6 +911,7 @@ internal sealed class NestedPane
         }
 
         var ticket = ++_flightTicket;
+        var moves = _userCameraMoves;
         FlightsUnderWay++;
         try
         {
@@ -936,8 +941,10 @@ internal sealed class NestedPane
                 folder = await Tree.MaterializePathAsync(folderPath);
             }
 
-            // Nowhere to go, or superseded: a flight asked for since is the one that counts.
-            if (folder is null || _detached || ticket != _flightTicket || requestCurrent?.Invoke() == false)
+            // Nowhere to go, or superseded: a flight asked for since is the one
+            // that counts, and so is a wheel or a drag of the user's while the
+            // folders were read - as the canvas lets its newest camera request win.
+            if (folder is null || _detached || ticket != _flightTicket || moves != _userCameraMoves || requestCurrent?.Invoke() == false)
             {
                 return;
             }
@@ -1170,8 +1177,10 @@ internal sealed class NestedPane
             {
                 Clear = true,
                 Added = [.. shared.Items],
-                Anchor = shared.Anchor,
-                Focus = shared.Focus ?? FocusPath,
+                // Null leaves the kept copy's own unchanged, which was the
+                // last pane's: empty clears it (see ApplyArchivePreference).
+                Anchor = shared.Anchor ?? string.Empty,
+                Focus = shared.Focus ?? FocusPath ?? string.Empty,
                 Source = SelectionSource.Navigation
             });
         }
@@ -1205,8 +1214,11 @@ internal sealed class NestedPane
             {
                 Clear = true,
                 Added = [.. kept.Items],
-                Anchor = kept.Anchor ?? focus,
-                Focus = focus,
+                // Null would leave the other pane's focus and anchor in the
+                // shared selection, and the address bar and New Folder with
+                // its folder: empty clears them.
+                Anchor = kept.Anchor ?? focus ?? string.Empty,
+                Focus = focus ?? string.Empty,
                 RecordsNavigation = false,
                 Source = SelectionSource.Navigation
             });
@@ -1919,7 +1931,9 @@ internal sealed class NestedPane
     /// <summary>The archive on disk directly inside <paramref name="folder"/> that <paramref name="path"/> goes through.</summary>
     private static string? OutermostArchive(string path, string folder)
     {
-        var rest = path.Length > folder.Length ? path[(folder.Length + 1)..] : string.Empty;
+        // GetRelativePath, not a cut after the folder's length plus a slash:
+        // a drive's root ends in one already, and D:\backup.zip lost its b.
+        var rest = path.Length > folder.Length ? Path.GetRelativePath(folder, path) : string.Empty;
         var slash = rest.IndexOf('\\');
         return rest.Length == 0 ? null : Path.Combine(folder, slash < 0 ? rest : rest[..slash]);
     }
