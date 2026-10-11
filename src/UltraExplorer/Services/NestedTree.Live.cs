@@ -854,6 +854,7 @@ public sealed partial class NestedTree : IChangeSink
     {
         _applyStarted = Stopwatch.GetTimestamp();
         _filesBeforeApply = folder.AllFiles;
+        BeforeArrivalApply(folder, result);
         CaptureBeforeApply(folder, result);
     }
 
@@ -890,6 +891,7 @@ public sealed partial class NestedTree : IChangeSink
         }
 
         _filesBeforeApply = [];
+        AfterArrivalApply(folder);
         CaptureAfterApply(folder, result);
     }
 
@@ -1173,6 +1175,7 @@ public sealed partial class NestedTree : IChangeSink
     /// </summary>
     private void NoteRenames(NestedFolder folder, ReadOnlyMemory<RenamePair> pairs)
     {
+        NoteArrivalRenames(folder, pairs);
         List<RenamePair>? noted = null;
         if (folder.IsLoaded && !_renames.TryGetValue(folder, out noted))
         {

@@ -99,7 +99,7 @@ public sealed partial class NestedCanvas
     {
         get
         {
-            var pending = _cameraMotionActive || _transitionsActive || _tree?.HasWork == true;
+            var pending = _cameraMotionActive || _transitionsActive || _arrivalsVisible || _tree?.HasWork == true;
             PendingHubWork(ref pending);
             PendingIconWork(ref pending);
             PendingFilterWork(ref pending);
@@ -221,6 +221,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void StopFrames()
     {
+        PauseArrivalPulses();
         UnhookFrame();
         _loadRedrawTimer?.Stop();
         _frameRetry?.Stop();
@@ -592,7 +593,7 @@ public sealed partial class NestedCanvas
         LoopFrameCount++;
 
         // 1. The clock.
-        var fresh = _clock.Advance(renderingTime, _cameraMotionActive || _transitionsActive);
+        var fresh = _clock.Advance(renderingTime, _cameraMotionActive || _transitionsActive || _arrivalsVisible);
         var stats = new FrameStats { Fresh = fresh };
         try
         {
@@ -638,6 +639,7 @@ public sealed partial class NestedCanvas
                 var active = false;
                 StepTransitions(_clock.Now, ref active);
                 _transitionsActive = active;
+                AdvanceArrivalPulses(_clock.Now);
             }
 
             stats.TransitionMs = Lap(ref phase);
@@ -1567,7 +1569,8 @@ public sealed partial class NestedCanvas
             RequestFrame(Layers.Labels | Layers.Decor);
         }
 
-        if ((layers & Layers.Overlay) != 0)
+        if ((layers & Layers.Overlay) != 0
+            || _pendingArrivalCount > 0 && (layers & (Layers.Scene | Layers.Labels)) != 0)
         {
             RenderOverlay();
         }

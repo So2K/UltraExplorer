@@ -677,6 +677,7 @@ public sealed partial class NestedCanvas
         _textBudget = int.MaxValue;
         using (var dc = _overlay.RenderOpen())
         {
+            DrawArrivalPulses(dc);
             DrawHover(dc);
             DrawCopyButton(dc);
             DrawHoverTip(dc);
