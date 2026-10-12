@@ -58,9 +58,9 @@ account switch.
 
 The full headless run reports **5263/5265**. Its two failures are recursive
 duplication of a folder tree beyond Windows Shell's destination-path limit
-and a live Everything reply timeout. The real Everything query passes in an
+and a real Everything query that returned no reply. That query passes in an
 isolated group (**37/37**) and again after the combined search checks
-(**203/203**), but the cause of its full-run timeout remains unproven. These
+(**203/203**), but the cause of its full-run failure remains unproven. These
 focused passes do not replace the two failed assertions or make the broad
 run wholly green. The earlier stale-node reveal and hover-preference fixture
 failures are repaired and pass in this full run.
