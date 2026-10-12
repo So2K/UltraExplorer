@@ -1703,7 +1703,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         long? selectionVersion = null,
         Action<string>? holdGone = null)
     {
-        if (string.IsNullOrWhiteSpace(path))
+        if (_isDisposed || string.IsNullOrWhiteSpace(path))
         {
             return default;
         }
@@ -1734,89 +1734,152 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return default;
         }
 
-        ViewAllNodeViewModel? node = null;
-        if (PreferLightReveal)
+        bool GivenWay() => _isDisposed || taken != LatestRevealOf(holder)
+            || selectionVersion is { } ownedVersion && ownedVersion != Selection.Version;
+        RevealOutcome NoCommit()
         {
-            var result = await _graph.MaterializeChainAsync(normalized);
-            node = result.Node;
-            if (result.MissingStep is { } missing)
-            {
-                ReportMissing(missing, node, holdGone);
-            }
+            var current = !_isDisposed && _graph.TryGetNode(normalized, out var canonical) ? canonical : null;
+            return new(current, current is not null, Superseded: true);
         }
-        else
+
+        var completionStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+        string? missingStep = null;
+        ViewAllNodeViewModel? node = null;
+        try
         {
-            // A UNC share or a WSL distribution is not a DriveInfo root, so it only
-            // enters the graph when it is explicitly added.
-            if (chain.Count > 0 && !_graph.TryGetNode(chain[0], out _))
+            if (PreferLightReveal)
             {
-                await _graph.AddRootAsync(chain[0]);
+                var result = await _graph.MaterializeChainAsync(normalized);
+                if (GivenWay()) return NoCommit();
+                node = result.Node;
+                missingStep = result.MissingStep;
             }
-
-            // A folder on the way can be read again while this waits for it -
-            // a refresh of a busy folder above builds its children anew - and
-            // the next step adopted under the node it let go of would hang
-            // from nothing: the folder, read again, would never show it.  The
-            // walk then starts again from what is there now; the last of
-            // three goes walks on as ever, as the light reveal gives up.
-            for (var attempt = 0; attempt < 3; attempt++)
+            else
             {
-                node = null;
-                var lost = false;
-                foreach (var step in chain)
+                // A UNC share or a WSL distribution is not a DriveInfo root, so it only
+                // enters the graph when it is explicitly added.
+                if (chain.Count > 0 && !_graph.TryGetNode(chain[0], out _))
                 {
-                    // Given way to - Back twice on a slow share - it opens no
-                    // more folders on its way: they would only reflow the tree
-                    // under the navigation that came after it.
-                    if (select && node is not null && taken != LatestRevealOf(holder))
-                    {
-                        break;
-                    }
+                    await _graph.AddRootAsync(chain[0]);
+                    if (GivenWay()) return NoCommit();
+                }
 
-                    if (!_graph.TryGetNode(step, out var found))
+                // A folder on the way can be read again while this waits for it -
+                // a refresh of a busy folder above builds its children anew - and
+                // the next step adopted under the node it let go of would hang
+                // from nothing: the folder, read again, would never show it.  The
+                // walk then starts again from what is there now; the last of
+                // three goes walks on as ever, as the light reveal gives up.
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    node = null;
+                    var lost = false;
+                    foreach (var step in chain)
                     {
-                        // The step may simply be filtered out of its parent - hidden,
-                        // or not of the file type on offer.  Asking for it by name
-                        // outranks that.
-                        var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
-                        if (adopted is null)
+                        // Given way to - Back twice on a slow share - it opens no
+                        // more folders on its way: they would only reflow the tree
+                        // under the navigation that came after it.
+                        if (GivenWay()) return NoCommit();
+
+                        if (!_graph.TryGetNode(step, out var found))
                         {
-                            // Not given because the folder was read again while
-                            // the disk was asked, and is another node now: lost,
-                            // like a folder read again while it was opened.
-                            if (attempt < 2 && node is not null && !IsLive(node))
+                            // The step may simply be filtered out of its parent - hidden,
+                            // or not of the file type on offer.  Asking for it by name
+                            // outranks that.
+                            var adopted = node is null ? null : await _graph.AdoptChildAsync(node, step);
+                            if (GivenWay()) return NoCommit();
+                            if (adopted is null)
+                            {
+                                // Not given because the folder was read again while
+                                // the disk was asked, and is another node now: lost,
+                                // like a folder read again while it was opened.
+                                if (attempt < 2 && node is not null && !IsLive(node))
+                                {
+                                    lost = true;
+                                    break;
+                                }
+
+                                missingStep = step;
+                                break;
+                            }
+
+                            found = adopted;
+                        }
+
+                        node = found;
+                        var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
+                        if (!isDestination && node.IsDirectory)
+                        {
+                            await _graph.ExpandAsync(node);
+                            if (GivenWay()) return NoCommit();
+                            if (attempt < 2 && !IsLive(node))
                             {
                                 lost = true;
                                 break;
                             }
-
-                            ReportMissing(step, node, holdGone);
-                            break;
                         }
-
-                        found = adopted;
                     }
 
-                    node = found;
-                    var isDestination = string.Equals(step, normalized, StringComparison.OrdinalIgnoreCase);
-                    if (!isDestination && node.IsDirectory)
+                    if (!lost)
                     {
-                        await _graph.ExpandAsync(node);
-                        if (attempt < 2 && !IsLive(node))
-                        {
-                            lost = true;
-                            break;
-                        }
+                        break;
                     }
-                }
-
-                if (!lost)
-                {
-                    break;
                 }
             }
         }
+        catch (Exception error) when (_isDisposed && (error is ObjectDisposedException or OperationCanceledException))
+        {
+            return new(null, false, Superseded: true);
+        }
 
+        // A refresh can temporarily remove this named node while it restores
+        // ancestors and hidden children. Wait for the already running rebuild,
+        // then take the graph's current object rather than publishing that gap.
+        // One deadline covers every wait/retry, and only our own metadata read
+        // is cancelled; other callers' shared refreshes always keep running.
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            if (GivenWay()) return NoCommit();
+            var refreshing = _graph.RefreshCompletionFor(normalized);
+            if (refreshing is null && (node is null || IsLive(node))) break;
+            var remaining = ViewAllGraphService.ExtraRootTimeout - System.Diagnostics.Stopwatch.GetElapsedTime(completionStarted);
+            if (remaining <= TimeSpan.Zero) return new(null, false, Superseded: true);
+            if (refreshing is not null)
+            {
+                try { await refreshing.WaitAsync(remaining); }
+                catch (Exception error) when (error is OperationCanceledException or TimeoutException)
+                { return new(null, false, Superseded: true); }
+                if (GivenWay()) return NoCommit();
+            }
+
+            if (_graph.TryGetNode(normalized, out var canonical))
+            {
+                node = canonical;
+                missingStep = null;
+                continue;
+            }
+
+            remaining = ViewAllGraphService.ExtraRootTimeout - System.Diagnostics.Stopwatch.GetElapsedTime(completionStarted);
+            if (remaining <= TimeSpan.Zero) return new(null, false, Superseded: true);
+            using var ownRead = new CancellationTokenSource(remaining);
+            try
+            {
+                var fresh = await _graph.MaterializeChainAsync(normalized, ownRead.Token).WaitAsync(remaining);
+                if (GivenWay()) return NoCommit();
+                node = fresh.Node;
+                missingStep = fresh.MissingStep;
+            }
+            catch (Exception error) when (error is OperationCanceledException or TimeoutException)
+            {
+                ownRead.Cancel();
+                return new(null, false, Superseded: true);
+            }
+        }
+
+        if (GivenWay()) return NoCommit();
+        if (_graph.RefreshCompletionFor(normalized) is not null || node is not null && !IsLive(node))
+            return new(null, false, Superseded: true);
+        if (missingStep is not null) ReportMissing(missingStep, node, holdGone);
         if (node is null)
         {
             return default;

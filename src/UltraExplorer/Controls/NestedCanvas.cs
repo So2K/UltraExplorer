@@ -457,7 +457,11 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
                 _tree.Changed -= OnTreeChanged;
                 _tree.FolderLoaded -= OnFolderLoadedForFilter;
                 _tree.FolderLoaded -= OnFolderLoadedForGpu;
+                _tree.FolderLoaded -= OnFolderLoadedForArrivals;
+                _tree.FolderForgotten -= OnFolderForgottenForArrivals;
                 _tree.SortChanged -= OnTreeSortChanged;
+                _tree.ItemsAdded -= OnItemsAdded;
+                _tree.ItemsRenamed -= OnItemsRenamed;
                 StopDriving(_tree.Driver);
                 if (ReferenceEquals(_tree.Clock, _clockNow))
                 {
@@ -486,13 +490,18 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             }
 
             _tree = value;
+            ClearArrivalPulses();
             _hasCamera = false;
             if (_tree is not null)
             {
                 _tree.Changed += OnTreeChanged;
                 _tree.FolderLoaded += OnFolderLoadedForFilter;
                 _tree.FolderLoaded += OnFolderLoadedForGpu;
+                _tree.FolderLoaded += OnFolderLoadedForArrivals;
+                _tree.FolderForgotten += OnFolderForgottenForArrivals;
                 _tree.SortChanged += OnTreeSortChanged;
+                _tree.ItemsAdded += OnItemsAdded;
+                _tree.ItemsRenamed += OnItemsRenamed;
                 _tree.ShowFiles = Shows(CanvasLayer.Files);
 
                 // Its finished reads are taken in at the start of this

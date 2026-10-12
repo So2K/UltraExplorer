@@ -38,6 +38,8 @@ internal static partial class Program
             await OnDispatcher(() => VmRound2GoneFocusAsync(root));
             await OnDispatcher(() => VmRound2SupersededRevealAsync(root));
             await OnDispatcher(() => VmRound2RevealRefreshRaceAsync(root));
+            await OnDispatcher(() => VmRound2RevealInterruptionAsync(root, dispose: false));
+            await OnDispatcher(() => VmRound2RevealInterruptionAsync(root, dispose: true));
             await OnDispatcher(() => VmRound2RenumberAsync(root));
         }
         finally
@@ -440,14 +442,124 @@ internal static partial class Program
         bool Live(ViewAllNodeViewModel? node) => node is not null && tree.TryGetNode(node.FullPath, out var live) && ReferenceEquals(live, node);
 
         // Asked for by name - the address bar - while a change reads the folder above again.
+        var callingThread = Environment.CurrentManagedThreadId;
+        var chronology = 0;
+        var diagnosticStart = Stopwatch.GetTimestamp();
+        Task? refresh = null;
+        string? publication = null;
+        string? refreshCompletion = null;
+        bool? liveAtPublication = null;
+        var publicationThread = 0;
         var reveal = tree.RevealAsync(hidden, focus: false);
-        var refresh = tree.RefreshAsync(top);
+        var revealInitiallyCompleted = reveal.IsCompleted;
+        var publicationObserver = reveal.ContinueWith(completed =>
+        {
+            var sequence = Interlocked.Increment(ref chronology);
+            var thread = Environment.CurrentManagedThreadId;
+            if (completed.Status != TaskStatus.RanToCompletion)
+            {
+                publication = $"sequence={sequence}, status={completed.Status}, thread={thread}";
+                return;
+            }
+            var result = completed.Result;
+            publicationThread = thread;
+            // The observer normally runs inline on the producing dispatcher.
+            // A forced pool continuation cannot inspect that dispatcher's graph.
+            var publishedLive = thread == callingThread ? Live(result.Node).ToString() : "not observed off dispatcher";
+            if (thread == callingThread) liveAtPublication = Live(result.Node);
+            var currentId = thread == callingThread && result.Node is { } published
+                && tree.TryGetNode(published.FullPath, out var current) ? current.Id.ToString() : "none/off-dispatcher";
+            publication = $"sequence={sequence}, at={Stopwatch.GetElapsedTime(diagnosticStart).TotalMilliseconds:0.000}ms, thread={thread}, "
+                + $"returned={result.Node?.Id}, current={currentId}, live={publishedLive}, refreshCompleted={refresh?.IsCompleted.ToString() ?? "not started"}";
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        refresh = tree.RefreshAsync(top);
+        var refreshObserver = refresh.ContinueWith(_ => refreshCompletion =
+            $"sequence={Interlocked.Increment(ref chronology)}, at={Stopwatch.GetElapsedTime(diagnosticStart).TotalMilliseconds:0.000}ms, thread={Environment.CurrentManagedThreadId}",
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
         var outcome = await reveal;
+        // Reveal returns a live node at completion. A later completed refresh
+        // legitimately rebuilds that branch and replaces the returned object;
+        // its final live focus is verified separately below.
+        var liveWhenRevealCompleted = Live(outcome.Node);
+        var currentAtAwaitId = tree.TryGetNode(hidden, out var currentAtAwait) ? currentAtAwait.Id.ToString() : "none";
+        var resumed = $"sequence={Interlocked.Increment(ref chronology)}, at={Stopwatch.GetElapsedTime(diagnosticStart).TotalMilliseconds:0.000}ms, "
+            + $"thread={Environment.CurrentManagedThreadId}, returned={outcome.Node?.Id}, current={currentAtAwaitId}, refreshCompleted={refresh.IsCompleted}";
         await refresh;
-        Check($"a folder asked for by name while the folder above it is read again is found (exact: {outcome.IsExact}, live: {Live(outcome.Node)})",
-            outcome.IsExact && Live(outcome.Node));
+        await publicationObserver;
+        await refreshObserver;
+        Console.WriteLine($"  J134 chronology: reveal initially completed={revealInitiallyCompleted}; caller thread={callingThread}; task publication [{publication}]; "
+            + $"await resume [{resumed}]; refresh completion [{refreshCompletion}]");
+        Check("the reveal producer publishes a live exact node on its own dispatcher", publicationThread == callingThread
+            && liveAtPublication == true && outcome.IsExact);
+        Check($"a folder asked for by name while the folder above it is read again is found (exact: {outcome.IsExact}, live at reveal completion: {liveWhenRevealCompleted})",
+            outcome.IsExact && liveWhenRevealCompleted);
         Check($"nothing says it is gone ({string.Join(" | ", messages)})", !messages.Any(message => message.Contains("no longer inside", StringComparison.Ordinal)));
         Check("and what is selected is a node the graph has", Live(tree.ActiveNode) && ViewAllPath.Equals(tree.ActivePath, hidden));
+    }
+
+    private static async Task VmRound2RevealInterruptionAsync(string root, bool dispose)
+    {
+        Section(dispose ? "J134: disposal ends a reveal waiting for a real parent refresh"
+            : "J134: a newer navigation owns selection while an older reveal waits for refresh");
+        var folder = Path.Combine(root, dispose ? "refresh-disposed" : "refresh-superseded");
+        var hidden = Path.Combine(folder, "hidden");
+        var other = Path.Combine(folder, "other");
+        var scratch = folder + "-state";
+        Directory.CreateDirectory(hidden);
+        Directory.CreateDirectory(other);
+        Directory.CreateDirectory(scratch);
+        File.SetAttributes(hidden, FileAttributes.Directory | FileAttributes.Hidden);
+        for (var index = 0; index < 1024; index++) File.WriteAllText(Path.Combine(folder, $"baseline-{index:D4}.txt"), "baseline");
+        using var icons = new ShellIconService();
+        using var tree = NewTree(scratch, icons);
+        tree.RestoreShowHiddenItems(false);
+        await tree.InitializeAsync(folder);
+        if (!tree.TryGetNode(folder, out var top)) throw new InvalidOperationException("The owned refresh fixture was not materialized.");
+        await tree.ExpandAsync(top);
+        var messages = new List<string>();
+        tree.MessageRequested += (message, _) => messages.Add(message);
+        var graph = (ViewAllGraphService)typeof(ViewAllViewModel).GetField("_graph", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(tree)!;
+        var refresh = tree.RefreshAsync(top);
+        var completion = graph.RefreshCompletionFor(hidden);
+        Check("the owned filesystem refresh really is in flight for this hidden descendant", completion is not null);
+        var lightBefore = tree.PreferLightReveal;
+        tree.PreferLightReveal = true;
+        var sameFolder = tree.RevealAsync(folder, focus: false, select: false, exact: true);
+        tree.PreferLightReveal = lightBefore;
+        Check("revealing the live folder itself does not wait for its own children listing", sameFolder.IsCompletedSuccessfully
+            && graph.RefreshCompletionFor(folder) is null);
+        var ownFolder = await sameFolder.WaitAsync(TimeSpan.FromSeconds(5));
+        Check("the immediately returned folder remains the canonical live node", ownFolder.IsExact && !ownFolder.Superseded
+            && tree.TryGetNode(folder, out var ownLive) && ReferenceEquals(ownFolder.Node, ownLive));
+        var revealing = tree.RevealAsync(hidden, focus: false, exact: true);
+        if (dispose)
+        {
+            var selection = tree.Selection.Version;
+            tree.Dispose();
+            var outcome = await revealing.WaitAsync(TimeSpan.FromSeconds(5));
+            var canceled = false;
+            if (completion is not null)
+            {
+                try { await completion.WaitAsync(TimeSpan.FromSeconds(5)); }
+                catch (OperationCanceledException) { canceled = true; }
+            }
+            await refresh.WaitAsync(TimeSpan.FromSeconds(5));
+            Check("disposing the graph completes the shared refresh wait rather than stranding the reveal", canceled
+                && outcome.Superseded && outcome.Node is null && !outcome.IsExact);
+            Check("a disposed reveal neither changes selection nor emits a false gone message", tree.Selection.Version == selection && messages.Count == 0);
+        }
+        else
+        {
+            var away = tree.RevealAsync(other, focus: false, exact: true);
+            var old = await revealing.WaitAsync(TimeSpan.FromSeconds(5));
+            var latest = await away.WaitAsync(TimeSpan.FromSeconds(5));
+            await refresh.WaitAsync(TimeSpan.FromSeconds(5));
+            Check("the newer navigation wins without canceling the shared parent refresh", old.Superseded && latest.IsExact && !latest.Superseded
+                && completion?.IsCompletedSuccessfully == true && ViewAllPath.Equals(tree.ActivePath, other)
+                && tree.TryGetNode(other, out var live) && ReferenceEquals(tree.ActiveNode, live));
+            Check("the old hidden reveal produces no false gone toast or extra selected path", messages.Count == 0
+                && tree.Selection.Count == 1 && tree.Selection.Contains(other) && !tree.Selection.Contains(hidden));
+        }
     }
 
     // ---- J136: a renumber -------------------------------------------------------------------

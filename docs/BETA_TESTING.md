@@ -1,4 +1,4 @@
-# Try the v1.3.0-beta.4 beta
+# Try the v1.3.0-beta.5 beta
 
 The useful feedback is a short workflow that behaves unexpectedly: which file
 type, what you did, and what happened. Use copies in a small disposable folder
@@ -7,7 +7,7 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
 ## Get started
 
 1. Download the installer or portable ZIP from the
-   [v1.3.0-beta.4 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.4).
+   [v1.3.0-beta.5 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.5).
    For the ZIP, extract the entire folder before running `UltraExplorer.exe`.
 2. Keep a few sample files together: two text files, an image, a PDF and,
    if relevant to your work, a media file, a model or a small ZIP containing
@@ -45,6 +45,7 @@ extracting another copy does not create an isolated profile.
 | --- | --- |
 | Select a disposable folder and press `Ctrl+N`. Check the destination, then cancel or create a folder. | The dialog shows the full selected destination and rejects invalid names. Cancel creates nothing. `Ctrl+Shift+N` remains available; typing in an editor keeps its normal behavior. |
 | Select a copied file and press `Ctrl+D`, then hold the shortcut briefly. | One copy appears beside the original with the same contents and extension and a nonconflicting name. Key repeat does not make extra copies. `Ctrl+Shift+D` remains available. |
+| In a disposable folder already displayed on the nested canvas, copy or extract new items; repeat while their destination is outside the viewport. | New file and folder tiles pulse yellow twice when visible. Unseen items wait; the feedback itself does not change the camera or selection. Existing contents do not flash on first opening. |
 | In a disposable REAPER project, open Save Project with dialog replacement enabled. Change the target folder, then choose **Format**. | The project options appear. Format opens REAPER's native settings with the chosen filename, destination and options retained; that Save dialog stays native. Cancel without saving if you only want to inspect it. |
 | Select one image, move the pointer over another file, then tap `Space` briefly. | Quick Look shows the selected image. The file menu's **Quick Look** also opens its target. `Ctrl+Space` previews the hovered file, or the selection when nothing is hovered. |
 | Close the preview. Hold `Space` and move the pointer; repeat with `Space+drag`. | The map follows the pointer immediately. Releasing Space stops the movement and does not open a preview. |
@@ -89,7 +90,7 @@ before editing. These optional tools stay disabled in file-picker dialogs.
 
 [Open an issue](https://github.com/So2K/UltraExplorer/issues/new) with:
 
-- App version (`v1.3.0-beta.1`) and Windows version.
+- App version (`v1.3.0-beta.5`) and Windows version.
 - Exact steps, expected result and actual result; include the error text.
 - File extension and approximate size, and whether the path is local,
   removable, networked or cloud-backed.
@@ -102,4 +103,4 @@ Do not attach private documents or personal profile files. Unsupported codecs,
 encrypted PDFs and legacy Office files can use an information/header fallback;
 partial, binary and extracted document content is read-only. RAR, multipart and
 ISO coverage is still limited. See the
-[release notes](RELEASE_NOTES_v1.3.0-beta.1.md) for the remaining limits.
+[release notes](RELEASE_NOTES_v1.3.0-beta.5.md) for the remaining limits.
