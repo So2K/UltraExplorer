@@ -15,6 +15,13 @@
   unchanged refreshes, metadata changes and known renames do not become new
   arrivals. A newly added item renamed before it becomes visible keeps its
   pending feedback under the new name.
+- Pending feedback follows an ancestor folder rename, and deleted entries
+  release their pending signals. Exact names remain distinct in a
+  case-sensitive directory.
+- Revealing a file or hidden folder while an ancestor refreshes waits for
+  the current graph node before selecting it. A newer navigation or closing
+  the window ends the older request; opening a live folder still completes
+  without waiting for its own child listing.
 
 The [beta.4 Save options, creation shortcuts and update fixes](https://github.com/So2K/UltraExplorer/blob/v1.3.0-beta.4/docs/RELEASE_NOTES_v1.3.0-beta.4.md)
 remain included, along with Space Quick Look, text notes and compact media/3D
@@ -39,6 +46,25 @@ automatic refresh and actual yellow overlay, two visible pulses, deferred
 visibility, independent panes and unchanged selection/camera state. Tests do
 not copy or extract files into a user's workspace.
 
+The app builds in Debug and Release, and all ten test projects build in
+Release with **zero warnings and errors**. Focused checks pass **259/259**,
+including **67** arrival assertions and the strict reveal/refresh lifetime
+checks. Native Open/Save/folder-dialog checks pass **796/796**, including the
+REAPER options and Format handoff fixtures on an owned secondary monitor.
+All eight standalone test programs pass. Payload, quiet update and Setup
+identity fixtures pass **47/47**, **85/85** and **30/30**, respectively, in
+both PowerShell 5 and 7; the Setup fixtures do not exercise an actual UAC
+account switch.
+
+The full headless run reports **5263/5265**. Its two failures are recursive
+duplication of a folder tree beyond Windows Shell's destination-path limit
+and a live Everything reply timeout. The real Everything query passes in an
+isolated group (**37/37**) and again after the combined search checks
+(**203/203**), but the cause of its full-run timeout remains unproven. These
+focused passes do not replace the two failed assertions or make the broad
+run wholly green. The earlier stale-node reveal and hover-preference fixture
+failures are repaired and pass in this full run.
+
 Arrival feedback applies to the nested canvas. The separate tree canvas and
 folder list keep their existing behavior. A folder needs a complete known
 listing to distinguish new entries; first or incomplete listings establish a
@@ -46,7 +72,7 @@ baseline. Pending feedback is bounded, and a rename burst whose pairs exceed
 the watcher limit can conservatively omit feedback for that refresh.
 
 The [previous release's qualifications](https://github.com/So2K/UltraExplorer/blob/v1.3.0-beta.4/docs/RELEASE_NOTES_v1.3.0-beta.4.md#testing-and-limits)
-still describe the existing Windows Shell, tree-refresh, GPU and protected-folder
+still describe the existing Windows Shell, GPU and protected-folder
 update limits. A new beta label does not claim that every broad desktop or
 timing-sensitive check passes.
 
