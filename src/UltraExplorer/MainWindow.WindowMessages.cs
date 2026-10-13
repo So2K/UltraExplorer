@@ -71,17 +71,25 @@ public partial class MainWindow
             case WmDeviceChange:
             {
                 var result = IntPtr.Zero;
-                OnDeviceChangeMessage(wParam, lParam, ref handled, ref result);
+                // Every tab owns watches that Windows may ask to release,
+                // even while only one of its views is on screen.
+                foreach (var context in TabContexts)
+                {
+                    context.OnDeviceChangeMessage(wParam, lParam, ref handled, ref result);
+                }
                 return result;
             }
 
             // FALSE: a shutdown the windows had agreed to was cancelled.
             case WmEndSession when wParam == IntPtr.Zero:
-                OnSessionEndCancelled();
+                foreach (var context in TabContexts)
+                {
+                    context.OnSessionEndCancelled();
+                }
                 return IntPtr.Zero;
 
             case WmMouseHorizontalWheel:
-                OnHorizontalWheelMessage(wParam, lParam, ref handled);
+                ActiveTabContext.OnHorizontalWheelMessage(wParam, lParam, ref handled);
                 return IntPtr.Zero;
         }
 

@@ -612,6 +612,15 @@
                               IsChecked="{Binding IsDialogReplacementEnabled, Mode=TwoWay}"
                               AutomationProperties.Name="Use UltraExplorer throughout Windows" />
                 </controls:SettingCard>
+                <controls:SettingCard Glyph="&#xE8A5;"
+                                      Header="Open incoming folders in tabs"
+                                      Description="Choose where new folder requests from Windows and Win+E open. On: a new tab in the active UltraExplorer window. Off: a separate window. Your current folders stay open."
+                                      Status="{Binding FolderOpenModeStatus}">
+                    <CheckBox x:Name="IncomingFoldersTabsChoice" Style="{StaticResource ToggleSwitch}"
+                              IsChecked="{Binding OpenIncomingFoldersInTabs, Mode=TwoWay}"
+                              AutomationProperties.Name="Open incoming folders in tabs"
+                              AutomationProperties.HelpText="On opens each new folder request in a new tab. Off opens a separate window. Existing folders stay open." />
+                </controls:SettingCard>
                 <controls:SettingCard Glyph="&#xE765;"
                                       Header="Open UltraExplorer with Win+E"
                                       Description="Press Win+E to open UltraExplorer, even when Use UltraExplorer throughout Windows is off. Turning this off returns Win+E to Windows Explorer."

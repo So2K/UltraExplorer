@@ -209,6 +209,7 @@ public partial class MainWindow
         ViewAllNodeViewModel target,
         NodeDropAction action)
     {
+        if (_closeRequested || _viewModel.IsDisposed) return;
         try
         {
             if (action == NodeDropAction.MoveInto)

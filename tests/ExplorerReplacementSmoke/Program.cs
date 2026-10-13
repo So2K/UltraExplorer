@@ -4,7 +4,7 @@ using UltraExplorer.Services;
 
 namespace ExplorerReplacementSmoke;
 
-internal static class Program
+internal static partial class Program
 {
     private static int _checks, _failures;
     private static async Task<int> Main()
@@ -343,6 +343,8 @@ internal static class Program
             Assert(fixture.LastInvocation is { Kind: FolderInvocationKind.OpenFolder, SelectedPaths.Count: 0 }
                 && fixture.LastReceipt is { SelectedPaths.Count: 0 }, "opening a folder does not invent selected children");
         });
+
+        await CoordinatorRetirementChecks();
 
         Assert(!ExplorerWindowObserver.HasNoPendingInput(0, true, "Edit", false), "inline rename editor defers source transfer");
         Assert(!ExplorerWindowObserver.HasNoPendingInput(0, true, "RichEditD2DPT", false), "rich inline editor defers source transfer");

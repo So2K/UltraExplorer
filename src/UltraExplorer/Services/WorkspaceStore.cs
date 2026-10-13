@@ -131,7 +131,8 @@ public sealed class WorkspaceStore
                 // Held by a scanner or a sync client for a moment: tried again.
                 // Still unreadable, it is there but unknown - and a save of the
                 // defaults would write over the pins and orders it holds, so
-                // nothing is saved this session.
+                // nothing is saved until a later read succeeds or it can be
+                // safely backed up.
                 if (ex is IOException && attempt < 4)
                 {
                     await Task.Delay(150 * attempt, cancellationToken).ConfigureAwait(false);
@@ -167,7 +168,7 @@ public sealed class WorkspaceStore
     private void RequireReadableState()
     {
         if (_unreadable)
-            throw new IOException("The saved workspace could not be read or backed up; it has been kept unchanged. Reopen the window when the file is accessible to save changes.");
+            throw new IOException("The saved workspace could not be read or backed up; it has been kept unchanged. Try saving again when the file is accessible.");
     }
 
     public async Task SaveAsync(WorkspaceState state, CancellationToken cancellationToken = default)
@@ -237,7 +238,10 @@ public sealed class WorkspaceStore
         await _saving.WaitAsync(cancellationToken);
         try
         {
-            RequireReadableState();
+            // A previous failed read protects a snapshot save, but this path
+            // reads the latest file again under its cross-process turn. Let
+            // that fresh read recover from a transient lock or cancellation;
+            // Update still rejects an unreadable file before invoking merge.
             await Task.Run(() => Update(merge, cancellationToken), cancellationToken);
         }
         finally

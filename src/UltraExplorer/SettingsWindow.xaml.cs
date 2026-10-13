@@ -25,7 +25,11 @@ public partial class SettingsWindow : Window
         Settings = settings;
         DataContext = settings;
 
-        _rendererPoll.Tick += (_, _) => Settings.RefreshRendererStatus();
+        _rendererPoll.Tick += (_, _) =>
+        {
+            Settings.RefreshRendererStatus();
+            Settings.RefreshFolderOpenMode();
+        };
         Loaded += (_, _) => _rendererPoll.Start();
         Closed += (_, _) =>
         {

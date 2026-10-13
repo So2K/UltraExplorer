@@ -25,8 +25,9 @@ internal sealed record FolderRouteRequest(Guid Id, FolderInvocation Invocation, 
 internal static class ExplorerLaunchRouter
 {
     internal const int MaximumPacket = 128 * 1024;
-    internal static string PipeName => "UltraExplorer.Folders.v2." + DialogIntegrationStore.InstanceKey;
+    internal static string PipeName => "UltraExplorer.Folders.v3." + DialogIntegrationStore.InstanceKey;
     private static readonly List<MainWindow> Windows = [];
+    private static MainWindow? _lastActiveWindow;
     private static FolderRouteHost? _host;
     private static readonly uint OwnProcess = checked((uint)Environment.ProcessId);
     private static readonly long OwnStart = Process.GetCurrentProcess().StartTime.ToUniversalTime().ToFileTimeUtc();
@@ -42,14 +43,19 @@ internal static class ExplorerLaunchRouter
     /// replace it, so that no second UltraExplorer starts while they run.</summary>
     internal static Func<string[], Process> StartSelf { get; set; } = DialogSelfProcess.Start;
 
+    // Test seams for intent ownership. Production uses the same native bridge
+    // as picker handoffs; tests never switch the user's input desktop.
+    internal static Func<nint> NativeForeground { get; set; } = DialogNative.GetForegroundWindow;
+    internal static Func<nint, nint, bool> ForegroundBridge { get; set; } = DialogNative.BringForward;
+
     internal static bool TryOpenFolder(string path) => DialogIntegrationStore.Read().Enabled
         && FolderCommandLine.TryOpenFolder(path, out var request, out _) && Launch(request with { OriginIsShell = true });
     internal static bool TryReveal(IEnumerable<string> paths) => DialogIntegrationStore.Read().Enabled
         && FolderCommandLine.TryReveal(paths, out var request, out _) && Launch(request with { OriginIsShell = true });
     private static bool Launch(FolderInvocation invocation)
     {
-        if (ChooseDirectLaunchWindow(Application.Current?.MainWindow as MainWindow, Windows) is { } window)
-        { _ = ObserveAsync(window.ApplyFolderInvocationAsync(invocation)); return true; }
+        if (_host is { } host && Windows.Any(window => !window.IsFolderWindowClosing))
+        { _ = ObserveAsync(host.OpenInProcessAsync(invocation)); return true; }
         try { using var process = StartSelf(FolderCommandLine.BuildArguments(invocation)); return true; }
         catch (Exception ex) when (Failure(ex)) { DialogIntegrationStore.Log("The folder could not be opened", ex); return false; }
     }
@@ -63,6 +69,83 @@ internal static class ExplorerLaunchRouter
         if (main is not null && Free(main)) return main;
         var candidates = windows.Where(Free).ToArray();
         return candidates.FirstOrDefault(window => window.IsFolderWindowReady) ?? candidates.FirstOrDefault();
+    }
+
+    private static MainWindow? FindFolderContext(Guid destination) => destination == Guid.Empty ? null
+        : Windows.Select(window => window.FindFolderContext(destination)).FirstOrDefault(context => context is not null);
+
+    /// <summary>A new folder keeps its own selection, camera and navigation. The
+    /// explicit switch overrides the live preference; a retry keeps its context.</summary>
+    internal static bool ShouldCreateTab(FolderInvocation invocation) => !invocation.ForceNewWindow
+        && DialogIntegrationStore.ReadFolderOpenMode() == FolderOpenMode.NewTab;
+
+    private static MainWindow? ChooseTabLaunchHost()
+    {
+        static bool Available(MainWindow window)
+        {
+            if (!window.HasFolderTabs || !window.IsEnabled || window.IsFolderWindowClosing) return false;
+            var handle = new WindowInteropHelper(window).Handle;
+            return handle == 0 || DialogNative.IsWindowEnabled(handle);
+        }
+        return Windows.LastOrDefault(window => window.IsActive && Available(window))
+            ?? (_lastActiveWindow is { } active && Windows.Contains(active) && Available(active) ? active : null)
+            ?? Windows.LastOrDefault(window => window.IsFolderWindowReady && Available(window))
+            ?? Windows.LastOrDefault(Available);
+    }
+
+    /// <summary>Restore the visible shell for an explicit launch. Native handoffs
+    /// only transfer foreground from the exact source frame while it still owns it.</summary>
+    internal static void PresentFolderInvocationWindow(MainWindow context, FolderInvocation invocation)
+    {
+        var window = context.ShellWindow;
+        if (!ReferenceEquals(window.ActiveTabContext, context)) return;
+        var intent = invocation.Source ?? invocation.ActivationSource;
+        // Restore can itself activate a minimized window. Validate a captured
+        // gesture before restoring, so another foreground choice always wins.
+        if (intent is not null && DialogNative.MayActivate && !MainWindow.IsDiagnosticsRun
+            && !ForegroundSourceMatches(intent, requireExplorer: invocation.Source is not null)) return;
+        if (window.WindowState == WindowState.Minimized) window.WindowState = WindowState.Normal;
+        if (!window.IsVisible) window.Show();
+        if (MainWindow.IsDiagnosticsRun || !DialogNative.MayActivate) return;
+        if (invocation.Source is null && invocation.ActivationSource is null)
+        {
+            window.Activate();
+            return;
+        }
+        if (!ForegroundSourceMatches(intent!, requireExplorer: invocation.Source is not null)) return;
+        _ = ForegroundBridge(new WindowInteropHelper(window).Handle, (nint)intent!.Window);
+    }
+
+    internal static FolderInvocationSource? CaptureForegroundIntent()
+    {
+        if (!DialogNative.MayActivate || MainWindow.IsDiagnosticsRun) return null;
+        var handle = DialogNative.GetAncestor(NativeForeground(), 2);
+        var processId = DialogNative.ProcessId(handle);
+        if (handle == 0 || processId == 0 || !DialogNative.IsWindow(handle)) return null;
+        try
+        {
+            using var process = Process.GetProcessById(checked((int)processId));
+            var intent = new FolderInvocationSource(handle.ToInt64(), processId, process.StartTime.ToUniversalTime().ToFileTimeUtc());
+            return ForegroundSourceMatches(intent, requireExplorer: false) ? intent : null;
+        }
+        catch (Exception ex) when (Failure(ex) || ex is ArgumentException or OverflowException) { return null; }
+    }
+
+    internal static bool ForegroundSourceMatches(FolderInvocationSource source, bool requireExplorer = true)
+    {
+        if (source.Window <= 0 || source.Process == 0 || source.Started <= 0) return false;
+        var handle = (nint)source.Window;
+        if (!DialogNative.IsWindow(handle) || DialogNative.GetAncestor(NativeForeground(), 2) != handle
+            || requireExplorer && ExplorerWindowInterop.ClassName(handle) is not ("CabinetWClass" or "ExploreWClass")
+            || DialogNative.ProcessId(handle) != source.Process) return false;
+        try
+        {
+            using var process = Process.GetProcessById(checked((int)source.Process));
+            return !process.HasExited && process.StartTime.ToUniversalTime().ToFileTimeUtc() == source.Started
+                && (!requireExplorer || string.Equals(process.MainModule?.FileName, Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                    "explorer.exe"), StringComparison.OrdinalIgnoreCase));
+        }
+        catch (Exception ex) when (Failure(ex) || ex is ArgumentException or OverflowException) { return false; }
     }
 
     internal static bool TryHandleShellFallback(string[] arguments)
@@ -227,12 +310,14 @@ internal static class ExplorerLaunchRouter
         if (window.IsPickerMode || Windows.Contains(window)) return;
         if (window.FolderDestinationId == Guid.Empty) window.FolderDestinationId = Guid.NewGuid();
         Windows.Add(window);
+        window.Activated += (_, _) => _lastActiveWindow = window;
         FolderShellWindowRegistration.Attach(window);
         if (!_pruned) { _pruned = true; _ = Task.Run(PruneFolderWorkspaces); }
         _host ??= new FolderRouteHost(window.Dispatcher);
         window.Closed += (_, _) =>
         {
             Windows.Remove(window);
+            if (ReferenceEquals(_lastActiveWindow, window)) _lastActiveWindow = null;
             if (Windows.Count == 0) { _host?.Dispose(); _host = null; }
             DeleteFolderWorkspace(window.FolderDestinationId);
         };
@@ -255,6 +340,11 @@ internal static class ExplorerLaunchRouter
             try { File.Delete(path); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
+    }
+
+    internal static void ReleaseFolderContext(Guid destination)
+    {
+        if (destination != Guid.Empty) DeleteFolderWorkspace(destination);
     }
 
     /// <summary>
@@ -367,7 +457,7 @@ internal static class ExplorerLaunchRouter
         if (!ReceiptMatches(receipt, invocation) || !Allowed(invocation)) return false;
         try
         {
-            var fresh = await SendAsync(new(Guid.NewGuid(), invocation, true, true), cancellation);
+            var fresh = await SendAsync(new(Guid.NewGuid(), invocation with { DestinationId = receipt.DestinationId }, true, true), cancellation);
             return ReceiptMatches(fresh, invocation) && fresh.Process == receipt.Process && fresh.Started == receipt.Started
                 && fresh.Window == receipt.Window && fresh.DestinationId == receipt.DestinationId && Allowed(invocation);
         }
@@ -466,12 +556,16 @@ internal static class ExplorerLaunchRouter
         var invocation = request.Invocation;
         if (request.Id == Guid.Empty || invocation is null || invocation.SelectedPaths is null || invocation.FolderPath is null
             || invocation.Kind is not (FolderInvocationKind.OpenFolder or FolderInvocationKind.Reveal) || !Allowed(invocation)) return false;
-        return FolderCommandLine.TryParse(FolderCommandLine.BuildArguments(invocation), out normalized, out _)
-            && string.Equals(invocation.FolderPath, normalized.FolderPath, StringComparison.OrdinalIgnoreCase)
-            && (invocation.Kind != FolderInvocationKind.OpenFolder || invocation.SelectedPaths.Count == 0);
+        if (!FolderCommandLine.TryParse(FolderCommandLine.BuildArguments(invocation), out normalized, out _)
+            || !string.Equals(invocation.FolderPath, normalized.FolderPath, StringComparison.OrdinalIgnoreCase)
+            || invocation.Kind == FolderInvocationKind.OpenFolder && invocation.SelectedPaths.Count != 0) return false;
+        // Normalization does not allocate identity. A request built in-process
+        // with forcing but no GUID receives one only when its cached work commits.
+        normalized = normalized with { DestinationId = invocation.DestinationId };
+        return true;
     }
     private static FolderRouteReceipt Receipt(Guid id, bool accepted, bool ready, MainWindow? window = null) =>
-        new(id, accepted, ready, OwnProcess, OwnStart, window is null ? 0 : new WindowInteropHelper(window).Handle.ToInt64(),
+        new(id, accepted, ready, OwnProcess, OwnStart, window is null ? 0 : new WindowInteropHelper(window.ShellWindow).Handle.ToInt64(),
             window?.FolderDestinationId ?? Guid.Empty, window?.CurrentFolderPath ?? "", window?.CurrentFolderSelection ?? Array.Empty<string>());
 
     private sealed class FolderRouteHost : IDisposable
@@ -484,10 +578,12 @@ internal static class ExplorerLaunchRouter
         internal Task Listening => _listening.Task;
         internal FolderRouteHost(System.Windows.Threading.Dispatcher dispatcher)
         { _dispatcher = dispatcher; new Thread(RunThread) { IsBackground = true, Name = "UltraExplorer folder broker" }.Start(); }
+        internal async Task<bool> OpenInProcessAsync(FolderInvocation invocation)
+            => (await ExecuteAsync(new(Guid.NewGuid(), invocation, true))).Ready;
         private void RunThread()
         {
             // Mutex ownership stays on this thread across asynchronous I/O.
-            using var mutex = new Mutex(false, @"Local\UltraExplorer.FolderBroker." + DialogIntegrationStore.InstanceKey);
+            using var mutex = new Mutex(false, @"Local\UltraExplorer.FolderBroker.v3." + DialogIntegrationStore.InstanceKey);
             while (!_stop.IsCancellationRequested)
             {
                 var entered = false;
@@ -537,7 +633,7 @@ internal static class ExplorerLaunchRouter
                     {
                         result = await _dispatcher.InvokeAsync(() =>
                         {
-                            var window = Windows.FirstOrDefault(candidate => candidate.FolderDestinationId == result.DestinationId);
+                            var window = FindFolderContext(result.DestinationId);
                             return Receipt(request.Id, true, window is not null && Allowed(normalized)
                                 && window.MatchesFolderInvocation(normalized), window);
                         });
@@ -580,7 +676,7 @@ internal static class ExplorerLaunchRouter
             if (commit[0] != 1 || _stop.IsCancellationRequested) return;
             await _dispatcher.InvokeAsync(() =>
             {
-                if (Windows.FirstOrDefault(window => window.FolderDestinationId == destination) is { IsUntouchedHandoff: true } window)
+                if (FindFolderContext(destination) is { IsUntouchedHandoff: true } window)
                 {
                     DialogIntegrationStore.Log("A window opened for an Explorer folder that stayed with Windows was closed.");
                     window.Close();
@@ -590,7 +686,8 @@ internal static class ExplorerLaunchRouter
 
         private async Task<FolderRouteReceipt> ExecuteAsync(FolderRouteRequest request)
         {
-            var invocation = request.Invocation;
+            var invocation = request.Invocation.DestinationId == Guid.Empty && !request.VerifyOnly
+                ? request.Invocation with { DestinationId = Guid.NewGuid() } : request.Invocation;
             if (!Allowed(invocation) || _stop.IsCancellationRequested) return Receipt(request.Id, false, false);
             MainWindow? destination = null;
             Task<bool>? navigation = null;
@@ -601,21 +698,18 @@ internal static class ExplorerLaunchRouter
             {
                 await _dispatcher.InvokeAsync(() =>
                 {
-                    // A window still opening another request's folder, or
-                    // saving on its way out, is not free: folders opened
-                    // together each get a window, and none is dropped by a
-                    // window that is closing.
-                    bool Free(MainWindow window) => request.VerifyOnly || !window.IsFolderInvocationPending && !window.IsFolderWindowClosing;
-                    destination = invocation.DestinationId == Guid.Empty
-                        ? Windows.FirstOrDefault(window => window.IsFolderWindowReady && Free(window)) ?? Windows.FirstOrDefault(Free)
-                        : Windows.FirstOrDefault(window => window.FolderDestinationId == invocation.DestinationId && !window.IsFolderWindowClosing);
+                    destination = FindFolderContext(invocation.DestinationId);
                     if (destination is null && !request.VerifyOnly && Allowed(invocation) && !_stop.IsCancellationRequested)
                     {
-                        var id = invocation.DestinationId == Guid.Empty ? Guid.NewGuid() : invocation.DestinationId;
-                        destination = new MainWindow(null, FolderWorkspacePath(id)) { ShowActivated = false };
-                        destination.FolderDestinationId = id;
-                        destination.PrepareFolderInvocation(invocation);
-                        Attach(destination); destination.Show(); created = true;
+                        var host = ShouldCreateTab(invocation) ? ChooseTabLaunchHost() : null;
+                        if (host is not null) destination = host.CreateFolderTab(invocation);
+                        else
+                        {
+                            host = new MainWindow(null, FolderWorkspacePath(invocation.DestinationId)) { ShowActivated = false };
+                            destination = host.EnableFolderTabs(invocation);
+                            Attach(host); host.Show();
+                        }
+                        created = true;
                     }
                     // Begun on the window's thread right away, so the window
                     // counts as taken before the next request looks for one.

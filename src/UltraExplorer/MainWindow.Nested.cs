@@ -80,10 +80,13 @@ public partial class MainWindow : INestedPaneHost
     /// </summary>
     private void FocusCanvas(NestedPane pane)
     {
+        // An async navigation may finish after its tab has been put away.
+        // Its view is kept, but the keyboard stays with the presented tab.
+        if (!IsTabPresented) return;
         UIElement canvas = IsNested ? pane.Canvas : Editor;
-        if (!IsActive && (WithholdsKeyboard || IsDiagnosticsRun))
+        if (!ShellWindow.IsActive && (WithholdsKeyboard || IsDiagnosticsRun))
         {
-            FocusManager.SetFocusedElement(this, canvas);
+            FocusManager.SetFocusedElement(ShellWindow, canvas);
             return;
         }
 
@@ -179,7 +182,7 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>Starts running waiting slices, one a frame, if the nested canvas is on screen to run them for.</summary>
     private void HookSortSlices()
     {
-        if (!_sortSlicesHooked && IsNested && _sortSlices.Count > 0)
+        if (!_sortSlicesHooked && IsNested && IsTabPresented && _sortSlices.Count > 0)
         {
             _sortSlicesHooked = true;
             CompositionTarget.Rendering += OnSortSliceFrame;
@@ -210,7 +213,7 @@ public partial class MainWindow : INestedPaneHost
         }
 
         // Gone to the tree canvas: the rest waits for the nested one to be back.
-        if (!IsNested)
+        if (!IsNested || !IsTabPresented)
         {
             UnhookSortSlices();
             return;
@@ -793,8 +796,8 @@ public partial class MainWindow : INestedPaneHost
 
     string[]? INestedPaneHost.NestedDragPaths
     {
-        get => _nestedDragPaths;
-        set => _nestedDragPaths = value;
+        get => ShellWindow._nestedDragPaths;
+        set => ShellWindow._nestedDragPaths = value;
     }
 
     bool INestedPaneHost.IsActivePane(NestedPane pane) => ReferenceEquals(pane, ActivePane);
@@ -807,10 +810,15 @@ public partial class MainWindow : INestedPaneHost
 
     void INestedPaneHost.ClearDropTargets()
     {
-        foreach (var pane in _panes)
+        foreach (var context in ShellWindow.TabContexts)
         {
-            pane.Canvas.DropTarget = null;
+            context.ClearFolderListDropTarget();
+            foreach (var pane in context._panes)
+            {
+                pane.Canvas.DropTarget = null;
+            }
         }
+        RestorePresentedFocusAfterDrag();
     }
 
     void INestedPaneHost.DropPreparedMenu() => DropPreparedMenu();

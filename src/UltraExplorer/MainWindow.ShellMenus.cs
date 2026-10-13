@@ -231,7 +231,7 @@ public partial class MainWindow
         var generation = _shellMenuRequestGeneration;
         var selection = _viewModel.Tree.Selection.Version;
         var pane = ActivePane;
-        return () => !_closeRequested && !Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished
+        return () => !_closeRequested && IsTabPresented && !Dispatcher.HasShutdownStarted && !Dispatcher.HasShutdownFinished
             && generation == _shellMenuRequestGeneration
             && selection == _viewModel.Tree.Selection.Version && ReferenceEquals(pane, ActivePane);
     }
@@ -242,7 +242,7 @@ public partial class MainWindow
         if (!ShellMenuCountAllowed(paths.Count, prepared: false)) return null;
         current ??= CaptureShellMenuRequest();
         if (!current()) return null;
-        var owner = new WindowInteropHelper(this).Handle;
+        var owner = new WindowInteropHelper(ShellWindow).Handle;
         if (owner == IntPtr.Zero)
         {
             return null;
@@ -392,7 +392,7 @@ public partial class MainWindow
     {
         try
         {
-            if (PresentationSource.FromVisual(this) is not HwndSource source)
+            if (PresentationSource.FromVisual(ShellWindow) is not HwndSource source)
             {
                 return;
             }

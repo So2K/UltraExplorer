@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Threading;
 using UltraExplorer.Models;
@@ -59,7 +60,7 @@ public partial class MainWindow
     }
 
     private void OnSourceInitializedForDevices(object? sender, EventArgs e) =>
-        _volumeNotifications?.SetWindow(new WindowInteropHelper(this).Handle);
+        _volumeNotifications?.SetWindow(new WindowInteropHelper(ShellWindow).Handle);
 
     /// <summary>
     /// Coming back to the window is when a change made somewhere else is most
@@ -88,7 +89,13 @@ public partial class MainWindow
         {
             // The watch was not all that held the drive: a video or model in
             // Quick Look is open in mpv or F3D, which vetoed the removal too.
-            _quickPreview?.ReleaseMediaOnVolume(root.Key);
+            // This notification names one watch handle, but another tab or
+            // window can have a player holding a file from the same volume.
+            // Each preview checks its own path before releasing anything.
+            foreach (var preview in Application.Current.Windows.OfType<QuickPreviewWindow>().ToArray())
+            {
+                preview.ReleaseMediaOnVolume(root.Key);
+            }
         }
     }
 

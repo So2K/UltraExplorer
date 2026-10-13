@@ -99,7 +99,9 @@ internal static partial class Program
 
             WinEShortcutAgent.LaunchHome();
             Check("Win+E starts the normal Home launcher only when no listener answers",
-                fallbackStarts == 1 && fallbackArguments is [FolderCommandLine.HomeSwitch]);
+                fallbackStarts == 1 && fallbackArguments is not null && FolderCommandLine.TryParse(fallbackArguments, out var fallbackHome, out _)
+                && fallbackHome.DestinationId != Guid.Empty && !fallbackHome.OriginIsShell
+                && ViewAllPath.Equals(fallbackHome.FolderPath, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)));
 
             WriteWinEPreference(enabled: false);
             WinEShortcutAgent.LaunchHome();

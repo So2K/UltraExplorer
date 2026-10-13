@@ -1,3 +1,5 @@
+using System.Globalization;
+
 namespace UltraExplorer.Services;
 
 public enum FolderInvocationKind
@@ -6,13 +8,19 @@ public enum FolderInvocationKind
     Reveal
 }
 
-/// <summary>A normal Explorer window request, with its complete selection.</summary>
+/// <summary>The native frame that owned foreground intent when its view was handed over.</summary>
+public sealed record FolderInvocationSource(long Window, uint Process, long Started);
+
+/// <summary>A normal Explorer context request, with its complete selection.</summary>
 public sealed record FolderInvocation(
     FolderInvocationKind Kind,
     string FolderPath,
     IReadOnlyList<string> SelectedPaths,
     bool OriginIsShell = false,
-    Guid DestinationId = default);
+    Guid DestinationId = default,
+    bool ForceNewWindow = false,
+    FolderInvocationSource? Source = null,
+    FolderInvocationSource? ActivationSource = null);
 
 /// <summary>
 /// Explicit filesystem launches. Windows passes quoted arguments to .NET
@@ -27,11 +35,14 @@ public static class FolderCommandLine
     public const string HomeSwitch = "--home";
     public const string NewWindowSwitch = "--new-window";
     public const string DestinationSwitch = "--destination-id";
+    internal const string SourceSwitch = "--source-window";
+    internal const string ActivationSwitch = "--activation-window";
 
     public static bool IsInvocation(IReadOnlyList<string> args)
         => args.Any(argument => IsSwitch(argument, OpenFolderSwitch) || IsSwitch(argument, RevealSwitch)
             || IsSwitch(argument, ShellRequestSwitch) || IsSwitch(argument, HomeSwitch)
-            || IsSwitch(argument, NewWindowSwitch) || IsSwitch(argument, DestinationSwitch));
+            || IsSwitch(argument, NewWindowSwitch) || IsSwitch(argument, DestinationSwitch)
+            || IsSwitch(argument, SourceSwitch) || IsSwitch(argument, ActivationSwitch));
 
     public static bool TryParse(IReadOnlyList<string> args, out FolderInvocation invocation, out string error)
     {
@@ -41,19 +52,33 @@ public static class FolderCommandLine
         var shellRequest = false;
         var destination = Guid.Empty;
         var wantsNewWindow = false;
+        FolderInvocationSource? source = null;
+        FolderInvocationSource? activationSource = null;
         var selected = new List<string>();
         for (var index = 0; index < args.Count; index++)
         {
             var argument = args[index];
+            if (IsSwitch(argument, ActivationSwitch))
+            {
+                if (activationSource is not null || source is not null || ++index >= args.Count || !TrySource(args[index], out activationSource))
+                { error = "--activation-window requires one foreground window identity."; return false; }
+                continue;
+            }
+            if (IsSwitch(argument, SourceSwitch))
+            {
+                if (source is not null || activationSource is not null || ++index >= args.Count || !TrySource(args[index], out source))
+                { error = "--source-window requires one native window identity."; return false; }
+                continue;
+            }
             if (IsSwitch(argument, NewWindowSwitch))
             {
-                if (wantsNewWindow || destination != Guid.Empty) { error = "Use one new-window destination."; return false; }
+                if (wantsNewWindow) { error = "Use one new-window destination."; return false; }
                 wantsNewWindow = true;
                 continue;
             }
             if (IsSwitch(argument, DestinationSwitch))
             {
-                if (wantsNewWindow || destination != Guid.Empty || ++index >= args.Count
+                if (destination != Guid.Empty || ++index >= args.Count
                     || !Guid.TryParse(args[index], out destination) || destination == Guid.Empty)
                 { error = "--destination-id requires one nonempty GUID."; return false; }
                 continue;
@@ -118,11 +143,14 @@ public static class FolderCommandLine
             }
         }
 
+        if (source is not null && (!shellRequest || destination == Guid.Empty))
+        { error = "A native source requires a shell destination."; return false; }
         var parsed = folder is not null
             ? TryOpenFolder(folder, out invocation, out error)
             : TryReveal(selected, out invocation, out error);
         if (parsed) invocation = invocation with { OriginIsShell = shellRequest,
-            DestinationId = wantsNewWindow ? Guid.NewGuid() : destination };
+            DestinationId = wantsNewWindow && destination == Guid.Empty ? Guid.NewGuid() : destination,
+            ForceNewWindow = wantsNewWindow, Source = source, ActivationSource = activationSource };
         return parsed;
     }
 
@@ -186,7 +214,23 @@ public static class FolderCommandLine
             : invocation.SelectedPaths.SelectMany(path => new[] { RevealSwitch, path }).ToArray();
         if (invocation.OriginIsShell) arguments = [ShellRequestSwitch, .. arguments];
         if (invocation.DestinationId != Guid.Empty) arguments = [DestinationSwitch, invocation.DestinationId.ToString("D"), .. arguments];
+        if (invocation.ForceNewWindow) arguments = [NewWindowSwitch, .. arguments];
+        if (invocation.Source is { } source)
+            arguments = [SourceSwitch, FormattableString.Invariant($"{source.Window}:{source.Process}:{source.Started}"), .. arguments];
+        if (invocation.ActivationSource is { } activationSource)
+            arguments = [ActivationSwitch, FormattableString.Invariant($"{activationSource.Window}:{activationSource.Process}:{activationSource.Started}"), .. arguments];
         return arguments;
+    }
+
+    private static bool TrySource(string value, out FolderInvocationSource? source)
+    {
+        source = null;
+        var parts = value.Split(':');
+        if (parts.Length != 3 || !long.TryParse(parts[0], NumberStyles.None, CultureInfo.InvariantCulture, out var window) || window <= 0
+            || !uint.TryParse(parts[1], NumberStyles.None, CultureInfo.InvariantCulture, out var process) || process == 0
+            || !long.TryParse(parts[2], NumberStyles.None, CultureInfo.InvariantCulture, out var started) || started <= 0) return false;
+        source = new(window, process, started);
+        return true;
     }
 
     /// <summary>For registry command strings and callers requiring a quoted command line.</summary>

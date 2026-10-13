@@ -78,6 +78,12 @@ internal static partial class Program
         await Group(PickerCommandLine);
         await Group(() => FolderInvocationChecks(fixtureRoot));
         await Group(FolderRouterChecks);
+        await Group(FolderOpenPreferenceChecks);
+        await Group(WorkspaceRetryChecks);
+        await Group(FolderLaunchContextChecks);
+        await Group(FolderForegroundChecks);
+        await Group(ExplorerTabChecks);
+        await Group(FolderListTabDragChecks);
         await Group(FolderRouteCacheChecks);
         await Group(PickerNames);
         await Group(DialogIntegrationChecks);

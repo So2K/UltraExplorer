@@ -6,6 +6,12 @@ using UltraExplorer.Infrastructure;
 
 namespace UltraExplorer.Picker.Integration;
 
+internal enum FolderOpenMode
+{
+    SeparateWindow,
+    NewTab
+}
+
 internal sealed record DialogIntegrationSettings
 {
     public bool Enabled { get; init; }
@@ -13,6 +19,9 @@ internal sealed record DialogIntegrationSettings
     public string WinELastError { get; init; } = string.Empty;
     public string[] ExcludedApplications { get; init; } = [];
     public string LastRecovery { get; init; } = string.Empty;
+
+    /// <summary>New shell folder requests get their own window unless tabs were explicitly chosen.</summary>
+    public string FolderOpenMode { get; init; } = nameof(global::UltraExplorer.Picker.Integration.FolderOpenMode.SeparateWindow);
 }
 
 /// <summary>Separate from the canvas workspace: a watchdog can switch integration
@@ -35,6 +44,24 @@ internal static class DialogIntegrationStore
             WindowsIdentity.GetCurrent().User?.Value + "|" + AppPaths.StateDirectory.ToUpperInvariant())))[..24];
 
     public static DialogIntegrationSettings Read() => ReadCore(preserveOnReadFailure: false);
+
+    /// <summary>Read for each incoming folder request, so a choice made in another window applies immediately.</summary>
+    internal static FolderOpenMode ReadFolderOpenMode() => ParseFolderOpenMode(ReadSteady().FolderOpenMode);
+
+    internal static FolderOpenMode ParseFolderOpenMode(string? value) =>
+        string.Equals(value?.Trim(), nameof(FolderOpenMode.NewTab), StringComparison.OrdinalIgnoreCase)
+            ? FolderOpenMode.NewTab
+            : FolderOpenMode.SeparateWindow;
+
+    /// <summary>Shares the integration store's atomic merge without touching Windows registrations.</summary>
+    internal static void SetFolderOpenMode(FolderOpenMode mode)
+    {
+        if (mode is not (FolderOpenMode.SeparateWindow or FolderOpenMode.NewTab))
+            throw new ArgumentOutOfRangeException(nameof(mode));
+        _lastRead = WithSettingsLock(() => UpdateLocked(
+            current => current with { FolderOpenMode = mode.ToString() },
+            requireFolderRegistration: false, applyRegistrations: false));
+    }
 
     /// <summary>What this process last read whole; see <see cref="ReadSteady"/>.</summary>
     private static volatile DialogIntegrationSettings? _lastRead;
@@ -70,19 +97,26 @@ internal static class DialogIntegrationStore
     /// <summary>The setting read last, as a test sets it; null forgets it.</summary>
     internal static void RememberRead(DialogIntegrationSettings? settings) => _lastRead = settings;
 
-    private static DialogIntegrationSettings ReadCore(bool preserveOnReadFailure)
+    private static DialogIntegrationSettings ReadCore(bool preserveOnReadFailure, bool failOnMalformed = false)
     {
         try
         {
             if (!File.Exists(SettingsPath)) return new() { WinEEnabled = false };
             using var stream = new FileStream(SettingsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-            if (stream.Length > 64 * 1024) return new() { WinEEnabled = false };
-            var settings = JsonSerializer.Deserialize<DialogIntegrationSettings>(stream, Json) ?? new();
+            if (stream.Length > 64 * 1024)
+            {
+                if (failOnMalformed) throw new JsonException("The integration settings are too large to read safely; they have been kept unchanged.");
+                return new() { WinEEnabled = false };
+            }
+            var settings = JsonSerializer.Deserialize<DialogIntegrationSettings>(stream, Json);
+            if (settings is null && failOnMalformed)
+                throw new JsonException("The integration settings could not be read; they have been kept unchanged.");
+            settings ??= new();
             return settings with { WinEEnabled = settings.WinEEnabled ?? settings.Enabled, WinELastError = settings.WinELastError ?? string.Empty,
                 ExcludedApplications = (settings.ExcludedApplications ?? []).Where(path => !string.IsNullOrWhiteSpace(path)).Take(128).ToArray(),
                 LastRecovery = settings.LastRecovery ?? string.Empty };
         }
-        catch (Exception ex) when (ex is JsonException
+        catch (Exception ex) when (ex is JsonException && !failOnMalformed
             || !preserveOnReadFailure && (ex is IOException or UnauthorizedAccessException))
         {
             return new() { WinEEnabled = false, LastRecovery = "The integration settings could not be read. Windows dialogs are in use." };
@@ -120,9 +154,10 @@ internal static class DialogIntegrationStore
         finally { if (entered) mutex.ReleaseMutex(); }
     }
 
-    private static DialogIntegrationSettings UpdateLocked(Func<DialogIntegrationSettings, DialogIntegrationSettings> update, bool requireFolderRegistration)
+    private static DialogIntegrationSettings UpdateLocked(Func<DialogIntegrationSettings, DialogIntegrationSettings> update,
+        bool requireFolderRegistration, bool applyRegistrations = true)
     {
-        var before = ReadCore(preserveOnReadFailure: true);
+        var before = ReadCore(preserveOnReadFailure: true, failOnMalformed: !applyRegistrations);
         var settings = update(before);
         var registeredBeforeWrite = false;
         try
@@ -155,7 +190,8 @@ internal static class DialogIntegrationStore
                 }
             }
             finally { try { File.Delete(temporary); } catch (IOException) { } }
-            ApplyRegistrations(settings, before.Enabled, shellAlreadyRegistered: registeredBeforeWrite);
+            if (applyRegistrations)
+                ApplyRegistrations(settings, before.Enabled, shellAlreadyRegistered: registeredBeforeWrite);
             return settings;
         }
         catch
