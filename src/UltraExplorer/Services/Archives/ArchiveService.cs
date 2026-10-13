@@ -738,7 +738,8 @@ public static class ArchiveService
         {
             var archiveFile = index.Path;
             var zone = ArchiveZoneHelper.Capture(archiveFile);
-            using var session = ArchiveSession.Open(archiveFile, Passwords.GetValueOrDefault(archiveFile), cancellation, index.Format);
+            var opened = Passwords.GetValueOrDefault(archiveFile);
+            using var session = ArchiveSession.Open(archiveFile, opened, cancellation, index.Format);
             var targets = new Dictionary<uint, (string Output, long Ticks, long Size)>(files.Count);
             foreach (var (item, output) in files)
             {
@@ -764,7 +765,9 @@ public static class ArchiveService
             cancellation.ThrowIfCancellationRequested();
             if (callback.WrongPassword || result == HResult.Abort && callback.PasswordRefused)
             {
-                Passwords.TryRemove(archiveFile, out _);
+                // Only the password this attempt tried: a parallel share may
+                // already have stored the right one the user typed since.
+                if ((callback.PasswordUsed ?? opened) is { } used) Passwords.TryRemove(KeyValuePair.Create(archiveFile, used));
                 if (callback.PasswordRefused || attempt > 0)
                 {
                     throw new ArchivePasswordException(archiveFile);
@@ -951,6 +954,15 @@ public static class ArchiveService
                     {
                         try
                         {
+                            // A file opened from an archive and saved in place
+                            // since is the user's work, not a leftover: kept
+                            // for a month. Saving in place leaves the folder's
+                            // own date alone.
+                            if (kind == "open" && old.CreationTimeUtc > DateTime.UtcNow.AddDays(-30) && HasEditsSince(old))
+                            {
+                                continue;
+                            }
+
                             old.Delete(recursive: true);
                         }
                         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -963,6 +975,18 @@ public static class ArchiveService
                 }
             }
         });
+    }
+
+    /// <summary>
+    /// Whether a file in <paramref name="folder"/> was written after the
+    /// folder was made: taken out, a file keeps the date it has in the
+    /// archive; one saved since has a later one.
+    /// </summary>
+    private static bool HasEditsSince(DirectoryInfo folder)
+    {
+        var extracted = folder.CreationTimeUtc.AddMinutes(2);
+        return folder.EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true, AttributesToSkip = FileAttributes.ReparsePoint })
+            .Any(file => file.LastWriteTimeUtc > extracted);
     }
 
     /// <summary>Progress over several handles and threads, summed and passed on as one.</summary>
@@ -1001,6 +1025,9 @@ internal sealed class ExtractCallback(
     private bool _passwordGiven;
 
     public int Failed { get; private set; }
+
+    /// <summary>The password this attempt was given, if any: only that one is forgotten as wrong.</summary>
+    public string? PasswordUsed { get; private set; }
 
     public string FirstProblem { get; private set; } = string.Empty;
 
@@ -1169,6 +1196,7 @@ internal sealed class ExtractCallback(
     {
         text = password();
         _passwordGiven = text is not null;
+        if (text is not null) PasswordUsed = text;
         PasswordRefused = text is null;
         return text is null ? HResult.Abort : HResult.Ok;
     }
