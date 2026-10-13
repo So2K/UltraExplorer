@@ -22,6 +22,11 @@ public sealed record CreateItemPrompt(string TargetDirectory, bool IsFolder, str
         if (name is "." or ".." || name.EndsWith('.'))
             return "A name cannot end with a period.";
 
+        if (name.Length > 255)
+            return "A name can be at most 255 characters long.";
+        if (name.Equals("CONIN$", StringComparison.OrdinalIgnoreCase) || name.Equals("CONOUT$", StringComparison.OrdinalIgnoreCase))
+            return "This name is reserved by Windows. Choose another name.";
+
         var stem = name.Split('.')[0].TrimEnd();
         if (stem.Equals("CON", StringComparison.OrdinalIgnoreCase)
             || stem.Equals("PRN", StringComparison.OrdinalIgnoreCase)
