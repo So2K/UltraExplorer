@@ -282,7 +282,7 @@ internal sealed class NestedPane
     /// </summary>
     public string? FocusPath => IsActive
         ? _viewModel.Tree.ActivePath is { Length: > 0 } active ? active : null
-        : KeptSelection.Focus ?? (KeptSelection.Count > 0 ? KeptSelection.Paths[0] : null) ?? Canvas.FolderInView?.FullPath;
+        : (KeptSelection.Focus is { Length: > 0 } kept ? kept : null) ?? (KeptSelection.Count > 0 ? KeptSelection.Paths[0] : null) ?? Canvas.FolderInView?.FullPath;
 
     /// <summary>
     /// For the checks: flights (<see cref="FlyToAsync"/>) still reading the
@@ -564,7 +564,8 @@ internal sealed class NestedPane
         {
             _host.ActivatePane(this);
             await OpenAsync(path, animated: true);
-            if (_detached) return;
+            // Another pane taken up meanwhile keeps the keyboard.
+            if (_detached || !IsActive) return;
             _host.FocusCanvas(this);
         }
         catch (Exception exception)
