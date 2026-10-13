@@ -198,7 +198,7 @@ jobs:
 
       # Owned fixtures and offscreen WPF windows only. The real native-dialog
       # REAPER checks remain a local secondary-monitor gate.
-      - name: Check creation shortcuts and the October 9 review fixes
+      - name: Check creation shortcuts and the October 9 and 13 review fixes
         timeout-minutes: 5
         shell: pwsh
         run: |
@@ -206,7 +206,7 @@ jobs:
           $env:TEMP = Join-Path $env:RUNNER_TEMP 'ue-r1009-t'
           $env:TMP = $env:TEMP
           New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
-          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only CreateItemChecks,Review1009CoreChecks,Review1009ArchiveChecks,Review1009PickerChecks,Review1009StateChecks,Review1009UiChecks,Review1009InstallChecks
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only CreateItemChecks,Review1009CoreChecks,Review1009ArchiveChecks,Review1009PickerChecks,Review1009StateChecks,Review1009UiChecks,Review1009InstallChecks,Review1013Checks
           if ($LASTEXITCODE -ne 0) { throw "Creation and October 9 review checks failed with exit code $LASTEXITCODE." }
 
       # Deterministic owned-state/primitive coverage. No foreground window,
