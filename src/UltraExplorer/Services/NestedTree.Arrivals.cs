@@ -40,6 +40,9 @@ public sealed partial class NestedTree
     private sealed class ArrivalRenames
     {
         public List<RenamePair> Pairs { get; } = [];
+
+        /// <summary>For each of <see cref="Pairs"/>, the applies it has already been kept past.</summary>
+        public List<int> Ages { get; } = [];
         public bool Incomplete { get; set; }
     }
 
@@ -89,6 +92,7 @@ public sealed partial class NestedTree
                 }
             }
             pending.Pairs.Add(pair);
+            pending.Ages.Add(0);
             if (caseSources is not null) AddArrivalCaseSource(caseSources, pair.NewName);
         }
     }
@@ -186,7 +190,24 @@ public sealed partial class NestedTree
             // aliases for the following refresh instead of flashing the final
             // name when that refresh finally reflects the rename.
             foreach (var pair in pending.Pairs)
-                if (TryArrivalKind(folder, pair.OldName, out _)) return;
+                if (TryArrivalKind(folder, pair.OldName, out _))
+                {
+                    // For that one refresh only: a source name made again -
+                    // a save that renames the original away, renames its new
+                    // copy to the name and deletes the backup - would keep
+                    // every pair forever, until the set was Incomplete and
+                    // nothing added to this folder ever pulsed again.
+                    for (var index = pending.Pairs.Count - 1; index >= 0; index--)
+                    {
+                        if (++pending.Ages[index] > 1)
+                        {
+                            pending.Pairs.RemoveAt(index);
+                            pending.Ages.RemoveAt(index);
+                        }
+                    }
+                    if (pending.Pairs.Count > 0) return;
+                    break;
+                }
             break;
         }
         _arrivalRenames.Remove(folder);
