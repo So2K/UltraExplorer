@@ -918,27 +918,31 @@ internal sealed class IconAtlas : IDisposable
 
         try
         {
-            if (texture.Capacity < _nextSlot && !texture.Grow(context, CapacityFor(_nextSlot)))
-            {
-                _active = null;
-                _drawableSlots = texture.Capacity;
-                return;
-            }
-
-            _drawableSlots = int.MaxValue;
-
-            for (var slot = 0; slot < _nextSlot; slot++)
-            {
-                if (_slotData[slot] is { } data && texture.VersionOf(slot) != _slotVersion[slot])
-                {
-                    texture.Upload(context, slot, data, _slotVersion[slot]);
-                }
-            }
+            // A card short of memory keeps this texture: the slots it holds
+            // are still kept current and handed out, the rest wait for a
+            // later grow. Dropping it instead left reused slots below its
+            // capacity showing the icon they held before.
+            _drawableSlots = texture.Capacity < _nextSlot && !texture.Grow(context, CapacityFor(_nextSlot))
+                ? texture.Capacity : int.MaxValue;
+            UploadStale(texture, context);
         }
         catch (SharpGenException)
         {
             // The card is gone; the device set is rebuilt and brings a new texture.
             _active = null;
+        }
+    }
+
+    /// <summary>Copies into <paramref name="texture"/> every slot it holds whose current version it lacks.</summary>
+    private void UploadStale(IconAtlasTexture texture, ID3D11DeviceContext context)
+    {
+        var end = Math.Min(_nextSlot, texture.Capacity);
+        for (var slot = 0; slot < end; slot++)
+        {
+            if (_slotData[slot] is { } data && texture.VersionOf(slot) != _slotVersion[slot])
+            {
+                texture.Upload(context, slot, data, _slotVersion[slot]);
+            }
         }
     }
 
@@ -1238,11 +1242,21 @@ internal sealed class IconAtlas : IDisposable
 
         try
         {
-            if (slot >= texture.Capacity && !texture.Grow(context, CapacityFor(slot + 1)))
+            if (slot >= texture.Capacity)
             {
-                _active = null;
-                _drawableSlots = texture.Capacity;
-                return;
+                if (!texture.Grow(context, CapacityFor(slot + 1)))
+                {
+                    // Short of memory: this slot waits, the texture stays.
+                    _drawableSlots = Math.Min(_drawableSlots, texture.Capacity);
+                    return;
+                }
+
+                if (_drawableSlots != int.MaxValue)
+                {
+                    // Grown after all: what waited is put on the card now.
+                    _drawableSlots = texture.Capacity >= _nextSlot ? int.MaxValue : texture.Capacity;
+                    UploadStale(texture, context);
+                }
             }
 
             if (!texture.Upload(context, slot, pixels, _slotVersion[slot]))
