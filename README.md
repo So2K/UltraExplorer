@@ -13,7 +13,7 @@ See the structure, fly into a folder, and keep your bearings.
 [![MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 [Download for Windows](https://github.com/So2K/UltraExplorer/releases/latest) ·
-[Try v1.3.0 beta](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.5) ·
+[What's new in v1.3.0](docs/RELEASE_NOTES_v1.3.0.md) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -24,19 +24,18 @@ See the structure, fly into a folder, and keep your bearings.
 
 </div>
 
-**v1.3.0-beta.5 is available for testing:** new-item feedback joins clearer
-creation dialogs, keyboard shortcuts and REAPER Save options. Quiet update
-checks with user-initiated installation, Space Quick Look, quick text notes,
-compact media/3D previews and optional archive, shelf and copy-path tools remain included.
-See the [beta testing guide](docs/BETA_TESTING.md) for short sample workflows
-and reporting steps. Archive browsing, the shelf and copy-path button start
-off; enable each in Settings when you want to test it.
+**v1.3.0 is the current stable release.** It brings Space Quick Look,
+quick text notes, compact media and 3D previews, highlighting of newly
+added items, clearer creation dialogs with `Ctrl+N` and `Ctrl+D`, REAPER
+Save options and quiet update checks that install only when you click.
+Archive browsing, the shelf and the copy-path button are optional and start
+off; enable each in Settings.
 
 In folders already read, newly added files and folders pulse yellow twice
 when they become visible on the nested canvas. Offscreen, hidden, filtered or
 too-small entries wait. Existing contents do not flash on first opening, and
 the feedback keeps your selection and camera unchanged.
-[Beta.5 release notes and validation limits](docs/RELEASE_NOTES_v1.3.0-beta.5.md).
+[v1.3.0 release notes and validation limits](docs/RELEASE_NOTES_v1.3.0.md).
 
 You remember roughly where something lives: a project inside a client folder,
 an export beside its source, a reference tucked several levels down. UltraExplorer
@@ -151,7 +150,7 @@ which folder occupies the most bytes.
 
 ## Download
 
-The current stable-channel release is **v1.2.1 for Windows x64**. Get the assets from
+The current stable-channel release is **v1.3.0 for Windows x64**. Get the assets from
 [the latest release](https://github.com/So2K/UltraExplorer/releases/latest):
 
 - [Installer — UltraExplorer-Setup-x64.exe](https://github.com/So2K/UltraExplorer/releases/latest/download/UltraExplorer-Setup-x64.exe): installs into `%LOCALAPPDATA%\Programs\UltraExplorer`, adds a Start menu entry and an uninstaller.
@@ -163,7 +162,19 @@ in `%LOCALAPPDATA%\UltraExplorer`.
 Windows 11, x64. For earlier and newer builds, see
 [all releases](https://github.com/So2K/UltraExplorer/releases).
 
-[Release notes and validation limits](docs/RELEASE_NOTES_v1.2.1.md).
+[Release notes and validation limits](docs/RELEASE_NOTES_v1.3.0.md).
+
+## What changed in v1.3.0
+
+Select a file and tap **`Space`** to look inside it: images, PDFs, text you
+can edit and save, audio, video and 3D models. Newly added files and folders
+pulse yellow once they come into view. `Ctrl+N` creates a folder and
+`Ctrl+D` duplicates the selection. Other programs' Save dialogs keep their own
+options. Updates download quietly and install only when you click
+**Install update**. A full code review fixed the issues it found before
+the release.
+[Release notes](docs/RELEASE_NOTES_v1.3.0.md) ·
+[Review](docs/REVIEW_2026-10-13.md).
 
 ## What changed in v1.2.1
 
