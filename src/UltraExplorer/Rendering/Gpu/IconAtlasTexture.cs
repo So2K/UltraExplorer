@@ -162,7 +162,19 @@ internal sealed class IconAtlasTexture : IDisposable
             }
 
             var description = Describe(capacity);
-            var grown = Device.CreateTexture2D(description);
+            ID3D11Texture2D grown;
+            try
+            {
+                grown = Device.CreateTexture2D(description);
+            }
+            catch (SharpGen.Runtime.SharpGenException ex) when (ex.ResultCode.Code == unchecked((int)0x8007000E))
+            {
+                // E_OUTOFMEMORY: the card is there but has no room for the
+                // larger array. This texture stays as it is; the atlas hands
+                // out only what it holds. A lost card still throws.
+                return false;
+            }
+
             ID3D11ShaderResourceView view;
             try
             {

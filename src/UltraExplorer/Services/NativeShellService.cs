@@ -671,13 +671,24 @@ public sealed class NativeShellService
         var baseName = Path.GetFileNameWithoutExtension(name);
         var extension = Path.GetExtension(name);
         var suffix = 2;
-        while (File.Exists(target) || Directory.Exists(target))
+        while (true)
         {
+            if (!Directory.Exists(target))
+            {
+                try
+                {
+                    // CreateNew: a file another program made under this name
+                    // since the check is never truncated.
+                    using (new FileStream(target, FileMode.CreateNew, FileAccess.Write)) { }
+                    return target;
+                }
+                catch (IOException) when (File.Exists(target) || Directory.Exists(target))
+                {
+                }
+            }
+
             target = Path.Combine(parentPath, $"{baseName} ({suffix++}){extension}");
         }
-
-        File.WriteAllText(target, string.Empty);
-        return target;
     }
 
     /// <summary>

@@ -25,41 +25,69 @@ public sealed class ViewAllWorkspaceStore
 
     public string StatePath { get; }
 
+    /// <summary>
+    /// The file is there but could not be read (another program holding it,
+    /// no access), or damaged and could not be set aside: the canvas starts
+    /// afresh for this session, and its saves leave the file as it is - a
+    /// save would otherwise write the empty start over the user's whole
+    /// arrangement.
+    /// </summary>
+    public bool SavesHeld { get; private set; }
+
     public async Task<ViewAllWorkspaceState?> LoadAsync(CancellationToken cancellationToken = default)
     {
         StateFiles.SweepTemporaries(StatePath, hidden: true);
-        if (!File.Exists(StatePath))
+        for (var attempt = 0; ; attempt++)
         {
-            return null;
-        }
+            if (!File.Exists(StatePath))
+            {
+                return null;
+            }
 
-        try
-        {
-            await using var stream = new FileStream(
-                StatePath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite,
-                bufferSize: 32 * 1024,
-                useAsync: true);
-            return await JsonSerializer.DeserializeAsync<ViewAllWorkspaceState>(stream, JsonOptions, cancellationToken);
-        }
-        catch (JsonException)
-        {
-            // The canvas starts afresh, and the first save of the session would
-            // write that over the damaged file; it is set aside first, so the
-            // arrangement in it can still be recovered by hand.
-            StateFiles.Quarantine(StatePath);
-            return null;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return null;
+            try
+            {
+                await using var stream = new FileStream(
+                    StatePath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete,
+                    bufferSize: 32 * 1024,
+                    useAsync: true);
+                return await JsonSerializer.DeserializeAsync<ViewAllWorkspaceState>(stream, JsonOptions, cancellationToken);
+            }
+            catch (JsonException)
+            {
+                // The canvas starts afresh, and the first save of the session would
+                // write that over the damaged file; it is set aside first, so the
+                // arrangement in it can still be recovered by hand.
+                if (!StateFiles.Quarantine(StatePath))
+                {
+                    SavesHeld = true;
+                }
+
+                return null;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // A scanner or a backup holding it for a moment: asked again.
+                if (attempt >= 3)
+                {
+                    SavesHeld = true;
+                    return null;
+                }
+
+                await Task.Delay(150 * (attempt + 1), cancellationToken);
+            }
         }
     }
 
     public async Task SaveAsync(ViewAllWorkspaceState state, CancellationToken cancellationToken = default)
     {
+        if (SavesHeld)
+        {
+            return;
+        }
+
         await _saving.WaitAsync(cancellationToken);
         try
         {
@@ -188,18 +216,21 @@ internal static class StateFiles
     /// <c>&lt;name&gt;.corrupt-yyyyMMdd-HHmmss</c> beside it.  Starting empty
     /// is right - a damaged file must never stop the app from opening - but the
     /// next save would then replace it, and whatever the user kept in it would
-    /// be lost for good.  Set aside, it can still be mended by hand.  A move
-    /// that fails is let go: this is a precaution, not a step anything
-    /// depends on.
+    /// be lost for good.  Set aside, it can still be mended by hand.  True
+    /// when it was moved: a caller whose next save would replace the damaged
+    /// file holds its saves when it was not.  A short unique tail keeps two
+    /// files set aside in the same second apart.
     /// </summary>
-    public static void Quarantine(string path)
+    public static bool Quarantine(string path)
     {
         try
         {
-            File.Move(path, $"{path}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}");
+            File.Move(path, $"{path}.corrupt-{DateTime.Now:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..8]}");
+            return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
+            return !File.Exists(path);
         }
     }
 }

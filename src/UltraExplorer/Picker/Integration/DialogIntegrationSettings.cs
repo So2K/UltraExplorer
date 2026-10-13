@@ -96,7 +96,12 @@ internal static class DialogIntegrationStore
     /// the same lock as an update, never a snapshot read before taking turns.</summary>
     internal static DialogIntegrationSettings ReconcileRegistrations() => WithSettingsLock(() =>
     {
-        var current = Read();
+        // A file Windows will not open for a moment is not "off": reconciling
+        // that would take away the start entries and folder verbs of a mode
+        // the file still says is on. The caller is told the settings are busy.
+        DialogIntegrationSettings current;
+        try { current = ReadCore(preserveOnReadFailure: true); }
+        catch (UnauthorizedAccessException ex) { throw new IOException("The integration settings could not be read now.", ex); }
         ApplyRegistrations(current, current.Enabled, fullReconcile: true);
         return current;
     });
@@ -194,7 +199,7 @@ internal static class DialogIntegrationStore
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
-    public static bool IsExcluded(string application) => Read().ExcludedApplications
+    public static bool IsExcluded(string application) => ReadSteady().ExcludedApplications
         .Any(path => string.Equals(path, application, StringComparison.OrdinalIgnoreCase));
 }
 

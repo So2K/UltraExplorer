@@ -602,6 +602,7 @@ public sealed partial class ChangeHub : IDisposable
 
         WatchRoot root;
         List<ChangeRegistry.RootMove>? moves = null;
+        WatchRoot? replaced = null;
         lock (_rootsGate)
         {
             if (_letters[index] is { IsDropped: false } raced)
@@ -624,16 +625,16 @@ public sealed partial class ChangeHub : IDisposable
                 }
                 else
                 {
-                    root = ReuseOrAddLocked(spelling, WatchKind.Network, isNetwork: true);
+                    root = ReuseOrAddLocked(spelling, WatchKind.Network, isNetwork: true, ref replaced);
                 }
             }
             else if (found.DriveType is WatchNative.DriveCdRom or WatchNative.DriveNoRootDirectory or WatchNative.DriveUnknown)
             {
-                root = ReuseOrAddLocked(spelling, WatchKind.None, isNetwork: false);
+                root = ReuseOrAddLocked(spelling, WatchKind.None, isNetwork: false, ref replaced);
             }
             else
             {
-                root = ReuseOrAddLocked(spelling, WatchKind.Local, isNetwork: false);
+                root = ReuseOrAddLocked(spelling, WatchKind.Local, isNetwork: false, ref replaced);
             }
 
             // The letter was another root's spelling before - subst'ed or
@@ -660,6 +661,12 @@ public sealed partial class ChangeHub : IDisposable
             }
 
             _letters[index] = root;
+        }
+
+        if (replaced is not null)
+        {
+            // As after Drop: its device notification goes with its watch.
+            RootClosed?.Invoke(replaced);
         }
 
         if (moves is not null)
@@ -719,7 +726,7 @@ public sealed partial class ChangeHub : IDisposable
     /// otherwise a new one in its place - a letter that had no drive when first
     /// asked about and has one now.
     /// </summary>
-    private WatchRoot ReuseOrAddLocked(string key, WatchKind kind, bool isNetwork)
+    private WatchRoot ReuseOrAddLocked(string key, WatchKind kind, bool isNetwork, ref WatchRoot? replaced)
     {
         if (_roots.TryGetValue(key, out var known) && !known.IsDropped
             && (known.Kind == WatchKind.None) == (kind == WatchKind.None) && known.IsNetwork == isNetwork)
@@ -731,7 +738,19 @@ public sealed partial class ChangeHub : IDisposable
         {
             lock (known.Gate)
             {
+                // Its watch is stopped as Drop stops it: left armed, its
+                // directory handle stayed open - holding the volume against
+                // a safe removal - with nothing left to stop it.
+                var wasDropped = known.IsDropped;
+                var watcher = known.Watcher;
                 known.IsDropped = true;
+                known.Watcher = null;
+                known.Handle = null;
+                known.Generation++;
+                known.State = WatchState.Off;
+                known.RetryAt = 0;
+                watcher?.Stop();
+                if (!wasDropped) replaced = known;
             }
 
             Volatile.Write(ref _orphans, 1);

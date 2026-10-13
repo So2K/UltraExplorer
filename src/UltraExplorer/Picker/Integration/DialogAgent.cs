@@ -94,7 +94,7 @@ internal sealed class DialogAgent : IDisposable
         catch (IOException ex)
         {
             DialogIntegrationStore.Log("The integration settings are busy; the listener goes on with them as they are", ex);
-            return DialogIntegrationStore.Read();
+            return DialogIntegrationStore.ReadSteady();
         }
     }
 

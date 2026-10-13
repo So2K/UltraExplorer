@@ -14,6 +14,9 @@ public sealed class NavigationHistory
     private readonly List<string> _places = [];
     private int _index = -1;
 
+    /// <summary>The place the pane last actually got to: recorded, or a step that landed (<see cref="Landed"/>).</summary>
+    private int _reached = -1;
+
     /// <summary>Changes at every step and every place recorded: the same number later means nothing moved since.</summary>
     public int Version { get; private set; }
 
@@ -54,6 +57,7 @@ public sealed class NavigationHistory
         }
 
         _index = _places.Count - 1;
+        _reached = _index;
         Version++;
     }
 
@@ -62,6 +66,7 @@ public sealed class NavigationHistory
     {
         _places.Clear();
         _index = -1;
+        _reached = -1;
         Version++;
     }
 
@@ -85,12 +90,32 @@ public sealed class NavigationHistory
     /// away every place ahead of it.  Nothing is taken back once anything else
     /// moved the history since the step (<paramref name="version"/>).
     /// </summary>
+    /// <para>It goes back to the place the pane last got to, not necessarily
+    /// <paramref name="position"/>: two quick Backs, the first overtaken by
+    /// the second before it got anywhere and the second failing, leave the
+    /// pane where it was before both. Taken back to the first's place, the
+    /// history said the pane was somewhere it never went.</para>
     public void Undo(int position, int version)
     {
-        if (Version == version && position >= 0 && position < _places.Count)
+        if (Version != version)
         {
-            _index = position;
+            return;
+        }
+
+        var to = _reached >= 0 && _reached < _places.Count ? _reached : position;
+        if (to >= 0 && to < _places.Count)
+        {
+            _index = to;
             Version++;
+        }
+    }
+
+    /// <summary>A step back or forward got to <paramref name="position"/>.</summary>
+    public void Landed(int position)
+    {
+        if (position >= 0 && position < _places.Count)
+        {
+            _reached = position;
         }
     }
 

@@ -1727,10 +1727,15 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private async Task NavigateHistoryAsync(NavigationHistory history, string path, int from)
     {
         var version = history.Version;
+        var to = history.Position;
         var outcome = await Tree.RevealAsync(path, records: false, exact: true);
         if (outcome.Node is null || !outcome.IsExact && !outcome.Superseded)
         {
             history.Undo(from, version);
+        }
+        else if (outcome.IsExact && !outcome.Superseded)
+        {
+            history.Landed(to);
         }
     }
 
@@ -2126,6 +2131,10 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
         catch (Exception ex)
         {
+            // A move that failed part way still moved what it got to: their
+            // colours and notes follow them as after a cancel.
+            await CarryMarksAsync(carried, targetDirectory);
+            await RefreshAfterOperationAsync(targetDirectory, sourceDirectories);
             Toast.ShowError(ex.Message);
         }
 

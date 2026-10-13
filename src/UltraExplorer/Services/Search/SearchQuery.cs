@@ -12,7 +12,7 @@ namespace UltraExplorer.Services.Search;
 /// syntax means there, it means here.  The folder walk that stands in for
 /// Everything understands the common part of it (<see cref="Matches"/>).</para>
 /// </summary>
-internal sealed class SearchQuery
+internal sealed partial class SearchQuery
 {
     private static readonly char[] Wildcards = ['*', '?'];
 
@@ -61,7 +61,7 @@ internal sealed class SearchQuery
     /// the whole path, so <c>path:"D:\Games\"</c> keeps what is in D:\Games
     /// and not what is in D:\Games2.
     /// </summary>
-    public string Under(string folder) => $"{PathTerm(folder)} {Text}";
+    public string Under(string folder) => $"{PathTerm(folder)} {Joinable}";
 
     /// <summary>
     /// Everything's query for the text, leaving out what is under each of
@@ -77,7 +77,7 @@ internal sealed class SearchQuery
             return Text;
         }
 
-        var builder = new StringBuilder(Text);
+        var builder = new StringBuilder(Joinable);
         if (Text.Count(character => character == '"') % 2 != 0)
         {
             builder.Append('"');
@@ -107,6 +107,28 @@ internal sealed class SearchQuery
 
         return builder.ToString();
     }
+
+    /// <summary>
+    /// The text to put next to a path term: an operator left dangling while
+    /// typing - "foo |" on the way to "foo | bar", "foo !", "|foo" - would
+    /// join the path term, and "foo | !path:..." finds nearly everything.
+    /// Inside a quote still open, nothing is an operator, and nothing goes.
+    /// </summary>
+    private string Joinable
+    {
+        get
+        {
+            if (Text.Count(character => character == '"') % 2 != 0)
+            {
+                return Text;
+            }
+
+            return DanglingOperators().Replace(Text, string.Empty).Trim();
+        }
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"^(?:\s*\|)+|(?:(?<=^|\s)[|!]+\s*)+$")]
+    private static partial System.Text.RegularExpressions.Regex DanglingOperators();
 
     private static string PathTerm(string folder)
     {
@@ -564,11 +586,13 @@ internal sealed class SearchQuery
         {
             // The full path is the folder, a separator and the name; built
             // only for the few entries that get this far.
-            var length = directory.Length + 1 + name.Length;
+            // A drive root ends in its own separator: "C:\" and "Windows" is "C:\Windows".
+            var separator = directory.Length > 0 && directory[^1] == '\\' ? 0 : 1;
+            var length = directory.Length + separator + name.Length;
             Span<char> rented = length <= 512 ? stackalloc char[length] : new char[length];
             directory.CopyTo(rented);
-            rented[directory.Length] = '\\';
-            name.CopyTo(rented[(directory.Length + 1)..]);
+            if (separator == 1) rented[directory.Length] = '\\';
+            name.CopyTo(rented[(directory.Length + separator)..]);
             return rented.Contains(value, StringComparison.OrdinalIgnoreCase);
         }
     }

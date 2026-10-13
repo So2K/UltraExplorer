@@ -523,7 +523,9 @@ public sealed partial class NestedCanvas
         var width = state.Width * _viewWidth;
         var x = _viewWidth / 2 + state.X * _viewWidth;
         var y = _viewHeight / 2 + state.Y * _viewWidth;
-        if (!double.IsFinite(width) || !double.IsFinite(x) || !double.IsFinite(y))
+        // A width too small to divide by (a damaged saved state) would zoom by
+        // infinity in ClampZoom and leave the camera NaN.
+        if (!double.IsFinite(width) || width < 1e-6 || !double.IsFinite(x) || !double.IsFinite(y))
         {
             _cameraReads = null;
             return;

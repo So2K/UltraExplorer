@@ -332,6 +332,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         };
         foreach (var argument in arguments) start.ArgumentList.Add(argument);
         var process = Process.Start(start) ?? throw new IOException("The preview engine did not start.");
+        PreviewTools.Adopt(process);
         try { diagnostics = new ModelProcessDiagnostics(process); return process; }
         catch { PreviewTools.Kill(process); process.Dispose(); throw; }
     }
@@ -960,7 +961,7 @@ internal sealed class NativePreviewHost : UserControl, IDisposable
         _session?.Dispose();
         _session = null;
         _processCancellation.Dispose();
-        PreviewTools.Kill(_process);
+        PreviewTools.KillAndWait(_process);
         _modelDiagnostics?.Dispose();
         _modelDiagnostics = null;
         _process?.Dispose();

@@ -264,8 +264,27 @@ internal static class DialogGuardian
     public static void EnsureRunning()
     {
         if (Mutex.TryOpenExisting(MutexName, out var existing)) { existing.Dispose(); return; }
-        using var process = DialogSelfProcess.Start("--dialog-guardian");
+        lock (StartGate)
+        {
+            // One this process started is still starting - a cold start takes
+            // a second or two before its mutex shows: asked again every 300 ms
+            // meanwhile, another copy would start each time, only to lose.
+            if (_starting is { } earlier)
+            {
+                try
+                {
+                    if (!earlier.HasExited && DateTime.Now - earlier.StartTime < TimeSpan.FromSeconds(10)) return;
+                }
+                catch (Exception ex) when (ex is InvalidOperationException or System.ComponentModel.Win32Exception) { }
+                earlier.Dispose();
+                _starting = null;
+            }
+            _starting = DialogSelfProcess.Start("--dialog-guardian");
+        }
     }
+
+    private static readonly object StartGate = new();
+    private static Process? _starting;
 
     /// <summary>More lease files than this in one folder can only be litter;
     /// a pass never reads further, and the litter is removed as it is read.</summary>

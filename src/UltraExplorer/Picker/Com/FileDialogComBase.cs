@@ -17,7 +17,10 @@ namespace UltraExplorer.Picker.Com;
 internal abstract class FileDialogComBase
 {
     private readonly FileDialogRequest _request = new() { Options = FileDialogOptions.None };
+    /// <summary>Advised and unadvised on the caller's COM threads, read on the UI thread: under its own lock.</summary>
     private readonly Dictionary<uint, IFileDialogEvents> _sinks = [];
+
+    private IFileDialogEvents[] Sinks() { lock (_sinks) return [.. _sinks.Values]; }
 
     private readonly ConcurrentQueue<Action> _callerWork = new();
 
@@ -298,14 +301,13 @@ internal abstract class FileDialogComBase
             return Hresult.InvalidArg;
         }
 
-        cookie = _nextCookie++;
-        _sinks[cookie] = events;
+        lock (_sinks) { cookie = _nextCookie++; _sinks[cookie] = events; }
         return Hresult.Ok;
     }
 
     public int Unadvise(uint cookie)
     {
-        _sinks.Remove(cookie);
+        lock (_sinks) _sinks.Remove(cookie);
         return Hresult.Ok;
     }
 
@@ -555,7 +557,7 @@ internal abstract class FileDialogComBase
     /// </summary>
     private bool OnBeforeAccept(IReadOnlyList<string> paths)
     {
-        if (_sinks.Count == 0)
+        if (Sinks().Length == 0)
         {
             return true;
         }
@@ -565,7 +567,7 @@ internal abstract class FileDialogComBase
         var accepted = true;
         OnCallerThread(() =>
         {
-            foreach (var sink in _sinks.Values.ToArray())
+            foreach (var sink in Sinks())
             {
                 if (Guard(() => sink.OnFileOk(AsDialog())) != Hresult.Ok)
                 {
@@ -584,7 +586,7 @@ internal abstract class FileDialogComBase
     /// </summary>
     private bool? OnBeforeOverwrite(string path)
     {
-        if (_sinks.Count == 0 || ShellNative.ItemFor(path) is not { } item)
+        if (Sinks().Length == 0 || ShellNative.ItemFor(path) is not { } item)
         {
             return null;
         }
@@ -592,7 +594,7 @@ internal abstract class FileDialogComBase
         bool? decision = null;
         OnCallerThread(() =>
         {
-            foreach (var sink in _sinks.Values.ToArray())
+            foreach (var sink in Sinks())
             {
                 var response = OverwriteResponse.Default;
                 if (Guard(() => sink.OnOverwrite(AsDialog(), item, out response)) != Hresult.Ok)
@@ -619,14 +621,14 @@ internal abstract class FileDialogComBase
 
     private void RaiseFolderChange()
     {
-        if (_sinks.Count == 0)
+        if (Sinks().Length == 0)
         {
             return;
         }
 
         Notify(Notice.Folder, () =>
         {
-            foreach (var sink in _sinks.Values.ToArray())
+            foreach (var sink in Sinks())
             {
                 _ = Guard(() => sink.OnFolderChange(AsDialog()));
             }
@@ -635,14 +637,14 @@ internal abstract class FileDialogComBase
 
     private void RaiseSelectionChange()
     {
-        if (_sinks.Count == 0)
+        if (Sinks().Length == 0)
         {
             return;
         }
 
         Notify(Notice.Selection, () =>
         {
-            foreach (var sink in _sinks.Values.ToArray())
+            foreach (var sink in Sinks())
             {
                 _ = Guard(() => sink.OnSelectionChange(AsDialog()));
             }
@@ -651,14 +653,14 @@ internal abstract class FileDialogComBase
 
     private void RaiseTypeChange()
     {
-        if (_sinks.Count == 0)
+        if (Sinks().Length == 0)
         {
             return;
         }
 
         Notify(Notice.Type, () =>
         {
-            foreach (var sink in _sinks.Values.ToArray())
+            foreach (var sink in Sinks())
             {
                 _ = Guard(() => sink.OnTypeChange(AsDialog()));
             }

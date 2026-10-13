@@ -250,7 +250,11 @@ public sealed class ShelfStore
         lock (_gate)
         {
             all = [.. _entries];
-            Change(list => list.Clear());
+
+            // Only what this window showed: a card another window or copy
+            // put on the shelf since - and its copy - is not this Clear's.
+            var shown = all.Select(entry => (entry.Path.ToUpperInvariant(), entry.AddedUtc)).ToHashSet();
+            Change(list => list.RemoveAll(entry => shown.Contains((entry.Path.ToUpperInvariant(), entry.AddedUtc))));
         }
 
         DeleteCopies(all);

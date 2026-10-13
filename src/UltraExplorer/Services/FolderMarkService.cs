@@ -482,7 +482,7 @@ public sealed class FolderMarkService
                 }
                 else
                 {
-                    await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 16 * 1024, useAsync: true);
+                    await using var stream = new FileStream(StatePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 16 * 1024, useAsync: true);
                     stored = await JsonSerializer.DeserializeAsync<Dictionary<string, FolderMark>>(stream, JsonOptions, cancellationToken);
                 }
             }

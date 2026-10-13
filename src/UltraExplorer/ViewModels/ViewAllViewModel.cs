@@ -3260,7 +3260,16 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         var ticket = ++_selectTicket;
         var records = selection.LastRecordsNavigation;
         _pendingFocus = null;
-        if (selection.Focus is { } focus && !(_activeNode is { } current && string.Equals(current.FullPath, focus, StringComparison.OrdinalIgnoreCase)))
+        if (selection.Focus is { Length: 0 } && _activeNode is not null)
+        {
+            // Empty clears the focus (a pane activated on This PC, nothing
+            // kept): the address bar and New Folder must not stay with the
+            // other pane's folder. No path to look a node up by.
+            _focusRecordsNavigation = records;
+            try { ActiveNode = null; }
+            finally { _focusRecordsNavigation = true; }
+        }
+        else if (selection.Focus is { Length: > 0 } focus && !(_activeNode is { } current && string.Equals(current.FullPath, focus, StringComparison.OrdinalIgnoreCase)))
         {
             if (TryGetNode(focus, out var node))
             {
