@@ -47,13 +47,13 @@ internal static class FolderShellWindowRegistration
         {
             Window = window;
             _messages = OnMessage;
-            _folderChanged = (_, _) => Refresh(DialogIntegrationStore.Read().Enabled);
-            _sourceInitialized = (_, _) => Refresh(DialogIntegrationStore.Read().Enabled);
-            _settingsChanged = () => Refresh(DialogIntegrationStore.Read().Enabled);
+            _folderChanged = (_, _) => Refresh(DialogIntegrationStore.ReadSteady().Enabled);
+            _sourceInitialized = (_, _) => Refresh(DialogIntegrationStore.ReadSteady().Enabled);
+            _settingsChanged = () => Refresh(DialogIntegrationStore.ReadSteady().Enabled);
             window.FolderLocationChanged += _folderChanged;
             window.SourceInitialized += _sourceInitialized;
             DialogIntegrationController.Shared.Changed += _settingsChanged;
-            Refresh(DialogIntegrationStore.Read().Enabled);
+            Refresh(DialogIntegrationStore.ReadSteady().Enabled);
         }
 
         internal void Refresh(bool enabled)
@@ -89,7 +89,7 @@ internal static class FolderShellWindowRegistration
                     if (_closed) return;
                     _registration?.Dispose();
                     _registration = null;
-                    Refresh(DialogIntegrationStore.Read().Enabled);
+                    Refresh(DialogIntegrationStore.ReadSteady().Enabled);
                 });
             return 0;
         }

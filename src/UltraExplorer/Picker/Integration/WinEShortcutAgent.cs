@@ -71,11 +71,11 @@ internal static class WinEShortcutAgent
             DialogIntegrationStore.Log("Independent Win+E shortcut is ready.");
             poll.Tick += (_, _) =>
             {
-                if (DialogIntegrationStore.Read().WinEEnabled != true || !service.IsReady)
+                if (DialogIntegrationStore.ReadSteady().WinEEnabled != true || !service.IsReady)
                 {
                     // A busy settings lock must not end this process from a timer
                     // tick; the hook is gone either way and the listener stops.
-                    if (!service.IsReady && DialogIntegrationStore.Read().WinEEnabled == true)
+                    if (!service.IsReady && DialogIntegrationStore.ReadSteady().WinEEnabled == true)
                         try
                         {
                             DialogIntegrationStore.Update(settings => settings with { WinEEnabled = false,
