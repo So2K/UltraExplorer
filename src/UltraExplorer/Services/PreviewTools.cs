@@ -156,7 +156,9 @@ internal static class PreviewTools
             WorkingDirectory = workingDirectory ?? Path.GetDirectoryName(executable)!
         };
         foreach (var argument in arguments) info.ArgumentList.Add(argument);
-        return Process.Start(info) ?? throw new IOException("The preview engine did not start.");
+        var process = Process.Start(info) ?? throw new IOException("The preview engine did not start.");
+        Adopt(process);
+        return process;
     }
 
     internal static void Kill(Process? process)
@@ -166,4 +168,85 @@ internal static class PreviewTools
         catch (InvalidOperationException) { }
         catch (System.ComponentModel.Win32Exception) { }
     }
+
+    /// <summary>
+    /// Kills <paramref name="process"/> and waits a moment for it to be gone:
+    /// Kill only asks, and a player still exiting holds its file - the drive
+    /// asked to be removed is refused, the session folder cannot be deleted.
+    /// </summary>
+    internal static void KillAndWait(Process? process, int milliseconds = 1000)
+    {
+        Kill(process);
+        try { process?.WaitForExit(milliseconds); }
+        catch (InvalidOperationException) { }
+        catch (System.ComponentModel.Win32Exception) { }
+    }
+
+    /// <summary>
+    /// Every preview engine goes into one job that dies with this process:
+    /// a crash or an end from Task Manager would otherwise leave mpv playing,
+    /// with the file and its drive held, until found and ended by hand.
+    /// </summary>
+    internal static void Adopt(Process process)
+    {
+        if (EngineJob.Value is not { } job) return;
+        try { _ = AssignProcessToJobObject(job, process.Handle); }
+        catch (InvalidOperationException) { }
+    }
+
+    private static readonly Lazy<IntPtr?> EngineJob = new(CreateEngineJob);
+
+    private static IntPtr? CreateEngineJob()
+    {
+        var job = CreateJobObjectW(IntPtr.Zero, null);
+        if (job == IntPtr.Zero) return null;
+        var limits = new JobExtendedLimits { LimitFlags = 0x2000 }; // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if (!SetInformationJobObject(job, 9, ref limits, Marshal.SizeOf<JobExtendedLimits>()))
+        {
+            CloseHandle(job);
+            return null;
+        }
+
+        // Never closed: the handle closing with the process is what ends the engines.
+        return job;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JobExtendedLimits
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObjectW(IntPtr attributes, string? name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetInformationJobObject(IntPtr job, int infoClass, ref JobExtendedLimits info, int length);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    [DllImport("kernel32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 }

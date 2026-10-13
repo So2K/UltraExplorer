@@ -155,7 +155,9 @@ internal static class PreviewImageService
             """;
         // The built-in configuration is copied to a private process directory;
         // no registry, PATH or system ImageMagick configuration is changed.
-        var configDirectory = Path.Combine(Path.GetTempPath(), "UltraExplorerImagePolicy", Guid.NewGuid().ToString("N"));
+        var policyRoot = Path.Combine(Path.GetTempPath(), "UltraExplorerImagePolicy");
+        SweepOldPolicyDirectories(policyRoot);
+        var configDirectory = Path.Combine(policyRoot, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(configDirectory);
         MagickNET.Initialize(configuration, configDirectory);
         ResourceLimits.Memory = 256 * 1024 * 1024;
@@ -163,6 +165,31 @@ internal static class PreviewImageService
         ResourceLimits.Thread = 2;
         ResourceLimits.MaxProfileSize = 16 * 1024 * 1024;
         _magickInitialized = true;
+    }
+
+    /// <summary>
+    /// Each process copies the policy into a folder of its own, and nothing
+    /// took them away: those of earlier days go. A process still running
+    /// read its policy when it started, so a day-old folder is no one's.
+    /// </summary>
+    private static void SweepOldPolicyDirectories(string policyRoot)
+    {
+        try
+        {
+            if (!Directory.Exists(policyRoot)) return;
+            var cutoff = DateTime.UtcNow.AddDays(-1);
+            foreach (var directory in Directory.EnumerateDirectories(policyRoot))
+            {
+                // Only the folders this code names: 32 hex digits.
+                if (Path.GetFileName(directory) is not { Length: 32 } name || !name.All(char.IsAsciiHexDigit)) continue;
+                try
+                {
+                    if (Directory.GetLastWriteTimeUtc(directory) < cutoff) Directory.Delete(directory, true);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
     private static void ValidateSize(int width, int height, long maximumPixels)

@@ -28,6 +28,15 @@ internal static partial class UpdateInstaller
         if (!string.Equals(Path.GetFileName(executable), "UltraExplorer.exe", StringComparison.OrdinalIgnoreCase)
             || !string.Equals(Path.GetFullPath(executable), Path.Combine(destination, "UltraExplorer.exe"), StringComparison.OrdinalIgnoreCase))
             throw new IOException("Updates can only replace the currently running UltraExplorer folder.");
+        // The helper scripts and the unpacked files wait in the user's TEMP,
+        // which the user's unelevated programs can write: run elevated, the
+        // helper would copy into the app folder whatever one put there.
+        using (var identity = WindowsIdentity.GetCurrent())
+        {
+            if (new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator)
+                || ShellReplacementRegistration.IsPerMachineInstall(executable))
+                throw new IOException("This copy runs as administrator or for all users. Install the update with its Setup download instead.");
+        }
         AssertNoLinks(destination);
         var zip = Path.GetFullPath(package.ZipPath);
         AssertNoLinks(zip);
