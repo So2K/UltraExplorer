@@ -799,6 +799,8 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     /// </summary>
     private bool IsShown(NestedBeacon beacon)
     {
+        if (_searchMapProjection is not null && !_searchMapProjection.ContainsFolder(beacon.Path)
+            && !_searchMapProjection.ContainsFile(Path.GetDirectoryName(beacon.Path) ?? string.Empty, Path.GetFileName(beacon.Path))) return false;
         // Filter-only hits cannot materialize a stale, hidden match. A global
         // search/mark/pin at that same path remains an independent user intent.
         if (beacon.Kind == NestedBeaconKind.Filter

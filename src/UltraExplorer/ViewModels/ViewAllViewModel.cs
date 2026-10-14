@@ -249,6 +249,9 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
     /// <summary>Raised when the graph structure changed and cached drawing is stale.</summary>
     public event Action? GraphInvalidated;
 
+    /// <summary>Membership or metadata may have changed on disk, including folders hidden by a search mask.</summary>
+    public event Action? FilesystemChanged;
+
     /// <summary>
     /// Raised after a directory was read again because the window changed
     /// something in it - a file operation - or F5 asked.  What else shows the
@@ -2489,6 +2492,7 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         {
             _lastChange = (change.Key, change.FirstTicks, change.Kinds);
             FollowChangeWithSelection(change);
+            FilesystemChanged?.Invoke();
         }
 
         switch (consumer)
@@ -2524,6 +2528,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
             return;
         }
 
+        FilesystemChanged?.Invoke();
+
         foreach (var sink in _nestedChanges)
         {
             sink.EpochBumped(root);
@@ -2546,6 +2552,8 @@ public sealed class ViewAllViewModel : ObservableObject, IDisposable, IChangeSin
         {
             return;
         }
+
+        FilesystemChanged?.Invoke();
 
         foreach (var sink in _nestedChanges)
         {

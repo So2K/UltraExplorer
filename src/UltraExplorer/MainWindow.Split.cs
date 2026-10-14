@@ -144,6 +144,7 @@ public partial class MainWindow
                 PlaceSearchPanel();
                 break;
             case nameof(MainViewModel.IsNestedLayout):
+                UpdateSearchMapAvailability();
                 // The tree canvas shows no split, whatever is left on.
                 UpdateSplitControls();
                 PlaceSearchPanel();
@@ -232,6 +233,9 @@ public partial class MainWindow
             _ = ForgetVanishedAsync(items);
         }
 
+        pane.Canvas.SetSearchMapProjection(_mapProjection);
+        ScheduleSearchMap();
+
         return pane;
     }
 
@@ -285,6 +289,7 @@ public partial class MainWindow
         second.Canvas.Tree = null;
         second.Detach();
         _panes.Remove(second);
+        ScheduleSearchMap();
 
         // A folder launch it had holds on to it no more; one still under way
         // lets go of it itself as it ends.

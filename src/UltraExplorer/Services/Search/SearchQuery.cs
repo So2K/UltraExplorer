@@ -37,6 +37,12 @@ internal sealed partial class SearchQuery
     /// </summary>
     public bool IsPlain { get; private set; } = true;
 
+    /// <summary>Every condition can be judged by the filesystem fallback, without silently dropping an advanced Everything function.</summary>
+    public bool SupportsLocalMatching { get; private set; } = true;
+
+    /// <summary>Extension searches describe files; folders are retained only as the path to those files on the map.</summary>
+    public bool MapFilesOnly { get; private set; }
+
     /// <summary>
     /// The words a name is measured against for the order of the results:
     /// every term that names part of a name, without its wildcards.  The
@@ -284,6 +290,7 @@ internal sealed partial class SearchQuery
 
     private void Parse()
     {
+        SupportsLocalMatching = CanMatchLocally();
         var words = new List<string>();
         foreach (var token in JoinedAtBars(Tokens(Text)))
         {
@@ -379,6 +386,66 @@ internal sealed partial class SearchQuery
         }
 
         Words = [.. words.Distinct(StringComparer.OrdinalIgnoreCase).OrderByDescending(word => word.Length)];
+        MapFilesOnly = !_terms.Any(term => !term.Excluded && term.Kind == TermKind.FoldersOnly)
+            && _terms.Any(term => !term.Excluded && (term.Kind is TermKind.Extensions or TermKind.FilesOnly
+            || term.Kind == TermKind.Wildcard && IsExtensionPattern(term.Value)
+            || term.Kind == TermKind.AnyOf && term.Value.Split('|', StringSplitOptions.RemoveEmptyEntries).All(IsExtensionPattern)));
+    }
+
+    private static bool IsExtensionPattern(string value)
+    {
+        var dot = value.LastIndexOf('.');
+        return dot >= 0 && dot < value.Length - 1 && value.IndexOfAny(Wildcards) >= 0
+            && value.AsSpan(dot + 1).IndexOfAny(Wildcards) < 0;
+    }
+
+    private bool CanMatchLocally()
+    {
+        var inQuotes = false;
+        foreach (var character in Text)
+        {
+            if (character == '"') inQuotes = !inQuotes;
+            else if (!inQuotes && character is '<' or '>') return false;
+        }
+        if (inQuotes) return false;
+
+        foreach (var token in JoinedAtBars(Tokens(Text)))
+        {
+            var raw = token.Text;
+            if (raw.StartsWith("!!", StringComparison.Ordinal)) return false;
+            var excluded = raw.StartsWith('!');
+            if (excluded) raw = raw[1..];
+            if (raw.Length == 0 || raw.StartsWith('|') || raw.EndsWith('|')) return false;
+            var colon = raw.IndexOf(':');
+            if (raw.Contains('|'))
+            {
+                // The local OR joins names. Everything also accepts whole expressions,
+                // whose negation, paths and functions require its index.
+                if (token.Quoted || colon >= 0 || raw.IndexOfAny(['!', '\\', '/']) >= 0) return false;
+                continue;
+            }
+            if (colon > 0 && (token.QuoteAt < 0 || token.QuoteAt > token.Text.IndexOf(':')) && !IsDrivePath(raw))
+            {
+                var function = raw[..colon].ToLowerInvariant();
+                var argument = raw[(colon + 1)..];
+                switch (function)
+                {
+                    case "ext":
+                        if (argument.IndexOfAny(Wildcards) >= 0) return false;
+                        break;
+                    case "file" or "files" or "folder" or "folders":
+                        if (excluded && argument.Length > 0) return false;
+                        break;
+                    case "path" or "wfn" or "wholefilename":
+                        if (argument.IndexOfAny(Wildcards) >= 0) return false;
+                        break;
+                    default:
+                        return false;
+                }
+            }
+            else if (raw.IndexOfAny(['\\', '/']) >= 0 && raw.IndexOfAny(Wildcards) >= 0) return false;
+        }
+        return true;
     }
 
     private void AddPlain(string raw, bool excluded, List<string> words)

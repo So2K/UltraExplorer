@@ -33,6 +33,56 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     /// <summary>The pause after the last key before a search starts.</summary>
     private static readonly TimeSpan TypingPause = TimeSpan.FromMilliseconds(70);
 
+    private bool _showOnMap;
+    private bool _isMapBusy;
+    private string _mapStatus = "Enter a query to filter the map. Positions stay unchanged.";
+    private bool _canFilterMap = true;
+
+    public bool CanFilterMap
+    {
+        get => _canFilterMap;
+        internal set => SetProperty(ref _canFilterMap, value);
+    }
+
+    /// <summary>A second press of Search in map mode refreshes its independent, uncapped search.</summary>
+    public event EventHandler? MapRefreshRequested;
+
+    public bool ShowOnMap
+    {
+        get => _showOnMap;
+        set
+        {
+            if (!SetProperty(ref _showOnMap, value)) return;
+            OnPropertyChanged(nameof(IsResultsPanelOpen));
+            OnPropertyChanged(nameof(Placeholder));
+            if (value)
+            {
+                _typing.Stop();
+                _revealing.Stop();
+                _waitingForEverything.Stop();
+                _folderSettling.Stop();
+                _run?.Cancel();
+                _run = null;
+                IsBusy = false;
+            }
+            else if (_isOpen && !string.IsNullOrWhiteSpace(_text)) SearchNow();
+        }
+    }
+
+    public bool IsResultsPanelOpen => IsOpen && !ShowOnMap;
+
+    public bool IsMapBusy
+    {
+        get => _isMapBusy;
+        internal set => SetProperty(ref _isMapBusy, value);
+    }
+
+    public string MapStatus
+    {
+        get => _mapStatus;
+        internal set => SetProperty(ref _mapStatus, value);
+    }
+
     /// <summary>The pause after the last arrow key before the canvas goes to the result.</summary>
     private static readonly TimeSpan RevealPause = TimeSpan.FromMilliseconds(160);
 
@@ -210,6 +260,7 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
             }
 
             IsOpen = true;
+            if (ShowOnMap) return;
             _typing.Stop();
             _typing.Start();
         }
@@ -218,7 +269,10 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     public bool IsOpen
     {
         get => _isOpen;
-        private set => SetProperty(ref _isOpen, value);
+        private set
+        {
+            if (SetProperty(ref _isOpen, value)) OnPropertyChanged(nameof(IsResultsPanelOpen));
+        }
     }
 
     public bool IsBusy
@@ -274,7 +328,7 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     /// <summary>Whether Everything is not installed, so the panel can offer it.</summary>
     public bool OffersEverything => IsWalking && !SearchEngine.EverythingInstalled;
 
-    public string Placeholder => "Search everywhere";
+    public string Placeholder => ShowOnMap ? "Search this map" : "Search everywhere";
 
     /// <summary>
     /// Told whenever the folder the search would be made from may have
@@ -284,7 +338,7 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
     /// </summary>
     public void NoteFolder(string? folder)
     {
-        if (!IsOpen)
+        if (!IsOpen || ShowOnMap)
         {
             return;
         }
@@ -315,6 +369,11 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
         }
 
         IsOpen = true;
+        if (ShowOnMap)
+        {
+            MapRefreshRequested?.Invoke(this, EventArgs.Empty);
+            return;
+        }
         _ = RunAsync();
     }
 
@@ -436,7 +495,7 @@ public sealed class SearchViewModel : ObservableObject, IDisposable
 
     private async Task RunAsync()
     {
-        if (_disposed)
+        if (_disposed || ShowOnMap)
         {
             return;
         }

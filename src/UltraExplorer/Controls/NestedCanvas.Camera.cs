@@ -598,6 +598,7 @@ public sealed partial class NestedCanvas
     /// <param name="place">Whether what it reads is placed for the current order first (see <see cref="RectOf"/>).</param>
     private Rect? TargetRect(NestedFolder folder, int fileIndex, bool place = true)
     {
+        if (!MapTargetVisible(folder, fileIndex)) return null;
         if (RectOf(folder, place) is not { } r)
         {
             return null;

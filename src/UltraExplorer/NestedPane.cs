@@ -1714,7 +1714,7 @@ internal sealed class NestedPane
             }
         }
 
-        if (_viewModel.Search.IsOpen)
+        if (_viewModel.Search.IsResultsPanelOpen)
         {
             foreach (var result in _viewModel.Search.Results.Take(SearchBeaconLimit))
             {

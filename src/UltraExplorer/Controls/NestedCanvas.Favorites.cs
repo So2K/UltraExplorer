@@ -91,6 +91,7 @@ public sealed partial class NestedCanvas
         DrawTextAt(dc, title, new Point(root.X + root.W * 0.03, root.Y - FavoriteStripHeight * root.W));
         foreach (var (link, centre, radius) in FavoriteLinkPositions())
         {
+            if (_searchMapProjection?.ContainsFolder(link.Path) == false) continue;
             var labelSize = Math.Min(17, root.W * 0.0135);
             var label = Text(link.Label, labelSize, TextBrush, root.W * 0.108, bold: false, scaled: true);
             var labelAt = new Point(centre.X - label.Width / 2, centre.Y + radius + root.W * 0.005);

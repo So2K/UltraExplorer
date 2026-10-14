@@ -21,7 +21,12 @@ internal readonly record struct EverythingItem(
     string Highlighted);
 
 /// <summary>What one query to Everything answered: the items it sent, and how many matched in all.</summary>
-internal sealed record EverythingPage(long Total, IReadOnlyList<EverythingItem> Items);
+internal sealed record EverythingPage(long Total, IReadOnlyList<EverythingItem> Items)
+{
+    public uint Offset { get; init; }
+    /// <summary>All declared records were readable; this says nothing about later pages.</summary>
+    public bool IsComplete { get; init; } = true;
+}
 
 /// <summary>
 /// Talks to Everything (voidtools) directly, the way its SDK library does -
@@ -233,7 +238,11 @@ internal sealed class EverythingClient
     /// <c>EVERYTHING_IPC_SORT_*</c> value), with how many match in all.
     /// Null when Everything is not running or did not answer in time.
     /// </summary>
-    public async Task<EverythingPage?> QueryAsync(string search, int maximum, CancellationToken cancellationToken, uint sort = SortNameAscending)
+    public Task<EverythingPage?> QueryAsync(string search, int maximum, CancellationToken cancellationToken, uint sort = SortNameAscending)
+        => QueryPageAsync(search, maximum, 0, cancellationToken, sort);
+
+    /// <summary>Reads a page in the same stable order, without the result panel's display limit.</summary>
+    public async Task<EverythingPage?> QueryPageAsync(string search, int maximum, uint offset, CancellationToken cancellationToken, uint sort = SortNameAscending)
     {
         ArgumentNullException.ThrowIfNull(search);
         var everything = FindEverythingWindow();
@@ -258,7 +267,7 @@ internal sealed class EverythingClient
         {
             // Off the caller's thread: sending waits for Everything to take
             // the query, which is quick but is still another process.
-            var sent = await Task.Run(() => Send(everything, reply, id, search, (uint)Math.Max(0, maximum), sort), cancellationToken).ConfigureAwait(false);
+            var sent = await Task.Run(() => Send(everything, reply, id, search, (uint)Math.Max(0, maximum), sort, offset), cancellationToken).ConfigureAwait(false);
             if (!sent)
             {
                 return null;
@@ -289,20 +298,23 @@ internal sealed class EverythingClient
     {
         if (reply.Length < 20)
         {
-            return new EverythingPage(0, []);
+            return new EverythingPage(0, []) { IsComplete = false };
         }
 
         var total = BinaryPrimitives.ReadUInt32LittleEndian(reply);
         var count = BinaryPrimitives.ReadUInt32LittleEndian(reply[4..]);
+        var offsetInResults = BinaryPrimitives.ReadUInt32LittleEndian(reply[8..]);
         var flags = BinaryPrimitives.ReadUInt32LittleEndian(reply[12..]);
         var items = new List<EverythingItem>((int)Math.Min(count, 4096));
         for (var index = 0; index < count; index++)
         {
-            var header = 20 + (index * 8);
-            if (header + 8 > reply.Length)
+            var headerWide = 20UL + ((ulong)index * 8UL);
+            if (headerWide + 8 > (ulong)reply.Length)
             {
                 break;
             }
+
+            var header = (int)headerWide;
 
             var itemFlags = BinaryPrimitives.ReadUInt32LittleEndian(reply[header..]);
             var offset = (int)BinaryPrimitives.ReadUInt32LittleEndian(reply[(header + 4)..]);
@@ -312,7 +324,7 @@ internal sealed class EverythingClient
             }
         }
 
-        return new EverythingPage(total, items);
+        return new EverythingPage(total, items) { Offset = offsetInResults, IsComplete = items.Count == count };
     }
 
     private static bool TryReadItem(ReadOnlySpan<byte> reply, int offset, uint flags, uint itemFlags, out EverythingItem item)
@@ -470,7 +482,7 @@ internal sealed class EverythingClient
         return SendMessageTimeoutW(window, WmUser, command, 0, abortIfHung, 1000, out var result) == 0 ? null : result;
     }
 
-    private static unsafe bool Send(nint everything, nint reply, uint id, string search, uint maximum, uint sort)
+    private static unsafe bool Send(nint everything, nint reply, uint id, string search, uint maximum, uint sort, uint offset)
     {
         // EVERYTHING_IPC_QUERY2: seven DWORDs, then the search and its null.
         var size = 28 + ((search.Length + 1) * 2);
@@ -479,7 +491,7 @@ internal sealed class EverythingClient
         BinaryPrimitives.WriteUInt32LittleEndian(span, unchecked((uint)reply));
         BinaryPrimitives.WriteUInt32LittleEndian(span[4..], id);
         BinaryPrimitives.WriteUInt32LittleEndian(span[8..], 0);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[12..], 0);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[12..], offset);
         BinaryPrimitives.WriteUInt32LittleEndian(span[16..], maximum);
         BinaryPrimitives.WriteUInt32LittleEndian(span[20..], Requested);
         BinaryPrimitives.WriteUInt32LittleEndian(span[24..], sort);

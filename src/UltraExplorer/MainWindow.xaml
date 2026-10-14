@@ -569,6 +569,7 @@
                         <ColumnDefinition Width="30" />
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
+                        <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
                     <Button Width="28"
                             Height="26"
@@ -601,6 +602,14 @@
                                    Visibility="{Binding Search.Text, Converter={StaticResource StringToVisibility}, ConverterParameter=Invert}" />
                     </Grid>
                     <Button Grid.Column="2"
+                            Width="27" Height="26" Padding="0"
+                            Style="{StaticResource ChromeButton}"
+                            Click="SearchBuilderButton_Click"
+                            ToolTip="Build a search: name, extension, folder and exclusions"
+                            AutomationProperties.Name="Build search conditions">
+                        <TextBlock Text="&#xE9E9;" Style="{StaticResource IconText}" FontSize="12" />
+                    </Button>
+                    <Button Grid.Column="3"
                             Width="26"
                             Height="26"
                             Padding="0"
@@ -659,6 +668,17 @@
                                           ToolTip="Behaviour is not defined yet" />
                         </StackPanel>
                     </Border>
+                    <CheckBox x:Name="SearchMapToggle"
+                              Style="{StaticResource SearchCheckBox}"
+                              Content="Filter map"
+                              Margin="14,0,4,0"
+                              VerticalAlignment="Center"
+                              Foreground="{StaticResource TextBrush}"
+                              FontSize="12"
+                              IsChecked="{Binding Search.ShowOnMap, Mode=TwoWay}"
+                              Visibility="{Binding Search.CanFilterMap, Converter={StaticResource BoolToVisibility}}"
+                              ToolTip="Show search matches and their containing folders. Keep every block in its original place."
+                              AutomationProperties.Name="Show search matches on the map" />
                 </StackPanel>
 
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
@@ -924,6 +944,25 @@
                     <local:NestedPaneView x:Name="FirstPaneView" />
                 </Grid>
 
+                <Border x:Name="SearchMapStatus"
+                        HorizontalAlignment="Left" VerticalAlignment="Bottom"
+                        Margin="14,14,14,70" Padding="10,6" MaxWidth="620"
+                        CornerRadius="5" Background="#F01B1B1B"
+                        BorderBrush="{StaticResource BorderStrongBrush}" BorderThickness="1"
+                        IsHitTestVisible="False"
+                        Visibility="{Binding Search.ShowOnMap, Converter={StaticResource BoolToVisibility}}">
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="&#xE71C;" Style="{StaticResource IconText}" FontSize="12" Margin="0,0,8,0"
+                                   Foreground="{StaticResource AccentBrush}" VerticalAlignment="Center" />
+                        <TextBlock Text="{Binding Search.MapStatus}" FontSize="11" TextWrapping="Wrap" MaxWidth="545"
+                                   Foreground="{StaticResource TextMutedBrush}" VerticalAlignment="Center"
+                                   AutomationProperties.LiveSetting="Polite" />
+                        <ProgressBar Width="36" Height="3" Margin="10,0,0,0" VerticalAlignment="Center"
+                                     IsIndeterminate="True" Foreground="{StaticResource AccentBrush}" Background="Transparent"
+                                     Visibility="{Binding Search.IsMapBusy, Converter={StaticResource BoolToVisibility}}" />
+                    </StackPanel>
+                </Border>
+
                 <!-- The current folder as a plain list.  The canvas answers
                      "what is where"; this answers "where is the one called X",
                      which is the half a canvas is bad at. -->
@@ -1170,7 +1209,7 @@
                         Background="#F5222222"
                         BorderBrush="{StaticResource BorderStrongBrush}"
                         BorderThickness="1"
-                        Visibility="{Binding Search.IsOpen, Converter={StaticResource BoolToVisibility}}">
+                        Visibility="{Binding Search.IsResultsPanelOpen, Converter={StaticResource BoolToVisibility}}">
                     <Border.Effect>
                         <DropShadowEffect BlurRadius="24" ShadowDepth="6" Opacity="0.5" Color="#000000" />
                     </Border.Effect>

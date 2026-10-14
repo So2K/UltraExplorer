@@ -113,6 +113,7 @@ public partial class MainWindow : INestedPaneHost
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged += OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
+        AttachSearchMap();
 
         // What the canvas being worked with draws of the selection, for
         // Delete to ask about the rest (see MainViewModel.ShownSelectionCount).
@@ -124,6 +125,7 @@ public partial class MainWindow : INestedPaneHost
 
     private void DetachNested()
     {
+        DetachSearchMap();
         Shelf.Dispose();
         _viewModel.ShownSelectionCount = null;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
@@ -289,6 +291,7 @@ public partial class MainWindow : INestedPaneHost
 
         SyncNestedSelection();
         _nestedReady = true;
+        ScheduleSearchMap();
 
         // A drive plugged in or pulled out while the canvas was starting:
         // the drives it copied above may be from before it.
@@ -416,6 +419,7 @@ public partial class MainWindow : INestedPaneHost
         {
             pane.Tree.SetRoots(roots);
         }
+        ScheduleSearchMap();
     }
 
     private void EnsureNestedLocation(string folder)
@@ -694,6 +698,7 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>F5 on a folder: every pane reads it again, and what it read below it as it is drawn (see <see cref="NestedPane.RefreshDeep"/>).</summary>
     private void OnTreeDeepRefreshRequested(string path)
     {
+        ScheduleSearchMap(refresh: true);
         foreach (var pane in _panes)
         {
             pane.RefreshDeep(path);
@@ -707,7 +712,8 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>The search's results are beacons on the canvas while its panel is up.</summary>
     private void OnSearchPropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(SearchViewModel.IsOpen) or nameof(SearchViewModel.Results))
+        OnSearchMapPropertyChanged(e);
+        if (e.PropertyName is nameof(SearchViewModel.IsOpen) or nameof(SearchViewModel.IsResultsPanelOpen) or nameof(SearchViewModel.Results))
         {
             ScheduleBeacons();
         }

@@ -170,6 +170,7 @@ public partial class MainWindow : Window
         }
 
         UpdateSplitControls();
+        UpdateSearchMapAvailability();
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -2186,18 +2187,24 @@ public partial class MainWindow : Window
     {
         var search = _viewModel.Search;
         var modifiers = Keyboard.Modifiers;
+        if (search.ShowOnMap && e.Key is Key.Enter)
+        {
+            search.SearchNow();
+            e.Handled = true;
+            return;
+        }
         switch (e.Key)
         {
-            case Key.Down when search.IsOpen:
+            case Key.Down when search.IsResultsPanelOpen:
                 search.MoveSelection(1);
                 break;
-            case Key.Up when search.IsOpen:
+            case Key.Up when search.IsResultsPanelOpen:
                 search.MoveSelection(-1);
                 break;
-            case Key.PageDown when search.IsOpen:
+            case Key.PageDown when search.IsResultsPanelOpen:
                 search.MoveSelection(8);
                 break;
-            case Key.PageUp when search.IsOpen:
+            case Key.PageUp when search.IsResultsPanelOpen:
                 search.MoveSelection(-8);
                 break;
             case Key.Enter when (modifiers & (ModifierKeys.Control | ModifierKeys.Shift)) != 0:

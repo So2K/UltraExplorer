@@ -113,6 +113,9 @@ internal static partial class Program
         await Group(AddressBar);
         await Group(() => FolderColours(fixtureRoot));
         await Group(SearchChecks);
+        await Group(SearchBuilderChecks);
+        await Group(SearchBuilderVisualChecks);
+        await Group(SearchMapChecks);
         await Group(ProgramTargets);
         await Group(NestedLayoutChecks);
         await Group(NestedTreeChecks);
