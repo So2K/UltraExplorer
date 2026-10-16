@@ -211,23 +211,33 @@ internal static class FolderRouterFixture
             Check("source frame " + index + " is a real normal HWND with its own selected tiles",
                 new WindowInteropHelper(window.ShellWindow).Handle.ToInt64() == receipt.Window && !window.IsPickerMode && window.Nested.SelectedCount == 2
                 && window.CurrentFolderPath == folder && window.CurrentFolderSelection.SequenceEqual([a, b]));
-            var bounds = window.Nested.ScreenRectOf(window.ActivePane.Tree.Find(folder)!);
-            Check("source frame " + index + " visibly frames its folder at a readable local zoom",
-                window.Nested.CaptureCamera() is { AnchorPath: var anchor, Width: >= 0.4 and <= 1.5 }
-                && anchor == folder && bounds is { Width: > 200, Height: > 100 }
-                && bounds.Value.IntersectsWith(new Rect(0, 0, window.Nested.ActualWidth, window.Nested.ActualHeight))
-                && ((UltraExplorer.ViewModels.MainViewModel)window.DataContext).Address.CurrentPath == folder
-                && window.Nested.ZoomText.Length < 12 && !window.Nested.ZoomText.Contains('M') && !window.Nested.ZoomText.Contains('K'));
             var loadedFolder = window.ActivePane.Tree.Find(folder)!;
+            var bounds = window.Nested.ScreenRectOf(loadedFolder);
             var tileRects = loadedFolder.Files.Select((file, tile) =>
             {
                 var origin = loadedFolder.FileGrid.Origin(tile);
                 return new Rect(bounds!.Value.X + origin.X * bounds.Value.Width, bounds.Value.Y + origin.Y * bounds.Value.Width,
                     loadedFolder.FileGrid.TileWidth * bounds.Value.Width, loadedFolder.FileGrid.TileHeight * bounds.Value.Width);
             }).ToArray();
+            var viewport = new Rect(0, 0, window.Nested.ActualWidth, window.Nested.ActualHeight);
+            var selectedIndex = window.ActivePane.Tree.FindFileIndex(loadedFolder, Path.GetFileName(a));
+            Rect? primary = selectedIndex >= 0 && selectedIndex < tileRects.Length ? tileRects[selectedIndex] : null;
+            var camera = window.Nested.CaptureCamera();
+            // Reveal frames a readable file card. Its containing folder may
+            // extend outside a smaller desktop, so a folder/viewport zoom ratio
+            // cannot establish whether the actual selected file is visible.
+            Check("source frame " + index + " centres its readable selected file card (viewport " + viewport
+                + ", card " + primary + ", camera width " + camera?.Width + ")",
+                camera is { AnchorPath: var anchor } && anchor == folder
+                && double.IsFinite(camera.X) && double.IsFinite(camera.Y) && double.IsFinite(camera.Width) && camera.Width > 0
+                && bounds is { Width: > 200, Height: > 100 } && bounds.Value.IntersectsWith(viewport)
+                && primary is { Width: >= 180 and <= 401, Height: >= 36 and <= 65 } card && viewport.Contains(card)
+                && Math.Abs(card.X + card.Width / 2 - viewport.Width / 2) <= 1
+                && Math.Abs(card.Y + card.Height / 2 - viewport.Height / 2) <= 1
+                && shell.Address.CurrentPath == folder);
             Check("source frame " + index + " shows both selected file tiles on screen",
                 tileRects.Length == 2 && tileRects.All(rect => rect.Width > 100 && rect.Height > 20
-                    && new Rect(0, 0, window.Nested.ActualWidth, window.Nested.ActualHeight).Contains(rect)));
+                    && viewport.Contains(rect)));
             if (index == 0)
             {
                 var visible = window.ShellWindow;
