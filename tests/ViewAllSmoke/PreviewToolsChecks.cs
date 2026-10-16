@@ -42,6 +42,7 @@ internal static partial class Program
         Directory.CreateDirectory(artifacts);
         try
         {
+            await PreviewToolsSnapshotReadinessChecksAsync(directory);
             var model = Path.Combine(directory, "literal mesh with spaces.obj");
             await File.WriteAllTextAsync(model, "v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n");
             var video = Path.Combine(directory, "literal video with spaces.avi");
@@ -90,9 +91,14 @@ internal static partial class Program
                 await Task.Delay(250);
                 host.RequestModelSnapshot();
                 var snapshot = host.ModelSnapshotPath!;
-                var clock = Stopwatch.StartNew();
-                while (!File.Exists(snapshot) && clock.ElapsedMilliseconds < 5000) await Task.Delay(40);
-                var captured = File.Exists(snapshot) && new FileInfo(snapshot).Length > 100;
+                var snapshotResult = await PreviewToolsWaitForSnapshotAsync(snapshot,
+                    () => modelPid is { } id && host.OwnedProcessId == id && PreviewToolsProcessExists(id));
+                var captured = snapshotResult.Bitmap is not null;
+                var snapshotDiagnostic = snapshotResult.Diagnostic + "; ownedPid=" + modelPid
+                    + "; currentPid=" + host.OwnedProcessId + "; nativeError=" + host.LastError
+                    + "; nativeDiagnostic=" + host.LastNativeDiagnostic;
+                Console.WriteLine("Native snapshot readiness: " + snapshotDiagnostic);
+                File.WriteAllText(Path.Combine(artifacts, "native-model-snapshot-readiness.log"), snapshotDiagnostic);
                 Check("the embedded F3D viewport produces actual rendered pixels on a local screenshot request", captured);
                 if (captured) File.Copy(snapshot, Path.Combine(artifacts, "native-model-viewport.png"), true);
                 window.Width = 920; window.Height = 640; window.UpdateLayout();
@@ -153,6 +159,90 @@ internal static partial class Program
             Check("native preview never edits the original model or video bytes", (await File.ReadAllBytesAsync(model)).SequenceEqual(modelBefore) && (await File.ReadAllBytesAsync(video)).SequenceEqual(videoBefore));
         }
         finally { TryDelete(directory); }
+    }
+
+    private static async Task PreviewToolsSnapshotReadinessChecksAsync(string directory)
+    {
+        var pixels = new byte[32 * 24 * 4];
+        for (var y = 0; y < 24; y++) for (var x = 0; x < 32; x++)
+        {
+            var at = (y * 32 + x) * 4;
+            pixels[at] = (byte)(x * 7); pixels[at + 1] = (byte)(y * 10);
+            pixels[at + 2] = (byte)(x + y); pixels[at + 3] = 255;
+        }
+        var complete = Path.Combine(directory, "complete snapshot fixture.png");
+        PreviewToolsSavePicture(BitmapSource.Create(32, 24, 96, 96, PixelFormats.Bgra32, null, pixels, 32 * 4), complete);
+        var png = await File.ReadAllBytesAsync(complete);
+        var path = Path.Combine(directory, "snapshot being written.png");
+        await File.WriteAllBytesAsync(path, []);
+        var pending = PreviewToolsWaitForSnapshotAsync(path);
+        Check("a newly created empty screenshot remains pending instead of failing at file presence",
+            File.Exists(path) && new FileInfo(path).Length == 0 && !pending.IsCompleted);
+        await File.WriteAllBytesAsync(path, png[..8]);
+        await Task.Delay(80);
+        Check("a screenshot containing only its PNG signature cannot complete the pixel readiness check", !pending.IsCompleted);
+        await File.WriteAllBytesAsync(path, png);
+        var completed = await pending;
+        Check("the same pending screenshot completes only after its actual varied PNG pixels can be decoded",
+            completed.Bitmap is { IsFrozen: true, PixelWidth: 32, PixelHeight: 24 } decoded && PreviewToolsVariedPixels(decoded));
+        Console.WriteLine("Delayed snapshot fixture: " + completed.Diagnostic);
+
+        var invalid = Path.Combine(directory, "invalid screenshot larger than the old length threshold.png");
+        await File.WriteAllBytesAsync(invalid, new byte[256]);
+        var refused = await PreviewToolsWaitForSnapshotAsync(invalid, timeoutMilliseconds: 160);
+        Check("an existing screenshot larger than 100 bytes still fails without decodable rendered pixels",
+            refused.Bitmap is null && refused.Diagnostic.Contains("decodeFailures=", StringComparison.Ordinal)
+            && !refused.Diagnostic.Contains("decodeFailures=0;", StringComparison.Ordinal));
+    }
+
+    private static async Task<(BitmapSource? Bitmap, string Diagnostic)> PreviewToolsWaitForSnapshotAsync(
+        string path, Func<bool>? current = null, int timeoutMilliseconds = 5000)
+    {
+        var clock = Stopwatch.StartNew();
+        var lengths = new List<string>();
+        var attempts = 0;
+        var decodeFailures = 0;
+        var lastFailure = "";
+        string Diagnostic(string state) => "state=" + state + "; elapsedMs=" + clock.ElapsedMilliseconds
+            + "; attempts=" + attempts + "; lengths=" + string.Join(",", lengths)
+            + "; decodeFailures=" + decodeFailures + "; lastFailure=" + lastFailure;
+        while (clock.ElapsedMilliseconds < timeoutMilliseconds)
+        {
+            if (current?.Invoke() == false) return (null, Diagnostic("owned process ended"));
+            attempts++;
+            try
+            {
+                var length = File.Exists(path) ? new FileInfo(path).Length : -1;
+                var observed = length < 0 ? "absent" : length.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                if ((lengths.Count == 0 || lengths[^1] != observed) && lengths.Count < 16) lengths.Add(observed);
+                if (length > 100)
+                {
+                    // F3D creates the path before its PNG writer is finished.
+                    // Opening without write sharing also waits for that writer
+                    // to close; OnLoad plus CopyPixels proves actual decoding.
+                    using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                    var decoder = BitmapDecoder.Create(stream, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                    var bitmap = decoder.Frames[0];
+                    if (bitmap.PixelWidth > 0 && bitmap.PixelHeight > 0 && PreviewToolsVariedPixels(bitmap))
+                    {
+                        bitmap.Freeze();
+                        return (bitmap, Diagnostic("decoded varied pixels"));
+                    }
+                    decodeFailures++;
+                    lastFailure = "decoded frame has no varied rendered pixels";
+                }
+            }
+            catch (Exception ex) when (ex is IOException or FileFormatException or NotSupportedException
+                or ArgumentException or InvalidOperationException or System.Runtime.InteropServices.COMException)
+            {
+                decodeFailures++;
+                lastFailure = ex.GetType().Name + ": " + ex.Message;
+                if (lastFailure.Length > 400) lastFailure = lastFailure[..400];
+            }
+            var remaining = timeoutMilliseconds - clock.ElapsedMilliseconds;
+            if (remaining > 0) await Task.Delay((int)Math.Min(40, remaining));
+        }
+        return (null, Diagnostic("deadline exceeded"));
     }
 
     private static bool PreviewToolsProcessExists(int id)
