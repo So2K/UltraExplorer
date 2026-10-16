@@ -137,8 +137,10 @@ public partial class MainWindow
             && ActivePane.Canvas.SelectionState.Items().Select(item => item.Path).ToHashSet(StringComparer.OrdinalIgnoreCase)
                 .SetEquals(_viewModel.Tree.Selection.Paths)
             && _viewModel.Address.CurrentPath == invocation.FolderPath
-            && ActivePane.Canvas.CaptureCamera() is { Width: >= 0.4 and <= 1.5 } camera
-            && string.Equals(camera.AnchorPath, invocation.FolderPath, StringComparison.OrdinalIgnoreCase);
+            && (invocation.Kind == FolderInvocationKind.Reveal
+                ? invocation.SelectedPaths.Count > 0 && ActivePane.Canvas.IsRevealTargetFramed(invocation.SelectedPaths[0])
+                : ActivePane.Canvas.CaptureCamera() is { Width: >= 0.4 and <= 1.5 } camera
+                    && string.Equals(camera.AnchorPath, invocation.FolderPath, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Opens a filesystem launch in the normal window. The initialized tile
@@ -258,8 +260,28 @@ public partial class MainWindow
             pane.SyncSelection();
             await Dispatcher.InvokeAsync(() => { if (Current()) pane.Canvas.UpdateLayout(); }, DispatcherPriority.ContextIdle);
             if (!Current() || !Allowed(fresh: true)) return false;
-            var target = pane.Tree.Find(invocation.FolderPath);
-            if (target is null || !pane.Canvas.FlyTo(target, 0.92, animated: false)) return false;
+            if (invocation.Kind == FolderInvocationKind.Reveal)
+            {
+                if (invocation.SelectedPaths.Count == 0) return false;
+                var selectedPath = invocation.SelectedPaths[0];
+                bool SelectionCurrent() => Current()
+                    && _viewModel.Tree.Selection.Paths.SequenceEqual(invocation.SelectedPaths, StringComparer.OrdinalIgnoreCase);
+                if (!SelectionCurrent()) return false;
+                // An enabled archive is a folder on the canvas, while the
+                // filesystem selection must remain a physical ZIP/file for
+                // Open/Delete. Target its existing visual instead of inserting
+                // a second file tile with the same path.
+                var isDirectory = pane.Tree.Find(selectedPath) is not null ? true
+                    : _viewModel.Tree.Selection.TryGetItem(selectedPath, out var selected)
+                        ? selected.IsDirectory : (bool?)null;
+                if (!await pane.RevealSelectionPathAsync(selectedPath, isDirectory, SelectionCurrent)
+                    || !SelectionCurrent()) return false;
+            }
+            else
+            {
+                var target = pane.Tree.Find(invocation.FolderPath);
+                if (target is null || !pane.Canvas.FlyTo(target, 0.92, animated: false)) return false;
+            }
             _viewModel.Address.SetPath(invocation.FolderPath);
             _viewModel.DialogTitle = FolderName(invocation.FolderPath);
             pane.Canvas.RenderNow();

@@ -175,8 +175,17 @@ public sealed partial class NestedCanvas
     }
 
     /// <summary>Frames the requested file card tightly, or a folder whole. Unlike arrow navigation this is an explicit, normally instant focus.</summary>
-    public async Task<bool> FocusPathAsync(string path, bool? isDirectory = null,
+    public Task<bool> FocusPathAsync(string path, bool? isDirectory = null,
         Func<bool>? requestCurrent = null, bool animated = false)
+        => FocusPathCoreAsync(path, isDirectory, requestCurrent, animated, keepContext: false);
+
+    /// <summary>Shows a Shell-selected file at a readable row size, keeping its neighbours in view.</summary>
+    internal Task<bool> RevealSelectionPathAsync(string path, bool? isDirectory,
+        Func<bool>? requestCurrent)
+        => FocusPathCoreAsync(path, isDirectory, requestCurrent, animated: false, keepContext: true);
+
+    private async Task<bool> FocusPathCoreAsync(string path, bool? isDirectory,
+        Func<bool>? requestCurrent, bool animated, bool keepContext)
     {
         if (_tree is not { } tree || string.IsNullOrWhiteSpace(path) || requestCurrent?.Invoke() == false) return false;
         var request = NextCameraRequest();
@@ -228,7 +237,7 @@ public sealed partial class NestedCanvas
                 return folderMoved;
             }
 
-            if (!TryFileFocusEnd(folder, index, out var end)) return false;
+            if (!TryFileFocusEnd(folder, index, out var end, keepContext)) return false;
             var moved = FlyToRect(folder, end, animated);
             if (moved && animated && _flight is { } flight)
             {
@@ -270,7 +279,8 @@ public sealed partial class NestedCanvas
         }
     }
 
-    private bool TryFileFocusEnd(NestedFolder folder, int index, out (double X, double Y, double W) end)
+    private bool TryFileFocusEnd(NestedFolder folder, int index, out (double X, double Y, double W) end,
+        bool keepContext = false)
     {
         var files = folder.FileGrid;
         if (files.IsEmpty || index < 0 || index >= folder.Files.Count
@@ -280,12 +290,40 @@ public sealed partial class NestedCanvas
             return false;
         }
 
-        var width = Math.Min(_viewWidth * 0.75 / files.TileWidth, _viewHeight * 0.75 / files.TileHeight);
+        // F deliberately fills the view. A browser's Show in folder instead
+        // needs a normal readable row and enough surrounding files for context.
+        var width = keepContext
+            ? Math.Min(Math.Min(400, _viewWidth * 0.72) / files.TileWidth,
+                Math.Min(64, _viewHeight * 0.72) / files.TileHeight)
+            : Math.Min(_viewWidth * 0.75 / files.TileWidth, _viewHeight * 0.75 / files.TileHeight);
         var (x, y) = files.Origin(index);
         end = (_viewWidth / 2 - (x + files.TileWidth / 2) * width,
             _viewHeight / 2 - (y + files.TileHeight / 2) * width,
             width);
         return double.IsFinite(end.X) && double.IsFinite(end.Y) && double.IsFinite(end.W) && end.W > 0;
+    }
+
+    /// <summary>A reveal is ready only when the exact selected card can be seen and read.</summary>
+    internal bool IsRevealTargetFramed(string path)
+    {
+        if (_tree is not { } tree || !(_viewWidth > 0 && _viewHeight > 0)) return false;
+        EnsureCamera();
+        BuildChain();
+        var folder = tree.Find(path);
+        var fileIndex = -1;
+        if (folder is null)
+        {
+            if (Path.GetDirectoryName(path) is not { } parent || tree.Find(parent) is not { } found) return false;
+            folder = found;
+            tree.EnsureLayout(folder);
+            fileIndex = tree.FindFileIndex(folder, Path.GetFileName(path));
+            if (fileIndex < 0) return false;
+        }
+        if (TargetRect(folder, fileIndex) is not { } rect || rect.IsEmpty
+            || rect.Left < -1 || rect.Top < -1 || rect.Right > _viewWidth + 1 || rect.Bottom > _viewHeight + 1)
+            return false;
+        return fileIndex < 0 || rect.Width >= Math.Min(180, _viewWidth * 0.6)
+            && rect.Height >= Math.Min(36, _viewHeight * 0.6);
     }
 
     /// <summary>

@@ -368,11 +368,23 @@ internal static partial class Program
                 backgroundDrop.Handled && backgroundDrop.Effects == DragDropEffects.None
                 && await LiveWait(() => File.Exists(backgroundMoved) && !File.Exists(backgroundSource), 10000) >= 0
                 && await File.ReadAllTextAsync(backgroundMoved) == "move onto list background");
+            var destinationHandle = new WindowInteropHelper(main).Handle;
+            var sourceHandle = new WindowInteropHelper(sourceWindow).Handle;
+            var foregroundAfter = DialogNative.GetForegroundWindow();
+            var transferStayedHidden = main.CurrentFolderListDropTarget is null && main.IsVisible && !main.IsActive
+                && destinationHandle != IntPtr.Zero && DialogNative.IsCloaked(destinationHandle)
+                && foregroundAfter == foregroundBefore && !sourceWindow.IsVisible && sourceHandle == IntPtr.Zero;
+            if (!transferStayedHidden)
+                Console.WriteLine("List transfer window diagnostic: " + System.Text.Json.JsonSerializer.Serialize(new {
+                    DropTargetCleared = main.CurrentFolderListDropTarget is null,
+                    DestinationVisible = main.IsVisible, DestinationActive = main.IsActive,
+                    DestinationHandle = destinationHandle.ToInt64(),
+                    DestinationCloaked = destinationHandle != IntPtr.Zero && DialogNative.IsCloaked(destinationHandle),
+                    ForegroundBefore = foregroundBefore.ToInt64(), ForegroundAfter = foregroundAfter.ToInt64(),
+                    SourceVisible = sourceWindow.IsVisible, SourceHandle = sourceHandle.ToInt64()
+                }));
             Check("routed list transfers leave the destination cloaked, the source unshown and the foreground unchanged",
-                main.CurrentFolderListDropTarget is null && main.IsVisible && !main.IsActive
-                && new WindowInteropHelper(main).Handle != IntPtr.Zero && DialogNative.IsCloaked(new WindowInteropHelper(main).Handle)
-                && DialogNative.GetForegroundWindow() == foregroundBefore
-                && !sourceWindow.IsVisible && new WindowInteropHelper(sourceWindow).Handle == IntPtr.Zero);
+                transferStayedHidden);
         }
         finally
         {

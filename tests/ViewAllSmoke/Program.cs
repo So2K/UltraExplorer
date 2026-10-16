@@ -216,6 +216,8 @@ internal static partial class Program
         await Group(NewItemArrivalChecks);
         await Group(NestedVisibilityRenameIntegrationChecks);
         await Group(FocusSelectionChecks);
+        await Group(ExternalRevealFocusChecks);
+        await Group(ExternalRevealShellChecks);
         await Group(BatchCommandLineChecks);
         await Group(PublicationLifecycleChecks);
         await Group(RefreshIdentityConsumerChecks);
