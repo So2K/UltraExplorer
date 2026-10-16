@@ -1,4 +1,4 @@
-# Try the v1.3.0-beta.5 beta
+# Test UltraExplorer v1.3.0
 
 The useful feedback is a short workflow that behaves unexpectedly: which file
 type, what you did, and what happened. Use copies in a small disposable folder
@@ -7,7 +7,7 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
 ## Get started
 
 1. Download the installer or portable ZIP from the
-   [v1.3.0-beta.5 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0-beta.5).
+   [v1.3.0 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0).
    For the ZIP, extract the entire folder before running `UltraExplorer.exe`.
 2. Keep a few sample files together: two text files, an image, a PDF and,
    if relevant to your work, a media file, a model or a small ZIP containing
@@ -90,7 +90,7 @@ before editing. These optional tools stay disabled in file-picker dialogs.
 
 [Open an issue](https://github.com/So2K/UltraExplorer/issues/new) with:
 
-- App version (`v1.3.0-beta.5`) and Windows version.
+- App version (`v1.3.0`) and Windows version.
 - Exact steps, expected result and actual result; include the error text.
 - File extension and approximate size, and whether the path is local,
   removable, networked or cloud-backed.
@@ -103,4 +103,4 @@ Do not attach private documents or personal profile files. Unsupported codecs,
 encrypted PDFs and legacy Office files can use an information/header fallback;
 partial, binary and extracted document content is read-only. RAR, multipart and
 ISO coverage is still limited. See the
-[release notes](RELEASE_NOTES_v1.3.0-beta.5.md) for the remaining limits.
+[release notes](RELEASE_NOTES_v1.3.0.md) for the remaining limits.
