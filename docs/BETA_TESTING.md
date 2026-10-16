@@ -1,4 +1,4 @@
-# Test UltraExplorer v1.3.0
+# Test UltraExplorer v1.3.1-beta.1
 
 The useful feedback is a short workflow that behaves unexpectedly: which file
 type, what you did, and what happened. Use copies in a small disposable folder
@@ -7,7 +7,7 @@ so editing, extraction and Recycle Bin checks are easy to repeat.
 ## Get started
 
 1. Download the installer or portable ZIP from the
-   [v1.3.0 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.0).
+   [v1.3.1-beta.1 release](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.1-beta.1).
    For the ZIP, extract the entire folder before running `UltraExplorer.exe`.
 2. Keep a few sample files together: two text files, an image, a PDF and,
    if relevant to your work, a media file, a model or a small ZIP containing
@@ -43,6 +43,9 @@ extracting another copy does not create an isolated profile.
 
 | Try | Expected result |
 | --- | --- |
+| Download a disposable file into a busy folder, then choose the browser's **Show in folder**. Repeat with UltraExplorer already open. | The exact file is selected and centred as a readable card with neighbouring files visible. The whole parent folder should not be fitted at a scale that hides the target. |
+| In Settings, choose incoming folders in tabs; reveal another file, then switch between tabs. | Each tab retains its own camera and selection. Separate windows remain the default until you change this preference. |
+| Build a search query, enable **Filter map**, then clear it. | Matching items keep their spatial positions; clearing the filter restores the view. |
 | Select a disposable folder and press `Ctrl+N`. Check the destination, then cancel or create a folder. | The dialog shows the full selected destination and rejects invalid names. Cancel creates nothing. `Ctrl+Shift+N` remains available; typing in an editor keeps its normal behavior. |
 | Select a copied file and press `Ctrl+D`, then hold the shortcut briefly. | One copy appears beside the original with the same contents and extension and a nonconflicting name. Key repeat does not make extra copies. `Ctrl+Shift+D` remains available. |
 | In a disposable folder already displayed on the nested canvas, copy or extract new items; repeat while their destination is outside the viewport. | New file and folder tiles pulse yellow twice when visible. Unseen items wait; the feedback itself does not change the camera or selection. Existing contents do not flash on first opening. |
@@ -90,7 +93,7 @@ before editing. These optional tools stay disabled in file-picker dialogs.
 
 [Open an issue](https://github.com/So2K/UltraExplorer/issues/new) with:
 
-- App version (`v1.3.0`) and Windows version.
+- App version (`v1.3.1-beta.1`) and Windows version.
 - Exact steps, expected result and actual result; include the error text.
 - File extension and approximate size, and whether the path is local,
   removable, networked or cloud-backed.
@@ -103,4 +106,4 @@ Do not attach private documents or personal profile files. Unsupported codecs,
 encrypted PDFs and legacy Office files can use an information/header fallback;
 partial, binary and extracted document content is read-only. RAR, multipart and
 ISO coverage is still limited. See the
-[release notes](RELEASE_NOTES_v1.3.0.md) for the remaining limits.
+[release notes](RELEASE_NOTES_v1.3.1-beta.1.md) for the remaining limits.
