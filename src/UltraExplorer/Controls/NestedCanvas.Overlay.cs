@@ -155,6 +155,7 @@ public sealed partial class NestedCanvas
     /// <summary>What is selected directly inside one folder, or lit by the rectangle drawn over it; returns the shapes drawn.</summary>
     private int DrawSelectedIn(DrawingContext dc, NestedFolder container, NestedMarquee? marquee)
     {
+        if (!MapFolderVisible(container)) return 0;
         if (CellOf(container, place: false) is not { } cell)
         {
             // Not on the canvas: filtered out, hidden, or gone - which the
@@ -211,7 +212,7 @@ public sealed partial class NestedCanvas
                     break;
                 }
 
-                if (marquee is not null ? marquee.IsFolderSelected(index) : _selection.IsSelected(children[index]))
+                if (MapFolderVisible(children[index]) && (marquee is not null ? marquee.IsFolderSelected(index) : _selection.IsSelected(children[index])))
                 {
                     visible++;
                 }
@@ -238,7 +239,7 @@ public sealed partial class NestedCanvas
                 }
 
                 var child = children[index];
-                if (!(marquee is not null ? marquee.IsFolderSelected(index) : _selection.IsSelected(child)))
+                if (!MapFolderVisible(child) || !(marquee is not null ? marquee.IsFolderSelected(index) : _selection.IsSelected(child)))
                 {
                     continue;
                 }
@@ -300,7 +301,7 @@ public sealed partial class NestedCanvas
             return 0;
         }
 
-        bool IsSelected(int index) => marquee is not null ? marquee.IsFileSelected(index) : set![index];
+        bool IsSelected(int index) => MapFileVisible(container, index) && (marquee is not null ? marquee.IsFileSelected(index) : set![index]);
 
         var oneByOne = tileHeight >= 12;
         if (oneByOne)
@@ -495,6 +496,8 @@ public sealed partial class NestedCanvas
         {
             return 0;
         }
+        if (active.Folder is { } focusedFolder ? !MapFolderVisible(focusedFolder)
+            : _searchMapProjection?.ContainsFile(active.Container.FullPath, active.FileName!) == false) return 0;
 
         Rect rect;
         if (active.Folder is { } folder)
@@ -1330,6 +1333,7 @@ public sealed partial class NestedCanvas
             }
 
             var child = folder.Children[index];
+            if (!MapFolderVisible(child)) break;
             if (_chain.TryGetValue(child, out var exact))
             {
                 (x, y, w) = exact;

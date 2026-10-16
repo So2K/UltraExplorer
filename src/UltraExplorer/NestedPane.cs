@@ -988,8 +988,15 @@ internal sealed class NestedPane
     }
 
     /// <summary>Precise F focus in this active pane; no selection, navigation history or other pane is changed.</summary>
-    public async Task<bool> FocusSelectionPathAsync(string path, bool? isDirectory = null,
+    public Task<bool> FocusSelectionPathAsync(string path, bool? isDirectory = null,
         Func<bool>? requestCurrent = null, bool animated = false)
+        => FocusSelectionPathCoreAsync(path, isDirectory, requestCurrent, animated, keepContext: false);
+
+    internal Task<bool> RevealSelectionPathAsync(string path, bool? isDirectory, Func<bool> requestCurrent)
+        => FocusSelectionPathCoreAsync(path, isDirectory, requestCurrent, animated: false, keepContext: true);
+
+    private async Task<bool> FocusSelectionPathCoreAsync(string path, bool? isDirectory,
+        Func<bool>? requestCurrent, bool animated, bool keepContext)
     {
         if (_detached || !IsActive || string.IsNullOrWhiteSpace(path) || requestCurrent?.Invoke() == false) return false;
         var ticket = ++_flightTicket;
@@ -1005,7 +1012,9 @@ internal sealed class NestedPane
             // A previous hand-adjusted sparse view is no longer the requested
             // camera; its deferred keep-in-view correction must not cancel F.
             _movedByHand = false;
-            return await Canvas.FocusPathAsync(path, isDirectory, Current, animated);
+            return keepContext
+                ? await Canvas.RevealSelectionPathAsync(path, isDirectory, Current)
+                : await Canvas.FocusPathAsync(path, isDirectory, Current, animated);
         }
         catch (Exception error) when (error is OperationCanceledException or IOException or UnauthorizedAccessException
             or ArgumentException or NotSupportedException or ObjectDisposedException)
@@ -1714,7 +1723,7 @@ internal sealed class NestedPane
             }
         }
 
-        if (_viewModel.Search.IsOpen)
+        if (_viewModel.Search.IsResultsPanelOpen)
         {
             foreach (var result in _viewModel.Search.Results.Take(SearchBeaconLimit))
             {

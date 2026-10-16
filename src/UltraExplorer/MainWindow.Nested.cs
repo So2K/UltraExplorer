@@ -80,10 +80,13 @@ public partial class MainWindow : INestedPaneHost
     /// </summary>
     private void FocusCanvas(NestedPane pane)
     {
+        // An async navigation may finish after its tab has been put away.
+        // Its view is kept, but the keyboard stays with the presented tab.
+        if (!IsTabPresented) return;
         UIElement canvas = IsNested ? pane.Canvas : Editor;
-        if (!IsActive && (WithholdsKeyboard || IsDiagnosticsRun))
+        if (!ShellWindow.IsActive && (WithholdsKeyboard || IsDiagnosticsRun))
         {
-            FocusManager.SetFocusedElement(this, canvas);
+            FocusManager.SetFocusedElement(ShellWindow, canvas);
             return;
         }
 
@@ -110,6 +113,7 @@ public partial class MainWindow : INestedPaneHost
         _viewModel.QuickAccess.CollectionChanged += OnBeaconSourceChanged;
         _viewModel.Search.PropertyChanged += OnSearchPropertyChangedForNested;
         _viewModel.Marks.MarkChanged += OnMarkChangedForNested;
+        AttachSearchMap();
 
         // What the canvas being worked with draws of the selection, for
         // Delete to ask about the rest (see MainViewModel.ShownSelectionCount).
@@ -121,6 +125,7 @@ public partial class MainWindow : INestedPaneHost
 
     private void DetachNested()
     {
+        DetachSearchMap();
         Shelf.Dispose();
         _viewModel.ShownSelectionCount = null;
         _viewModel.PropertyChanged -= OnShellPropertyChangedForNested;
@@ -179,7 +184,7 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>Starts running waiting slices, one a frame, if the nested canvas is on screen to run them for.</summary>
     private void HookSortSlices()
     {
-        if (!_sortSlicesHooked && IsNested && _sortSlices.Count > 0)
+        if (!_sortSlicesHooked && IsNested && IsTabPresented && _sortSlices.Count > 0)
         {
             _sortSlicesHooked = true;
             CompositionTarget.Rendering += OnSortSliceFrame;
@@ -210,7 +215,7 @@ public partial class MainWindow : INestedPaneHost
         }
 
         // Gone to the tree canvas: the rest waits for the nested one to be back.
-        if (!IsNested)
+        if (!IsNested || !IsTabPresented)
         {
             UnhookSortSlices();
             return;
@@ -286,6 +291,7 @@ public partial class MainWindow : INestedPaneHost
 
         SyncNestedSelection();
         _nestedReady = true;
+        ScheduleSearchMap();
 
         // A drive plugged in or pulled out while the canvas was starting:
         // the drives it copied above may be from before it.
@@ -413,6 +419,7 @@ public partial class MainWindow : INestedPaneHost
         {
             pane.Tree.SetRoots(roots);
         }
+        ScheduleSearchMap();
     }
 
     private void EnsureNestedLocation(string folder)
@@ -691,6 +698,7 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>F5 on a folder: every pane reads it again, and what it read below it as it is drawn (see <see cref="NestedPane.RefreshDeep"/>).</summary>
     private void OnTreeDeepRefreshRequested(string path)
     {
+        ScheduleSearchMap(refresh: true);
         foreach (var pane in _panes)
         {
             pane.RefreshDeep(path);
@@ -704,7 +712,8 @@ public partial class MainWindow : INestedPaneHost
     /// <summary>The search's results are beacons on the canvas while its panel is up.</summary>
     private void OnSearchPropertyChangedForNested(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(SearchViewModel.IsOpen) or nameof(SearchViewModel.Results))
+        OnSearchMapPropertyChanged(e);
+        if (e.PropertyName is nameof(SearchViewModel.IsOpen) or nameof(SearchViewModel.IsResultsPanelOpen) or nameof(SearchViewModel.Results))
         {
             ScheduleBeacons();
         }
@@ -793,8 +802,8 @@ public partial class MainWindow : INestedPaneHost
 
     string[]? INestedPaneHost.NestedDragPaths
     {
-        get => _nestedDragPaths;
-        set => _nestedDragPaths = value;
+        get => ShellWindow._nestedDragPaths;
+        set => ShellWindow._nestedDragPaths = value;
     }
 
     bool INestedPaneHost.IsActivePane(NestedPane pane) => ReferenceEquals(pane, ActivePane);
@@ -807,10 +816,15 @@ public partial class MainWindow : INestedPaneHost
 
     void INestedPaneHost.ClearDropTargets()
     {
-        foreach (var pane in _panes)
+        foreach (var context in ShellWindow.TabContexts)
         {
-            pane.Canvas.DropTarget = null;
+            context.ClearFolderListDropTarget();
+            foreach (var pane in context._panes)
+            {
+                pane.Canvas.DropTarget = null;
+            }
         }
+        RestorePresentedFocusAfterDrag();
     }
 
     void INestedPaneHost.DropPreparedMenu() => DropPreparedMenu();

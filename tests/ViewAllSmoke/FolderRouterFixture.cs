@@ -62,6 +62,11 @@ internal static class FolderRouterFixture
         if (!passed) _failures++;
         File.AppendAllText(_result, (passed ? "ok " : "FAIL ") + name + Environment.NewLine);
     }
+    private static int WindowCount() => Application.Current.Windows.OfType<MainWindow>()
+        .Count(window => ReferenceEquals(window.ShellWindow, window));
+    private static MainWindow Context(Guid destination) => Application.Current.Windows.OfType<MainWindow>()
+        .Where(window => ReferenceEquals(window.ShellWindow, window))
+        .Select(window => window.FindFolderContext(destination)).OfType<MainWindow>().Single();
     private static void Mode(bool enabled)
     {
         Directory.CreateDirectory(AppPaths.StateDirectory);
@@ -147,19 +152,19 @@ internal static class FolderRouterFixture
         Check("a null invocation is refused", !nullInvocation.Accepted && !nullInvocation.Ready);
         Check("malformed and oversized packets leave the resident channel usable", ExplorerLaunchRouter.ReceiptMatches(await RouteAsync(open), open));
 
-        var before = Application.Current.Windows.OfType<MainWindow>().Count();
+        var before = WindowCount();
         var abandoned = open with { DestinationId = Guid.NewGuid() };
         await using (var pipe = await ConnectAsync())
         {
             await ExplorerLaunchRouter.WritePacketAsync(pipe, new FolderRouteRequest(Guid.NewGuid(), abandoned, true), CancellationToken.None);
             var offer = await ExplorerLaunchRouter.ReadPacketAsync<FolderRouteReceipt>(pipe, CancellationToken.None);
-            Check("the offer precedes destination creation", offer.Accepted && Application.Current.Windows.OfType<MainWindow>().Count() == before);
+            Check("the offer precedes destination creation", offer.Accepted && WindowCount() == before);
             // Deliberately disconnect without committing.
         }
         await Task.Delay(150);
-        Check("an abandoned offer never creates a late duplicate window", Application.Current.Windows.OfType<MainWindow>().Count() == before);
+        Check("an abandoned offer never creates a late duplicate window", WindowCount() == before);
         var off = await RouteAsync(open with { OriginIsShell = true, DestinationId = Guid.NewGuid() });
-        Check("shell-origin requests are canceled with integration off", !off.Accepted && Application.Current.Windows.OfType<MainWindow>().Count() == before);
+        Check("shell-origin requests are canceled with integration off", !off.Accepted && WindowCount() == before);
 
         Mode(true);
         await using (var pipe = await ConnectAsync())
@@ -171,7 +176,7 @@ internal static class FolderRouterFixture
             Mode(false); pipe.WriteByte(1);
         }
         await Task.Delay(150);
-        Check("turning off between offer and commit preserves every existing window", Application.Current.Windows.OfType<MainWindow>().Count() == before);
+        Check("turning off between offer and commit preserves every existing window", WindowCount() == before);
 
         var originalShell = (MainViewModel)first.DataContext;
         originalShell.Marks.SetNote(basic, "main window marker");
@@ -196,7 +201,7 @@ internal static class FolderRouterFixture
             invocation = invocation with { DestinationId = Guid.NewGuid() };
             var request = Guid.NewGuid(); var receipt = await RouteAsync(invocation, request);
             Check("source frame " + index + " has its exact ready folder and complete selection", ExplorerLaunchRouter.ReceiptMatches(receipt, invocation));
-            var window = Application.Current.Windows.OfType<MainWindow>().Single(item => item.FolderDestinationId == invocation.DestinationId);
+            var window = Context(invocation.DestinationId);
             var shell = (MainViewModel)window.DataContext;
             var workspace = ExplorerLaunchRouter.FolderWorkspacePath(invocation.DestinationId);
             Check("source frame " + index + " has one normal pane and the user's own workspace and marks",
@@ -204,30 +209,41 @@ internal static class FolderRouterFixture
                 && shell.Marks.StatePath == AppPaths.State("folder-marks.json")
                 && shell.Marks.Get(basic).Note == "main window marker");
             Check("source frame " + index + " is a real normal HWND with its own selected tiles",
-                new WindowInteropHelper(window).Handle.ToInt64() == receipt.Window && !window.IsPickerMode && window.Nested.SelectedCount == 2
+                new WindowInteropHelper(window.ShellWindow).Handle.ToInt64() == receipt.Window && !window.IsPickerMode && window.Nested.SelectedCount == 2
                 && window.CurrentFolderPath == folder && window.CurrentFolderSelection.SequenceEqual([a, b]));
-            var bounds = window.Nested.ScreenRectOf(window.ActivePane.Tree.Find(folder)!);
-            Check("source frame " + index + " visibly frames its folder at a readable local zoom",
-                window.Nested.CaptureCamera() is { AnchorPath: var anchor, Width: >= 0.4 and <= 1.5 }
-                && anchor == folder && bounds is { Width: > 200, Height: > 100 }
-                && bounds.Value.IntersectsWith(new Rect(0, 0, window.Nested.ActualWidth, window.Nested.ActualHeight))
-                && ((UltraExplorer.ViewModels.MainViewModel)window.DataContext).Address.CurrentPath == folder
-                && window.Nested.ZoomText.Length < 12 && !window.Nested.ZoomText.Contains('M') && !window.Nested.ZoomText.Contains('K'));
             var loadedFolder = window.ActivePane.Tree.Find(folder)!;
+            var bounds = window.Nested.ScreenRectOf(loadedFolder);
             var tileRects = loadedFolder.Files.Select((file, tile) =>
             {
                 var origin = loadedFolder.FileGrid.Origin(tile);
                 return new Rect(bounds!.Value.X + origin.X * bounds.Value.Width, bounds.Value.Y + origin.Y * bounds.Value.Width,
                     loadedFolder.FileGrid.TileWidth * bounds.Value.Width, loadedFolder.FileGrid.TileHeight * bounds.Value.Width);
             }).ToArray();
+            var viewport = new Rect(0, 0, window.Nested.ActualWidth, window.Nested.ActualHeight);
+            var selectedIndex = window.ActivePane.Tree.FindFileIndex(loadedFolder, Path.GetFileName(a));
+            Rect? primary = selectedIndex >= 0 && selectedIndex < tileRects.Length ? tileRects[selectedIndex] : null;
+            var camera = window.Nested.CaptureCamera();
+            // Reveal frames a readable file card. Its containing folder may
+            // extend outside a smaller desktop, so a folder/viewport zoom ratio
+            // cannot establish whether the actual selected file is visible.
+            Check("source frame " + index + " centres its readable selected file card (viewport " + viewport
+                + ", card " + primary + ", camera width " + camera?.Width + ")",
+                camera is { AnchorPath: var anchor } && anchor == folder
+                && double.IsFinite(camera.X) && double.IsFinite(camera.Y) && double.IsFinite(camera.Width) && camera.Width > 0
+                && bounds is { Width: > 200, Height: > 100 } && bounds.Value.IntersectsWith(viewport)
+                && primary is { Width: >= 180 and <= 401, Height: >= 36 and <= 65 } card && viewport.Contains(card)
+                && Math.Abs(card.X + card.Width / 2 - viewport.Width / 2) <= 1
+                && Math.Abs(card.Y + card.Height / 2 - viewport.Height / 2) <= 1
+                && shell.Address.CurrentPath == folder);
             Check("source frame " + index + " shows both selected file tiles on screen",
                 tileRects.Length == 2 && tileRects.All(rect => rect.Width > 100 && rect.Height > 20
-                    && new Rect(0, 0, window.Nested.ActualWidth, window.Nested.ActualHeight).Contains(rect)));
+                    && viewport.Contains(rect)));
             if (index == 0)
             {
-                window.UpdateLayout();
-                var bitmap = new RenderTargetBitmap(Math.Max(1, (int)window.ActualWidth), Math.Max(1, (int)window.ActualHeight), 96, 96, PixelFormats.Pbgra32);
-                bitmap.Render(window);
+                var visible = window.ShellWindow;
+                visible.UpdateLayout();
+                var bitmap = new RenderTargetBitmap(Math.Max(1, (int)visible.ActualWidth), Math.Max(1, (int)visible.ActualHeight), 96, 96, PixelFormats.Pbgra32);
+                bitmap.Render(visible);
                 var png = new PngBitmapEncoder(); png.Frames.Add(BitmapFrame.Create(bitmap));
                 using var output = File.Create(Path.Combine(root, "folder-router-ui.png")); png.Save(output);
                 File.WriteAllText(Path.Combine(root, "folder-router-ui.json"), JsonSerializer.Serialize(new
@@ -240,13 +256,13 @@ internal static class FolderRouterFixture
             receipts.Add((invocation, receipt, request));
         }
         Check("seven source frames retain seven distinct destinations", receipts.Select(item => item.Receipt.Window).Distinct().Count() == 7
-            && Application.Current.Windows.OfType<MainWindow>().Count() == before + 7);
+            && WindowCount() == before + 7);
         foreach (var item in receipts)
             Check("earlier frame " + item.Receipt.DestinationId + " still retains its original context",
                 await ExplorerLaunchRouter.ValidateReadyAsync(item.Receipt, item.Invocation, CancellationToken.None));
 
         var original = receipts[0];
-        var moved = Application.Current.Windows.OfType<MainWindow>().Single(item => item.FolderDestinationId == original.Invocation.DestinationId);
+        var moved = Context(original.Invocation.DestinationId);
         await moved.ApplyFolderInvocationAsync(open);
         var repeated = await RouteAsync(original.Invocation, original.Request);
         Check("replaying an accepted id never navigates a changed destination back", !repeated.Ready && moved.CurrentFolderPath == basic);
@@ -255,7 +271,7 @@ internal static class FolderRouterFixture
         ((MainViewModel)moved.DataContext).Marks.SetNote(basic, "edited in an adopted window");
         foreach (var item in receipts)
         {
-            var window = Application.Current.Windows.OfType<MainWindow>().Single(candidate => candidate.FolderDestinationId == item.Invocation.DestinationId);
+            var window = Context(item.Invocation.DestinationId);
             await ((MainViewModel)window.DataContext).SaveNowAsync();
             var workspace = ExplorerLaunchRouter.FolderWorkspacePath(item.Invocation.DestinationId);
             Check("source frame " + item.Invocation.DestinationId + " keeps only its own view in a file of its own",

@@ -773,7 +773,7 @@ public sealed partial class NestedCanvas
 
         _sink = sink;
         var (cover, x, y, w, covers) = CoverCell();
-        if (!covers)
+        if (!covers || _searchMapProjection is not null)
         {
             sink.Clear(CanvasColour);
         }
@@ -796,7 +796,7 @@ public sealed partial class NestedCanvas
                 break;
             }
 
-            if (Covers(rect.X, rect.Y, rect.W))
+            if (MapFolderVisible(folder) && Covers(rect.X, rect.Y, rect.W))
             {
                 return (folder, rect.X, rect.Y, rect.W, true);
             }
@@ -817,6 +817,7 @@ public sealed partial class NestedCanvas
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
     private void DrawCell(NestedFolder folder, double x, double y, double w, bool labelsAllowed)
     {
+        if (!MapFolderVisible(folder)) return;
         var h = w * NestedLayout.CellHeight;
         if (x >= _viewWidth || y >= _viewHeight || x + w <= 0 || y + h <= 0 || w < _minCell)
         {
@@ -928,6 +929,11 @@ public sealed partial class NestedCanvas
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveOptimization)]
     private void DrawFiles(NestedFolder folder, double x, double y, double w, bool labelsAllowed)
     {
+        if (_searchMapProjection is not null)
+        {
+            DrawMapFiles(folder, x, y, w, labelsAllowed);
+            return;
+        }
         var grid = folder.FileGrid;
         if (grid.IsEmpty)
         {

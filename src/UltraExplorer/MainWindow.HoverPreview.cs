@@ -17,6 +17,8 @@ public partial class MainWindow
     private HoverPreviewController _hoverPreview = null!;
     private HoverPreviewCard _previewCard = null!;
     private Canvas _previewOverlay = null!;
+    private FrameworkElement _previewEventRoot = null!;
+    private Window? _previewEventWindow;
     private NestedCanvas? _previewCanvas;
     private NestedTree? _previewTree;
     private Point _previewPointer;
@@ -27,7 +29,7 @@ public partial class MainWindow
 
     internal void OpenQuickPreview(string path, bool readOnly = false)
     {
-        if (_previewDetached || _closeRequested) return;
+        if (_previewDetached || _closeRequested || !IsTabPresented) return;
         if (!readOnly && TryBeginArchiveQuickPreview(path, PresentPhysicalQuickPreview)) return;
         CancelArchiveQuickPreview();
         PresentPhysicalQuickPreview(path, readOnly, null);
@@ -38,12 +40,12 @@ public partial class MainWindow
 
     private void PresentPhysicalQuickPreview(string path, bool readOnly, string? originPath)
     {
-        if (_previewDetached || _closeRequested || _viewModel.IsDisposed) return;
+        if (_previewDetached || _closeRequested || _viewModel.IsDisposed || !IsTabPresented) return;
         ClearHoverPreview();
         if (_quickPreview is null)
         {
-            var preview = new QuickPreviewWindow { Owner = this };
-            PreviewOwnerActivation.Attach(preview, this, () => _previewDetached || _closeRequested || _quickPreviewClosingOwner);
+            var preview = new QuickPreviewWindow { Owner = ShellWindow };
+            PreviewOwnerActivation.Attach(preview, ShellWindow, () => _previewDetached || _closeRequested || _quickPreviewClosingOwner);
             _quickPreview = preview;
             preview.Closed += (_, _) =>
             {
@@ -92,6 +94,10 @@ public partial class MainWindow
 
     private void AttachHoverPreviews()
     {
+        // The content remains attached when the window becomes a tab's
+        // context. Its routed events still reach this root, while they no
+        // longer reach the unshown MainWindow that owns the context.
+        _previewEventRoot = (FrameworkElement)Content;
         _previewOverlay = new Canvas { IsHitTestVisible = false, ClipToBounds = true };
         Grid.SetRowSpan(_previewOverlay, ((Grid)Content).RowDefinitions.Count);
         Panel.SetZIndex(_previewOverlay, 100);
@@ -101,20 +107,19 @@ public partial class MainWindow
         _hoverPreview = new HoverPreviewController(Dispatcher,
             (path, token) => (_thumbnails ??= new FileThumbnailService()).GetAsync(path, token));
         _hoverPreview.Changed += RefreshHoverPreview;
-        AddHandler(Mouse.PreviewMouseMoveEvent, new MouseEventHandler(PreviewHoverMove), handledEventsToo: true);
-        AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(PreviewHoverPress), handledEventsToo: true);
-        AddHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(PreviewHoverRelease), handledEventsToo: true);
-        AddHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler(PreviewHoverWheel), handledEventsToo: true);
-        AddHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler(PreviewHoverKey), handledEventsToo: true);
-        AddHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(SpacePreviewFocusLost), handledEventsToo: true);
-        AddHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler(SpacePreviewCaptureLost), handledEventsToo: true);
-        AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(PreviewHoverScroll), handledEventsToo: true);
-        AddHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(PreviewHoverMenu), handledEventsToo: true);
-        AddHandler(ToolTipService.ToolTipOpeningEvent, new ToolTipEventHandler(PreviewHoverTooltip), handledEventsToo: true);
-        AddHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler(PreviewHoverDrag), handledEventsToo: true);
-        MouseLeave += PreviewHoverLeave;
-        Deactivated += PreviewHoverDeactivate;
-        SizeChanged += PreviewHoverResize;
+        _previewEventRoot.AddHandler(Mouse.PreviewMouseMoveEvent, new MouseEventHandler(PreviewHoverMove), handledEventsToo: true);
+        _previewEventRoot.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(PreviewHoverPress), handledEventsToo: true);
+        _previewEventRoot.AddHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(PreviewHoverRelease), handledEventsToo: true);
+        _previewEventRoot.AddHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler(PreviewHoverWheel), handledEventsToo: true);
+        _previewEventRoot.AddHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler(PreviewHoverKey), handledEventsToo: true);
+        _previewEventRoot.AddHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(SpacePreviewFocusLost), handledEventsToo: true);
+        _previewEventRoot.AddHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler(SpacePreviewCaptureLost), handledEventsToo: true);
+        _previewEventRoot.AddHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(PreviewHoverScroll), handledEventsToo: true);
+        _previewEventRoot.AddHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(PreviewHoverMenu), handledEventsToo: true);
+        _previewEventRoot.AddHandler(ToolTipService.ToolTipOpeningEvent, new ToolTipEventHandler(PreviewHoverTooltip), handledEventsToo: true);
+        _previewEventRoot.AddHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler(PreviewHoverDrag), handledEventsToo: true);
+        _previewEventRoot.MouseLeave += PreviewHoverLeave;
+        AttachHoverPreviewWindow();
         _viewModel.PropertyChanged += PreviewPreferenceChanged;
         _viewModel.Tree.FolderList.PropertyChanged += PreviewListChanged;
         _viewModel.Tree.FolderList.Items.CollectionChanged += PreviewListItemsChanged;
@@ -123,9 +128,26 @@ public partial class MainWindow
         Closing += PreviewHoverClosing;
     }
 
+    /// <summary>
+    /// Window changes dismiss a hover, while content layout by itself does
+    /// not. A retained context is rebound once it belongs to the tab host.
+    /// </summary>
+    private void AttachHoverPreviewWindow()
+    {
+        if (ReferenceEquals(_previewEventWindow, ShellWindow)) return;
+        if (_previewEventWindow is { } previous)
+        {
+            previous.Deactivated -= PreviewHoverDeactivate;
+            previous.SizeChanged -= PreviewHoverResize;
+        }
+        _previewEventWindow = ShellWindow;
+        _previewEventWindow.Deactivated += PreviewHoverDeactivate;
+        _previewEventWindow.SizeChanged += PreviewHoverResize;
+    }
+
     private void PreviewHoverMove(object sender, MouseEventArgs args)
     {
-        if (_previewDetached) return;
+        if (_previewDetached || !IsTabPresented) return;
         if (HandleSpacePointerMove(args)) { args.Handled = true; ClearHoverPreview(); return; }
         if (!_viewModel.ShowHoverPreviews || _closeRequested || args.LeftButton == MouseButtonState.Pressed
             || args.MiddleButton == MouseButtonState.Pressed || args.RightButton == MouseButtonState.Pressed
@@ -251,7 +273,7 @@ public partial class MainWindow
         // Wait until the item's own release has finished selection/navigation.
         QueueHoverPreviewAfterRelease(args.ChangedButton, () =>
         {
-            if (!IsMouseOver) return;
+            if (!_previewEventRoot.IsMouseOver || !IsTabPresented) return;
             PreviewHoverMove(this, new MouseEventArgs(Mouse.PrimaryDevice, Environment.TickCount)
             {
                 RoutedEvent = Mouse.PreviewMouseMoveEvent, Source = Mouse.DirectlyOver
@@ -271,7 +293,7 @@ public partial class MainWindow
         var generation = _previewGeneration;
         Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () =>
         {
-            if (_previewDetached || _closeRequested || !_viewModel.ShowHoverPreviews || generation != _previewGeneration) return;
+            if (_previewDetached || _closeRequested || !IsTabPresented || !_viewModel.ShowHoverPreviews || generation != _previewGeneration) return;
             reevaluate();
         });
     }
@@ -313,17 +335,24 @@ public partial class MainWindow
         _viewModel.Tree.FolderList.PropertyChanged -= PreviewListChanged;
         _viewModel.Tree.FolderList.Items.CollectionChanged -= PreviewListItemsChanged;
         _viewModel.Tree.PathRefreshed -= PreviewPathRefreshed;
-        RemoveHandler(Mouse.PreviewMouseMoveEvent, new MouseEventHandler(PreviewHoverMove));
-        RemoveHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(PreviewHoverPress));
-        RemoveHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(PreviewHoverRelease));
-        RemoveHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler(PreviewHoverWheel));
-        RemoveHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler(PreviewHoverKey));
-        RemoveHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(SpacePreviewFocusLost));
-        RemoveHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler(SpacePreviewCaptureLost));
-        RemoveHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(PreviewHoverScroll));
-        RemoveHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(PreviewHoverMenu));
-        RemoveHandler(ToolTipService.ToolTipOpeningEvent, new ToolTipEventHandler(PreviewHoverTooltip));
-        RemoveHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler(PreviewHoverDrag));
+        _previewEventRoot.RemoveHandler(Mouse.PreviewMouseMoveEvent, new MouseEventHandler(PreviewHoverMove));
+        _previewEventRoot.RemoveHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(PreviewHoverPress));
+        _previewEventRoot.RemoveHandler(Mouse.PreviewMouseUpEvent, new MouseButtonEventHandler(PreviewHoverRelease));
+        _previewEventRoot.RemoveHandler(Mouse.PreviewMouseWheelEvent, new MouseWheelEventHandler(PreviewHoverWheel));
+        _previewEventRoot.RemoveHandler(Keyboard.PreviewKeyDownEvent, new KeyEventHandler(PreviewHoverKey));
+        _previewEventRoot.RemoveHandler(Keyboard.LostKeyboardFocusEvent, new KeyboardFocusChangedEventHandler(SpacePreviewFocusLost));
+        _previewEventRoot.RemoveHandler(Mouse.LostMouseCaptureEvent, new MouseEventHandler(SpacePreviewCaptureLost));
+        _previewEventRoot.RemoveHandler(ScrollViewer.ScrollChangedEvent, new ScrollChangedEventHandler(PreviewHoverScroll));
+        _previewEventRoot.RemoveHandler(ContextMenuService.ContextMenuOpeningEvent, new ContextMenuEventHandler(PreviewHoverMenu));
+        _previewEventRoot.RemoveHandler(ToolTipService.ToolTipOpeningEvent, new ToolTipEventHandler(PreviewHoverTooltip));
+        _previewEventRoot.RemoveHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler(PreviewHoverDrag));
+        _previewEventRoot.MouseLeave -= PreviewHoverLeave;
+        if (_previewEventWindow is { } window)
+        {
+            window.Deactivated -= PreviewHoverDeactivate;
+            window.SizeChanged -= PreviewHoverResize;
+            _previewEventWindow = null;
+        }
     }
 
     internal HoverPreviewController HoverPreviewsForChecks => _hoverPreview;

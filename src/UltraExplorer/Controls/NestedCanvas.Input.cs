@@ -45,6 +45,8 @@ public sealed partial class NestedCanvas
 
         BuildChain();
         var folder = _tree.Root;
+        if (!MapFolderVisible(folder)) return null;
+        var maskedGap = false;
         var (x, y, w) = _chain[folder];
         if (!Inside(point, x, y, w))
         {
@@ -68,6 +70,7 @@ public sealed partial class NestedCanvas
             }
 
             var child = folder.Children[index];
+            if (!MapFolderVisible(child)) { maskedGap = true; break; }
             if (_chain.TryGetValue(child, out var exact))
             {
                 (x, y, w) = exact;
@@ -87,7 +90,8 @@ public sealed partial class NestedCanvas
         if (!files.IsEmpty && w * files.TileWidth >= 2)
         {
             var fileIndex = files.IndexAt((point.X - x) / w, (point.Y - y) / w);
-            if (fileIndex >= 0 && fileIndex < folder.Files.Count)
+            if (fileIndex >= 0 && fileIndex < folder.Files.Count && !MapFileVisible(folder, fileIndex)) maskedGap = true;
+            if (fileIndex >= 0 && fileIndex < folder.Files.Count && MapFileVisible(folder, fileIndex))
             {
                 var (fx, fy) = files.Origin(fileIndex);
                 var tile = new Rect(x + fx * w, y + fy * w, files.TileWidth * w, files.TileHeight * w);
@@ -96,7 +100,7 @@ public sealed partial class NestedCanvas
         }
 
         var header = w * NestedLayout.HeaderHeight;
-        var onHeader = header < HeaderGrabPixels || point.Y - y <= header;
+        var onHeader = !maskedGap && (header < HeaderGrabPixels || point.Y - y <= header);
         return new NestedHit(folder, new Rect(x, y, w, w * NestedLayout.CellHeight), onHeader);
     }
 
@@ -142,6 +146,7 @@ public sealed partial class NestedCanvas
         }
 
         var active = ActiveTarget();
+        if (active is { } mapped && !MapTargetVisible(mapped.Folder, mapped.FileIndex)) active = null;
         if (isArrow && FocusLeftByRemoval() is not null)
         {
             // No item to move from: the arrows start inside the folder (Neighbour).
@@ -977,7 +982,7 @@ public sealed partial class NestedCanvas
         for (var index = _labelHotspots.Count - 1; index >= 0; index--)
         {
             var spot = _labelHotspots[index];
-            if (spot.Bounds.Contains(point) && ScreenRect(spot.Folder) is { } cell)
+            if (MapFolderVisible(spot.Folder) && spot.Bounds.Contains(point) && ScreenRect(spot.Folder) is { } cell)
             {
                 return new NestedHit(spot.Folder, cell, IsOnHeader: true);
             }
@@ -1014,7 +1019,8 @@ public sealed partial class NestedCanvas
     private void MarkSelected(string path)
     {
         TakeSetSelection();
-        if (Resolve(path) is not { } target || target.FileIndex < 0 && target.Folder.Parent is null)
+        if (Resolve(path) is not { } target || !MapTargetVisible(target.Folder, target.FileIndex)
+            || target.FileIndex < 0 && target.Folder.Parent is null)
         {
             return;
         }
@@ -1049,6 +1055,19 @@ public sealed partial class NestedCanvas
     /// over their parent's grid, files over their folder's.
     /// </summary>
     private (NestedFolder Folder, int FileIndex)? Neighbour((NestedFolder Folder, int FileIndex)? active, Key key)
+    {
+        var next = NeighbourUnmasked(active, key);
+        if (_searchMapProjection is null) return next;
+        var seen = new HashSet<(NestedFolder, int)>();
+        while (next is { } target && !MapTargetVisible(target.Folder, target.FileIndex))
+        {
+            if (!seen.Add(target)) return null;
+            next = NeighbourUnmasked(next, key);
+        }
+        return next;
+    }
+
+    private (NestedFolder Folder, int FileIndex)? NeighbourUnmasked((NestedFolder Folder, int FileIndex)? active, Key key)
     {
         // Next along is next in the order on screen: the folders whose grids
         // are walked are placed for it first.

@@ -35,6 +35,7 @@ public partial class MainWindow : Window
 
     private readonly MainViewModel _viewModel;
     private WindowCaptureService? _capture;
+    private EventHandler? _performanceFrameWatcher;
     private bool _allowClose;
 
     /// <summary>Set once a close has started saving, so it saves once.</summary>
@@ -129,8 +130,8 @@ public partial class MainWindow : Window
         Shelf.Initialize(new ShelfStore(), _viewModel);
         Shelf.CompleteDrop = CompleteExternalDrop;
         Shelf.Enabled = _viewModel.ShowDropShelf && !IsPickerMode;
-        AddHandler(DragDrop.PreviewDragEnterEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
-        AddHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
+        ContextContent.AddHandler(DragDrop.PreviewDragEnterEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
+        ContextContent.AddHandler(DragDrop.PreviewDragOverEvent, new DragEventHandler((_, _) => Shelf.NotifyDragOver()), handledEventsToo: true);
         _viewModel.ConfirmRequested += ShowConfirmDialog;
         _viewModel.ContextMenuRequested += ShowContextMenu;
         _viewModel.Tree.FocusNodeRequested += FocusNode;
@@ -149,6 +150,7 @@ public partial class MainWindow : Window
         Harness.Index = _viewModel.Tree.SpatialIndex;
         AttachNested();
         AttachSelection();
+        if (picker is null) AttachFolderListDrag();
         AttachHoverPreviews();
 
         StateChanged += (_, _) =>
@@ -163,9 +165,12 @@ public partial class MainWindow : Window
         {
             AttachPicker(picker);
             ConfigurePickerSelection();
+            NewTabButton.ToolTip = "Reset the canvas view";
+            AutomationProperties.SetName(NewTabButton, "Reset the canvas view");
         }
 
         UpdateSplitControls();
+        UpdateSearchMapAvailability();
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -199,6 +204,8 @@ public partial class MainWindow : Window
 
     private async void Window_Loaded(object sender, RoutedEventArgs e)
     {
+        if (_isTabHost || _contentLoadStarted) return;
+        _contentLoadStarted = true;
         if (_closeRequested) return;
         // The dialog's entry rules go in before the first read, so the folder
         // the caller asked for is already filtered when it appears.
@@ -261,6 +268,7 @@ public partial class MainWindow : Window
         // leaving a half-built window that would save its defaults on close.
         CrashReporter.MarkStarted();
         _folderLaunchReady.TrySetResult();
+        StartTabHostQuietUpdates();
 
         // The shares and WSL distributions the workspace lists are asked for
         // only now, all at once: one whose server is off takes as long as the
@@ -301,7 +309,7 @@ public partial class MainWindow : Window
             // up here as a gap between frames, including the work no stopwatch of
             // ours wraps - WPF's own measure, arrange and container realisation.
             var lastFrame = Stopwatch.GetTimestamp();
-            CompositionTarget.Rendering += (_, _) =>
+            _performanceFrameWatcher = (_, _) =>
             {
                 var now = Stopwatch.GetTimestamp();
                 var gap = Stopwatch.GetElapsedTime(lastFrame, now).TotalMilliseconds;
@@ -313,6 +321,7 @@ public partial class MainWindow : Window
                     PerfLog.Value("frame.gap.containers", Editor.Items.Count);
                 }
             };
+            CompositionTarget.Rendering += _performanceFrameWatcher;
         }
 
         if (_picker is not null)
@@ -345,18 +354,30 @@ public partial class MainWindow : Window
 
         await RunSelectionDemoAsync();
         await RunMenuDemoAsync();
-        if (!_closeRequested && !IsTestWindow && !IsDiagnosticsRun && Application.Current is App app)
+        if (!_closeRequested && _tabHostWindow is null && !IsTestWindow && !IsDiagnosticsRun && Application.Current is App app)
             app.StartQuietUpdates(this);
     }
 
     private async void Window_Closing(object? sender, CancelEventArgs e)
     {
+        if (_isTabHost && !_allowClose)
+        {
+            e.Cancel = true;
+            await CloseTabHostAsync();
+            return;
+        }
         // A rename the list asked for a moment ago would open its dialog
         // over a window on its way out, or on one already torn down.
         _folderListRenameTimer.Stop();
         _folderListRenameRow = null;
         if (_allowClose)
         {
+            _settingsWindow?.Close();
+            if (_performanceFrameWatcher is not null)
+            {
+                CompositionTarget.Rendering -= _performanceFrameWatcher;
+                _performanceFrameWatcher = null;
+            }
             // However the window goes away, the caller gets an answer.
             CompletePickerOnClose();
             if (Application.Current is { } application)
@@ -370,6 +391,7 @@ public partial class MainWindow : Window
             _viewModel.Tree.ExtraRootAdded -= OnExtraRootAdded;
             DetachNodeDrag();
             DetachSelection();
+            DetachFolderListDrag();
             DetachNested();
             DropPreparedMenu();
             _capture?.Dispose();
@@ -387,6 +409,7 @@ public partial class MainWindow : Window
         }
 
         _closeRequested = true;
+        _folderLaunchReady.TrySetResult();
         _quickPreviewClosingOwner = true;
         var preview = _quickPreview;
         preview?.BeginOwnerClose();
@@ -472,6 +495,9 @@ public partial class MainWindow : Window
     /// </summary>
     private void OnSessionEnding(object? sender, SessionEndingCancelEventArgs e)
     {
+        // Each retained context receives the application's event and saves its
+        // own state. The shell's unused model has no session to overwrite.
+        if (_isTabHost) return;
         var transaction = SessionCloseTransactions.GetValue(e, args => new SessionCloseTransaction(args, Dispatcher));
         if (e.Cancel) { transaction.Cancel(); return; }
         if (_allowClose) return;
@@ -486,7 +512,7 @@ public partial class MainWindow : Window
         var started = Stopwatch.GetTimestamp();
         try
         {
-            if (_pendingExternalDrop is { IsCompleted: false }) { e.Cancel = true; return; }
+            if (_pendingExternalDrop is { IsCompleted: false } || _viewModel.ArchiveWritesPending) { e.Cancel = true; return; }
             if (preview is not null)
             {
                 var noteSave = preview.CommitForCloseAsync();
@@ -1046,6 +1072,7 @@ public partial class MainWindow : Window
     private void FolderListItems_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
         _folderListRenameTimer.Stop();
+        if (BeginFolderListDragPress(e)) { e.Handled = true; return; }
         _folderListMouseDown = true;
         NoteListInput();
         _folderListClickWasOnSelection =
@@ -1069,6 +1096,7 @@ public partial class MainWindow : Window
     /// </summary>
     private void FolderListItems_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
+        if (FinishFolderListDragPress(e)) return;
         _folderListMouseDown = false;
         if (!_viewModel.Tree.FolderList.HasCurrentRows) return;
 
@@ -1869,7 +1897,11 @@ public partial class MainWindow : Window
 
     private void CloseWindowButton_Click(object sender, RoutedEventArgs e) => Close();
 
-    private void NewTabButton_Click(object sender, RoutedEventArgs e) => FitAll();
+    private void NewTabButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (HasFolderTabs) ShellWindow.NewExplorerTab();
+        else FitAll();
+    }
 
     private void PaneToggleButton_Click(object sender, RoutedEventArgs e)
     {
@@ -2155,18 +2187,24 @@ public partial class MainWindow : Window
     {
         var search = _viewModel.Search;
         var modifiers = Keyboard.Modifiers;
+        if (search.ShowOnMap && e.Key is Key.Enter)
+        {
+            search.SearchNow();
+            e.Handled = true;
+            return;
+        }
         switch (e.Key)
         {
-            case Key.Down when search.IsOpen:
+            case Key.Down when search.IsResultsPanelOpen:
                 search.MoveSelection(1);
                 break;
-            case Key.Up when search.IsOpen:
+            case Key.Up when search.IsResultsPanelOpen:
                 search.MoveSelection(-1);
                 break;
-            case Key.PageDown when search.IsOpen:
+            case Key.PageDown when search.IsResultsPanelOpen:
                 search.MoveSelection(8);
                 break;
-            case Key.PageUp when search.IsOpen:
+            case Key.PageUp when search.IsResultsPanelOpen:
                 search.MoveSelection(-8);
                 break;
             case Key.Enter when (modifiers & (ModifierKeys.Control | ModifierKeys.Shift)) != 0:
@@ -2270,6 +2308,15 @@ public partial class MainWindow : Window
 
     private async void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
+        if (_closeRequested || _viewModel.IsDisposed) { e.Handled = true; return; }
+        if (_isTabHost)
+        {
+            _activeTabContext?.MarkFolderRequestUsed();
+            var tabKey = e.Key == Key.System ? e.SystemKey : e.Key;
+            if (TryTabKey(tabKey, Keyboard.Modifiers)) e.Handled = true;
+            else _activeTabContext?.Window_PreviewKeyDown(sender, e);
+            return;
+        }
         var modifiers = Keyboard.Modifiers;
 
         // WPF reports F10 and every Alt combination as Key.System with the real
@@ -2552,6 +2599,12 @@ public partial class MainWindow : Window
 
     private void Window_Activated(object? sender, EventArgs e)
     {
+        if (_isTabHost)
+        {
+            _activeTabContext?.OnActivatedForChanges(sender, e);
+            _activeTabContext?.Window_Activated(sender, e);
+            return;
+        }
         // Coming back from another window can leave focus nowhere.
         if (Keyboard.FocusedElement is null)
         {
@@ -2561,6 +2614,7 @@ public partial class MainWindow : Window
 
     private void Window_Deactivated(object? sender, EventArgs e)
     {
+        if (_isTabHost) { _activeTabContext?.Window_Deactivated(sender, e); return; }
         CancelSpacePreview(disarm: true);
         if (_isSpacePanning)
         {
@@ -2581,6 +2635,7 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyUp(object sender, KeyEventArgs e)
     {
+        if (_isTabHost) { _activeTabContext?.Window_PreviewKeyUp(sender, e); return; }
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
         if (key == Key.Space)
         {
@@ -2629,20 +2684,20 @@ public partial class MainWindow : Window
     private string? ShowInputDialog(string title, string prompt, string initialValue, bool selectStem)
     {
         var dialog = new InputDialog(title, prompt, initialValue, selectStem,
-            password: title.Equals("Password", StringComparison.Ordinal)) { Owner = this };
+            password: title.Equals("Password", StringComparison.Ordinal)) { Owner = ShellWindow };
         return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 
     private string? ShowCreationInputDialog(CreateItemPrompt request)
     {
         var dialog = new InputDialog(request.Title, request.Prompt, request.InitialValue, request.SelectStem,
-            creation: request) { Owner = this };
+            creation: request) { Owner = ShellWindow };
         return dialog.ShowOwnerModal() ? dialog.Value : null;
     }
 
     private bool ShowConfirmDialog(string title, string message, string confirmLabel)
     {
-        var dialog = new ConfirmDialog(title, message, confirmLabel, danger: confirmLabel == "Delete") { Owner = this };
+        var dialog = new ConfirmDialog(title, message, confirmLabel, danger: confirmLabel == "Delete") { Owner = ShellWindow };
         return dialog.ShowOwnerModal();
     }
 

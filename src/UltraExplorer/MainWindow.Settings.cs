@@ -52,6 +52,19 @@ public partial class MainWindow
     /// </summary>
     internal void OpenSettings()
     {
+        if (_isTabHost)
+        {
+            ActiveTabContext.OpenSettings();
+            return;
+        }
+
+        // Settings follows the tab that opened it. A visible shell keeps one
+        // Settings window, so changing tabs cannot leave several editors over it.
+        foreach (var context in ShellWindow.TabContexts)
+        {
+            if (!ReferenceEquals(context, this)) context._settingsWindow?.Close();
+        }
+
         if (_settingsWindow is null)
         {
             var settings = new SettingsViewModel(
@@ -81,8 +94,8 @@ public partial class MainWindow
             return;
         }
 
-        window.Owner = this;
-        window.Height = Math.Clamp(ActualHeight - 60, window.MinHeight, window.Height);
+        window.Owner = ShellWindow;
+        window.Height = Math.Clamp(ShellWindow.ActualHeight - 60, window.MinHeight, window.Height);
 
         // A test or diagnostics copy on the other monitor must not take the
         // keyboard from whatever the user is doing.
@@ -102,7 +115,7 @@ public partial class MainWindow
     /// <summary>The app's confirmation, over the Settings window when that is what asked.</summary>
     private bool ConfirmFromSettings(string title, string message, string confirmLabel)
     {
-        Window owner = _settingsWindow is { IsVisible: true } settings ? settings : this;
+        Window owner = _settingsWindow is { IsVisible: true } settings ? settings : ShellWindow;
         var dialog = new ConfirmDialog(title, message, confirmLabel) { Owner = owner };
         return dialog.ShowOwnerModal();
     }

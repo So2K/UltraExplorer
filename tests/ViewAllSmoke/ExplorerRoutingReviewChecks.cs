@@ -139,8 +139,9 @@ internal static class ExplorerRoutingFixture
         Check("the main window opens its folder", await main.ApplyFolderInvocationAsync(open).WaitAsync(TimeSpan.FromSeconds(60)));
         FolderCommandLine.TryOpenFolder(Path.Combine(folders, "backup."), out var dotted, out _);
         var dottedReceipt = await RouteAsync(dotted);
-        Check($"a folder named with a trailing dot is opened and framed in the window ({main.CurrentFolderPath})",
-            ExplorerLaunchRouter.ReceiptMatches(dottedReceipt, dotted) && main.CurrentFolderPath == Path.Combine(folders, "backup."));
+        Check($"a folder named with a trailing dot opens in its own exact context ({dottedReceipt.FolderPath})",
+            ExplorerLaunchRouter.ReceiptMatches(dottedReceipt, dotted) && dottedReceipt.Window != Handle(main)
+            && dottedReceipt.FolderPath == Path.Combine(folders, "backup.") && main.CurrentFolderPath == home);
         await ClosingWindowChecksAsync(main, folders);
         await FoldersTogetherChecksAsync(main, folders);
         await SlowStartChecksAsync(folders);
@@ -165,7 +166,7 @@ internal static class ExplorerRoutingFixture
         FolderCommandLine.TryOpenFolder(target, out var invocation, out _);
         invocation = invocation with { DestinationId = Guid.NewGuid() };
         var receipt = await RouteAsync(invocation);
-        var window = Windows().Single(candidate => candidate.FolderDestinationId == invocation.DestinationId);
+        var window = Windows().Select(candidate => candidate.FindFolderContext(invocation.DestinationId)).OfType<UltraExplorer.MainWindow>().Single();
         await ((UltraExplorer.ViewModels.MainViewModel)window.DataContext).SaveNowAsync();
         var workspace = ExplorerLaunchRouter.FolderWorkspacePath(invocation.DestinationId);
         // Since I009 a folder window shares the user's settings, pins and
@@ -364,9 +365,11 @@ internal static class ExplorerRoutingFixture
         Check("an ordinary folder is spelt as ever", FolderCommandLine.TryOpenFolder(plain + @"\.\", out var ordinary, out _) && ordinary.FolderPath == plain);
     }
 
-    private static UltraExplorer.MainWindow[] Windows() => Application.Current.Windows.OfType<UltraExplorer.MainWindow>().ToArray();
+    private static UltraExplorer.MainWindow[] Windows() => Application.Current.Windows.OfType<UltraExplorer.MainWindow>()
+        .Where(window => ReferenceEquals(window.ShellWindow, window)).ToArray();
 
-    private static long Handle(Window window) => new System.Windows.Interop.WindowInteropHelper(window).Handle.ToInt64();
+    private static long Handle(Window window) => new System.Windows.Interop.WindowInteropHelper(
+        window is UltraExplorer.MainWindow explorer ? explorer.ShellWindow : window).Handle.ToInt64();
 
     private static async Task<FolderRouteReceipt> RouteAsync(FolderInvocation invocation)
     {
@@ -432,7 +435,8 @@ internal static class ExplorerRoutingFixture
             receipts.Select(receipt => receipt.Window).Distinct().Count() == 3);
         Check("and each window still shows its own folder", receipts.Zip(targets).All(pair =>
             Windows().FirstOrDefault(window => Handle(window) == pair.First.Window)?.CurrentFolderPath == pair.Second));
-        Check("the window already open took one of them", receipts.Any(receipt => receipt.Window == Handle(main)));
+        Check("the window already open retains its earlier context", receipts.All(receipt => receipt.Window != Handle(main))
+            && main.CurrentFolderPath == Path.Combine(folders, "main window folder"));
         Mode(false);
         await CloseAsync(opened);
     }

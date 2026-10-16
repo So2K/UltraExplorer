@@ -88,10 +88,10 @@ internal static partial class Program
         main.FolderDestinationId = handoff.DestinationId;
         main.PrepareFolderInvocation(handoff);
         Check("a freshly prepared destination is untouched and unused", main.IsUntouchedHandoff && main.IsUnusedFolderRequest);
-        main.RaiseEvent(new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, 0) { RoutedEvent = UIElement.PreviewMouseWheelEvent });
+        main.ContextRoot.RaiseEvent(new MouseWheelEventArgs(Mouse.PrimaryDevice, Environment.TickCount, 0) { RoutedEvent = UIElement.PreviewMouseWheelEvent });
         Check("a wheel event makes the real destination user-owned", !main.IsUntouchedHandoff && !main.IsUnusedFolderRequest);
         main.PrepareFolderInvocation(handoff);
-        main.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, PresentationSource.FromVisual(main)!, Environment.TickCount, Key.None)
+        main.ContextRoot.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, PresentationSource.FromVisual(main.ContextRoot)!, Environment.TickCount, Key.None)
             { RoutedEvent = UIElement.PreviewKeyDownEvent });
         Check("a key event also makes the real destination user-owned", !main.IsUntouchedHandoff && !main.IsUnusedFolderRequest);
 

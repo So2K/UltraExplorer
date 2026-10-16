@@ -58,6 +58,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private bool _applyingDialogs;
     private bool? _winEWanted;
     private bool _applyingWinE;
+    private FolderOpenMode _folderOpenMode;
+    private bool? _folderTabsWanted;
+    private bool _applyingFolderTabs;
     private readonly DialogIntegrationController _dialogIntegration = DialogIntegrationController.Shared;
     private readonly QuietUpdateService _quietUpdates;
     private readonly System.Windows.Threading.Dispatcher _settingsDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
@@ -77,6 +80,7 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     {
         _main = main;
         _quietUpdates = quietUpdates ?? QuietUpdateService.Shared;
+        _folderOpenMode = DialogIntegrationStore.ReadFolderOpenMode();
         CanChooseLayout = canChooseLayout;
         _rendererNow = rendererNow;
         _confirm = confirm;
@@ -144,6 +148,60 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         }
     }
     public string WinEShortcutStatus => _dialogIntegration.WinEStatus;
+    public bool OpenIncomingFoldersInTabs
+    {
+        get => _folderTabsWanted ?? _folderOpenMode == FolderOpenMode.NewTab;
+        set
+        {
+            if (value == OpenIncomingFoldersInTabs) return;
+            _folderTabsWanted = value;
+            NotifyFolderOpenMode();
+            if (!_applyingFolderTabs) _ = ApplyFolderOpenModeAsync();
+        }
+    }
+    public string FolderOpenModeStatus => OpenIncomingFoldersInTabs
+        ? "New tab in the active UltraExplorer window"
+        : "Separate window for every folder request";
+
+    private async Task ApplyFolderOpenModeAsync()
+    {
+        _applyingFolderTabs = true;
+        try
+        {
+            bool? applied = null;
+            while (_folderTabsWanted is { } wanted && wanted != applied)
+            {
+                var mode = wanted ? FolderOpenMode.NewTab : FolderOpenMode.SeparateWindow;
+                await Task.Run(() => DialogIntegrationStore.SetFolderOpenMode(mode));
+                _folderOpenMode = mode;
+                applied = wanted;
+            }
+        }
+        catch (Exception ex) { _main.Toast.ShowError(ex.Message); }
+        finally
+        {
+            _folderTabsWanted = null;
+            _applyingFolderTabs = false;
+            NotifyFolderOpenMode();
+        }
+    }
+
+    /// <summary>Other windows and processes share the same choice; an in-progress click keeps its wanted value.</summary>
+    public void RefreshFolderOpenMode()
+    {
+        if (_isDisposed || _applyingFolderTabs) return;
+        var mode = DialogIntegrationStore.ReadFolderOpenMode();
+        if (mode == _folderOpenMode) return;
+        _folderOpenMode = mode;
+        NotifyFolderOpenMode();
+    }
+
+    private void NotifyFolderOpenMode()
+    {
+        OnPropertyChanged(nameof(OpenIncomingFoldersInTabs));
+        OnPropertyChanged(nameof(FolderOpenModeStatus));
+    }
+
     public string DialogExceptionsDescription => _dialogIntegration.ExclusionCount == 0
         ? "Every supported application can use UltraExplorer."
         : $"{_dialogIntegration.ExclusionCount} application(s) keep their Windows dialogs. Reset to try them again.";

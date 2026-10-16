@@ -156,10 +156,9 @@ public partial class App : Application
                 }
             }
 
-            folderInvocation = invocation;
             // Several folders opened together start a launch each: with no
-            // window listening, the first builds one and the others wait to
-            // hand it their folders, rather than each building its own.
+            // broker listening, the first builds one and the others wait to
+            // hand it fresh folder contexts, each in its own window or tab.
             folderStartup = ExplorerLaunchRouter.EnterFolderStartup();
             if (ExplorerLaunchRouter.TryForward(invocation))
             {
@@ -173,6 +172,8 @@ public partial class App : Application
                 Shutdown(FileDialogCommandLine.ExitAccepted);
                 return;
             }
+            folderInvocation = invocation.DestinationId == Guid.Empty
+                ? invocation with { DestinationId = Guid.NewGuid() } : invocation;
         }
 
         // The tray's "Open settings" while a window is open is shown by that
@@ -197,12 +198,12 @@ public partial class App : Application
         ShutdownMode = ShutdownMode.OnLastWindowClose;
         MainWindow = window;
         _quietUpdatesAllowed = !isTestCopy;
-        if (folderInvocation is not null) window.FolderDestinationId = folderInvocation.DestinationId;
-        if (folderInvocation is not null) window.PrepareFolderInvocation(folderInvocation);
+        var context = window.EnableFolderTabs(folderInvocation);
+        if (folderInvocation?.Source is not null || folderInvocation?.ActivationSource is not null) window.ShowActivated = false;
         ExplorerLaunchRouter.Attach(window);
         ExplorerLaunchRouter.LeaveFolderStartup(folderStartup, whenListening: true);
         window.Show();
-        if (folderInvocation is not null) _ = window.ApplyFolderInvocationAsync(folderInvocation);
+        if (folderInvocation is not null) _ = context.ApplyFolderInvocationAsync(folderInvocation);
         DialogIntegrationController.OnApplicationStarted();
         if (e.Args.Contains("--settings")) window.Loaded += (_, _) => window.OpenSettings();
     }

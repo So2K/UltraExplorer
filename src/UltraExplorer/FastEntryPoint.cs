@@ -40,7 +40,18 @@ internal static class FastEntryPoint
 
     /// <summary>Win+E's resident agent uses the same broker without spawning a launcher.</summary>
     internal static bool TryForwardHome()
-        => TryForward([FolderCommandLine.HomeSwitch], rememberFolderForApp: false);
+        => TryForwardHome(PrepareHomeInvocation());
+
+    internal static FolderInvocation PrepareHomeInvocation()
+    {
+        var activationSource = ExplorerLaunchRouter.CaptureForegroundIntent();
+        if (!FolderCommandLine.TryParse([FolderCommandLine.HomeSwitch], out var home, out var error))
+            throw new IOException(error);
+        return home with { DestinationId = Guid.NewGuid(), ActivationSource = activationSource };
+    }
+
+    /// <summary>The agent reuses this exact gesture identity if it needs a process fallback.</summary>
+    internal static bool TryForwardHome(FolderInvocation home) => ExplorerLaunchRouter.TryForward(home);
 
     private static bool TryForward(string[] args, bool rememberFolderForApp)
     {

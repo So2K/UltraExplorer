@@ -14,6 +14,7 @@ See the structure, fly into a folder, and keep your bearings.
 
 [Download for Windows](https://github.com/So2K/UltraExplorer/releases/latest) ·
 [What's new in v1.3.0](docs/RELEASE_NOTES_v1.3.0.md) ·
+[Try v1.3.1-beta.1](https://github.com/So2K/UltraExplorer/releases/tag/v1.3.1-beta.1) ·
 [Watch the demos](#see-it-in-action) ·
 [Build from source](BUILD.md) ·
 [Русский](docs/README.ru.md)
@@ -30,6 +31,12 @@ added items, clearer creation dialogs with `Ctrl+N` and `Ctrl+D`, REAPER
 Save options and quiet update checks that install only when you click.
 Archive browsing, the shelf and the copy-path button are optional and start
 off; enable each in Settings.
+
+**v1.3.1-beta.1 is available for testing.** Browser **Show in folder** selects
+and centres the exact file at a readable size, including in large folders.
+It also adds optional retained folder tabs, a search-query builder and spatial
+map filtering. [Beta notes](docs/RELEASE_NOTES_v1.3.1-beta.1.md) ·
+[Testing guide](docs/BETA_TESTING.md).
 
 In folders already read, newly added files and folders pulse yellow twice
 when they become visible on the nested canvas. Offscreen, hidden, filtered or

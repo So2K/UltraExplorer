@@ -466,13 +466,13 @@ internal static partial class Program
             using var coordinator = new ExplorerReplacementCoordinator(actions);
             await coordinator.TransferForChecksAsync(shown).WaitAsync(TimeSpan.FromSeconds(90));
             var destination = opened.TryPeek(out var asked) ? asked.DestinationId : Guid.Empty;
-            window = Application.Current.Windows.OfType<MainWindow>().FirstOrDefault(candidate => candidate.FolderDestinationId == destination);
+            window = ExplorerReview2FindContext(destination);
             var gaveUp = closed.IsEmpty && window is not null;
             // The observer hands the next state over once it has held still for 250 ms.
             await Task.Delay(300);
             await coordinator.TransferForChecksAsync(selected).WaitAsync(TimeSpan.FromSeconds(90));
             await LiveWait(() => !closed.IsEmpty, 3000);
-            var windows = Application.Current.Windows.OfType<MainWindow>().Where(candidate => candidate.FolderDestinationId == destination).ToArray();
+            var windows = ExplorerReview2Hosts().Select(candidate => candidate.FindFolderContext(destination)).OfType<MainWindow>().ToArray();
             Check($"the selection is handed over in the window the folder's handoff opened ({(gaveUp ? "given up first" : "not given up")}, "
                 + $"{closed.Count} handed over, {discarded.Count} discards, {windows.Length} windows for it, "
                 + $"{(window is null ? "none" : ExplorerReview2Shown(window) ? "still open" : "closed")})",
@@ -482,7 +482,7 @@ internal static partial class Program
         }
         finally
         {
-            foreach (var made in Application.Current.Windows.OfType<MainWindow>()
+            foreach (var made in ExplorerReview2Hosts()
                 .Where(candidate => opened.Any(invocation => invocation.DestinationId == candidate.FolderDestinationId)).ToArray())
                 made.Close();
             ExplorerReview2Mode(false);
@@ -510,12 +510,11 @@ internal static partial class Program
             using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(60));
             var routed = ExplorerLaunchRouter.SendAsync(new FolderRouteRequest(Guid.NewGuid(), invocation, true), deadline.Token);
             MainWindow? made = null;
-            await LiveWait(() => (made = Application.Current.Windows.OfType<MainWindow>()
-                .FirstOrDefault(candidate => candidate.FolderDestinationId == invocation.DestinationId)) is not null, 30_000);
+            await LiveWait(() => (made = ExplorerReview2FindContext(invocation.DestinationId)) is not null, 30_000);
             var early = made is { IsFolderWindowReady: false };
             if (click)
             {
-                made?.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+                made?.ContextRoot.RaiseEvent(new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
                 {
                     RoutedEvent = UIElement.PreviewMouseDownEvent
                 });
@@ -540,6 +539,12 @@ internal static partial class Program
             unused is { Early: true, Window: { } gone } && !ExplorerReview2Shown(gone));
         foreach (var window in new[] { used.Window, unused.Window }.OfType<MainWindow>().Where(ExplorerReview2Shown)) window.Close();
     }
+
+    private static MainWindow[] ExplorerReview2Hosts() => Application.Current.Windows.OfType<MainWindow>()
+        .Where(window => ReferenceEquals(window.ShellWindow, window)).ToArray();
+
+    private static MainWindow? ExplorerReview2FindContext(Guid destination) => ExplorerReview2Hosts()
+        .Select(window => window.FindFolderContext(destination)).FirstOrDefault(context => context is not null);
 
     // ---- J097: a minimized window shown before its folder has loaded ------------------------
 

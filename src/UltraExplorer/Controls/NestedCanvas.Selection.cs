@@ -115,6 +115,15 @@ public sealed partial class NestedCanvas
             SelectionChangedHere();
         }
 
+        if (_searchMapProjection is not null)
+        {
+            // Retain the user's underlying selection for clearing the mask,
+            // but deletion must still warn about every item no longer shown.
+            return _selection.Items().Count(item => NestedTree.IsOnCanvas(item.Container)
+                && (item.Folder is { } folder ? MapFolderVisible(folder)
+                    : MapFolderVisible(item.Container) && _searchMapProjection.ContainsFile(item.Container.FullPath, item.FileName!)));
+        }
+
         return _selection.CountOnCanvas() + _selection.CountWaiting(path =>
             _tree?.Find(path) is not { } folder || !folder.IsLoaded && !folder.IsComputer
             || folder.IsTruncated || folder.UnlistedFileCount > 0);
@@ -358,7 +367,7 @@ public sealed partial class NestedCanvas
             {
                 var index = ordinal - children.Count;
                 var file = files[index];
-                if (FileMatches(file) && (fileSet!.Set(index, true) || !add))
+                if (FileMatches(container, file) && (fileSet!.Set(index, true) || !add))
                 {
                     items.Add(new SelectionItem(string.Concat(prefix, file.Name), false, file.Length));
                 }
@@ -406,6 +415,7 @@ public sealed partial class NestedCanvas
         {
             folder = _anchor ?? _tree.Root;
         }
+        while (!MapFolderVisible(folder) && folder.Parent is { } parent) folder = parent;
 
         Ensure(folder);
         _selection.Clear();
@@ -427,7 +437,7 @@ public sealed partial class NestedCanvas
             for (var index = 0; index < files.Count; index++)
             {
                 var file = files[index];
-                if (FileMatches(file))
+                if (FileMatches(folder, file))
                 {
                     fileSet.Set(index, true);
                     items.Add(new SelectionItem(string.Concat(prefix, file.Name), false, file.Length));
@@ -557,13 +567,13 @@ public sealed partial class NestedCanvas
             // Sorted or read again: the base and the matches by place are
             // both for the places before.
             TakeBase(marquee);
-            if (_filter is not null)
+            if (_filter is not null || _searchMapProjection is not null)
             {
                 TakeMatches(marquee);
             }
         }
 
-        if (_filter is null ? marquee.MatchStamp != -1 : marquee.MatchStamp != _filterStamp)
+        if (_filter is null && _searchMapProjection is null ? marquee.MatchStamp != -1 : marquee.MatchStamp != _filterStamp)
         {
             TakeMatches(marquee);
         }
@@ -580,7 +590,7 @@ public sealed partial class NestedCanvas
     /// <summary>Which of the container's items the filter lets a rectangle take, once per filter and placing.</summary>
     private void TakeMatches(NestedMarquee marquee)
     {
-        if (_filter is null)
+        if (_filter is null && _searchMapProjection is null)
         {
             marquee.SetMatches(null, null, -1);
             marquee.MatchCount = -1;
@@ -604,7 +614,7 @@ public sealed partial class NestedCanvas
         var fileBits = new ulong[(files.Count + 63) >> 6];
         for (var index = 0; index < files.Count; index++)
         {
-            if (_filter(files[index].Name))
+            if (FileMatches(container, files[index]))
             {
                 NestedMarquee.SetBit(fileBits, index);
                 matching++;
@@ -1007,7 +1017,9 @@ public sealed partial class NestedCanvas
     /// part of what the user asked for.
     /// </summary>
     private bool FolderMatches(NestedFolder child) =>
-        _filter is null || (child.FilterStamp == _filterStamp ? (child.FilterState & FilterSelf) != 0 : !child.IsComputer && _filter(child.Name));
+        MapFolderVisible(child) && (_searchMapProjection is null || _searchMapProjection.IsFolderMatch(child.FullPath))
+        && (_filter is null || (child.FilterStamp == _filterStamp ? (child.FilterState & FilterSelf) != 0 : !child.IsComputer && _filter(child.Name)));
 
-    private bool FileMatches(in NestedFile file) => _filter is null || _filter(file.Name);
+    private bool FileMatches(NestedFolder folder, in NestedFile file) =>
+        (_searchMapProjection?.ContainsFile(folder.FullPath, file.Name) != false) && (_filter is null || _filter(file.Name));
 }

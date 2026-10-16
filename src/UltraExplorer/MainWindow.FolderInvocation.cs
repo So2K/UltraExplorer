@@ -35,11 +35,17 @@ public partial class MainWindow
     private bool _folderRequestUsed;
     internal bool IsUnusedFolderRequest => !_folderRequestUsed && !_closeRequested;
 
-    public string CurrentFolderPath => _viewModel.Tree.FolderList.FolderPath;
-    public IReadOnlyList<string> CurrentFolderSelection => _viewModel.Tree.Selection.Paths.ToArray();
+    public string CurrentFolderPath => _isTabHost && _activeTabContext is { } context ? context.CurrentFolderPath : _viewModel.Tree.FolderList.FolderPath;
+    public IReadOnlyList<string> CurrentFolderSelection => _isTabHost && _activeTabContext is { } context ? context.CurrentFolderSelection : _viewModel.Tree.Selection.Paths.ToArray();
     public event EventHandler? FolderLocationChanged;
-    internal bool IsFolderWindowReady => _folderLaunchReady.Task.IsCompletedSuccessfully && !_closeRequested && !IsPickerMode;
-    internal Guid FolderDestinationId { get; set; }
+    internal bool IsFolderWindowReady => !_closeRequested && !IsPickerMode && (_isTabHost
+        ? _activeTabContext?.IsFolderWindowReady == true : _folderLaunchReady.Task.IsCompletedSuccessfully);
+    private Guid _folderDestinationId;
+    internal Guid FolderDestinationId
+    {
+        get => _isTabHost && _activeTabContext is not null ? _activeTabContext.FolderDestinationId : _folderDestinationId;
+        set => _folderDestinationId = value;
+    }
 
     /// <summary>Saving on its way out: a folder sent now would be dropped here.</summary>
     internal bool IsFolderWindowClosing => _closeRequested;
@@ -85,17 +91,25 @@ public partial class MainWindow
         _viewModel.Tree.PropertyChanged += OnFolderInvocationStateChanged;
 
         // Any use of the window makes it the user's (see IsUntouchedHandoff).
-        void Used() { _handoffUntouched = false; _folderRequestUsed = true; }
-        PreviewMouseDown += (_, _) => Used();
-        PreviewMouseWheel += (_, _) => Used();
-        PreviewKeyDown += (_, _) => Used();
-        PreviewTouchDown += (_, _) => Used();
-        PreviewStylusDown += (_, _) => Used();
+        void Used() => MarkFolderRequestUsed();
+        ContextContent.PreviewMouseDown += (_, _) => Used();
+        ContextContent.PreviewMouseWheel += (_, _) => Used();
+        ContextContent.AddHandler(System.Windows.Input.Keyboard.PreviewKeyDownEvent,
+            new System.Windows.Input.KeyEventHandler((_, _) => Used()), handledEventsToo: true);
+        ContextContent.PreviewTouchDown += (_, _) => Used();
+        ContextContent.PreviewStylusDown += (_, _) => Used();
+        ContextContent.AddHandler(DragDrop.PreviewDropEvent, new DragEventHandler((_, _) => Used()), handledEventsToo: true);
         Closed += (_, _) =>
         {
             _viewModel.Tree.FolderList.PropertyChanged -= OnFolderInvocationStateChanged;
             _viewModel.Tree.PropertyChanged -= OnFolderInvocationStateChanged;
         };
+    }
+
+    internal void MarkFolderRequestUsed()
+    {
+        _handoffUntouched = false;
+        _folderRequestUsed = true;
     }
 
     private void OnFolderInvocationStateChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -123,8 +137,10 @@ public partial class MainWindow
             && ActivePane.Canvas.SelectionState.Items().Select(item => item.Path).ToHashSet(StringComparer.OrdinalIgnoreCase)
                 .SetEquals(_viewModel.Tree.Selection.Paths)
             && _viewModel.Address.CurrentPath == invocation.FolderPath
-            && ActivePane.Canvas.CaptureCamera() is { Width: >= 0.4 and <= 1.5 } camera
-            && string.Equals(camera.AnchorPath, invocation.FolderPath, StringComparison.OrdinalIgnoreCase);
+            && (invocation.Kind == FolderInvocationKind.Reveal
+                ? invocation.SelectedPaths.Count > 0 && ActivePane.Canvas.IsRevealTargetFramed(invocation.SelectedPaths[0])
+                : ActivePane.Canvas.CaptureCamera() is { Width: >= 0.4 and <= 1.5 } camera
+                    && string.Equals(camera.AnchorPath, invocation.FolderPath, StringComparison.OrdinalIgnoreCase));
 
     /// <summary>
     /// Opens a filesystem launch in the normal window. The initialized tile
@@ -132,7 +148,8 @@ public partial class MainWindow
     /// file dialog session or footer.
     /// </summary>
     public Task<bool> ApplyFolderInvocationAsync(FolderInvocation invocation)
-        => ApplyFolderInvocationAsync(invocation, CancellationToken.None);
+        => (_isTabHost ? FindFolderContext(invocation.DestinationId) ?? ActiveTabContext : this)
+            .ApplyFolderInvocationAsync(invocation, CancellationToken.None);
 
     internal async Task<bool> ApplyFolderInvocationAsync(FolderInvocation invocation, CancellationToken cancellation)
     {
@@ -210,7 +227,28 @@ public partial class MainWindow
                 if (Dispatcher.CheckAccess()) ReleaseLoadGate();
                 else if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(ReleaseLoadGate, DispatcherPriority.Send);
             });
-            if (!await FolderInvocationNavigation.ApplyAsync(_viewModel.Tree, invocation, Current)
+
+            // Resolve the current visual kind before publishing the logical
+            // selection. Turning archive browsing off refreshes lazily: a ZIP
+            // may still be a cached folder here. If selected before that read,
+            // a drawing frame can report its discarded folder object as gone
+            // and remove the still-existing physical file from the selection.
+            async Task<bool> PrepareVisualsAsync()
+            {
+                pane.Tree.ForceVisible(invocation.SelectedPaths);
+                var folders = invocation.SelectedPaths.Select(Path.GetDirectoryName)
+                    .OfType<string>().Append(invocation.FolderPath).Distinct(StringComparer.OrdinalIgnoreCase);
+                foreach (var path in folders)
+                {
+                    var folder = await pane.Tree.MaterializePathAsync(path);
+                    if (!Current() || folder is null || !string.Equals(folder.FullPath, path, StringComparison.OrdinalIgnoreCase)) return false;
+                    await pane.Tree.LoadAsync(folder);
+                    if (!Current()) return false;
+                    pane.Tree.EnsureLayout(folder);
+                }
+                return Current();
+            }
+            if (!await FolderInvocationNavigation.ApplyAsync(_viewModel.Tree, invocation, Current, PrepareVisualsAsync)
                 || !Current()) return false;
 
             pane.SyncSelection();
@@ -229,22 +267,31 @@ public partial class MainWindow
                 pane.Canvas.ShownLayers |= CanvasLayer.Files;
                 pane.ScheduleBeacons();
             }
-            pane.Tree.ForceVisible(invocation.SelectedPaths);
-            var folders = invocation.SelectedPaths.Select(Path.GetDirectoryName)
-                .OfType<string>().Append(invocation.FolderPath).Distinct(StringComparer.OrdinalIgnoreCase);
-            foreach (var path in folders)
-            {
-                var folder = await pane.Tree.MaterializePathAsync(path);
-                if (!Current() || folder is null || !string.Equals(folder.FullPath, path, StringComparison.OrdinalIgnoreCase)) return false;
-                await pane.Tree.LoadAsync(folder);
-                if (!Current()) return false;
-                pane.Tree.EnsureLayout(folder);
-            }
             pane.SyncSelection();
             await Dispatcher.InvokeAsync(() => { if (Current()) pane.Canvas.UpdateLayout(); }, DispatcherPriority.ContextIdle);
             if (!Current() || !Allowed(fresh: true)) return false;
-            var target = pane.Tree.Find(invocation.FolderPath);
-            if (target is null || !pane.Canvas.FlyTo(target, 0.92, animated: false)) return false;
+            if (invocation.Kind == FolderInvocationKind.Reveal)
+            {
+                if (invocation.SelectedPaths.Count == 0) return false;
+                var selectedPath = invocation.SelectedPaths[0];
+                bool SelectionCurrent() => Current()
+                    && _viewModel.Tree.Selection.Paths.SequenceEqual(invocation.SelectedPaths, StringComparer.OrdinalIgnoreCase);
+                if (!SelectionCurrent()) return false;
+                // An enabled archive is a folder on the canvas, while the
+                // filesystem selection must remain a physical ZIP/file for
+                // Open/Delete. Target its existing visual instead of inserting
+                // a second file tile with the same path.
+                var isDirectory = pane.Tree.Find(selectedPath) is not null ? true
+                    : _viewModel.Tree.Selection.TryGetItem(selectedPath, out var selected)
+                        ? selected.IsDirectory : (bool?)null;
+                if (!await pane.RevealSelectionPathAsync(selectedPath, isDirectory, SelectionCurrent)
+                    || !SelectionCurrent()) return false;
+            }
+            else
+            {
+                var target = pane.Tree.Find(invocation.FolderPath);
+                if (target is null || !pane.Canvas.FlyTo(target, 0.92, animated: false)) return false;
+            }
             _viewModel.Address.SetPath(invocation.FolderPath);
             _viewModel.DialogTitle = FolderName(invocation.FolderPath);
             pane.Canvas.RenderNow();
@@ -269,12 +316,7 @@ public partial class MainWindow
 
     private void PresentFolderInvocationWindow(FolderInvocation invocation)
     {
-        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
-        if (!IsVisible) Show();
-        if (!IsTestWindow && !IsDiagnosticsRun && (!invocation.OriginIsShell || invocation.DestinationId == Guid.Empty))
-        {
-            Activate();
-            FocusCanvas();
-        }
+        ExplorerLaunchRouter.PresentFolderInvocationWindow(this, invocation);
+        if (!IsTestWindow && !IsDiagnosticsRun && IsTabPresented && ShellWindow.IsActive) FocusCanvas();
     }
 }

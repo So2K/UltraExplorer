@@ -78,6 +78,12 @@ internal static partial class Program
         await Group(PickerCommandLine);
         await Group(() => FolderInvocationChecks(fixtureRoot));
         await Group(FolderRouterChecks);
+        await Group(FolderOpenPreferenceChecks);
+        await Group(WorkspaceRetryChecks);
+        await Group(FolderLaunchContextChecks);
+        await Group(FolderForegroundChecks);
+        await Group(ExplorerTabChecks);
+        await Group(FolderListTabDragChecks);
         await Group(FolderRouteCacheChecks);
         await Group(PickerNames);
         await Group(DialogIntegrationChecks);
@@ -107,6 +113,9 @@ internal static partial class Program
         await Group(AddressBar);
         await Group(() => FolderColours(fixtureRoot));
         await Group(SearchChecks);
+        await Group(SearchBuilderChecks);
+        await Group(SearchBuilderVisualChecks);
+        await Group(SearchMapChecks);
         await Group(ProgramTargets);
         await Group(NestedLayoutChecks);
         await Group(NestedTreeChecks);
@@ -207,6 +216,8 @@ internal static partial class Program
         await Group(NewItemArrivalChecks);
         await Group(NestedVisibilityRenameIntegrationChecks);
         await Group(FocusSelectionChecks);
+        await Group(ExternalRevealFocusChecks);
+        await Group(ExternalRevealShellChecks);
         await Group(BatchCommandLineChecks);
         await Group(PublicationLifecycleChecks);
         await Group(RefreshIdentityConsumerChecks);

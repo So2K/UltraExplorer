@@ -107,10 +107,11 @@ internal static class WinEShortcutAgent
     internal static void LaunchHome()
     {
         if (DialogIntegrationStore.Read().WinEEnabled != true) return;
-        if (FastEntryPoint.TryForwardHome()) return;
+        var home = FastEntryPoint.PrepareHomeInvocation();
+        if (FastEntryPoint.TryForwardHome(home)) return;
         // OFF wins when it races the bounded broker attempt already in flight.
         if (DialogIntegrationStore.Read().WinEEnabled != true) return;
-        try { using var launched = StartHomeProcess([FolderCommandLine.HomeSwitch]); }
+        try { using var launched = StartHomeProcess(FolderCommandLine.BuildArguments(home)); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
         {
             DialogIntegrationStore.Log("The Win+E folder window could not start", ex);

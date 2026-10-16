@@ -1149,6 +1149,9 @@ public sealed partial class NestedCanvas
         public int DetailFolders { get; set; } = -1;
 
         public int DetailFiles { get; set; } = -1;
+        public object? DetailMapProjection { get; set; }
+        public IReadOnlyList<NestedFolder>? DetailMapChildren { get; set; }
+        public IReadOnlyList<NestedFile>? DetailMapFiles { get; set; }
 
         /// <summary>The folder's time the detail shows, or zero when it shows none.</summary>
         public long DetailTicks { get; set; } = -1;
@@ -1751,21 +1754,37 @@ public sealed partial class NestedCanvas
         facts ??= FactsOf(folder);
         var culture = CultureInfo.CurrentCulture;
         if (facts.DetailFolders == folders && facts.DetailFiles == files && facts.DetailTicks == ticks
+            && ReferenceEquals(facts.DetailMapProjection, _searchMapProjection)
+            && (_searchMapProjection is null || ReferenceEquals(facts.DetailMapChildren, folder.Children)
+                && ReferenceEquals(facts.DetailMapFiles, folder.Files))
             && ReferenceEquals(facts.DetailCulture, culture))
         {
             return facts.Detail;
         }
 
-        var counts = CountsText(folders, files);
+        var counts = _searchMapProjection is null ? CountsText(folders, files) : MapCountsText(folder, folders, files);
         var date = DateText(ticks, dateOnly: false);
         facts.Detail = date.Length == 0 ? counts : counts.Length == 0 ? date : string.Concat(counts, "  ·  ", date);
         facts.DetailCounts = counts;
         facts.DetailDate = date;
         facts.DetailFolders = folders;
         facts.DetailFiles = files;
+        facts.DetailMapProjection = _searchMapProjection;
+        facts.DetailMapChildren = folder.Children;
+        facts.DetailMapFiles = folder.Files;
         facts.DetailTicks = ticks;
         facts.DetailCulture = culture;
         return facts.Detail;
+    }
+
+    private string MapCountsText(NestedFolder folder, int folders, int files)
+    {
+        var visibleFolders = folder.Children.Count(MapFolderVisible);
+        var visibleFiles = MapFiles(folder).Indices.Length;
+        var parts = new List<string>(2);
+        if (folders > 0) parts.Add($"{visibleFolders:N0} of {folders:N0} {(folders == 1 ? "folder" : "folders")}");
+        if (files > 0) parts.Add($"{visibleFiles:N0} of {files:N0} {(files == 1 ? "file" : "files")}");
+        return string.Join("  ·  ", parts);
     }
 
     /// <summary>"3 folders  ·  12 files", made once per pair of counts rather than once per title per frame.</summary>

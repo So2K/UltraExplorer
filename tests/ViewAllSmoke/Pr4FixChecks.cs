@@ -41,23 +41,40 @@ internal static partial class Program
             var lostPath = Path.Combine(root, "unreadable.json");
             await File.WriteAllBytesAsync(lostPath, bytes);
             var lost = new WorkspaceStore(lostPath);
+            var called = false;
             using (var held = new FileStream(lostPath, FileMode.Open, FileAccess.Read, FileShare.None))
             {
                 var loading = lost.LoadAsync();
                 var saving = Pr4WriteRefusedAsync(() => lost.SaveAsync(new WorkspaceState { SidebarWidth = 240 }));
                 Check("an exhausted locked-file read opens with no loaded workspace", await loading is null);
                 Check("a save already queued behind the failed read is refused", await saving);
+                Check("the actual update path refuses to merge defaults while the workspace remains unreadable",
+                    await Pr4WriteRefusedAsync(() => lost.UpdateAsync(_ => { called = true; return new WorkspaceState(); })) && !called);
             }
             Check("a direct save after the file becomes readable still protects the unread original",
                 await Pr4WriteRefusedAsync(() => lost.SaveAsync(new WorkspaceState()))
                 && (await File.ReadAllBytesAsync(lostPath)).AsSpan().SequenceEqual(bytes));
-            var called = false;
-            Check("the actual update path refuses to merge defaults over an unread workspace",
-                await Pr4WriteRefusedAsync(() => lost.UpdateAsync(_ => { called = true; return new WorkspaceState(); })) && !called);
+            WorkspaceState? recovered = null;
+            await lost.UpdateAsync(current => { recovered = current; return null; });
+            Check("an update retries the now-readable original before invoking its merge and can leave it unchanged",
+                recovered is { SidebarWidth: 327, Favorites.Count: 1, FolderSorts.Count: 1 }
+                && recovered.Favorites[0].Path == @"Q:\Keep" && recovered.FolderSorts[0].Sort == "Name-desc"
+                && (await File.ReadAllBytesAsync(lostPath)).AsSpan().SequenceEqual(bytes));
             Check("a successful explicit read recovers the original workspace", await lost.LoadAsync() is { SidebarWidth: 327, Favorites.Count: 1 });
-            await lost.UpdateAsync(current => { current!.SidebarWidth = 328; return current; });
+            await new WorkspaceStore(lostPath).UpdateAsync(current =>
+            {
+                current!.CanvasSort = "Name-asc";
+                current.Favorites.Add(new FavoriteState("Newer", @"Q:\Newer", "pin", "#58A6FF"));
+                return current;
+            });
+            recovered = null;
+            await lost.UpdateAsync(current => { recovered = current; current!.SidebarWidth = 328; return current; });
+            Check("the recovered store merges against another store's newer pins and sort instead of its earlier read",
+                recovered is { CanvasSort: "Name-asc", Favorites.Count: 2, FolderSorts.Count: 1 }
+                && recovered.Favorites[0].Path == @"Q:\Keep" && recovered.Favorites[1].Path == @"Q:\Newer"
+                && recovered.FolderSorts[0].Sort == "Name-desc");
             Check("saving resumes after a successful read and retains the pins and orders",
-                await lost.LoadAsync() is { SidebarWidth: 328, Favorites.Count: 1, FolderSorts.Count: 1 });
+                await lost.LoadAsync() is { SidebarWidth: 328, CanvasSort: "Name-asc", Favorites.Count: 2, FolderSorts.Count: 1 });
 
             var updatePath = Path.Combine(root, "update-only.json");
             await File.WriteAllBytesAsync(updatePath, bytes);
@@ -94,12 +111,16 @@ internal static partial class Program
             await File.WriteAllBytesAsync(corruptPath, corrupt);
             var damaged = new WorkspaceStore(corruptPath);
             using (var held = new FileStream(corruptPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
                 Check("malformed JSON still loads as none when its backup rename is blocked", await damaged.LoadAsync() is null);
+                called = false;
+                Check("failed quarantine also protects the production update path while the backup rename remains blocked",
+                    await Pr4WriteRefusedAsync(() => damaged.UpdateAsync(_ => { called = true; return new WorkspaceState(); })) && !called
+                    && (await File.ReadAllBytesAsync(corruptPath)).AsSpan().SequenceEqual(corrupt));
+            }
             Check("failed quarantine cannot permit a later direct save to destroy the damaged original",
                 await Pr4WriteRefusedAsync(() => damaged.SaveAsync(new WorkspaceState()))
                 && (await File.ReadAllBytesAsync(corruptPath)).AsSpan().SequenceEqual(corrupt));
-            Check("failed quarantine also protects the production update path",
-                await Pr4WriteRefusedAsync(() => damaged.UpdateAsync(_ => new WorkspaceState())));
             Check("a later read can quarantine the damaged file once its rename is allowed", await damaged.LoadAsync() is null && !File.Exists(corruptPath));
             var backups = Directory.GetFiles(root, "corrupt.json.corrupt-*");
             Check("the quarantined original is retained byte for byte", backups.Length == 1 && (await File.ReadAllBytesAsync(backups[0])).AsSpan().SequenceEqual(corrupt));
@@ -110,10 +131,17 @@ internal static partial class Program
             Directory.CreateDirectory(deniedPath);
             var denied = new WorkspaceStore(deniedPath);
             Check("an inaccessible file target is treated as unknown even when File.Exists says false", await denied.LoadAsync() is null);
+            called = false;
+            Check("the update path refuses its merge while the file target is still inaccessible",
+                await Pr4WriteRefusedAsync(() => denied.UpdateAsync(_ => { called = true; return new WorkspaceState(); })) && !called
+                && Directory.Exists(deniedPath));
             Directory.Delete(deniedPath);
             await File.WriteAllBytesAsync(deniedPath, bytes);
-            Check("an earlier access failure cannot overwrite a workspace that appeared afterward",
-                await Pr4WriteRefusedAsync(() => denied.UpdateAsync(_ => new WorkspaceState()))
+            recovered = null;
+            await denied.UpdateAsync(current => { recovered = current; return null; });
+            Check("an update after an access failure reads the workspace that appeared afterward without replacing it by defaults",
+                recovered is { SidebarWidth: 327, Favorites.Count: 1, FolderSorts.Count: 1 }
+                && recovered.Favorites[0].Path == @"Q:\Keep" && recovered.FolderSorts[0].Sort == "Name-desc"
                 && (await File.ReadAllBytesAsync(deniedPath)).AsSpan().SequenceEqual(bytes));
 
             var missingPath = Path.Combine(root, "new", "workspace.json");

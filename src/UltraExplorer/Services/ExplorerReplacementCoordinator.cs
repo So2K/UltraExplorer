@@ -74,6 +74,7 @@ internal sealed class ExplorerReplacementCoordinator : IDisposable
     private async Task TransferAsync(ShellFolderSnapshot snapshot)
     {
         var key = SourceKey(snapshot);
+        PruneExpiredRetries();
         if (!Enabled() || _actions.NativeSession?.Invoke(snapshot) == true || _retry.TryGetValue(key, out var retry)
             && retry.Generation == snapshot.Generation && Environment.TickCount64 < retry.Until)
         {
@@ -118,6 +119,8 @@ internal sealed class ExplorerReplacementCoordinator : IDisposable
             var invocation = selected.Count > 0
                 ? new FolderInvocation(FolderInvocationKind.Reveal, snapshot.FolderPath, selected, true, destination)
                 : new FolderInvocation(FolderInvocationKind.OpenFolder, snapshot.FolderPath, [], true, destination);
+            invocation = invocation with { Source = new(snapshot.RootHwnd.ToInt64(), snapshot.SourceProcessId,
+                snapshot.SourceProcessStartUtc.ToFileTimeUtc()) };
 
             opened = invocation;
             lock (_destinationGate) destinationState.Opened = invocation;
@@ -135,15 +138,10 @@ internal sealed class ExplorerReplacementCoordinator : IDisposable
                 handedOff = true;
                 lock (_destinationGate) destinationState.Opened = null;
                 DialogIntegrationStore.Log("An Explorer folder and its exact selection were opened through UltraExplorer.");
-                var closed = Stopwatch.StartNew();
-                while (SourceIdentityMatches(snapshot) && closed.ElapsedMilliseconds < 1000)
-                    await Task.Delay(20, deadline.Token);
-                if (!SourceIdentityMatches(snapshot))
-                {
-                    lock (_destinationGate)
-                        if (_destinations.TryGetValue(key, out var held) && ReferenceEquals(held, destinationState))
-                            _destinations.Remove(key);
-                }
+                // WM_CLOSE being queued is not window destruction. Keep the
+                // identity briefly for a final observer state, without making
+                // an accepted close depend on the preparation deadline.
+                _ = RetireAcceptedDestinationAsync(key, destinationState, epoch, snapshot);
             }
         }
         catch (Exception ex) when (Failure(ex)) { if (!_disposed) DialogIntegrationStore.Log("A folder window remains with Windows", ex); }
@@ -170,7 +168,34 @@ internal sealed class ExplorerReplacementCoordinator : IDisposable
             // newer state of the frame going to the same window keeps it.
             if (opened is not null && !handedOff && !retried)
                 _ = DiscardAfterGraceAsync(key, destinationState, epoch, opened);
+            else if (opened is null && !retried)
+            {
+                // A refusal before any destination was asked for owns no UI
+                // and needs no grace period. Do not retain every refused frame.
+                lock (_destinationGate)
+                    if (_destinations.TryGetValue(key, out var held) && ReferenceEquals(held, destinationState)
+                        && held.Epoch == epoch && held.Opened is null) _destinations.Remove(key);
+            }
         }
+    }
+
+    private void PruneExpiredRetries()
+    {
+        var now = Environment.TickCount64;
+        var retries = (ICollection<KeyValuePair<(nint Root, uint Process, DateTime Start), (long Generation, long Until)>>)_retry;
+        foreach (var pair in _retry)
+            if (pair.Value.Until <= now) retries.Remove(pair);
+    }
+
+    private async Task RetireAcceptedDestinationAsync((nint Root, uint Process, DateTime Start) key,
+        DestinationState state, long epoch, ShellFolderSnapshot snapshot)
+    {
+        var until = Environment.TickCount64 + 1000;
+        while (SourceIdentityMatches(snapshot) && Environment.TickCount64 < until)
+            await Task.Delay(20);
+        lock (_destinationGate)
+            if (_destinations.TryGetValue(key, out var current) && ReferenceEquals(current, state)
+                && state.Epoch == epoch && state.Opened is null) _destinations.Remove(key);
     }
 
     private void ScheduleKnownDestinationCleanup((nint Root, uint Process, DateTime Start) key)
@@ -189,7 +214,6 @@ internal sealed class ExplorerReplacementCoordinator : IDisposable
     private async Task DiscardAfterGraceAsync((nint Root, uint Process, DateTime Start) key,
         DestinationState state, long epoch, FolderInvocation opened)
     {
-        if (_actions.DiscardDestination is not { } discard) return;
         await Task.Delay(600);
         lock (_destinationGate)
         {
@@ -197,7 +221,7 @@ internal sealed class ExplorerReplacementCoordinator : IDisposable
                 || state.Epoch != epoch || state.Opened is null || _busy.ContainsKey(key.Root)) return;
             _destinations.Remove(key);
         }
-        await DiscardAsync(discard, opened);
+        if (_actions.DiscardDestination is { } discard) await DiscardAsync(discard, opened);
     }
 
     private static async Task DiscardAsync(Func<FolderInvocation, Task> discard, FolderInvocation opened)
