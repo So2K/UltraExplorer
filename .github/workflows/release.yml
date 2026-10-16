@@ -255,7 +255,7 @@ jobs:
           $env:TEMP = Join-Path $env:RUNNER_TEMP 'ue-reveal-t'
           $env:TMP = $env:TEMP
           New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
-          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only FolderInvocationChecks,FolderRouterChecks,FolderOpenPreferenceChecks,FolderLaunchContextChecks,FolderRouteCacheChecks,ExplorerTabChecks,ExternalRevealFocusChecks,ExternalRevealShellChecks
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only FolderInvocationChecks,FolderRouterChecks,FolderOpenPreferenceChecks,FolderLaunchContextChecks,FolderRouteCacheChecks,ExplorerTabChecks,WorkspaceRetryChecks,ExternalRevealFocusChecks,ExternalRevealShellChecks
           if ($LASTEXITCODE -ne 0) { throw "External reveal and folder context checks failed with exit code $LASTEXITCODE." }
 
       - name: Check search builder and spatial map filtering

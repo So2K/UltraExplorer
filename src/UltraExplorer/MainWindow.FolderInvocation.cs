@@ -227,7 +227,28 @@ public partial class MainWindow
                 if (Dispatcher.CheckAccess()) ReleaseLoadGate();
                 else if (!Dispatcher.HasShutdownStarted) Dispatcher.BeginInvoke(ReleaseLoadGate, DispatcherPriority.Send);
             });
-            if (!await FolderInvocationNavigation.ApplyAsync(_viewModel.Tree, invocation, Current)
+
+            // Resolve the current visual kind before publishing the logical
+            // selection. Turning archive browsing off refreshes lazily: a ZIP
+            // may still be a cached folder here. If selected before that read,
+            // a drawing frame can report its discarded folder object as gone
+            // and remove the still-existing physical file from the selection.
+            async Task<bool> PrepareVisualsAsync()
+            {
+                pane.Tree.ForceVisible(invocation.SelectedPaths);
+                var folders = invocation.SelectedPaths.Select(Path.GetDirectoryName)
+                    .OfType<string>().Append(invocation.FolderPath).Distinct(StringComparer.OrdinalIgnoreCase);
+                foreach (var path in folders)
+                {
+                    var folder = await pane.Tree.MaterializePathAsync(path);
+                    if (!Current() || folder is null || !string.Equals(folder.FullPath, path, StringComparison.OrdinalIgnoreCase)) return false;
+                    await pane.Tree.LoadAsync(folder);
+                    if (!Current()) return false;
+                    pane.Tree.EnsureLayout(folder);
+                }
+                return Current();
+            }
+            if (!await FolderInvocationNavigation.ApplyAsync(_viewModel.Tree, invocation, Current, PrepareVisualsAsync)
                 || !Current()) return false;
 
             pane.SyncSelection();
@@ -245,17 +266,6 @@ public partial class MainWindow
             {
                 pane.Canvas.ShownLayers |= CanvasLayer.Files;
                 pane.ScheduleBeacons();
-            }
-            pane.Tree.ForceVisible(invocation.SelectedPaths);
-            var folders = invocation.SelectedPaths.Select(Path.GetDirectoryName)
-                .OfType<string>().Append(invocation.FolderPath).Distinct(StringComparer.OrdinalIgnoreCase);
-            foreach (var path in folders)
-            {
-                var folder = await pane.Tree.MaterializePathAsync(path);
-                if (!Current() || folder is null || !string.Equals(folder.FullPath, path, StringComparison.OrdinalIgnoreCase)) return false;
-                await pane.Tree.LoadAsync(folder);
-                if (!Current()) return false;
-                pane.Tree.EnsureLayout(folder);
             }
             pane.SyncSelection();
             await Dispatcher.InvokeAsync(() => { if (Current()) pane.Canvas.UpdateLayout(); }, DispatcherPriority.ContextIdle);

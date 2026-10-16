@@ -6,7 +6,8 @@ namespace UltraExplorer.Services;
 /// <summary>The same filesystem navigation for startup and resident requests.</summary>
 internal static class FolderInvocationNavigation
 {
-    public static async Task<bool> ApplyAsync(ViewAllViewModel tree, FolderInvocation invocation, Func<bool>? allowed = null)
+    public static async Task<bool> ApplyAsync(ViewAllViewModel tree, FolderInvocation invocation, Func<bool>? allowed = null,
+        Func<Task<bool>>? prepareVisuals = null)
     {
         var ticket = tree.BeginNavigation();
         var holder = tree.SelectionHolder;
@@ -33,6 +34,11 @@ internal static class FolderInvocationNavigation
         var folder = await tree.RevealAsync(invocation.FolderPath, focus: false,
             select: false, ticket: ticket, exact: true);
         if (!folder.IsExact || folder.Superseded || !IsCurrent()) return false;
+        // A canvas may need to finish a pending archive-mode refresh before a
+        // physical file can be selected through its current visual. Retain the
+        // navigation ticket across that wait: a later address/Back request or
+        // a replacement selection holder must still supersede this request.
+        if (prepareVisuals is not null && (!await prepareVisuals() || !IsCurrent())) return false;
         if (invocation.Kind == FolderInvocationKind.OpenFolder)
         {
             tree.Selection.Apply(new SelectionEdit { Clear = true, Anchor = folder.Node!.FullPath,

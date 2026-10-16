@@ -1,6 +1,8 @@
 using System.Diagnostics;
+using System.Collections;
 using System.IO;
 using System.IO.Compression;
+using System.Reflection;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -173,6 +175,8 @@ internal static partial class Program
             await ExternalRevealLayerChecksAsync(main, shell, pane, reveal, selected);
             await ExternalRevealLatestChecksAsync(main, shell, selected, otherFile);
             await ExternalRevealArchiveChecksAsync(main, shell, pane, browsableZip);
+            await ExternalRevealArchiveOffReadChecksAsync(main, shell, pane, reveal, selected, neighbour);
+            await ExternalRevealArchiveOffReadChecksAsync(main, shell, pane, reveal, selected, neighbour, supersede: true);
 
             main.Width = 860;
             main.Height = 650;
@@ -300,6 +304,143 @@ internal static partial class Program
             ExternalRevealSave(pane.Canvas, "browsable-archive-reveal.png");
         }
         finally { shell.BrowseArchives = priorMode; pane.ApplyArchivePreference(); }
+    }
+
+    private static async Task ExternalRevealArchiveOffReadChecksAsync(MainWindow main, MainViewModel shell,
+        NestedPane pane, FolderInvocation reveal, string selected, string neighbour, bool supersede = false)
+    {
+        Section(supersede ? "external reveal: a newer user navigation wins during the frozen archive OFF read"
+            : "external reveal: an archive OFF refresh completes before its new physical selection is published");
+        var tree = pane.Tree;
+        var parentPath = Path.GetDirectoryName(selected)!;
+        var priorMode = shell.BrowseArchives;
+        shell.BrowseArchives = true;
+        pane.ApplyArchivePreference();
+        var parent = await tree.MaterializePathAsync(parentPath)
+            ?? throw new InvalidOperationException("The archive transition parent was not materialized.");
+        await tree.RefreshAsync(parent).WaitAsync(TimeSpan.FromSeconds(30));
+        Check("the transition starts with the target cached as an archive-folder visual",
+            tree.Find(selected) is { IsArchive: true });
+        shell.Tree.Selection.ReplaceSingle(neighbour, false, new FileInfo(neighbour).Length, SelectionSource.Command);
+        pane.SyncSelection();
+
+        // Only this fixture's tree is intercepted. Keep the real directory
+        // reader and freeze its first OFF read, so neither machine speed nor
+        // a delay decides whether an old archive object is still present.
+        var readerField = typeof(NestedTree).GetField("_reader", BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("The owned tree reader was not found.");
+        var reader = (Func<string, CancellationToken, NestedListing>)readerField.GetValue(tree)!;
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        var held = 0;
+        var publishedAgainstOldArchive = false;
+        var paintCount = 0;
+        var targetRemovedByPaint = false;
+        var selectVersionBeforePaint = -1L;
+        var selectVersionAfterPaint = -1L;
+        Task? refresh = null;
+        Task<bool>? pending = null;
+        void SelectionChanged(ItemSelection selection)
+        {
+            if (selection.Contains(selected) && tree.Find(selected) is { IsArchive: true })
+                publishedAgainstOldArchive = true;
+        }
+        void Loaded(NestedFolder loaded)
+        {
+            if (!ReferenceEquals(loaded, parent) || tree.ArchivesEnabled || tree.Find(selected) is not null) return;
+            var selectedBefore = shell.Tree.Selection.Contains(selected);
+            selectVersionBeforePaint = shell.Tree.Selection.Version;
+            // This is the same actual selection drawing that otherwise runs
+            // on a frame between the fresh listing and awaiting navigation.
+            pane.Canvas.RecordSelectionForTests();
+            selectVersionAfterPaint = shell.Tree.Selection.Version;
+            targetRemovedByPaint |= selectedBefore && !shell.Tree.Selection.Contains(selected);
+            paintCount++;
+        }
+        try
+        {
+            readerField.SetValue(tree, new Func<string, CancellationToken, NestedListing>((path, cancellation) =>
+            {
+                if (ViewAllPath.Equals(path, parentPath) && !tree.ArchivesEnabled
+                    && Interlocked.CompareExchange(ref held, 1, 0) == 0)
+                {
+                    entered.TrySetResult();
+                    release.Wait(cancellation);
+                }
+                return reader(path, cancellation);
+            }));
+            shell.Tree.Selection.Changed += SelectionChanged;
+            tree.FolderLoaded += Loaded;
+            shell.BrowseArchives = false;
+            pane.ApplyArchivePreference();
+            refresh = tree.RefreshAsync(parent);
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            pending = main.ApplyFolderInvocationAsync(reveal);
+            // The existing refresh owns one waiter. A second proves the new
+            // request reached its listing barrier; the old implementation
+            // instead publishes its selection before waiting for that read.
+            await ExternalRevealWaitAsync(() => publishedAgainstOldArchive || pending.IsCompleted
+                || ExternalRevealExplicitWaiters(tree, parent) >= 2, "the reveal reaches its frozen parent read");
+            Check("the pending reveal waits for current visual kinds before publishing a new selection",
+                !publishedAgainstOldArchive && !pending.IsCompleted
+                && !shell.Tree.Selection.Contains(selected) && ExternalRevealExplicitWaiters(tree, parent) >= 2);
+            string? userPath = null;
+            NestedCameraState? userCamera = null;
+            if (supersede)
+            {
+                var userFile = parent.AllFiles.First(file => !ArchiveFormats.IsBrowsable(file.Name)
+                    && !ViewAllPath.Equals(parent.PathOf(file), neighbour));
+                userPath = parent.PathOf(userFile);
+                shell.Tree.BeginNavigation();
+                shell.Tree.Selection.ReplaceSingle(userPath, false, userFile.Length, SelectionSource.Navigation);
+                pane.SyncSelection();
+                pane.Canvas.FlyTo(parent, 0.88, animated: false);
+                pane.Canvas.Pan(new Vector(23, -11));
+                userCamera = pane.Canvas.CaptureCamera();
+            }
+            release.Set();
+            await refresh.WaitAsync(TimeSpan.FromSeconds(30));
+            var applied = await pending.WaitAsync(TimeSpan.FromSeconds(45));
+            Check("a real selection paint during archive demotion cannot remove the pending physical file",
+                paintCount > 0 && !targetRemovedByPaint && selectVersionBeforePaint == selectVersionAfterPaint);
+            await ExternalRevealSettleAsync(pane.Canvas);
+            if (supersede)
+            {
+                Check("a later user navigation during the parent read cancels the older reveal",
+                    !applied && userPath is not null && ExternalRevealExactSelection(main, [userPath]));
+                Check("the superseded reveal cannot replace the user's newer camera",
+                    userCamera is not null && pane.Canvas.CaptureCamera() == userCamera);
+            }
+            else
+            {
+                Check("the archive OFF reveal finishes with its exact physical file selected in both models",
+                    applied && ExternalRevealExactSelection(main, [selected])
+                    && shell.Tree.Selection.TryGetItem(selected, out var item) && !item.IsDirectory
+                    && tree.Find(selected) is null && tree.FindFileIndex(parent, Path.GetFileName(selected)) >= 0);
+                ExternalRevealCheckGeometry(pane, selected, "archive OFF with an in-flight refresh");
+            }
+        }
+        finally
+        {
+            release.Set();
+            readerField.SetValue(tree, reader);
+            shell.Tree.Selection.Changed -= SelectionChanged;
+            tree.FolderLoaded -= Loaded;
+            if (refresh is not null) await refresh.WaitAsync(TimeSpan.FromSeconds(30));
+            if (pending is not null) await pending.WaitAsync(TimeSpan.FromSeconds(45));
+            shell.BrowseArchives = priorMode;
+            pane.ApplyArchivePreference();
+        }
+    }
+
+    private static int ExternalRevealExplicitWaiters(NestedTree tree, NestedFolder parent)
+    {
+        var requests = (IDictionary?)typeof(NestedTree).GetField("_explicit", BindingFlags.Instance | BindingFlags.NonPublic)?.GetValue(tree)
+            ?? throw new InvalidOperationException("The owned tree's explicit read requests were not found.");
+        if (requests[parent] is not { } request) return 0;
+        var waiters = (ICollection?)request.GetType().GetProperty("Waiters", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(request)
+            ?? throw new InvalidOperationException("The owned read's waiters were not found.");
+        return waiters.Count;
     }
 
     private static async Task ExternalRevealWaitAsync(Func<bool> condition, string description)
