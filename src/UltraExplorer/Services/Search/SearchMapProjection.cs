@@ -16,17 +16,28 @@ internal sealed class SearchMapProjection
     private readonly SearchQuery _query;
 
     private SearchMapProjection(SearchQuery query, Dictionary<string, HashSet<string>> files,
-        HashSet<string> folders, HashSet<string> directFolders, string[] unknownBranches, bool isComplete)
+        HashSet<string> folders, HashSet<string> directFolders, string[] unknownBranches, bool isComplete,
+        CancellationToken cancellationToken)
     {
         _query = query;
         _files = files.ToFrozenDictionary(pair => pair.Key,
-            pair => pair.Value.ToFrozenSet(StringComparer.Ordinal), StringComparer.OrdinalIgnoreCase);
+            pair =>
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                return pair.Value.ToFrozenSet(StringComparer.Ordinal);
+            }, StringComparer.OrdinalIgnoreCase);
+        cancellationToken.ThrowIfCancellationRequested();
         _folders = folders.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
         _directFolders = directFolders.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
         _unknownBranches = unknownBranches;
         var unknownAncestors = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var branch in unknownBranches) AddAncestors(branch, unknownAncestors);
+        foreach (var branch in unknownBranches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            AddAncestors(branch, unknownAncestors);
+        }
         _unknownAncestors = unknownAncestors.ToFrozenSet(StringComparer.OrdinalIgnoreCase);
+        cancellationToken.ThrowIfCancellationRequested();
         FileCount = files.Values.Sum(names => (long)names.Count);
         FolderCount = directFolders.Count;
         IsComplete = isComplete && unknownBranches.Length == 0;
@@ -42,29 +53,68 @@ internal sealed class SearchMapProjection
         IEnumerable<string>? matchingFolders = null, IEnumerable<string>? unknownBranches = null, bool isComplete = true)
     {
         var parsed = SearchQuery.Parse(query);
-        var files = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
-        var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var direct = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new Accumulator(parsed);
         foreach (var path in matchingFiles)
+            result.AddFile(Path.GetDirectoryName(path) ?? string.Empty, Path.GetFileName(path));
+        if (!parsed.MapFilesOnly)
+            foreach (var path in matchingFolders ?? []) result.AddFolder(path);
+        foreach (var path in unknownBranches ?? []) result.AddUnknown(path);
+        return result.Build(isComplete);
+    }
+
+    /// <summary>Consumes each page directly, without retaining another full-path result list.</summary>
+    internal sealed class Accumulator(SearchQuery query, CancellationToken cancellationToken = default)
+    {
+        private readonly Dictionary<string, HashSet<string>> _files = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _folders = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _direct = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _unknown = new(StringComparer.OrdinalIgnoreCase);
+        private bool _built;
+
+        internal void AddFile(string parent, string name)
         {
-            var parent = Path.GetDirectoryName(path);
-            var name = Path.GetFileName(path);
-            if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(name)) continue;
+            CheckWritable();
+            if (string.IsNullOrEmpty(parent) || string.IsNullOrEmpty(name)) return;
             parent = Normalize(parent);
-            if (!files.TryGetValue(parent, out var names)) files.Add(parent, names = new(StringComparer.Ordinal));
-            if (names.Add(name)) AddAncestors(parent, folders);
+            if (!_files.TryGetValue(parent, out var names)) _files.Add(parent, names = new(StringComparer.Ordinal));
+            if (names.Add(name)) AddAncestors(parent, _folders);
         }
-        if (!parsed.MapFilesOnly && matchingFolders is not null)
+
+        internal void AddFolder(string path)
         {
-            foreach (var path in matchingFolders)
-            {
-                var normalized = Normalize(path);
-                if (normalized.Length > 0 && direct.Add(normalized)) AddAncestors(normalized, folders);
-            }
+            CheckWritable();
+            if (query.MapFilesOnly) return;
+            var normalized = Normalize(path);
+            if (normalized.Length > 0 && _direct.Add(normalized)) AddAncestors(normalized, _folders);
         }
-        var unknown = (unknownBranches ?? []).Select(Normalize).Where(path => path.Length > 0)
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        return new(parsed, files, folders, direct, unknown, isComplete);
+
+        internal void AddUnknown(string path)
+        {
+            CheckWritable();
+            var normalized = Normalize(path);
+            if (normalized.Length > 0) _unknown.Add(normalized);
+        }
+
+        internal SearchMapProjection Build(bool isComplete = true)
+        {
+            CheckWritable();
+            var result = new SearchMapProjection(query, _files, _folders, _direct, _unknown.ToArray(), isComplete, cancellationToken);
+            _built = true;
+            // Frozen sets own their membership arrays. Release the mutable
+            // tables even when the completed async builder remains reachable.
+            _files.Clear();
+            _folders.Clear();
+            _direct.Clear();
+            _unknown.Clear();
+            cancellationToken.ThrowIfCancellationRequested();
+            return result;
+        }
+
+        private void CheckWritable()
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_built) throw new InvalidOperationException("The map projection has already been completed.");
+        }
     }
 
     public bool ContainsFolder(string path)

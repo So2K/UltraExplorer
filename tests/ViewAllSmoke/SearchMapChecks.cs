@@ -39,6 +39,7 @@ internal static partial class Program
         RunOnSta("search map: retained query context", SearchMapViewModelChecksAsync);
         RunOnSta("search map: paged Everything protocol", SearchMapPagingChecksAsync);
         RunOnSta("search map: complete and incomplete indexed sets", SearchMapIndexedChecksAsync);
+        RunOnSta("search map: streamed membership and exact record identity", SearchMapStreamingChecksAsync);
         RunOnSta("search map: positions and gestures", SearchMapCanvasChecksAsync);
         RunOnSta("search map: uncapped scoped fallback", SearchMapFallbackChecksAsync);
         RunOnSta("search map: actual retained window lifecycle", SearchMapWindowChecksAsync);
@@ -340,6 +341,162 @@ internal static partial class Program
             && bounded.IsComplete);
     }
 
+    private static async Task SearchMapStreamingChecksAsync()
+    {
+        Section("search map: streamed pages preserve exact record identity and immutable membership");
+        const string firstRoot = @"Q:\scope";
+        const string secondRoot = @"R:\scope";
+        var first = Enumerable.Range(0, 9003).Select(index => new EverythingItem($"image-{index:D5}.png",
+            firstRoot + @"\deep", false, index, null, string.Empty)).Concat(new[]
+        {
+            new EverythingItem("Case.PNG", firstRoot + @"\case", false, 0, null, ""),
+            new EverythingItem("Case.PNG", @"q:\SCOPE\CASE", false, 0, null, ""),
+            new EverythingItem("case.PNG", firstRoot + @"\case", false, 0, null, ""),
+            new EverythingItem("both", firstRoot, false, 0, null, ""),
+            new EverythingItem("both", firstRoot, true, 0, null, ""),
+            new EverythingItem("literal. ", firstRoot, false, 0, null, ""),
+            new EverythingItem("", firstRoot, true, 0, null, ""),
+            new EverythingItem("outside.png", @"Q:\scope2", false, 0, null, ""),
+            new EverythingItem("bare", "", false, 0, null, ""),
+            new EverythingItem("bare", @"\", false, 0, null, ""),
+            new EverythingItem("", @"Q:\", true, 0, null, ""),
+            new EverythingItem("", @"\\server\share\", true, 0, null, "")
+        }).ToArray();
+        EverythingItem[] second =
+        [
+            new("other.bin", secondRoot, false, 0, null, ""),
+            new("other-folder", secondRoot, true, 0, null, "")
+        ];
+        var fallbacks = 0;
+        var calls = new List<(string Query, uint Offset)>();
+        var builder = new SearchMapProjectionBuilder(indexReady: () => true,
+            queryPage: (query, maximum, offset, _, _) =>
+            {
+                calls.Add((query, offset));
+                var items = query.Contains(secondRoot, StringComparison.Ordinal) ? second : first;
+                return Task.FromResult<EverythingPage?>(new EverythingPage(items.Length,
+                    items.Skip(checked((int)offset)).Take(maximum).ToArray()) { Offset = offset });
+            }, scan: (_, _, _) =>
+            {
+                fallbacks++;
+                return Task.FromResult(new SearchMapScanResult([firstRoot + @"\wrong-fallback.png"], [], []));
+            });
+        var answer = await builder.RunAsync("*", [firstRoot, secondRoot], CancellationToken.None);
+        Check("streaming retains every page across two roots without using the result-panel caps",
+            answer is { IsComplete: true, Source: SearchSource.Everything, Projection.FileCount: 9008 }
+            && answer.Projection.ContainsFile(firstRoot + @"\deep", "image-09002.png")
+            && answer.Projection.ContainsFile(secondRoot, "other.bin") && calls.Count == 4 && fallbacks == 0);
+        Check("parent-case twins remain valid records while final parent lookup is case-insensitive and names stay ordinal",
+            answer.Projection is { } names && names.ContainsFile(@"q:\scope\CASE", "Case.PNG")
+            && names.ContainsFile(firstRoot + @"\case", "case.PNG") && !names.ContainsFile(firstRoot + @"\case", "CASE.PNG"));
+        Check("same-path kind twins and literal file names keep their distinct map roles",
+            answer.Projection is { } kinds && kinds.ContainsFile(firstRoot, "both") && kinds.IsFolderMatch(firstRoot + @"\both")
+            && kinds.ContainsFile(firstRoot, "literal. ") && !kinds.ContainsFile(firstRoot, "literal")
+            && kinds.IsFolderMatch(firstRoot) && !kinds.ContainsFolder(@"Q:\scope2"));
+        Check("bare, root-relative, drive and share records are validated without inventing out-of-scope matches",
+            answer.IsComplete && fallbacks == 0 && answer.Projection is { } scoped
+            && !scoped.ContainsFolder(@"\\server\share") && !scoped.ContainsFile(@"Q:\scope2", "outside.png"));
+
+        foreach (var problem in new[] { "in scope", "outside scope", "ignored folder", "drive root", "share root" })
+        {
+            var repeated = problem switch
+            {
+                "outside scope" => new EverythingItem("first.png", @"Q:\scope2", false, 0, null, ""),
+                "ignored folder" => new EverythingItem("folder.png", firstRoot, true, 0, null, ""),
+                "drive root" => new EverythingItem("", @"Q:\", true, 0, null, ""),
+                "share root" => new EverythingItem("", @"\\server\share\", true, 0, null, ""),
+                _ => new EverythingItem("first.png", firstRoot, false, 0, null, "")
+            };
+            var duplicate = problem == "share root" ? repeated with { Directory = @"\\?\UNC\server\share\" } : repeated;
+            var recovered = 0;
+            var unstable = new SearchMapProjectionBuilder(indexReady: () => true,
+                queryPage: (_, maximum, offset, _, _) =>
+                {
+                    var items = offset == 0
+                        ? new[] { repeated }.Concat(Enumerable.Range(0, maximum - 1).Select(index => new EverythingItem(
+                            $"filler-{index:D5}.png", firstRoot, false, 0, null, ""))).ToArray()
+                        : new[] { duplicate };
+                    return Task.FromResult<EverythingPage?>(new EverythingPage(SearchMapProjectionBuilder.PageSize + 1, items) { Offset = offset });
+                }, scan: (_, _, _) =>
+                {
+                    recovered++;
+                    return Task.FromResult(new SearchMapScanResult([firstRoot + @"\verified.png"], [], [firstRoot + @"\unknown"]));
+                });
+            var result = await unstable.RunAsync("*.png", [firstRoot], CancellationToken.None);
+            Check($"exact cross-page duplicates cannot hide a missing record even when ignored by projection ({problem})",
+                recovered == 1 && result.Source == SearchSource.Walk && !result.IsComplete
+                && result.Projection is { FileCount: 1 } mask && mask.ContainsFile(firstRoot, "verified.png")
+                && mask.ContainsFolder(firstRoot + @"\unknown\deeper") && mask.ContainsFile(firstRoot + @"\unknown", "pending.png")
+                && !mask.ContainsFile(firstRoot + @"\unknown", "pending.txt"));
+        }
+
+        var promotionFallbacks = 0;
+        async Task<SearchMapProjectionResult> PromotedRecords(EverythingItem[] items)
+        {
+            var promoted = new SearchMapProjectionBuilder(indexReady: () => true,
+                queryPage: (_, maximum, offset, _, _) => Task.FromResult<EverythingPage?>(new EverythingPage(items.Length,
+                    items.Skip(checked((int)offset)).Take(maximum).ToArray()) { Offset = offset }),
+                scan: (_, _, _) =>
+                {
+                    promotionFallbacks++;
+                    return Task.FromResult(new SearchMapScanResult([firstRoot + @"\verified-promotion.png"], [], []));
+                });
+            return await promoted.RunAsync("*", [firstRoot], CancellationToken.None);
+        }
+        var firstRecord = new EverythingItem("first.png", firstRoot, false, 0, null, "");
+        var duplicateAfterPromotion = await PromotedRecords(
+        [
+            firstRecord,
+            new("second.png", firstRoot, false, 0, null, ""),
+            firstRecord
+        ]);
+        Check("a duplicate of the first record remains detectable after its directory ledger is promoted",
+            promotionFallbacks == 1 && duplicateAfterPromotion.Source == SearchSource.Walk
+            && duplicateAfterPromotion.Projection is { FileCount: 1 } verified
+            && verified.ContainsFile(firstRoot, "verified-promotion.png"));
+        var kindPromotion = await PromotedRecords(
+        [
+            new("both", firstRoot, false, 0, null, ""),
+            new("both", firstRoot, true, 0, null, ""),
+            new("", @"Q:\", false, 0, null, ""),
+            new("", @"Q:\", true, 0, null, "")
+        ]);
+        Check("same-name kind twins promote independently, including an empty drive-root leaf",
+            promotionFallbacks == 1 && kindPromotion.Source == SearchSource.Everything && kindPromotion.IsComplete
+            && kindPromotion.Projection is { FileCount: 1 } kindsAfterPromotion
+            && kindsAfterPromotion.ContainsFile(firstRoot, "both") && kindsAfterPromotion.IsFolderMatch(firstRoot + @"\both"));
+
+        using var canceled = new CancellationTokenSource();
+        var canceledBuilder = new SearchMapProjectionBuilder(indexReady: () => true,
+            queryPage: (_, maximum, offset, _, _) =>
+            {
+                if (offset > 0) canceled.Cancel();
+                return Task.FromResult<EverythingPage?>(new EverythingPage(9003,
+                    first.Skip(checked((int)offset)).Take(maximum).ToArray()) { Offset = offset });
+            }, scan: (_, _, _) => throw new InvalidOperationException("Cancellation must not start a fallback."));
+        var stopped = false;
+        try { _ = await canceledBuilder.RunAsync("*.png", [firstRoot], canceled.Token); }
+        catch (OperationCanceledException) { stopped = true; }
+        Check("canceling after a full streamed page never publishes its partial projection or starts a fallback", stopped);
+
+        var accumulator = new SearchMapProjection.Accumulator(SearchQuery.Parse("*.png"));
+        accumulator.AddFile(firstRoot, "frozen.png");
+        var frozen = accumulator.Build();
+        var consumed = false;
+        try { accumulator.AddFile(firstRoot, "late.png"); }
+        catch (InvalidOperationException) { consumed = true; }
+        Check("completed membership owns its immutable data after the temporary accumulator is consumed",
+            consumed && frozen.FileCount == 1 && frozen.ContainsFile(firstRoot, "frozen.png") && !frozen.ContainsFile(firstRoot, "late.png"));
+        using var freezeCancellation = new CancellationTokenSource();
+        var abandoned = new SearchMapProjection.Accumulator(SearchQuery.Parse("*.png"), freezeCancellation.Token);
+        abandoned.AddFile(firstRoot, "never-published.png");
+        freezeCancellation.Cancel();
+        stopped = false;
+        try { _ = abandoned.Build(); }
+        catch (OperationCanceledException) { stopped = true; }
+        Check("an accumulator canceled after collecting matches cannot publish an immutable result", stopped);
+    }
+
     private static void SearchMapProjectionChecks()
     {
         Section("search map: matches retain their ancestor chain without retaining neighboring branches");
@@ -609,8 +766,9 @@ internal static partial class Program
             requests.Add((offset, maximum, sort, flags, text));
             var count = offset >= 12 ? 0 : (int)Math.Min(maximum, 12 - offset);
             var items = Enumerable.Range((int)offset, count)
-                .Select(index => (0u, $"picture-{index:D2}.png", @"Q:\photos", (long)index, 0L, string.Empty)).ToArray();
-            var answer = BuildList2(12, EverythingClient.Requested, items);
+                .Select(index => (0u, $"picture-{index:D2}.png", @"Q:\photos", (long)index,
+                    new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc).ToFileTimeUtc(), $"*picture*-{index:D2}.png")).ToArray();
+            var answer = BuildList2(12, flags, items);
             BinaryPrimitives.WriteUInt32LittleEndian(answer.AsSpan(8), offset);
             Dispatcher.CurrentDispatcher.BeginInvoke(DispatcherPriority.Normal,
                 new Action(() => SearchMapSendReply(replyWindow, window, replyId, answer)));
@@ -638,9 +796,24 @@ internal static partial class Program
                 && requests.Select(request => request.Offset).SequenceEqual(new uint[] { 0, 5, 10 })
                 && requests.All(request => request.Maximum == 5 && request.Sort == EverythingClient.SortNameAscending
                     && request.Flags == EverythingClient.Requested && request.Text == "*.png"));
+            var mapPage = await EverythingClient.Shared.QueryMapPageAsync("*.png", 2, 0, CancellationToken.None);
+            Check("map queries request only name and path on the actual IPC wire and decode without row metadata",
+                requests[^1].Flags == (EverythingClient.RequestName | EverythingClient.RequestPath)
+                && mapPage is { IsComplete: true, Items.Count: 2 }
+                && mapPage.Items[0] is { Name: "picture-00.png", Directory: @"Q:\photos", Size: -1, Modified: null, Highlighted.Length: 0 });
+            var mapped = await new SearchMapProjectionBuilder().RunAsync("*.png", [@"Q:\photos"], CancellationToken.None);
+            Check("the production map builder uses minimal columns while retaining every indexed member",
+                mapped is { IsComplete: true, Projection.FileCount: 12 }
+                && mapped.Projection.ContainsFile(@"Q:\photos", "picture-11.png")
+                && requests[^1].Flags == EverythingClient.MapRequested && requests[^1].Offset == 0
+                && requests[^1].Maximum == SearchMapProjectionBuilder.PageSize);
             var old = await EverythingClient.Shared.QueryAsync("*.png", 2, CancellationToken.None, EverythingClient.SortNewestFirst);
             Check("ordinary result-panel queries retain offset zero and their selected sort", old?.Items.Count == 2
                 && requests[^1].Offset == 0 && requests[^1].Maximum == 2 && requests[^1].Sort == EverythingClient.SortNewestFirst);
+            Check("ordinary result-panel replies keep size, modified date and highlighted names after a map request",
+                requests[^1].Flags == EverythingClient.Requested && old is { IsComplete: true, Items.Count: 2 }
+                && old.Items[1].Size == 1 && old.Items[1].Modified?.ToUniversalTime() == new DateTime(2026, 10, 1, 12, 0, 0, DateTimeKind.Utc)
+                && old.Items[1].Highlighted == "*picture*-01.png");
 
             using var canceled = new CancellationTokenSource();
             canceled.Cancel();

@@ -2288,6 +2288,14 @@ public sealed partial class NestedCanvas
             _drawn.Clear();
         }
 
+        public void ReleaseRecords()
+        {
+            Hide();
+            _calls.Clear();
+            _runFolder = null;
+            _dc = null;
+        }
+
         public override LabelText Text(string text, double size, Color ink, double maxWidth, LabelFace face, bool scaled)
         {
             var laidOut = canvas.Text(text, size, BrushOf(ink), maxWidth, bold: face == LabelFace.SemiBold, icon: face == LabelFace.Icons, scaled);

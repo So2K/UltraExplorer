@@ -179,11 +179,11 @@ internal static partial class Program
                 bytes.AddRange(Encoding.Unicode.GetBytes(text + "\0"));
             }
 
-            Text(item.Name);
-            Text(item.Path);
-            bytes.AddRange(BitConverter.GetBytes(item.Size));
-            bytes.AddRange(BitConverter.GetBytes(item.Modified));
-            Text(item.Highlighted);
+            if ((flags & EverythingClient.RequestName) != 0) Text(item.Name);
+            if ((flags & EverythingClient.RequestPath) != 0) Text(item.Path);
+            if ((flags & EverythingClient.RequestSize) != 0) bytes.AddRange(BitConverter.GetBytes(item.Size));
+            if ((flags & EverythingClient.RequestDateModified) != 0) bytes.AddRange(BitConverter.GetBytes(item.Modified));
+            if ((flags & EverythingClient.RequestHighlightedName) != 0) Text(item.Highlighted);
             data.Add([.. bytes]);
         }
 
