@@ -39,6 +39,7 @@ public sealed partial class NestedCanvas
         get => _iconArrivals;
         set
         {
+            if (_disposed && value is not null) return;
             if (ReferenceEquals(value, _iconArrivals))
             {
                 return;

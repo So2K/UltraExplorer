@@ -126,6 +126,7 @@ internal static partial class Program
         await Group(GpuIconAtlasChecks);
         await Group(GpuTextChecks);
         await Group(GlyphDisposalChecks);
+        await Group(CanvasResourceLifetimeChecks);
         await Group(GpuRectChecks);
         await Group(GpuLabelChecks);
         await Group(FrameWorkChecks);

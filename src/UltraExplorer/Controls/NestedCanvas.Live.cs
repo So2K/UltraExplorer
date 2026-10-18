@@ -50,6 +50,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     internal void AttachChanges(ChangeHub? hub, IChangeSink? sink)
     {
+        if (_disposed && hub is not null) return;
         if (_changes is { } previous)
         {
             StopDriving(previous.Driver);

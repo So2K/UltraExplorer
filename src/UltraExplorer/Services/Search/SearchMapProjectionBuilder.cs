@@ -1,4 +1,5 @@
 using System.IO.Enumeration;
+using System.Runtime.InteropServices;
 using System.Security;
 
 namespace UltraExplorer.Services.Search;
@@ -47,7 +48,7 @@ internal sealed class SearchMapProjectionBuilder
         Func<bool>? indexReady = null,
         Func<SearchQuery, IReadOnlyList<string>, CancellationToken, Task<SearchMapScanResult>>? scan = null)
     {
-        _queryPage = queryPage ?? EverythingClient.Shared.QueryPageAsync;
+        _queryPage = queryPage ?? EverythingClient.Shared.QueryMapPageAsync;
         _indexReady = indexReady ?? (() => EverythingClient.IsDatabaseLoaded);
         _scan = scan ?? ScanAsync;
     }
@@ -75,9 +76,8 @@ internal sealed class SearchMapProjectionBuilder
             ct.ThrowIfCancellationRequested();
             if (indexed is not null)
             {
-                var projection = Project(query, roots, indexed, ct);
-                return new(projection, projection.IsComplete, false, SearchSource.Everything,
-                    $"{MatchStatus(projection)} · Everything index · Only indexed locations are covered.");
+                return new(indexed, indexed.IsComplete, false, SearchSource.Everything,
+                    $"{MatchStatus(indexed)} · Everything index · Only indexed locations are covered.");
             }
             indexFailed = !preferWalk;
         }
@@ -100,29 +100,43 @@ internal sealed class SearchMapProjectionBuilder
         ct.ThrowIfCancellationRequested();
         // Scope is checked again for injected scanners and index replies, so a
         // query containing OR can never admit another drive into this map.
-        var files = result.MatchingFiles.Where(path =>
+        var projection = new SearchMapProjection.Accumulator(query, ct);
+        foreach (var path in result.MatchingFiles)
         {
             ct.ThrowIfCancellationRequested();
-            return roots.Any(root => IsInside(path, root));
-        });
-        List<string> folders = query.MapFilesOnly ? []
-            : result.MatchingFolders.Where(path => roots.Any(root => IsInside(path, root))).ToList();
+            if (roots.Any(root => IsInside(path, root)))
+                projection.AddFile(Path.GetDirectoryName(path) ?? string.Empty, Path.GetFileName(path));
+        }
+        if (!query.MapFilesOnly)
+            foreach (var path in result.MatchingFolders)
+            {
+                ct.ThrowIfCancellationRequested();
+                if (roots.Any(root => IsInside(path, root))) projection.AddFolder(path);
+            }
+        AddScopeFolders(projection, query, roots, ct);
+        foreach (var path in result.UnknownBranches)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (roots.Any(root => IsInside(path, root))) projection.AddUnknown(path);
+        }
+        return projection.Build();
+    }
+
+    private static void AddScopeFolders(SearchMapProjection.Accumulator projection, SearchQuery query, string[] roots, CancellationToken ct)
+    {
         if (!query.MapFilesOnly && query.SupportsLocalMatching)
         {
             // An empty scope folder is a real matching directory too. Neither
             // a scoped index query nor enumerating its children includes it.
             foreach (var root in roots)
             {
+                ct.ThrowIfCancellationRequested();
                 var named = root.TrimEnd('\\');
                 var name = Path.GetFileName(named);
                 if (name.Length == 0) name = named;
-                if (query.Matches(name, Path.GetDirectoryName(named) ?? string.Empty, isFolder: true)) folders.Add(root);
+                if (query.Matches(name, Path.GetDirectoryName(named) ?? string.Empty, isFolder: true)) projection.AddFolder(root);
             }
         }
-        var unknown = result.UnknownBranches.Where(path => roots.Any(root => IsInside(path, root))).ToArray();
-        var projection = SearchMapProjection.Create(query.Text, files, folders, unknown, isComplete: unknown.Length == 0);
-        ct.ThrowIfCancellationRequested();
-        return projection;
     }
 
     private static string MatchStatus(SearchMapProjection projection) => projection.FolderCount > 0
@@ -149,10 +163,9 @@ internal sealed class SearchMapProjectionBuilder
         }
     }
 
-    private async Task<SearchMapScanResult?> ReadIndexAsync(SearchQuery query, string[] roots, CancellationToken ct)
+    private async Task<SearchMapProjection?> ReadIndexAsync(SearchQuery query, string[] roots, CancellationToken ct)
     {
-        var files = new HashSet<string>(StringComparer.Ordinal);
-        var folders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var projection = new SearchMapProjection.Accumulator(query, ct);
         try
         {
             foreach (var root in roots)
@@ -161,7 +174,13 @@ internal sealed class SearchMapProjectionBuilder
                 var search = query.Under(root);
                 uint offset = 0;
                 long? total = null;
-                var records = new HashSet<(string Path, bool IsFolder)>();
+                // Ordinal parent IDs plus ordinal leaf names preserve the
+                // former full-path duplicate proof without retaining every
+                // concatenated path. Keep it separate from the projection's
+                // case-insensitive parent grouping. The separator bit also
+                // distinguishes a root-relative record from a bare name.
+                var directories = new Dictionary<(string Parent, bool HasSeparator), int>();
+                var records = new HashSet<(int Directory, string Name, bool IsFolder)>();
                 while (true)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -179,15 +198,27 @@ internal sealed class SearchMapProjectionBuilder
                     {
                         ct.ThrowIfCancellationRequested();
                         var path = LogicalPath(SearchHit.Join(item.Directory, item.Name));
+                        var parent = Path.GetDirectoryName(path) ?? string.Empty;
+                        var separator = path.LastIndexOf('\\');
+                        var exactParent = path.AsSpan(0, Math.Max(0, separator));
+                        var recordParent = exactParent.SequenceEqual(parent) ? parent : exactParent.ToString();
+                        var directoryKey = (recordParent, separator >= 0);
+                        var directoryId = GetDirectoryId(directories, directoryKey);
+                        var exactName = path.AsSpan(separator + 1);
+                        var recordName = exactName.SequenceEqual(item.Name) ? item.Name : exactName.ToString();
                         // A duplicate across pages can hide a missing result
                         // even if an index change kept the total unchanged.
-                        if (!records.Add((path, item.IsFolder))) return null;
+                        if (!records.Add((directoryId, recordName, item.IsFolder))) return null;
                         if (!IsInside(path, root)) continue;
                         if (item.IsFolder)
                         {
-                            if (!query.MapFilesOnly) folders.Add(path);
+                            projection.AddFolder(path);
                         }
-                        else files.Add(path);
+                        else
+                        {
+                            var name = Path.GetFileName(path.AsSpan());
+                            projection.AddFile(parent, name.SequenceEqual(recordName) ? recordName : name.ToString());
+                        }
                     }
                     var next = (long)offset + page.Items.Count;
                     if (next == total.Value) break;
@@ -201,7 +232,20 @@ internal sealed class SearchMapProjectionBuilder
         {
             return null;
         }
-        return new(files.ToArray(), folders.ToArray(), []);
+        AddScopeFolders(projection, query, roots, ct);
+        return projection.Build();
+    }
+
+    private static int GetDirectoryId(Dictionary<(string Parent, bool HasSeparator), int> directories,
+        (string Parent, bool HasSeparator) directory)
+    {
+        // Obtain or insert with one lookup. This local dictionary only grows,
+        // so its new entry's ID is Count - 1. Existence is explicit: zero is a
+        // valid ID. Copy it before returning; no dictionary reference crosses
+        // an await or survives another mutation/resize.
+        ref var id = ref CollectionsMarshal.GetValueRefOrAddDefault(directories, directory, out var exists);
+        if (!exists) id = directories.Count - 1;
+        return id;
     }
 
     private static async Task<SearchMapScanResult> ScanAsync(SearchQuery query, IReadOnlyList<string> roots, CancellationToken ct)

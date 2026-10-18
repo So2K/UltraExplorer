@@ -447,6 +447,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
         get => _tree;
         set
         {
+            if (_disposed && value is not null) return;
             if (ReferenceEquals(_tree, value))
             {
                 return;

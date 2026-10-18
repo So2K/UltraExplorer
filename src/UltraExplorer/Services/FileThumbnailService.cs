@@ -168,7 +168,8 @@ internal sealed class FileThumbnailService : IDisposable
                 Work work;
                 lock (_gate)
                 {
-                    while (!_disposed && _queue.Count == 0) Monitor.Wait(_gate);
+                    while (!_disposed && _queue.Count == 0)
+                        Monitor.Wait(_gate, IdleCacheWaitMilliseconds());
                     if (_disposed) return;
                     work = _queue.Last!.Value;
                     _queue.RemoveLast();
@@ -272,6 +273,37 @@ internal sealed class FileThumbnailService : IDisposable
         _cache.Remove(entry.Value.Path);
         _cacheBytes -= entry.Value.Bytes;
         _lru.Remove(entry);
+    }
+
+    /// <summary>
+    /// An existing idle worker releases expired pixels without a new timer or
+    /// lifetime callback. LRU order is not expiry order: a warm hit moves an
+    /// entry without extending its original content-validity deadline.
+    /// Called only under the gate; it never reads files or touches the UI.
+    /// </summary>
+    private int IdleCacheWaitMilliseconds()
+    {
+        if (_cache.Count == 0) return Timeout.Infinite;
+        var now = _options.TickCount();
+        var nextExpiry = long.MaxValue;
+        for (var node = _lru.First; node is not null;)
+        {
+            var next = node.Next;
+            if (node.Value.Expires <= now) RemoveCache(node);
+            else nextExpiry = Math.Min(nextExpiry, node.Value.Expires);
+            node = next;
+        }
+        return _cache.Count == 0 ? Timeout.Infinite : (int)Math.Clamp(nextExpiry - now, 1, int.MaxValue);
+    }
+
+    // The injected monotonic clock can advance without waiting for real TTLs.
+    // Wake the real idle worker; do not perform expiration on the test thread.
+    internal void WakeIdleWorkersForChecks()
+    {
+        lock (_gate)
+        {
+            if (!_disposed) Monitor.PulseAll(_gate);
+        }
     }
 
     private static List<Waiter> TakeWaiters(Work work)

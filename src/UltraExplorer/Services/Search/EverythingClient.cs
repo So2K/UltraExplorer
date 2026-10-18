@@ -85,8 +85,11 @@ internal sealed class EverythingClient
     internal const uint RequestHighlightedPath = 0x4000;
     internal const uint RequestHighlightedFullPath = 0x8000;
 
-    /// <summary>What every query here asks for.</summary>
+    /// <summary>Columns requested by ordinary result-panel queries.</summary>
     internal const uint Requested = RequestName | RequestPath | RequestSize | RequestDateModified | RequestHighlightedName;
+
+    /// <summary>Map membership needs names and kinds, not result-row metadata or highlighting.</summary>
+    internal const uint MapRequested = RequestName | RequestPath;
 
     /// <summary><c>EVERYTHING_IPC_FOLDER</c> and <c>EVERYTHING_IPC_DRIVE</c>, an item's flags.</summary>
     private const uint ItemFolder = 0x1;
@@ -242,7 +245,14 @@ internal sealed class EverythingClient
         => QueryPageAsync(search, maximum, 0, cancellationToken, sort);
 
     /// <summary>Reads a page in the same stable order, without the result panel's display limit.</summary>
-    public async Task<EverythingPage?> QueryPageAsync(string search, int maximum, uint offset, CancellationToken cancellationToken, uint sort = SortNameAscending)
+    public Task<EverythingPage?> QueryPageAsync(string search, int maximum, uint offset, CancellationToken cancellationToken, uint sort = SortNameAscending)
+        => QueryPageCoreAsync(search, maximum, offset, cancellationToken, sort, Requested);
+
+    internal Task<EverythingPage?> QueryMapPageAsync(string search, int maximum, uint offset, CancellationToken cancellationToken, uint sort = SortNameAscending)
+        => QueryPageCoreAsync(search, maximum, offset, cancellationToken, sort, MapRequested);
+
+    private async Task<EverythingPage?> QueryPageCoreAsync(string search, int maximum, uint offset,
+        CancellationToken cancellationToken, uint sort, uint requested)
     {
         ArgumentNullException.ThrowIfNull(search);
         var everything = FindEverythingWindow();
@@ -267,7 +277,7 @@ internal sealed class EverythingClient
         {
             // Off the caller's thread: sending waits for Everything to take
             // the query, which is quick but is still another process.
-            var sent = await Task.Run(() => Send(everything, reply, id, search, (uint)Math.Max(0, maximum), sort, offset), cancellationToken).ConfigureAwait(false);
+            var sent = await Task.Run(() => Send(everything, reply, id, search, (uint)Math.Max(0, maximum), sort, offset, requested), cancellationToken).ConfigureAwait(false);
             if (!sent)
             {
                 return null;
@@ -482,7 +492,7 @@ internal sealed class EverythingClient
         return SendMessageTimeoutW(window, WmUser, command, 0, abortIfHung, 1000, out var result) == 0 ? null : result;
     }
 
-    private static unsafe bool Send(nint everything, nint reply, uint id, string search, uint maximum, uint sort, uint offset)
+    private static unsafe bool Send(nint everything, nint reply, uint id, string search, uint maximum, uint sort, uint offset, uint requested)
     {
         // EVERYTHING_IPC_QUERY2: seven DWORDs, then the search and its null.
         var size = 28 + ((search.Length + 1) * 2);
@@ -493,7 +503,7 @@ internal sealed class EverythingClient
         BinaryPrimitives.WriteUInt32LittleEndian(span[8..], 0);
         BinaryPrimitives.WriteUInt32LittleEndian(span[12..], offset);
         BinaryPrimitives.WriteUInt32LittleEndian(span[16..], maximum);
-        BinaryPrimitives.WriteUInt32LittleEndian(span[20..], Requested);
+        BinaryPrimitives.WriteUInt32LittleEndian(span[20..], requested);
         BinaryPrimitives.WriteUInt32LittleEndian(span[24..], sort);
         MemoryMarshal.AsBytes(search.AsSpan()).CopyTo(span[28..]);
 

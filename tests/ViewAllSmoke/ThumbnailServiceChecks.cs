@@ -14,6 +14,7 @@ internal static partial class Program
         Section("hover thumbnail service");
         await ThumbnailCacheChecks();
         await ThumbnailNegativeChecks();
+        await ThumbnailCacheLifetimeChecks();
         await ThumbnailQueueChecks();
         await ThumbnailDedupChecks();
         await ThumbnailCaseIdentityChecks();

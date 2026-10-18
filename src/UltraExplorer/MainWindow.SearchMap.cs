@@ -42,6 +42,10 @@ public partial class MainWindow
         _mapTicket++;
         _mapRun?.Cancel();
         _mapRun = null;
+        _mapProjection = null;
+        _mapScope = [];
+        _mapQuery = string.Empty;
+        _mapRefreshAgain = false;
         _viewModel.Search.MapRefreshRequested -= OnMapRefreshRequested;
         _viewModel.Tree.FilesystemChanged -= OnMapFilesystemChanged;
     }

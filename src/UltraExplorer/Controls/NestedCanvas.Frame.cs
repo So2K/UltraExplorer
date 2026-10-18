@@ -120,6 +120,7 @@ public sealed partial class NestedCanvas
     /// <summary>Marks layers out of date and makes sure the next frame draws them; with none, only that there is a next frame.</summary>
     private void RequestFrame(Layers layers)
     {
+        if (_disposed) return;
         _dirty |= layers;
         if (_frameHooked)
         {
@@ -239,6 +240,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void OnIsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
     {
+        if (_disposed) return;
         ShareDrivenSlots(IsVisible);
         if (IsVisible)
         {
@@ -262,6 +264,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     internal void Drive(FrameDriverSlot slot)
     {
+        if (_disposed) return;
         if (!_drivenSlots.Contains(slot))
         {
             _drivenSlots.Add(slot);
@@ -327,6 +330,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     internal void Wake()
     {
+        if (_disposed) return;
         if (Interlocked.Exchange(ref _wakePosted, 1) == 0)
         {
             Dispatcher.BeginInvoke(DispatcherPriority.Render, _onWake);
@@ -343,6 +347,11 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void OnWake()
     {
+        if (_disposed)
+        {
+            Volatile.Write(ref _wakePosted, 0);
+            return;
+        }
         if (IsVisible && !FramesFailing)
         {
             RequestFrame(Layers.None);
@@ -588,6 +597,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void RunFrame(TimeSpan renderingTime)
     {
+        if (_disposed) return;
         // A wake that came since the last frame is served by this one.
         Volatile.Write(ref _wakePosted, 0);
         LoopFrameCount++;
@@ -1408,6 +1418,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private bool RenderLayers(Layers layers, bool inMotion, bool scoped = false)
     {
+        if (_disposed) return true;
         // Hidden or not laid out yet: draw nothing, and keep the size the
         // camera was set up for rather than forgetting it.  Nothing is left
         // drawn with less detail or with text set for motion either: the

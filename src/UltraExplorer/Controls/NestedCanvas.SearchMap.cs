@@ -14,6 +14,7 @@ public sealed partial class NestedCanvas
     /// <summary>Changes only visibility. Every cell keeps its ordinary grid, rectangle and camera.</summary>
     internal void SetSearchMapProjection(SearchMapProjection? projection)
     {
+        if (_disposed) return;
         if (ReferenceEquals(_searchMapProjection, projection)) return;
         CancelMarquee();
         PointerLost();

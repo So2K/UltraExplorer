@@ -534,7 +534,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void HookGpu()
     {
-        if (_gpuHooked)
+        if (_disposed || _gpuHooked)
         {
             return;
         }
@@ -600,6 +600,7 @@ public sealed partial class NestedCanvas
     private void OnGpuRetry(object? sender, EventArgs e)
     {
         _gpuRetry?.Stop();
+        if (_disposed) return;
         var decision = GpuBootstrap.Decide(this);
         if (IsSceneOnGpu && ReferenceEquals(decision.DeviceSet, _surface?.Devices))
         {
@@ -624,6 +625,7 @@ public sealed partial class NestedCanvas
     private void OnDeviceSetReady(GpuDeviceSet devices) =>
         Dispatcher.InvokeAsync(() =>
         {
+            if (_disposed) return;
             if (!IsSceneOnGpu || !ReferenceEquals(GpuBootstrap.Decide(this).DeviceSet, _surface?.Devices))
             {
                 RequestFrame(Layers.All);
@@ -653,6 +655,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void OnWindowMoved(object? sender, EventArgs e)
     {
+        if (_disposed) return;
         if (_monitorCheck is null)
         {
             _monitorCheck = new DispatcherTimer(DispatcherPriority.Background, Dispatcher) { Interval = TimeSpan.FromMilliseconds(150) };
@@ -666,6 +669,7 @@ public sealed partial class NestedCanvas
     private void OnMonitorCheck(object? sender, EventArgs e)
     {
         _monitorCheck?.Stop();
+        if (_disposed) return;
         if (!ReferenceEquals(GpuBootstrap.Decide(this).DeviceSet, _surface?.Devices))
         {
             RequestFrame(Layers.All);

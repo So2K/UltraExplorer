@@ -462,6 +462,7 @@ internal sealed class NestedPane
         _viewModel.Tree.RemoveNestedChanges(Tree);
         Tree.Changes = null;
         Tree.Dispose();
+        Canvas.Dispose();
     }
 
     /// <summary>
