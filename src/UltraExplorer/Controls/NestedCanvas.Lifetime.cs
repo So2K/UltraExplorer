@@ -16,6 +16,8 @@ public sealed partial class NestedCanvas
         if (_disposed) return;
         _disposed = true;
 
+        ClearFileDetailTarget();
+        SetFocusedFileDetailSource(null);
         SetInlineThumbnailSource(null);
 
         Tree = null;

@@ -967,6 +967,7 @@ public sealed partial class NestedCanvas
         var dx = job.X + job.W / 2 - _viewWidth / 2;
         var dy = job.Y + job.H / 2 - _viewHeight / 2;
         _labelDistance = dx * dx + dy * dy;
+        if (DrawFocusedFileLabel(target, job, ref folderFacts)) return;
         var file = folder.Files[job.Index];
         var font = Math.Clamp(job.H * 0.5, 7.5, 13);
         var cursor = job.X + Math.Min(3, job.H * 0.14) + font * 0.55;

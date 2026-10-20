@@ -457,6 +457,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
                 return;
             }
 
+            ClearFileDetailTarget();
             SuspendInlineThumbnails();
 
             if (_tree is not null)
