@@ -30,7 +30,7 @@ public sealed partial class NestedCanvas
         // Zooming out keeps the current file until it is small again. Clearing
         // it earlier would snap a deep view back to the ordinary folder cap.
         if (factor <= 1) return;
-        if (HitTest(at) is not { IsFile: true } hit)
+        if (HotspotAt(at) is not null || PointerHit(at) is not { IsFile: true } hit)
         {
             ClearFileDetailTarget();
             return;

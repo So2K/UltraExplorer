@@ -8,6 +8,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      snapshot_version:
+        description: 'Optional prerelease version for a private test artifact; does not publish a release'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -52,9 +57,15 @@ jobs:
         env:
           REF: ${{ github.ref }}
           RUN_NUMBER: ${{ github.run_number }}
+          SNAPSHOT_VERSION: ${{ inputs.snapshot_version }}
         run: |
           if ($env:REF.StartsWith('refs/tags/v')) {
             $version = $env:REF.Substring('refs/tags/v'.Length)
+          } elseif ($env:SNAPSHOT_VERSION) {
+            if ($env:SNAPSHOT_VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*$') {
+              throw 'A private snapshot requires a valid prerelease version.'
+            }
+            $version = $env:SNAPSHOT_VERSION
           } else {
             $version = "0.0.0-ci.$env:RUN_NUMBER"
           }
