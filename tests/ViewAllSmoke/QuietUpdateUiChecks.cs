@@ -44,6 +44,7 @@ internal static partial class Program
         }
         var owned = Path.Combine(AppPaths.StateDirectory, "quiet-ui-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(owned);
+        await QuietUpdateSettingsOnStaAsync(Path.Combine(owned, "manual-settings"));
         using var forbiddenNetwork = new QuietUiForbiddenNetworkHandler();
         using var service = new QuietUpdateService(Path.Combine(owned, "updates"), "1.3.0-beta.1", forbiddenNetwork, TimeProvider.System);
         var window = new MainWindow(null, Path.Combine(owned, "workspace.json"));
@@ -151,6 +152,21 @@ internal static partial class Program
                 window.QuietUpdateButton.RaiseEvent(new RoutedEventArgs(ButtonBase.ClickEvent));
                 Check("failure details appear only when the user opens the offer again", window.QuietUpdatePopover.IsOpen
                     && window.QuietUpdateStatusText.Visibility == Visibility.Visible && window.QuietUpdateStatusText.Text.Length > 0);
+
+                var previousChannel = service.Channel;
+                var launchesBeforeChannelChange = launches;
+                service.Channel = QuietUpdateChannel.Stable;
+                await SettingsSettle();
+                Check("changing channel invalidates an already-open beta offer without launching or leaving a stale arrow",
+                    !window.QuietUpdatePopover.IsOpen && window.QuietUpdateButton.Visibility == Visibility.Collapsed
+                    && !service.HasUpdate && launches == launchesBeforeChannelChange);
+                service.Channel = previousChannel;
+                store.SetReady(new QuietUpdateStore.Package("1.3.0-beta.2", hash, payload.Length));
+                await service.CheckOnceAsync();
+                await SettingsSettle();
+                Check("returning to the original channel restores only its verified cached arrow without reopening an offer",
+                    service.HasUpdate && window.QuietUpdateButton.IsEnabled && !window.QuietUpdatePopover.IsOpen
+                    && forbiddenNetwork.Requests == 0 && launches == launchesBeforeChannelChange);
 
                 // ExplorerLaunchRouter can keep two normal windows in one
                 // process. Restart Manager may close the initiating window

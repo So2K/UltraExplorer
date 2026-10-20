@@ -44,6 +44,12 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private static readonly string[] LayerProperties =
         [nameof(ShowFiles), nameof(ShowIcons), nameof(ShowDetails), nameof(ShowFolderCounts), nameof(ShowMarks), nameof(CanShowAllLayers)];
 
+    private static readonly string[] UpdateProperties =
+    [
+        nameof(ReceiveUpdates), nameof(UpdateChannel), nameof(UpdateChannelDescription),
+        nameof(CanChooseUpdateChannel), nameof(CanCheckForUpdates), nameof(CheckForUpdatesLabel), nameof(UpdateStatus)
+    ];
+
     private readonly MainViewModel _main;
     private readonly Func<string>? _rendererNow;
     private readonly Func<string, string, string, bool> _confirm;
@@ -64,6 +70,14 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     private readonly DialogIntegrationController _dialogIntegration = DialogIntegrationController.Shared;
     private readonly QuietUpdateService _quietUpdates;
     private readonly System.Windows.Threading.Dispatcher _settingsDispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
+    private readonly AsyncRelayCommand _checkForUpdatesCommand;
+    private CancellationTokenSource? _updateCheckCancellation;
+    private Task? _updateCheckCancellationCallbacks;
+    private QuietUpdateChannel _observedUpdateChannel;
+    private bool _observedUpdatesEnabled;
+    private long _updateCheckGeneration;
+    private bool _checkingFromThisPage;
+    private string _updateStatus = string.Empty;
 
     /// <param name="main">The window's view model, whose settings these are.</param>
     /// <param name="canChooseLayout">False in a file dialog, which keeps the tree canvas whatever is chosen.</param>
@@ -80,6 +94,9 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
     {
         _main = main;
         _quietUpdates = quietUpdates ?? QuietUpdateService.Shared;
+        _observedUpdateChannel = _quietUpdates.Channel;
+        _observedUpdatesEnabled = _quietUpdates.Enabled;
+        _checkForUpdatesCommand = new AsyncRelayCommand(CheckForUpdatesAsync, () => CanCheckForUpdates);
         _folderOpenMode = DialogIntegrationStore.ReadFolderOpenMode();
         CanChooseLayout = canChooseLayout;
         _rendererNow = rendererNow;
@@ -114,13 +131,130 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         }
     }
 
+    public QuietUpdateChannel[] UpdateChannels { get; } = Enum.GetValues<QuietUpdateChannel>();
+
+    public QuietUpdateChannel UpdateChannel
+    {
+        get => _quietUpdates.Channel;
+        set
+        {
+            if (_isDisposed || !CanChooseUpdateChannel || !Enum.IsDefined(value) || _quietUpdates.Channel == value) return;
+            CancelUpdateCheck();
+            _updateCheckGeneration++;
+            _updateStatus = string.Empty;
+            _quietUpdates.Channel = value;
+            RefreshUpdateSettings();
+        }
+    }
+
+    public string UpdateChannelDescription => UpdateChannel switch
+    {
+        QuietUpdateChannel.Stable => "Stable releases. Changing the channel keeps your current version until a newer eligible release is available.",
+        QuietUpdateChannel.Beta => "Stable releases and beta/RC builds. Your current version stays installed until you choose to update.",
+        QuietUpdateChannel.Experimental => "All releases, including experimental builds. Your current version stays installed until you choose to update.",
+        _ => string.Empty
+    };
+
+    public string InstalledVersion => _quietUpdates.InstalledVersion;
+
+    public bool CanChooseUpdateChannel => !_isDisposed && _quietUpdates.State != QuietUpdateState.Installing;
+
+    public bool CanCheckForUpdates => !_isDisposed && !_checkingFromThisPage && !_quietUpdates.IsChecking
+        && _quietUpdates.State != QuietUpdateState.Installing;
+
+    public string CheckForUpdatesLabel => _checkingFromThisPage || _quietUpdates.IsChecking ? "Checking…" : "Check now";
+
+    public string UpdateStatus => _updateStatus;
+
+    public ICommand CheckForUpdatesCommand => _checkForUpdatesCommand;
+
+    private async Task CheckForUpdatesAsync()
+    {
+        if (!CanCheckForUpdates) return;
+        var cancellation = new CancellationTokenSource();
+        var generation = ++_updateCheckGeneration;
+        var channel = _quietUpdates.Channel;
+        _updateCheckCancellation = cancellation;
+        _updateCheckCancellationCallbacks = null;
+        _checkingFromThisPage = true;
+        _updateStatus = "Checking GitHub…";
+        RefreshUpdateSettings();
+        try
+        {
+            var result = await _quietUpdates.CheckNowAsync(cancellation.Token);
+            if (_isDisposed || generation != _updateCheckGeneration || channel != _quietUpdates.Channel) return;
+            _updateStatus = result.Status switch
+            {
+                QuietUpdateCheckStatus.UpToDate => "No newer " + channel.ToString().ToLowerInvariant() + " release is available.",
+                QuietUpdateCheckStatus.Ready => "Update " + result.Version + " is ready. Use the update arrow to review and install it.",
+                QuietUpdateCheckStatus.Available => "Version " + result.Version + " is available. "
+                    + (_quietUpdates.Enabled ? "Check again to download it." : "Turn on Receive updates, then check again to download it."),
+                QuietUpdateCheckStatus.Busy => "Another update operation is already running. Try again shortly.",
+                QuietUpdateCheckStatus.Cancelled => "Update check canceled.",
+                _ => "Could not check for updates. Try again later."
+            };
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            if (!_isDisposed && generation == _updateCheckGeneration) _updateStatus = "Update check canceled.";
+        }
+        catch (Exception)
+        {
+            if (!_isDisposed && generation == _updateCheckGeneration) _updateStatus = "Could not check for updates. Try again later.";
+        }
+        finally
+        {
+            var callbacks = _updateCheckCancellationCallbacks;
+            if (ReferenceEquals(_updateCheckCancellation, cancellation))
+            {
+                _updateCheckCancellation = null;
+                _updateCheckCancellationCallbacks = null;
+            }
+            if (callbacks is { IsCompleted: false })
+                _ = callbacks.ContinueWith(_ => cancellation.Dispose(), CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            else cancellation.Dispose();
+            _checkingFromThisPage = false;
+            if (!_isDisposed) RefreshUpdateSettings();
+        }
+    }
+
+    private void CancelUpdateCheck()
+    {
+        try
+        {
+            if (_updateCheckCancellation is { } cancellation)
+                _updateCheckCancellationCallbacks ??= cancellation.CancelAsync();
+        }
+        catch (ObjectDisposedException) { }
+    }
+
+    private void RefreshUpdateSettings()
+    {
+        if (_isDisposed) return;
+        if (_observedUpdateChannel != _quietUpdates.Channel)
+        {
+            _observedUpdateChannel = _quietUpdates.Channel;
+            CancelUpdateCheck();
+            _updateCheckGeneration++;
+            _updateStatus = string.Empty;
+        }
+        if (_observedUpdatesEnabled != _quietUpdates.Enabled)
+        {
+            _observedUpdatesEnabled = _quietUpdates.Enabled;
+            _updateStatus = string.Empty;
+        }
+        Raise(UpdateProperties);
+        _checkForUpdatesCommand.RaiseCanExecuteChanged();
+    }
+
     private void OnQuietUpdatesChanged(object? sender, EventArgs e)
     {
         if (_isDisposed || _settingsDispatcher.HasShutdownStarted) return;
-        if (_settingsDispatcher.CheckAccess()) OnPropertyChanged(nameof(ReceiveUpdates));
+        if (_settingsDispatcher.CheckAccess()) RefreshUpdateSettings();
         else _ = _settingsDispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, () =>
         {
-            if (!_isDisposed) OnPropertyChanged(nameof(ReceiveUpdates));
+            if (!_isDisposed) RefreshUpdateSettings();
         });
     }
 
@@ -825,6 +959,8 @@ public sealed class SettingsViewModel : ObservableObject, IDisposable
         }
 
         _isDisposed = true;
+        _updateCheckGeneration++;
+        CancelUpdateCheck();
         _dialogIntegration.Changed -= OnDialogIntegrationChanged;
         _quietUpdates.SnapshotChanged -= OnQuietUpdatesChanged;
         _main.PropertyChanged -= OnMainPropertyChanged;

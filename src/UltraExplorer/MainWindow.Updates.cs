@@ -79,7 +79,7 @@ public partial class MainWindow
         AutomationProperties.SetName(QuietUpdateButton, tooltip);
         QuietUpdateInstallButton.IsEnabled = ready && !_quietUpdateInstalling;
 
-        if (!enabled)
+        if (!enabled || (!ready && state != QuietUpdateState.Installing))
         {
             CancelQuietUpdatePreparation();
             QuietUpdatePopover.IsOpen = false;
@@ -152,7 +152,7 @@ public partial class MainWindow
             // This is the only installation entry: a second, explicit click
             // on Install update in a panel the user opened themselves.
             cancellation.Token.ThrowIfCancellationRequested();
-            if (!service.MarkInstalling()) return;
+            if (!service.MarkInstalling(package)) return;
             var launched = QuietUpdateInstallLauncher is { } launch
                 ? await launch(package, cancellation.Token)
                 : await UpdateInstaller.BeginAsync(package, cancellation.Token);
@@ -176,7 +176,7 @@ public partial class MainWindow
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested || observationToken.IsCancellationRequested)
         {
             // Off, dismiss and window closure simply leave the old version.
-            if (service.Enabled && !observationToken.IsCancellationRequested)
+            if (!observationToken.IsCancellationRequested)
                 service.RestoreReady();
         }
         catch
