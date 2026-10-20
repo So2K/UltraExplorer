@@ -11,10 +11,13 @@ namespace UltraExplorer.Services;
 internal sealed record ThumbnailResult(BitmapSource Image, int? OriginalWidth = null, int? OriginalHeight = null, string? Detail = null);
 
 /// <summary>
-/// Hover-only thumbnail extraction. All metadata, image decoding and Shell calls
+/// Content extraction shared by hover previews and automatic file-card images.
+/// All metadata, image decoding and Shell calls
 /// run on at most two background STA threads. A slow drive or thumbnail handler
 /// can occupy those threads, but never the dispatcher or an unbounded sequence
 /// of replacement threads. Cancelling a waiter and disposing do not wait for it.
+/// Automatic work occupies at most one real worker, reserving the other for
+/// interactive previews even when an automatic native handler ignores cancel.
 /// </summary>
 internal sealed class FileThumbnailService : IDisposable
 {
@@ -29,7 +32,7 @@ internal sealed class FileThumbnailService : IDisposable
     private readonly FileThumbnailOptions _options;
     private readonly Func<string, ThumbnailFileStamp?> _metadata;
     private readonly Func<string, CancellationToken, ThumbnailResult?> _extract;
-    private int _workers, _active;
+    private int _workers, _active, _activeBackground;
     private long _cacheBytes, _extractions, _metadataReads;
     private bool _disposed;
     [ThreadStatic] private static bool _comInitialized;
@@ -49,7 +52,15 @@ internal sealed class FileThumbnailService : IDisposable
     /// hits also validate length/time/attributes on a worker before being shown.
     /// Cancelling one caller does not cancel another caller of the same file.
     /// </summary>
-    public Task<ThumbnailResult?> GetAsync(string path, CancellationToken token = default)
+    public Task<ThumbnailResult?> GetAsync(string path, CancellationToken token = default) => GetCoreAsync(path, token, background: false);
+
+    /// <summary>
+    /// Automatic viewport content uses the same cache and native workers, but
+    /// cannot occupy both workers or displace queued interactive requests.
+    /// </summary>
+    public Task<ThumbnailResult?> GetBackgroundAsync(string path, CancellationToken token = default) => GetCoreAsync(path, token, background: true);
+
+    private Task<ThumbnailResult?> GetCoreAsync(string path, CancellationToken token, bool background)
     {
         if (token.IsCancellationRequested) return Task.FromCanceled<ThumbnailResult?>(token);
         if (string.IsNullOrWhiteSpace(path)) return Task.FromResult<ThumbnailResult?>(null);
@@ -65,15 +76,22 @@ internal sealed class FileThumbnailService : IDisposable
             if (_disposed) return Task.FromResult<ThumbnailResult?>(null);
             if (!_pending.TryGetValue(path, out work!))
             {
-                work = new Work(path);
+                work = new Work(path, background);
                 _pending.Add(path, work);
                 work.Node = _queue.AddLast(work);
             }
-            else if (work.Node is not null)
+            else
             {
-                // Another visible request promotes this file over older hovers.
-                _queue.Remove(work.Node);
-                work.Node = _queue.AddLast(work);
+                // Foreground ownership is sticky: an automatic waiter cannot
+                // demote a user's hover, even after that hover is canceled.
+                if (!background) work.BackgroundOnly = false;
+                if (work.Node is not null && (!background || work.BackgroundOnly))
+                {
+                    // Newest foreground requests retain their existing LIFO
+                    // ordering; automatic joins never reorder that group.
+                    _queue.Remove(work.Node);
+                    work.Node = _queue.AddLast(work);
+                }
             }
 
             if (work.Waiters.Count >= 16)
@@ -85,8 +103,14 @@ internal sealed class FileThumbnailService : IDisposable
             work.Waiters.Add(waiter);
             while (_queue.Count > Math.Clamp(_options.MaximumPending, 1, 32))
             {
-                var oldest = _queue.First!.Value;
-                _queue.RemoveFirst();
+                // Reject automatic pressure before evicting any foreground
+                // request. If this new automatic work is the only such node,
+                // it rejects itself and completes its waiter with no pixels.
+                var victim = _queue.First;
+                while (victim is not null && !victim.Value.BackgroundOnly) victim = victim.Next;
+                victim ??= _queue.First!;
+                var oldest = victim.Value;
+                _queue.Remove(victim);
                 oldest.Node = null;
                 _pending.Remove(oldest.Path);
                 (displaced ??= []).AddRange(TakeWaiters(oldest));
@@ -144,6 +168,7 @@ internal sealed class FileThumbnailService : IDisposable
                 // abandoned worker is returning null/completing its old work.
                 if (_pending.TryGetValue(work.Path, out var pending) && ReferenceEquals(pending, work))
                     _pending.Remove(work.Path);
+                Monitor.PulseAll(_gate);
             }
         }
         waiter.Completion.TrySetCanceled(waiter.Token);
@@ -168,13 +193,14 @@ internal sealed class FileThumbnailService : IDisposable
                 Work work;
                 lock (_gate)
                 {
-                    while (!_disposed && _queue.Count == 0)
+                    Work? selected = null;
+                    while (!_disposed && (selected = TakeEligibleWork()) is null)
                         Monitor.Wait(_gate, IdleCacheWaitMilliseconds());
                     if (_disposed) return;
-                    work = _queue.Last!.Value;
-                    _queue.RemoveLast();
-                    work.Node = null;
+                    work = selected!;
                     _active++;
+                    work.UsesBackgroundSlot = work.BackgroundOnly;
+                    if (work.UsesBackgroundSlot) _activeBackground++;
                 }
 
                 ThumbnailResult? result = null;
@@ -185,9 +211,13 @@ internal sealed class FileThumbnailService : IDisposable
                 lock (_gate)
                 {
                     _active--;
+                    // A canceled/promoted waiter's native execution still
+                    // occupies its original automatic slot until here.
+                    if (work.UsesBackgroundSlot) _activeBackground--;
                     if (_pending.TryGetValue(work.Path, out var pending) && ReferenceEquals(pending, work))
                         _pending.Remove(work.Path);
                     waiters = TakeWaiters(work);
+                    Monitor.PulseAll(_gate);
                 }
                 Complete(waiters, result);
                 work.DisposeCancellation();
@@ -198,6 +228,23 @@ internal sealed class FileThumbnailService : IDisposable
             _comInitialized = false;
             if (initialized) CoUninitialize();
         }
+    }
+
+    /// <summary>
+    /// Called only under the queue gate. Foreground work always comes first;
+    /// when the automatic slot is occupied an idle worker sleeps, including
+    /// when the queue contains only automatic work, rather than polling it.
+    /// </summary>
+    private Work? TakeEligibleWork()
+    {
+        var selected = _queue.Last;
+        while (selected is not null && selected.Value.BackgroundOnly) selected = selected.Previous;
+        if (selected is null && _activeBackground == 0) selected = _queue.Last;
+        if (selected is null) return null;
+        _queue.Remove(selected);
+        var work = selected.Value;
+        work.Node = null;
+        return work;
     }
 
     private ThumbnailResult? Execute(Work work)
@@ -529,12 +576,14 @@ internal sealed class FileThumbnailService : IDisposable
         return result with { Image = detached };
     }
 
-    private sealed class Work(string path)
+    private sealed class Work(string path, bool backgroundOnly)
     {
         private readonly object _cancellationGate = new();
         private Task? _cancelCallbacks;
         private bool _cancellationDisposed;
         public string Path { get; } = path;
+        public bool BackgroundOnly = backgroundOnly;
+        public bool UsesBackgroundSlot;
         public CancellationTokenSource Cancellation { get; } = new();
         public LinkedListNode<Work>? Node;
         public List<Waiter> Waiters { get; } = [];

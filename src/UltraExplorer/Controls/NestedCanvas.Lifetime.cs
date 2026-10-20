@@ -16,6 +16,8 @@ public sealed partial class NestedCanvas
         if (_disposed) return;
         _disposed = true;
 
+        SetInlineThumbnailSource(null);
+
         Tree = null;
         IconArrivals = null;
         AttachChanges(null, null);

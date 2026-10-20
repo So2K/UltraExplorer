@@ -972,8 +972,27 @@ public sealed partial class NestedCanvas
         var cursor = job.X + Math.Min(3, job.H * 0.14) + font * 0.55;
         var right = job.X + job.W - font * 0.5;
 
+        var hasThumbnail = TryGetInlineThumbnailLayout(folder, file, out var thumbnail);
         var iconSize = Math.Min(job.H * 0.72, 20);
-        if (iconSize >= 9 && Shows(CanvasLayer.Icons))
+        if (hasThumbnail)
+        {
+            target.FillRounded(thumbnail.Slot, 4, InlineThumbnailBackground);
+            // The name keeps its place while pixels arrive. A pending or
+            // unsupported extraction keeps the familiar type icon in the
+            // reserved content slot rather than jumping the text sideways.
+            if (thumbnail.Image is null && Shows(CanvasLayer.Icons))
+            {
+                const double placeholderSize = 28;
+                var drawn = target.DrawIcon(folder, job.Index, file,
+                    new Rect(thumbnail.Slot.X + (thumbnail.Slot.Width - placeholderSize) / 2,
+                        thumbnail.Slot.Y + (thumbnail.Slot.Height - placeholderSize) / 2,
+                        placeholderSize, placeholderSize));
+                if (_gpuIconsLooked && !_gpuIconWaiting && ReferenceEquals(target, _gpuLabels))
+                    _gpuIconWaiting = IconStillToCome(drawn, folder, file);
+            }
+            cursor = thumbnail.Slot.Right + 11;
+        }
+        else if (iconSize >= 9 && Shows(CanvasLayer.Icons))
         {
             // The icon atlas streams independently. Its arrival changes the
             // ink, never the filename's origin or available room.
@@ -1000,7 +1019,9 @@ public sealed partial class NestedCanvas
             mark = MarkOf(folder, file, facts);
             if (facts.HasAccent)
             {
-                target.FillRect(new Rect(job.X + 1, job.Y + job.H * 0.12, Math.Max(2, job.H * 0.16), job.H * 0.76), facts.Accent);
+                var accentWidth = Math.Max(2, job.H * 0.16);
+                if (hasThumbnail) accentWidth = Math.Min(accentWidth, thumbnail.Slot.X - job.X - 4);
+                target.FillRect(new Rect(job.X + 1, job.Y + job.H * 0.12, accentWidth, job.H * 0.76), facts.Accent);
             }
         }
 

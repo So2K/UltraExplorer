@@ -248,6 +248,7 @@ public sealed partial class NestedCanvas
         }
         else if (PresentationSource.FromVisual(this) is not null)
         {
+            SuspendInlineThumbnails();
             StopFrames();
         }
     }
@@ -1496,6 +1497,7 @@ public sealed partial class NestedCanvas
         if ((layers & Layers.Labels) != 0)
         {
             LabelLayerCount++;
+            PrepareInlineThumbnails(inMotion);
             if (!TryDrawLabelsOnGpu(inMotion))
             {
                 DrawLabelsWithWpf();
@@ -1521,6 +1523,14 @@ public sealed partial class NestedCanvas
         // previous frame, and the walk and the names gave it that time.
         var shown = !_presentPending || PresentScene();
         var presentAllocated = GC.GetAllocatedBytesForCurrentThread() - allocated;
+        if (shown && (layers & Layers.Labels) != 0)
+        {
+            var thumbnailsStarted = System.Diagnostics.Stopwatch.GetTimestamp();
+            allocated = GC.GetAllocatedBytesForCurrentThread();
+            DrawInlineThumbnails();
+            labelsAllocated += GC.GetAllocatedBytesForCurrentThread() - allocated;
+            LastLabelsMilliseconds += System.Diagnostics.Stopwatch.GetElapsedTime(thumbnailsStarted).TotalMilliseconds;
+        }
         if (decorAfterPresent)
         {
             if (shown)
