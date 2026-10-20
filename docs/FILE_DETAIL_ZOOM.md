@@ -4,6 +4,8 @@ Zooming in over a file remembers that literal file independently of selection
 and hover. Its card can grow beyond the ordinary file-folder limit. Zooming
 toward a folder uses the existing folder navigation; zooming out of a file
 remains gradual. A file's grid position, selection and hit area do not change.
+The expanded file suppresses its duplicate floating hover card so it cannot
+cover the content being inspected. Other files retain their ordinary hover previews.
 
 At sufficiently large card size, the content region grows with the card.
 The filename stays at 13 DIP in a header within the visible card. Images retain

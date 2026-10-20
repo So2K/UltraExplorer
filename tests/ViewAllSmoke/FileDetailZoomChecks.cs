@@ -116,6 +116,11 @@ internal static partial class Program
         Check("the ordinary file view retains its compact thumbnail and starts no detail extraction",
             canvas.FocusedFileDetailStateForTests is null && requests.IsEmpty
             && canvas.InlineThumbnailStatesForTests().Any(state => state.Path == picturePath && state.Slot.Width <= 104));
+        await FileDetailWaitAsync(() => !canvas.IsCameraMoving, canvas);
+        var ordinaryCard = FocusFileRect(canvas, tree, picturePath)!.Value;
+        Check("an ordinary still file remains eligible for its small hover preview",
+            !canvas.IsCameraMoving && canvas.HoverPreviewHit(FileDetailVisiblePoint(ordinaryCard)) is { IsFile: true } ordinaryHover
+            && ordinaryHover.Path == picturePath);
         canvas.SetSelection([picturePath], picturePath);
         canvas.RenderNow();
         var selection = canvas.SelectionState.Items().Select(item => item.Path).ToArray();
@@ -135,6 +140,16 @@ internal static partial class Program
         Check("only the targeted file expands; visible siblings keep their bounded normal thumbnails",
             canvas.InlineThumbnailStatesForTests().All(state => state.Path != picturePath && state.Slot.Width <= 104)
             && canvas.InlineThumbnailStatesForTests().Any(state => state.Path == textPath || state.Path == siblingPath));
+        await FileDetailWaitAsync(() => !canvas.IsCameraMoving, canvas);
+        var focusedPoint = FileDetailVisiblePoint(card);
+        Check("a still expanded file suppresses only the covering hover preview while retaining its normal file hit",
+            !canvas.IsCameraMoving && canvas.HoverPreviewHit(focusedPoint) is null
+            && canvas.HitTest(focusedPoint) is { IsFile: true } focusedHit && focusedHit.Path == picturePath
+            && canvas.FileDetailTargetForTests == picturePath);
+        var siblingCard = FocusFileRect(canvas, tree, textPath)!.Value;
+        Check("a normal sibling still offers its hover preview beside an expanded file",
+            !canvas.IsCameraMoving && canvas.HoverPreviewHit(FileDetailVisiblePoint(siblingCard)) is { IsFile: true } siblingHover
+            && siblingHover.Path == textPath);
         FileDetailCheckHeaderFont(canvas, tree, picturePath);
         FileDetailCapture(canvas, "02-file-image-detail-240-cpu.png");
 
