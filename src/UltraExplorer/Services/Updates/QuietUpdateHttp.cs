@@ -15,7 +15,8 @@ internal sealed class QuietUpdateHttp : IDisposable
     private static readonly Uri ReleasesUri = new("https://api.github.com/repos/So2K/UltraExplorer/releases?per_page=100");
     private readonly HttpClient _client;
 
-    internal sealed record Release(UpdateVersion Version, Uri ZipUrl, long Size, string? Digest, Uri? SumsUrl);
+    internal sealed record Release(UpdateVersion Version, Uri ZipUrl, long Size, string? Digest, Uri? SumsUrl,
+        QuietUpdateChannel MinimumChannel);
 
     public QuietUpdateHttp(HttpMessageHandler? handler = null)
     {
@@ -27,6 +28,9 @@ internal sealed class QuietUpdateHttp : IDisposable
     }
 
     public async Task<Release?> FindAsync(UpdateVersion installed, CancellationToken token)
+        => await FindAsync(installed, QuietUpdateChannels.Default(installed), token).ConfigureAwait(false);
+
+    public async Task<Release?> FindAsync(UpdateVersion installed, QuietUpdateChannel channel, CancellationToken token)
     {
         using var response = await SendAsync(ReleasesUri, null, true, token).ConfigureAwait(false);
         var bytes = await ReadBoundedAsync(response, 2_097_152, token).ConfigureAwait(false);
@@ -38,7 +42,7 @@ internal sealed class QuietUpdateHttp : IDisposable
             if (item.ValueKind != JsonValueKind.Object || Bool(item, "draft")) continue;
             var tag = String(item, "tag_name");
             var version = UpdateVersion.Parse(tag, tag: true);
-            if (version is null || version.CompareTo(installed) <= 0 || (!installed.IsPrerelease && (version.IsPrerelease || Bool(item, "prerelease")))) continue;
+            if (version is null || version.CompareTo(installed) <= 0 || !QuietUpdateChannels.Allows(version, channel, Bool(item, "prerelease"))) continue;
             if (newest is not null && version.CompareTo(newest.Version) <= 0) continue;
             if (!item.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array) continue;
             Uri? zip = null; Uri? sums = null; string? digest = null; long size = 0; var duplicates = false;
@@ -63,7 +67,9 @@ internal sealed class QuietUpdateHttp : IDisposable
                 else { duplicates |= sums is not null; sums = uri; }
             }
             if (duplicates || zip is null || size <= 0 || size >= MaximumPackageSize || (digest is null && sums is null)) continue;
-            newest = new Release(version, zip, size, digest, sums);
+            var minimum = version.IsBetaOrReleaseCandidate ? QuietUpdateChannel.Beta
+                : version.IsPrerelease || Bool(item, "prerelease") ? QuietUpdateChannel.Experimental : QuietUpdateChannel.Stable;
+            newest = new Release(version, zip, size, digest, sums, minimum);
         }
         return newest;
     }

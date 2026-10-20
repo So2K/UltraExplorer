@@ -648,10 +648,35 @@
 
                 <controls:SettingCard Glyph="&#xE895;"
                                       Header="Receive updates"
-                                      Description="Check GitHub once a day and download quietly while UltraExplorer is open. A small arrow appears when ready; installation waits for your click. Turning this off stops checks and downloads.">
+                                      Description="Check GitHub once a day and download quietly while UltraExplorer is open. A small arrow appears when ready; installation waits for your click. Turning this off stops automatic checks and downloads. You can still check manually.">
                     <CheckBox x:Name="ReceiveUpdatesChoice" Style="{StaticResource ToggleSwitch}"
                               IsChecked="{Binding ReceiveUpdates, Mode=TwoWay}"
                               AutomationProperties.Name="Receive updates" />
+                </controls:SettingCard>
+
+                <controls:SettingCard Glyph="&#xE8A5;"
+                                      Header="Release channel"
+                                      Description="{Binding UpdateChannelDescription}">
+                    <ComboBox x:Name="UpdateChannelBox"
+                              Width="160"
+                              Height="32"
+                              ItemsSource="{Binding UpdateChannels}"
+                              SelectedItem="{Binding UpdateChannel, Mode=TwoWay}"
+                              IsEnabled="{Binding CanChooseUpdateChannel}"
+                              AutomationProperties.Name="Release channel" />
+                </controls:SettingCard>
+
+                <controls:SettingCard x:Name="UpdateCheckCard"
+                                      Glyph="&#xE72C;"
+                                      Header="Check for updates"
+                                      Description="Check GitHub now. Installation always waits for your explicit click."
+                                      Status="{Binding UpdateStatus}">
+                    <Button x:Name="CheckForUpdatesButton"
+                            Style="{StaticResource CardButton}"
+                            Content="{Binding CheckForUpdatesLabel}"
+                            Command="{Binding CheckForUpdatesCommand}"
+                            IsEnabled="{Binding CanCheckForUpdates}"
+                            AutomationProperties.Name="Check for updates now" />
                 </controls:SettingCard>
 
                 <controls:SettingCard Glyph="&#xE838;"

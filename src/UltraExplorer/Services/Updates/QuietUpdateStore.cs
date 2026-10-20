@@ -1,19 +1,27 @@
 using System.IO;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace UltraExplorer.Services.Updates;
 
 internal sealed class QuietUpdateStore
 {
-    internal sealed record Settings(bool Enabled = true);
+    internal sealed record Settings(bool Enabled = true, QuietUpdateChannel? Channel = null);
     internal sealed record Attempt(DateTimeOffset LastAttemptUtc);
-    internal sealed record Package(string Version, string Sha256, long Size);
+    internal sealed record Package(string Version, string Sha256, long Size, QuietUpdateChannel? MinimumChannel = null);
     /// <summary>Written once the normal main window of a version has started;
     /// scripts/ApplyDownloadedUpdate.ps1 waits for it before deleting its backup.</summary>
     internal sealed record Startup(string Version, int ProcessId, DateTimeOffset StartedUtc);
     private readonly string _directory;
-    public QuietUpdateStore(string directory) => _directory = Path.GetFullPath(directory);
+    private readonly string _settingsMutexName;
+    public QuietUpdateStore(string directory)
+    {
+        _directory = Path.GetFullPath(directory);
+        var identity = _directory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToUpperInvariant();
+        _settingsMutexName = @"Local\UltraExplorer.UpdateSettings." + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(identity)));
+    }
     public string DirectoryPath => _directory;
     public string PackagePath(string sha, bool partial = false) => Path.Combine(_directory, $"package-{sha}.zip{(partial ? ".partial" : "")}");
 
@@ -39,8 +47,51 @@ internal sealed class QuietUpdateStore
         }
     }
     public DateTimeOffset LastAttemptUtc => Read<Attempt>("attempt.json")?.LastAttemptUtc ?? DateTimeOffset.MinValue;
+    public QuietUpdateChannel? Channel
+    {
+        get
+        {
+            try
+            {
+                var path = Path.Combine(_directory, "settings.json");
+                AssertNoLinks(path);
+                using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                if (file.Length is <= 0 or > 65_536) return QuietUpdateChannel.Stable;
+                using var json = JsonDocument.Parse(file, new JsonDocumentOptions { MaxDepth = 16 });
+                if (json.RootElement.ValueKind != JsonValueKind.Object) return QuietUpdateChannel.Stable;
+                var fields = json.RootElement.EnumerateObject().Where(property => property.Name == nameof(Settings.Channel)).ToArray();
+                if (fields.Length == 0 || fields.Length == 1 && fields[0].Value.ValueKind == JsonValueKind.Null) return null;
+                if (fields.Length != 1 || fields[0].Value.ValueKind != JsonValueKind.String) return QuietUpdateChannel.Stable;
+                return fields[0].Value.GetString() switch
+                {
+                    nameof(QuietUpdateChannel.Beta) => QuietUpdateChannel.Beta,
+                    nameof(QuietUpdateChannel.Experimental) => QuietUpdateChannel.Experimental,
+                    _ => QuietUpdateChannel.Stable
+                };
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException) { return null; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return QuietUpdateChannel.Stable; }
+        }
+    }
     public Package? Ready => Read<Package>("ready.json");
-    public void SetEnabled(bool enabled) => Write("settings.json", new Settings(enabled));
+    public void SetEnabled(bool enabled) => UpdateSettings(() => new Settings(enabled, Channel));
+    public void SetChannel(QuietUpdateChannel channel) => UpdateSettings(() => new Settings(Enabled, channel));
+    private void UpdateSettings(Func<Settings> update)
+    {
+        // Atomic replacement prevents torn JSON; a shared mutex also protects
+        // the read/modify/write pair from losing another process's opt-out or
+        // channel change. No network lease is held or waited for here.
+        using var mutex = new Mutex(false, _settingsMutexName);
+        var acquired = false;
+        try
+        {
+            try { acquired = mutex.WaitOne(TimeSpan.FromSeconds(1)); }
+            catch (AbandonedMutexException) { acquired = true; }
+            if (!acquired) throw new IOException("Update settings are being written by another process.");
+            Write("settings.json", update());
+        }
+        finally { if (acquired) mutex.ReleaseMutex(); }
+    }
     public void RecordAttempt(DateTimeOffset utc) => Write("attempt.json", new Attempt(utc));
     public void SetReady(Package ready) => Write("ready.json", ready);
     public Startup? LastStartup => Read<Startup>("started.json");

@@ -1,11 +1,21 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
+using System.Text.Json.Serialization;
 
 namespace UltraExplorer.Services.Updates;
 
 public enum QuietUpdateState { Idle, Downloading, Ready, Installing, Failed }
 
-public sealed record PreparedUpdatePackage(string Version, string ZipPath, string Sha256, long Size);
+[JsonConverter(typeof(JsonStringEnumConverter<QuietUpdateChannel>))]
+public enum QuietUpdateChannel { Stable, Beta, Experimental }
+
+public enum QuietUpdateCheckStatus { UpToDate, Ready, Available, Busy, Failed, Cancelled }
+public sealed record QuietUpdateCheckResult(QuietUpdateCheckStatus Status, string Version = "");
+
+public sealed record PreparedUpdatePackage(string Version, string ZipPath, string Sha256, long Size)
+{
+    internal long ChannelGeneration { get; init; } = -1;
+}
 
 public sealed record QuietUpdateSnapshot(bool Enabled, QuietUpdateState State, double Progress,
     string ReadyVersion, string PreparedPackage)
@@ -21,6 +31,13 @@ internal sealed class UpdateVersion : IComparable<UpdateVersion>
     private readonly string[] _prerelease;
     public string Value { get; }
     public bool IsPrerelease => _prerelease.Length != 0;
+    internal bool IsBetaOrReleaseCandidate => _prerelease.Length > 0
+        && (_prerelease[0].Equals("beta", StringComparison.OrdinalIgnoreCase)
+            || _prerelease[0].Equals("rc", StringComparison.OrdinalIgnoreCase))
+        && !_prerelease.Any(part => part.Equals("experimental", StringComparison.OrdinalIgnoreCase)
+            || part.Equals("nightly", StringComparison.OrdinalIgnoreCase) || part.Equals("dev", StringComparison.OrdinalIgnoreCase)
+            || part.Equals("alpha", StringComparison.OrdinalIgnoreCase) || part.Equals("canary", StringComparison.OrdinalIgnoreCase)
+            || part.Equals("snapshot", StringComparison.OrdinalIgnoreCase));
     private UpdateVersion(string value, long[] numbers, string[] prerelease) =>
         (Value, _numbers, _prerelease) = (value, numbers, prerelease);
 
@@ -58,4 +75,18 @@ internal sealed class UpdateVersion : IComparable<UpdateVersion>
         }
         return _prerelease.Length.CompareTo(other._prerelease.Length);
     }
+}
+
+internal static class QuietUpdateChannels
+{
+    internal static QuietUpdateChannel Default(UpdateVersion? installed) => installed is not { IsPrerelease: true }
+        ? QuietUpdateChannel.Stable : installed.IsBetaOrReleaseCandidate ? QuietUpdateChannel.Beta : QuietUpdateChannel.Experimental;
+
+    internal static bool Allows(UpdateVersion version, QuietUpdateChannel channel, bool githubPrerelease = false) => channel switch
+    {
+        QuietUpdateChannel.Stable => !version.IsPrerelease && !githubPrerelease,
+        QuietUpdateChannel.Beta => version.IsBetaOrReleaseCandidate || !version.IsPrerelease && !githubPrerelease,
+        QuietUpdateChannel.Experimental => true,
+        _ => false
+    };
 }

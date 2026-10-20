@@ -82,12 +82,34 @@ public partial class SettingsWindow : Window
 
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        // Esc closes an open list first, as it does everywhere else.
-        if (e.Key == Key.Escape && !DefaultColumnBox.IsDropDownOpen)
+        if (e.Key == Key.Escape)
         {
             e.Handled = true;
-            Close();
+            if (!DismissOpenSettingsChoice()) Close();
         }
+    }
+
+    /// <summary>Escape dismisses an open choice before closing Settings.</summary>
+    internal bool DismissOpenSettingsChoice() => DismissOpenSettingsChoice(
+        DefaultColumnBox.IsDropDownOpen, UpdateChannelBox.IsDropDownOpen,
+        () => DefaultColumnBox.IsDropDownOpen = false, () => UpdateChannelBox.IsDropDownOpen = false);
+
+    // The close decision can be checked without opening a native popup (which
+    // would capture the mouse even in an otherwise invisible test window).
+    internal static bool DismissOpenSettingsChoice(bool defaultColumnOpen, bool updateChannelOpen,
+        Action closeDefaultColumn, Action closeUpdateChannel)
+    {
+        if (updateChannelOpen)
+        {
+            closeUpdateChannel();
+            return true;
+        }
+        if (defaultColumnOpen)
+        {
+            closeDefaultColumn();
+            return true;
+        }
+        return false;
     }
 
     private void CloseButton_Click(object sender, RoutedEventArgs e) => Close();

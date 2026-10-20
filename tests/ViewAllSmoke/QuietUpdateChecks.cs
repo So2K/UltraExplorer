@@ -23,6 +23,7 @@ internal static partial class Program
         await QuietResumeChecks();
         await QuietTrustChecks();
         await QuietCacheOwnershipChecks();
+        await QuietUpdateChannelChecks();
     }
 
     private static Task QuietVersionChecks()

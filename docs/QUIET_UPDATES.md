@@ -15,8 +15,9 @@ steps; only the user's **Install update** click starts installation.
 - Verified bytes become a blue download arrow. Clicking it opens a compact panel
   with the version, **Install update** and **Later**. Leaving it alone keeps the
   current version; the panel never opens by itself.
-- **Settings → About → Receive updates** controls the whole mechanism. Turning
-  it off cancels checking/downloads, closes the offer and hides the indicator.
+- **Settings → About → Receive updates** controls automatic checking and
+  downloading. Turning it off cancels current checks/downloads, closes the
+  offer and hides the indicator. An explicit metadata-only check remains available.
   Turning it off does not undo an installation the user already confirmed.
 - Closing the app cancels network work. An unfinished package can resume at the
   next daily check when the server supports byte ranges. A verified package is
@@ -24,8 +25,25 @@ steps; only the user's **Install update** click starts installation.
   that version is installed (or the offer is older), the next check deletes the
   offer and its package instead of keeping ~150 MB until the next release.
 
-Stable versions receive newer stable versions. An installed beta can receive
-newer betas or stable releases. SemVer precedence prevents downgrades.
+**Settings → About → Update channel** selects releases to receive:
+
+- **Stable** accepts stable releases only.
+- **Beta** accepts stable releases and beta/release-candidate previews.
+- **Experimental** also accepts experimental and other prerelease builds.
+
+The initial channel follows the installed version and the selection is saved.
+Changing it cancels incompatible pending work and clears the old ready offer.
+It neither starts a request nor downgrades the current application; SemVer
+precedence still requires a newer compatible release. Switching a channel
+does not reset the daily automatic-check limit.
+
+**Check for updates** in the same section explicitly checks the selected
+channel immediately, without the startup wait or the daily limit. The result
+appears inline in Settings; no panel or installation starts automatically.
+When **Receive updates** is off, this explicit action checks release metadata
+only and leaves the preference off. It does not download an application package
+or expose an installation arrow. Turning the preference on permits the usual
+quiet download. Opening Settings itself never starts a network request.
 
 ## What runs
 
