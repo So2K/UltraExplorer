@@ -282,6 +282,17 @@ jobs:
           & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only CanvasResourceLifetimeChecks,ThumbnailServiceChecks
           if ($LASTEXITCODE -ne 0) { throw "Resource lifetime checks failed with exit code $LASTEXITCODE." }
 
+      - name: Check zoomed inline content thumbnails
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $env:ULTRAEXPLORER_STATE_DIR = Join-Path $env:RUNNER_TEMP 'UltraExplorer-inline-checks'
+          $env:TEMP = Join-Path $env:RUNNER_TEMP 'ue-inline-t'
+          $env:TMP = $env:TEMP
+          New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only ThumbnailPriorityChecks,InlineThumbnailControllerChecks,InlineThumbnailRenderingChecks
+          if ($LASTEXITCODE -ne 0) { throw "Inline thumbnail checks failed with exit code $LASTEXITCODE." }
+
       - name: Publish with the .NET and WPF runtime beside the app
         shell: pwsh
         env:

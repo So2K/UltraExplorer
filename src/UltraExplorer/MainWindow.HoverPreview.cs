@@ -14,6 +14,7 @@ namespace UltraExplorer;
 public partial class MainWindow
 {
     private FileThumbnailService? _thumbnails;
+    private readonly object _thumbnailGate = new();
     private HoverPreviewController _hoverPreview = null!;
     private HoverPreviewCard _previewCard = null!;
     private Canvas _previewOverlay = null!;
@@ -104,8 +105,7 @@ public partial class MainWindow
         _previewCard = new HoverPreviewCard();
         _previewOverlay.Children.Add(_previewCard);
         ((Grid)Content).Children.Add(_previewOverlay);
-        _hoverPreview = new HoverPreviewController(Dispatcher,
-            (path, token) => (_thumbnails ??= new FileThumbnailService()).GetAsync(path, token));
+        _hoverPreview = new HoverPreviewController(Dispatcher, RequestFileThumbnailAsync);
         _hoverPreview.Changed += RefreshHoverPreview;
         _previewEventRoot.AddHandler(Mouse.PreviewMouseMoveEvent, new MouseEventHandler(PreviewHoverMove), handledEventsToo: true);
         _previewEventRoot.AddHandler(Mouse.PreviewMouseDownEvent, new MouseButtonEventHandler(PreviewHoverPress), handledEventsToo: true);
@@ -126,6 +126,26 @@ public partial class MainWindow
         _viewModel.Tree.PathRefreshed += PreviewPathRefreshed;
         Closed += PreviewHoverClosed;
         Closing += PreviewHoverClosing;
+    }
+
+    Func<string, CancellationToken, Task<ThumbnailResult?>>? INestedPaneHost.InlineThumbnailSource => RequestInlineFileThumbnailAsync;
+
+    internal Task<ThumbnailResult?> RequestFileThumbnailAsync(string path, CancellationToken token)
+        => RequestThumbnailAsync(path, token, background: false);
+
+    private Task<ThumbnailResult?> RequestInlineFileThumbnailAsync(string path, CancellationToken token)
+        => RequestThumbnailAsync(path, token, background: true);
+
+    private Task<ThumbnailResult?> RequestThumbnailAsync(string path, CancellationToken token, bool background)
+    {
+        if (token.IsCancellationRequested) return Task.FromCanceled<ThumbnailResult?>(token);
+        FileThumbnailService service;
+        lock (_thumbnailGate)
+        {
+            if (_previewDetached) return Task.FromResult<ThumbnailResult?>(null);
+            service = _thumbnails ??= new FileThumbnailService();
+        }
+        return background ? service.GetBackgroundAsync(path, token) : service.GetAsync(path, token);
     }
 
     /// <summary>
@@ -326,11 +346,17 @@ public partial class MainWindow
 
     private void PreviewHoverClosed(object? sender, EventArgs args)
     {
-        _previewDetached = true;
+        FileThumbnailService? thumbnails;
+        lock (_thumbnailGate)
+        {
+            _previewDetached = true;
+            thumbnails = _thumbnails;
+            _thumbnails = null;
+        }
         CancelSpacePreview(disarm: true);
         ClearHoverPreview();
         _hoverPreview.Dispose();
-        _thumbnails?.Dispose();
+        thumbnails?.Dispose();
         _viewModel.PropertyChanged -= PreviewPreferenceChanged;
         _viewModel.Tree.FolderList.PropertyChanged -= PreviewListChanged;
         _viewModel.Tree.FolderList.Items.CollectionChanged -= PreviewListItemsChanged;

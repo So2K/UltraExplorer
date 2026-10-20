@@ -239,7 +239,7 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
     private readonly HashSet<string> _pinned = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<Color, Brush> _brushes = [];
 
-    // The picture is four layers, each redrawn only when what it shows
+    // The picture's layers are redrawn only when what they show
     // changed: the cells (the GPU's surface, or a bitmap), the names on them,
     // the marks and outlines over them, and the pointer's outline and tag on
     // top.  A click that only moves the selection redraws the third; an icon
@@ -368,13 +368,16 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
         // icons on the names are scaled, and must be.
         RenderOptions.SetBitmapScalingMode(_sceneVisual, BitmapScalingMode.NearestNeighbor);
         RenderOptions.SetBitmapScalingMode(_labelVisual, BitmapScalingMode.HighQuality);
+        RenderOptions.SetBitmapScalingMode(_thumbnailVisual, BitmapScalingMode.HighQuality);
         ClipToBounds = true;
         AddVisualChild(_sceneVisual);
         AddVisualChild(_labelVisual);
+        AddVisualChild(_thumbnailVisual);
         AddVisualChild(_decorVisual);
         AddVisualChild(_overlay);
         Unloaded += (_, _) =>
         {
+            SuspendInlineThumbnails();
             StopFrames();
             UnhookGpu();
         };
@@ -386,14 +389,15 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
         IsVisibleChanged += OnIsVisibleChanged;
     }
 
-    protected override int VisualChildrenCount => 4;
+    protected override int VisualChildrenCount => 5;
 
     protected override Visual GetVisualChild(int index) => index switch
     {
         0 => _sceneVisual,
         1 => _labelVisual,
-        2 => _decorVisual,
-        3 => _overlay,
+        2 => _thumbnailVisual,
+        3 => _decorVisual,
+        4 => _overlay,
         _ => throw new ArgumentOutOfRangeException(nameof(index))
     };
 
@@ -452,6 +456,8 @@ public sealed partial class NestedCanvas : FrameworkElement, IFrameDriver
             {
                 return;
             }
+
+            SuspendInlineThumbnails();
 
             if (_tree is not null)
             {

@@ -23,6 +23,9 @@ internal interface INestedPaneHost
     /// <summary>Whether the window is a file dialog, which never drags anything out of the canvas.</summary>
     bool IsPickerMode { get; }
 
+    /// <summary>Optional shared, bounded content-preview service owned by the host.</summary>
+    Func<string, CancellationToken, Task<ThumbnailResult?>>? InlineThumbnailSource => null;
+
     /// <summary>
     /// The folder a file dialog's view has come to rest on.  <paramref name="movedByUser"/>:
     /// the user brought it there by hand, which moves the dialog there even
@@ -334,6 +337,7 @@ internal sealed class NestedPane
         };
         Canvas.MarkLookup = _viewModel.Marks.Get;
         Canvas.IconLookup = LookUpFileIcon;
+        Canvas.SetInlineThumbnailSource(_host.InlineThumbnailSource);
         Canvas.IconArrivals = _iconInbox;
         Tree.FolderLoaded += OnFolderLoadedForIcons;
         Tree.FolderLoaded += OnFolderLoadedKeepInView;

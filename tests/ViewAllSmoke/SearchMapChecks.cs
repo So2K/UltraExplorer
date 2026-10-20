@@ -345,7 +345,9 @@ internal static partial class Program
     {
         Section("search map: streamed pages preserve exact record identity and immutable membership");
         const string firstRoot = @"Q:\scope";
-        const string secondRoot = @"R:\scope";
+        // Disjoint roots on one synthetic volume avoid a real mapped drive
+        // changing coverage and bypassing this injected index fixture.
+        const string secondRoot = @"Q:\second-scope";
         var first = Enumerable.Range(0, 9003).Select(index => new EverythingItem($"image-{index:D5}.png",
             firstRoot + @"\deep", false, index, null, string.Empty)).Concat(new[]
         {

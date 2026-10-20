@@ -811,15 +811,15 @@ public sealed partial class NestedCanvas
         }
 
         // Nothing further in: an empty folder need not fill more than the
-        // screen.  A folder of files goes as far in as it takes for its
-        // smallest names to be read and picked up.
+        // screen. A folder of files also allows a content-sized card, so a
+        // dense listing can reach inline previews instead of stopping at names.
         Ensure(_anchor);
         var isDeadEnd = _anchor.Children.Count == 0
             && (_anchor.LoadState is NestedLoadState.Loaded or NestedLoadState.Failed || _anchor.IsReparsePoint);
         var maximum = !isDeadEnd
             ? 1e7 * _viewWidth
             : _anchor.FileGrid is { IsEmpty: false } files
-                ? Math.Max(3 * _viewWidth, 4 * FileLabelPixels / files.TileHeight)
+                ? Math.Max(3 * _viewWidth, 160 / files.TileHeight)
                 : 3 * _viewWidth;
         if (_aw > maximum)
         {
