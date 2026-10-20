@@ -8,6 +8,11 @@ on:
     tags: ['v*']
   pull_request:
   workflow_dispatch:
+    inputs:
+      snapshot_version:
+        description: 'Optional prerelease version for a private test artifact; does not publish a release'
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -52,9 +57,15 @@ jobs:
         env:
           REF: ${{ github.ref }}
           RUN_NUMBER: ${{ github.run_number }}
+          SNAPSHOT_VERSION: ${{ inputs.snapshot_version }}
         run: |
           if ($env:REF.StartsWith('refs/tags/v')) {
             $version = $env:REF.Substring('refs/tags/v'.Length)
+          } elseif ($env:SNAPSHOT_VERSION) {
+            if ($env:SNAPSHOT_VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*$') {
+              throw 'A private snapshot requires a valid prerelease version.'
+            }
+            $version = $env:SNAPSHOT_VERSION
           } else {
             $version = "0.0.0-ci.$env:RUN_NUMBER"
           }
@@ -290,7 +301,7 @@ jobs:
           $env:TEMP = Join-Path $env:RUNNER_TEMP 'ue-inline-t'
           $env:TMP = $env:TEMP
           New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
-          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only ThumbnailPriorityChecks,InlineThumbnailControllerChecks,InlineThumbnailRenderingChecks
+          & tests/ViewAllSmoke/bin/Release/net10.0-windows/win-x64/ViewAllSmoke.exe --only ThumbnailPriorityChecks,InlineThumbnailControllerChecks,FocusedFileDetailChecks,FileDetailZoomChecks,InlineThumbnailRenderingChecks
           if ($LASTEXITCODE -ne 0) { throw "Inline thumbnail checks failed with exit code $LASTEXITCODE." }
 
       - name: Publish with the .NET and WPF runtime beside the app

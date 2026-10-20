@@ -51,6 +51,7 @@ public sealed partial class NestedCanvas
     /// <summary>Shows all of This PC.</summary>
     public void FitAll(bool animated = true)
     {
+        ClearFileDetailTarget();
         NextCameraRequest();
         if (_tree is null)
         {
@@ -113,6 +114,7 @@ public sealed partial class NestedCanvas
             return false;
         }
 
+        ClearFileDetailTarget();
         NextCameraRequest();
         if (!animated)
         {
@@ -434,12 +436,14 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        PrepareFileDetailZoom(at, factor);
         NextCameraRequest();
         StopFlight();
         ZoomAround(at, factor);
         Normalize();
         ClampZoom(at);
         ClampPan();
+        ReleaseSmallFileDetailTarget();
         _cameraTouched = true;
         AfterCameraMove();
     }
@@ -569,6 +573,7 @@ public sealed partial class NestedCanvas
             return;
         }
 
+        ClearFileDetailTarget();
         StopFlight();
         _anchor = folder;
         _aw = width;
@@ -821,6 +826,7 @@ public sealed partial class NestedCanvas
             : _anchor.FileGrid is { IsEmpty: false } files
                 ? Math.Max(3 * _viewWidth, 160 / files.TileHeight)
                 : 3 * _viewWidth;
+        if (TryFileDetailMaximum(out var fileMaximum)) maximum = fileMaximum;
         if (_aw > maximum)
         {
             ZoomAround(at, maximum / _aw);

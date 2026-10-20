@@ -130,6 +130,21 @@ public partial class MainWindow
 
     Func<string, CancellationToken, Task<ThumbnailResult?>>? INestedPaneHost.InlineThumbnailSource => RequestInlineFileThumbnailAsync;
 
+    Func<string, CancellationToken, Task<FocusedFileDetailResult?>>? INestedPaneHost.FocusedFileDetailSource => RequestFocusedFileDetailAsync;
+
+    private async Task<FocusedFileDetailResult?> RequestFocusedFileDetailAsync(string path, CancellationToken token)
+    {
+        token.ThrowIfCancellationRequested();
+        lock (_thumbnailGate)
+            if (_previewDetached) return null;
+        if (FocusedFileDetailProvider.Supports(path))
+            return await FocusedFileDetailProvider.GetAsync(path, token).ConfigureAwait(false);
+        // Other formats reuse the same background thumbnail lane already used
+        // by this window. No extra Shell/F3D/media worker pool is introduced.
+        var thumbnail = await RequestInlineFileThumbnailAsync(path, token).ConfigureAwait(false);
+        return thumbnail is null ? null : new(thumbnail.Image, null, thumbnail.OriginalWidth, thumbnail.OriginalHeight);
+    }
+
     internal Task<ThumbnailResult?> RequestFileThumbnailAsync(string path, CancellationToken token)
         => RequestThumbnailAsync(path, token, background: false);
 

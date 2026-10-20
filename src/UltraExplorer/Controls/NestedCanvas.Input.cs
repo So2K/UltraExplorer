@@ -991,9 +991,13 @@ public sealed partial class NestedCanvas
         return HitTest(point);
     }
 
-    /// <summary>Content previews use exactly the same hit and motion rules as canvas hover.</summary>
-    internal NestedHit? HoverPreviewHit(Point point) =>
-        _press == PressKind.None && !IsCameraMoving && HotspotAt(point) is null ? PointerHit(point) : null;
+    /// <summary>A file already shown in detail needs no hover card over its content.</summary>
+    internal NestedHit? HoverPreviewHit(Point point)
+    {
+        if (_press != PressKind.None || IsCameraMoving || HotspotAt(point) is not null) return null;
+        var hit = PointerHit(point);
+        return hit is { IsFile: true } file && IsExpandedFile(file.Folder, file.File) ? null : hit;
+    }
 
     private Hotspot? HotspotAt(Point point)
     {

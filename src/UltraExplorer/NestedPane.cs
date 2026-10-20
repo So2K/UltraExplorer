@@ -26,6 +26,9 @@ internal interface INestedPaneHost
     /// <summary>Optional shared, bounded content-preview service owned by the host.</summary>
     Func<string, CancellationToken, Task<ThumbnailResult?>>? InlineThumbnailSource => null;
 
+    /// <summary>One settled, deeply zoomed file's higher quality content.</summary>
+    Func<string, CancellationToken, Task<FocusedFileDetailResult?>>? FocusedFileDetailSource => null;
+
     /// <summary>
     /// The folder a file dialog's view has come to rest on.  <paramref name="movedByUser"/>:
     /// the user brought it there by hand, which moves the dialog there even
@@ -338,6 +341,7 @@ internal sealed class NestedPane
         Canvas.MarkLookup = _viewModel.Marks.Get;
         Canvas.IconLookup = LookUpFileIcon;
         Canvas.SetInlineThumbnailSource(_host.InlineThumbnailSource);
+        Canvas.SetFocusedFileDetailSource(_host.FocusedFileDetailSource);
         Canvas.IconArrivals = _iconInbox;
         Tree.FolderLoaded += OnFolderLoadedForIcons;
         Tree.FolderLoaded += OnFolderLoadedKeepInView;

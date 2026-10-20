@@ -251,6 +251,8 @@ internal static partial class Program
         await Group(ThumbnailServiceChecks);
         await Group(ThumbnailPriorityChecks);
         await Group(InlineThumbnailControllerChecks);
+        await Group(FocusedFileDetailChecks);
+        await Group(FileDetailZoomChecks);
         await Group(InlineThumbnailRenderingChecks);
         await Group(HoverPreviewChecks);
         await Group(DocumentPreviewChecks);

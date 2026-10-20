@@ -65,12 +65,15 @@ public sealed partial class NestedCanvas
         _inlineThumbnailLookup.Clear();
         _oldInlineThumbnailLookup.Clear();
         _shownInlineThumbnails.Clear();
+        ClearFocusedFileDetailView();
         using (_thumbnailVisual.RenderOpen()) { }
+        _focusedDetailRecordingDirty = false;
     }
 
     private void SuspendInlineThumbnails()
     {
         _inlineThumbnails?.Suspend();
+        SuspendFocusedFileDetails();
         ClearInlineThumbnailView();
     }
 
@@ -83,6 +86,7 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void PrepareInlineThumbnails(bool moving)
     {
+        PrepareFocusedFileDetails(moving);
         if (_inlineThumbnails is not { } controller)
         {
             return;
@@ -108,6 +112,7 @@ public sealed partial class NestedCanvas
             }
 
             var file = job.Folder.Files[job.Index];
+            if (IsExpandedFile(job.Folder, file)) continue;
             if (!InlineThumbnailController.CanPreview(file.Extension)) continue;
             var key = (job.Folder.FullPath, file.Name);
             var retained = _oldInlineThumbnailLookup.TryGetValue(key, out var previous);
@@ -160,7 +165,8 @@ public sealed partial class NestedCanvas
     /// </summary>
     private void DrawInlineThumbnails()
     {
-        if (_inlineThumbnailLayouts.Count == 0 && _shownInlineThumbnails.Count == 0) return;
+        if (_inlineThumbnailLayouts.Count == 0 && _shownInlineThumbnails.Count == 0
+            && _focusedFileLayout is null && _shownFocusedFile is null && !_focusedDetailRecordingDirty) return;
         _shownInlineThumbnails.Clear();
         using var drawing = _thumbnailVisual.RenderOpen();
         foreach (var layout in _inlineThumbnailLayouts)
@@ -181,6 +187,7 @@ public sealed partial class NestedCanvas
             if (layout.Faded) drawing.Pop();
             _shownInlineThumbnails.Add((layout.Path, layout.Slot, imageBounds, layout.Image is not null));
         }
+        DrawFocusedFileDetails(drawing);
     }
 
     private readonly record struct InlineThumbnailLayout(
