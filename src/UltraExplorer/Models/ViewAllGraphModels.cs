@@ -35,7 +35,8 @@ public sealed record ViewAllEntryDescriptor(
     bool IsReparsePoint,
     long? SizeBytes,
     DateTime ModifiedUtc,
-    string SecondaryText = "");
+    string SecondaryText = "",
+    long? FreeSpaceBytes = null);
 
 public sealed record ViewAllDirectorySnapshot(
     IReadOnlyList<ViewAllEntryDescriptor> Entries,

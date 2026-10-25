@@ -248,6 +248,7 @@ internal static partial class Program
         await Group(CrossClusterReviewChecks);
         await Group(TopReviewFixChecks);
         await Group(DriveGateChecks);
+        await Group(DriveCapacityChecks);
         await Group(ThumbnailServiceChecks);
         await Group(ThumbnailPriorityChecks);
         await Group(InlineThumbnailControllerChecks);

@@ -276,7 +276,8 @@ public partial class MainWindow
         }
 
         _remoteDrivesWaiting.Remove(path);
-        var drive = new NestedRoot(answer.FullPath, answer.DisplayName, NestedFolderKind.Drive, answer.SecondaryText);
+        var drive = new NestedRoot(answer.FullPath, answer.DisplayName, NestedFolderKind.Drive, answer.SecondaryText,
+            answer.SizeBytes, answer.FreeSpaceBytes);
         if (at >= 0)
         {
             if (_nestedDrives[at] == drive)

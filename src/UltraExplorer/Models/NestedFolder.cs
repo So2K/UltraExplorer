@@ -224,6 +224,11 @@ public sealed class NestedFolder
 
     private volatile bool _isStale;
 
+    // Only drive roots need byte counts. Ordinary folders keep one null
+    // reference rather than two nullable Int64 fields per directory.
+    private sealed record DriveSpace(long? Total, long? Free);
+    private DriveSpace? _driveSpace;
+
     internal NestedFolder(
         string fullPath,
         string name,
@@ -232,7 +237,9 @@ public sealed class NestedFolder
         bool isHidden = false,
         bool isReparsePoint = false,
         string secondaryText = "",
-        long modifiedTicks = 0)
+        long modifiedTicks = 0,
+        long? driveTotalBytes = null,
+        long? driveFreeBytes = null)
     {
         _fullPath = fullPath;
         Name = name;
@@ -242,6 +249,7 @@ public sealed class NestedFolder
         IsHidden = isHidden;
         IsReparsePoint = isReparsePoint;
         SecondaryText = secondaryText;
+        SetDriveCapacity(driveTotalBytes, driveFreeBytes);
         ModifiedTicks = modifiedTicks;
         Watch = parent?.Watch;
         _pathHash = Hash(HashOrigin, fullPath);
@@ -300,6 +308,16 @@ public sealed class NestedFolder
 
     /// <summary>Free space for a drive; empty for a folder.</summary>
     public string SecondaryText { get; internal set; }
+
+    /// <summary>Last drive-description sample; null for ordinary or unknown roots.</summary>
+    public long? DriveTotalBytes => _driveSpace?.Total;
+
+    /// <summary>Available bytes from the same sample used for the drive caption.</summary>
+    public long? DriveFreeBytes => _driveSpace?.Free;
+
+    internal void SetDriveCapacity(long? total, long? free) =>
+        _driveSpace = Kind == NestedFolderKind.Drive && (total.HasValue || free.HasValue)
+            ? new DriveSpace(total, free) : null;
 
     /// <summary>
     /// When the folder was last written, as UTC ticks, from its parent's

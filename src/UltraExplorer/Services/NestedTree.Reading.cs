@@ -253,7 +253,8 @@ public sealed partial class NestedTree
         // Added/reinserted drives may have changed their device or alias. A
         // pick keeps its old lane so its completion always frees the right one.
         lock (_gate) { _localLaneLetters = new string?[26]; _localSpecialLanes.Clear(); _rankedFrame = NotRanked; }
-        return new(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText)
+        return new(root.FullPath, root.Name, root.Kind, Root, secondaryText: root.SecondaryText,
+            driveTotalBytes: root.DriveTotalBytes, driveFreeBytes: root.DriveFreeBytes)
         {
             Watch = watch ?? WatchRootFor?.Invoke(root.FullPath)
         };
