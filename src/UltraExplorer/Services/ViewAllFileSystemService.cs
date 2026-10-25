@@ -69,16 +69,21 @@ public sealed class ViewAllFileSystemService
             ? DriveTypeName(drive.DriveType)
             : drive.VolumeLabel;
         var driveName = drive.Name.TrimEnd(Path.DirectorySeparatorChar);
-        var secondary = $"{drive.DriveFormat}  ·  {FormatSize(drive.AvailableFreeSpace)} free of {FormatSize(drive.TotalSize)}";
+        // One background sample supplies both the caption and numeric usage;
+        // drawing never needs to parse rounded text or ask the drive again.
+        var freeBytes = drive.AvailableFreeSpace;
+        var totalBytes = drive.TotalSize;
+        var secondary = $"{drive.DriveFormat}  ·  {FormatSize(freeBytes)} free of {FormatSize(totalBytes)}";
         return new ViewAllEntryDescriptor(
             ViewAllPath.Normalize(drive.RootDirectory.FullName),
             $"{volume} ({driveName})",
             ViewAllEntryKind.Drive,
             IsHidden: false,
             IsReparsePoint: false,
-            SizeBytes: drive.TotalSize,
+            SizeBytes: totalBytes,
             ModifiedUtc: DateTime.MinValue,
-            SecondaryText: secondary);
+            SecondaryText: secondary,
+            FreeSpaceBytes: freeBytes);
     }
 
     /// <summary>

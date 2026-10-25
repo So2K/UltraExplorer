@@ -27,7 +27,8 @@ public sealed record NestedListing(
 public readonly record struct NestedEntry(string Name, bool IsHidden, bool IsReparsePoint, long ModifiedTicks = 0, bool IsArchive = false);
 
 /// <summary>A drive or extra root, as the canvas should name it.</summary>
-public sealed record NestedRoot(string FullPath, string Name, NestedFolderKind Kind, string SecondaryText = "");
+public sealed record NestedRoot(string FullPath, string Name, NestedFolderKind Kind, string SecondaryText = "",
+    long? DriveTotalBytes = null, long? DriveFreeBytes = null);
 
 /// <summary>
 /// The folder tree behind the nested canvas.
@@ -304,6 +305,7 @@ public sealed partial class NestedTree : IDisposable
                 && (kept.Watch is not null || (watch = WatchRootFor?.Invoke(root.FullPath)) is null))
             {
                 kept.SecondaryText = root.SecondaryText;
+                kept.SetDriveCapacity(root.DriveTotalBytes, root.DriveFreeBytes);
                 children.Add(kept);
                 continue;
             }

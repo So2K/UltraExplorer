@@ -68,6 +68,8 @@ public sealed class ViewAllNodeViewModel : ObservableObject
     public string FullPath => Entry.FullPath;
     public string DisplayName => Entry.DisplayName;
     public string SecondaryText => Entry.SecondaryText;
+    public long? SizeBytes => Entry.SizeBytes;
+    public long? FreeSpaceBytes => Entry.FreeSpaceBytes;
     public ViewAllEntryKind Kind => Entry.Kind;
     public bool IsDrive => Kind == ViewAllEntryKind.Drive;
     public bool IsDirectory => Kind is ViewAllEntryKind.Drive or ViewAllEntryKind.Folder;

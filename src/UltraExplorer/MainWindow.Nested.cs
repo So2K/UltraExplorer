@@ -257,7 +257,8 @@ public partial class MainWindow : INestedPaneHost
         _nestedDrives.Clear();
         _nestedDrives.AddRange(_viewModel.Tree.Roots
             .Where(root => root.IsDrive)
-            .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText)));
+            .Select(root => new NestedRoot(root.FullPath, root.DisplayName, NestedFolderKind.Drive, root.SecondaryText,
+                root.SizeBytes, root.FreeSpaceBytes)));
 
         // The folder keeps its physical ancestors. Only their named entries
         // are materialized, so no drive or parent listing delays the first view.
@@ -387,7 +388,8 @@ public partial class MainWindow : INestedPaneHost
         {
             var place = _nestedDrives.FindIndex(existing => string.Compare(existing.FullPath, drive.FullPath, StringComparison.OrdinalIgnoreCase) > 0);
             _nestedDrives.Insert(place < 0 ? _nestedDrives.Count : place,
-                new NestedRoot(drive.FullPath, drive.DisplayName, NestedFolderKind.Drive, drive.SecondaryText));
+                new NestedRoot(drive.FullPath, drive.DisplayName, NestedFolderKind.Drive, drive.SecondaryText,
+                    drive.SizeBytes, drive.FreeSpaceBytes));
             if (!_nestedReady)
             {
                 _nestedDrivesLate = true;

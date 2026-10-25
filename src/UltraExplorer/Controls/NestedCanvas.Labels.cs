@@ -1500,6 +1500,7 @@ public sealed partial class NestedCanvas
         {
             var folder = job.Folder;
             target.BeginLabel(folder, -1);
+            DrawDriveCapacity(target, job);
             if (job.Mode == LabelMode.Pill)
             {
                 var text = target.Text(folder.Name, PillFontSize, IsFilteredOut(folder) ? TextDimColour : TextColour, Math.Max(8, job.W - 10), LabelFace.Regular, scaled: false);
